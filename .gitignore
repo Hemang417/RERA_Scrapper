@@ -1,0 +1,8 @@
+output/
+__pycache__/
+*.pyc
+.venv/
+venv/
+.guest_token_cache.json
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
