@@ -385,6 +385,126 @@ def _render_promoter_profile_section(promoter_portfolio: dict | None, promoter_e
     return flowables
 
 
+def _charter_findings_table(rows: list, col_widths: list) -> Table:
+    table = Table(rows, colWidths=col_widths)
+    table.setStyle(
+        TableStyle(
+            [
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#dfe7f2")),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("FONTSIZE", (0, 0), (-1, -1), 8),
+            ]
+        )
+    )
+    return table
+
+
+def _render_charter_highlights_section(charter_facts: dict | None) -> list:
+    """Renders the highest-value code-computed findings from the Company
+    Charter (see company_charter.py) that would otherwise only ever live in
+    that separate docx: the Documentation Confidence Score, credit rating
+    check, IBBI insolvency check, matched appeal-level judgments, and the
+    sourced mortgage_lender field. Pulled straight from the same facts dict
+    the Charter itself was built from -- nothing here is recomputed or
+    re-fetched, only re-rendered into this PDF."""
+    flowables = [Paragraph("Company Charter Highlights", _SECTION_STYLE)]
+
+    if not charter_facts or not isinstance(charter_facts, dict):
+        flowables.append(
+            Paragraph(
+                "Not available this run -- Company Charter generation did not complete "
+                "(requires ANTHROPIC_API_KEY). Retry with `python company_charter.py <reg_no>` "
+                "and rebuild this PDF with `python finalize_report.py <reg_no>`.",
+                _NOTE_STYLE,
+            )
+        )
+        return flowables
+
+    confidence = charter_facts.get("documentation_confidence_score")
+    if confidence:
+        flowables.append(Paragraph("Documentation Confidence Score", _SUBSECTION_STYLE))
+        flowables.append(
+            Paragraph(
+                f"<b>{_esc(confidence.get('overall', 0))}/100 -- {_esc(confidence.get('band', ''))}</b> "
+                "(composite score over six weighted, code-computed criteria measuring how well-sourced "
+                "and verified THIS DOCUMENT's claims are -- not a rating of the project itself; see the "
+                "Company Charter for full methodology)",
+                _BODY_STYLE,
+            )
+        )
+        criteria = confidence.get("criteria", {})
+        if criteria:
+            rows = [["Criterion", "Score", "Weight"]]
+            for name, c in criteria.items():
+                rows.append(
+                    [
+                        Paragraph(_esc(name.replace("_", " ").title()), _SOURCE_STYLE),
+                        Paragraph(_esc(round(c.get("score", 0), 1)), _SOURCE_STYLE),
+                        Paragraph(f"{_esc(c.get('weight', ''))}%", _SOURCE_STYLE),
+                    ]
+                )
+            flowables.append(_charter_findings_table(rows, [9 * cm, 3.5 * cm, 3.5 * cm]))
+        flowables.append(Spacer(1, 8))
+
+    credit = charter_facts.get("credit_rating_check")
+    if credit:
+        flowables.append(Paragraph("Credit Rating Check (ICRA)", _SUBSECTION_STYLE))
+        for role, key in (("Promoter", "promoter"), ("Parent/group entity (separate -- not the promoter above)", "parent_group")):
+            result = credit.get(key)
+            if not result:
+                continue
+            if result.get("found"):
+                flowables.append(Paragraph(f"<b>{_esc(role)}:</b> {_esc(result['company_name'])}", _BODY_STYLE))
+                for item in result.get("instruments", []):
+                    flowables.append(Paragraph(f"• {_esc(item['instrument'])}: {_esc(item['rating'])}", _BODY_STYLE))
+            elif key == "promoter":
+                flowables.append(Paragraph(f"<b>{_esc(role)}:</b> {_esc(result.get('note', 'No result recorded.'))}", _NOTE_STYLE))
+        flowables.append(Spacer(1, 8))
+
+    ibbi = charter_facts.get("ibbi_insolvency_check")
+    if ibbi and ibbi.get("found_process") is not None:
+        flowables.append(Paragraph("Insolvency Check (IBBI)", _SUBSECTION_STYLE))
+        if ibbi["found_process"] is False:
+            flowables.append(
+                Paragraph(f"No insolvency process recorded against this CIN (\"{_esc(ibbi.get('status_text', ''))}\").", _BODY_STYLE)
+            )
+        else:
+            flowables.append(
+                Paragraph(
+                    "This CIN returned something other than the standard \"no process\" result -- see the "
+                    "Company Charter for the raw extracted text (not auto-classified; a human should read it directly).",
+                    _NOTE_STYLE,
+                )
+            )
+        flowables.append(Spacer(1, 8))
+
+    judgments = charter_facts.get("appeal_judgments_found")
+    if judgments:
+        flowables.append(Paragraph("Appeal-Level Judgments Found", _SUBSECTION_STYLE))
+        rows = [["Complainant No.", "Respondent", "Uploaded"]]
+        for item in judgments:
+            rows.append(
+                [
+                    Paragraph(_esc(item.get("complainant_no") or ""), _SOURCE_STYLE),
+                    Paragraph(_esc(item.get("respondent_name") or ""), _SOURCE_STYLE),
+                    Paragraph(_esc(item.get("uploaded_date") or ""), _SOURCE_STYLE),
+                ]
+            )
+        flowables.append(_charter_findings_table(rows, [5 * cm, 7 * cm, 4 * cm]))
+        flowables.append(Spacer(1, 8))
+
+    mortgage_lender = (charter_facts.get("fsi_metrics") or {}).get("mortgage_lender")
+    if isinstance(mortgage_lender, dict) and mortgage_lender.get("value"):
+        flowables.append(Paragraph("Mortgage Lender", _SUBSECTION_STYLE))
+        flowables.append(Paragraph(_esc(mortgage_lender["value"]), _BODY_STYLE))
+        history_note = charter_facts.get("mortgage_lender_history_note")
+        if history_note:
+            flowables.append(Paragraph(_esc(history_note), _NOTE_STYLE))
+
+    return flowables
+
+
 def _render_market_research_section(research_data: dict | None) -> list:
     flowables = [Paragraph("Market Research", _SECTION_STYLE)]
     research_data = research_data or {}
@@ -403,6 +523,7 @@ def build_pdf(
     auth_source: str | None = None,
     promoter_portfolio: dict | None = None,
     research_data: dict | None = None,
+    charter_facts: dict | None = None,
 ) -> None:
     doc = SimpleDocTemplate(
         out_path,
@@ -480,6 +601,9 @@ def build_pdf(
     # what is this, who's building it, is the market/location good, then the
     # regulatory paper trail.
     story.extend(_render_category_section("projects", category_data.get("projects"), failed_categories))
+    story.append(PageBreak())
+
+    story.extend(_render_charter_highlights_section(charter_facts))
     story.append(PageBreak())
 
     promoter_external = (research_data or {}).get("promoter_external")

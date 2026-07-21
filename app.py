@@ -320,6 +320,7 @@ with tab_run:
 
             # --- company charter ---
             charter_path = None
+            charter_facts = None
             if use_maps_scrape:
                 os.environ[company_charter._MAPS_SCRAPE_ENV_VAR] = "1"
             else:
@@ -327,11 +328,17 @@ with tab_run:
             spinner_msg = "Generating Company Charter docx -- this calls the Claude API and can take several minutes"
             if use_maps_scrape:
                 spinner_msg += " (Maps-scrape enabled: also launches a headless browser per landmark, adding time)"
+            # No automated review-fetching mechanism exists in this pipeline --
+            # this only picks up reviews a user has separately collected and
+            # saved here (e.g. via the Browser pane against a review site).
+            reviews_path = os.path.join(project_out_dir, "reviews.json")
+            reviews = json.load(open(reviews_path, encoding="utf-8")) if os.path.exists(reviews_path) else None
             with st.spinner(spinner_msg + "..."):
                 try:
-                    charter_path = company_charter.run_company_charter(
+                    charter_path, charter_facts = company_charter.run_company_charter(
                         reg_no, category_data, documents_manifest, documents_dir, research_data,
                         complaint_orders_manifest=complaint_orders_manifest, complaint_orders_dir=complaint_orders_dir,
+                        reviews=reviews,
                     )
                     st.success(f"Company Charter written to `{charter_path}`")
                 except Exception as e:
@@ -345,7 +352,7 @@ with tab_run:
 
             pdf_path = os.path.join(project_out_dir, f"{reg_no}_summary.pdf")
             with st.spinner("Building PDF report..."):
-                report.build_pdf(reg_no, project_id, category_data, documents_manifest, pdf_path, auth_source=auth_source, promoter_portfolio=portfolio, research_data=research_data)
+                report.build_pdf(reg_no, project_id, category_data, documents_manifest, pdf_path, auth_source=auth_source, promoter_portfolio=portfolio, research_data=research_data, charter_facts=charter_facts)
 
             st.session_state.run_result = {
                 "reg_no": reg_no, "project_id": project_id, "auth_source": auth_source, "retried": retried,

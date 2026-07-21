@@ -350,11 +350,24 @@ def main() -> int:
         print(f"[WARN] Deep research failed ({e}) -- continuing without it.")
         research_data = None
 
+    # No automated review-fetching mechanism exists in this pipeline (see
+    # company_charter.run_review_authenticity_triage's own module note) --
+    # this only picks up reviews a user has separately collected and saved
+    # here, e.g. via the Browser pane against a review site.
+    reviews_path = os.path.join(project_out_dir, "reviews.json")
+    reviews = None
+    if os.path.exists(reviews_path):
+        with open(reviews_path, "r", encoding="utf-8") as f:
+            reviews = json.load(f)
+        print(f"[INFO] Found {reviews_path} -- running review-authenticity triage on {len(reviews)} review(s).")
+
     print("\n[INFO] Generating Company Charter...")
+    charter_facts = None
     try:
-        charter_path = company_charter.run_company_charter(
+        charter_path, charter_facts = company_charter.run_company_charter(
             reg_no, category_data, documents_manifest, documents_dir, research_data, args.output_dir,
             complaint_orders_manifest=complaint_orders_manifest, complaint_orders_dir=complaint_orders_dir,
+            reviews=reviews,
         )
         print(f"[OK] Company Charter written to {charter_path}")
     except Exception as e:
@@ -393,6 +406,7 @@ def main() -> int:
         auth_source=auth_source,
         promoter_portfolio=portfolio,
         research_data=research_data,
+        charter_facts=charter_facts,
     )
 
     failed = [cat for cat, data in category_data.items() if data is None]

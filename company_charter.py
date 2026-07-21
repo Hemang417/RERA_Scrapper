@@ -524,8 +524,8 @@ def _verify_one_field(field_name: str, field, gaps: list, stats: dict) -> None:
     manually re-check it themselves.
 
     `stats` is mutated in place ({"attempted", "confirmed", "failed",
-    "could_not_run"}) so _compute_confidence_score can report a real
-    Independent Verification Rate instead of parsing gap text."""
+    "could_not_run"}) so _compute_documentation_confidence_score can report a
+    real Independent Verification Rate instead of parsing gap text."""
     if not isinstance(field, dict) or not field.get("value") or not field.get("source"):
         return
     if not field["source"].startswith("http"):
@@ -1510,6 +1510,7 @@ def _fill_template(reg_no: str, facts: dict, out_path: str) -> None:
     _append_credit_rating_section(doc, facts)
     _append_ibbi_check_section(doc, facts)
     _append_appeal_judgments_section(doc, facts)
+    _append_review_authenticity_section(doc, facts)
     _append_authenticity_page(doc, facts)
 
     doc.save(out_path)
@@ -1596,7 +1597,13 @@ def _compute_authenticity_summary(facts: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Composite Data Confidence Score -- six criteria, each computed directly from
+# Composite Documentation Confidence Score -- a score of how well-sourced and
+# verified THIS DOCUMENT's own claims are (source quality, completeness,
+# cross-corroboration, recency, re-check success), NOT a rating of the
+# underlying project's quality, safety, or investment merit. A project with a
+# genuinely bad track record whose problems are thoroughly documented can
+# score HIGH here; a genuinely fine project with little public paper trail to
+# verify against can score LOW. Six criteria, each computed directly from
 # data already in `facts`, none of them a model self-assessment. CRISIL's own
 # real-estate methodology (researched, not guessed -- see project notes) does
 # NOT publish a numeric weighting formula for any of its three products
@@ -1626,7 +1633,7 @@ _TIER_WEIGHTS = {
     "Other / unclassified source": 30,
 }
 
-_CONFIDENCE_WEIGHTS = {
+_DOC_CONFIDENCE_WEIGHTS = {
     "source_tier_quality": 0.30,
     "primary_tier_density": 0.20,
     "completeness_rate": 0.20,
@@ -1660,8 +1667,10 @@ def _months_since(date_str: str) -> float | None:
     return (datetime.now() - parsed).days / 30.44
 
 
-def _compute_confidence_score(facts: dict, authenticity_summary: dict) -> dict:
-    """Returns {overall, band, criteria: {name: {score, weight, note}}}. Every
+def _compute_documentation_confidence_score(facts: dict, authenticity_summary: dict) -> dict:
+    """Returns {overall, band, criteria: {name: {score, weight, note}}} -- a
+    score of how well-sourced and verified THIS DOCUMENT's claims are, not a
+    rating of the underlying project (see the module note above). Every
     criterion is either a plain ratio over data already in `facts`, or
     explicitly marked not-applicable and excluded (with the remaining
     weights renormalized to still sum to 100%) rather than silently scored
@@ -1744,15 +1753,15 @@ def _compute_confidence_score(facts: dict, authenticity_summary: dict) -> dict:
             "note": f"{fresh} of {len(ages)} dated sources are within this document's {_RECENCY_WINDOW_MONTHS}-month freshness window (this project's own calibration, not a disclosed external standard).",
         }
 
-    applicable_weight = sum(_CONFIDENCE_WEIGHTS[k] for k in criteria)
+    applicable_weight = sum(_DOC_CONFIDENCE_WEIGHTS[k] for k in criteria)
     if applicable_weight == 0:
         overall = 0.0
     else:
-        overall = sum(criteria[k]["score"] * _CONFIDENCE_WEIGHTS[k] for k in criteria) / applicable_weight
+        overall = sum(criteria[k]["score"] * _DOC_CONFIDENCE_WEIGHTS[k] for k in criteria) / applicable_weight
         for k in criteria:
-            criteria[k]["weight"] = round(100 * _CONFIDENCE_WEIGHTS[k] / applicable_weight, 1)
+            criteria[k]["weight"] = round(100 * _DOC_CONFIDENCE_WEIGHTS[k] / applicable_weight, 1)
 
-    skipped = sorted(set(_CONFIDENCE_WEIGHTS) - set(criteria))
+    skipped = sorted(set(_DOC_CONFIDENCE_WEIGHTS) - set(criteria))
     return {
         "overall": round(overall, 1),
         "band": _band_label(overall),
@@ -1982,6 +1991,81 @@ def _append_appeal_judgments_section(doc, facts: dict) -> None:
         row.cells[3].text = item.get("saved_filename") or "(save failed -- see facts.json)"
 
 
+def _append_review_authenticity_section(doc, facts: dict) -> None:
+    """Appends a section reporting the code-computed review-authenticity
+    heuristic triage (see run_review_authenticity_triage). Silently does
+    nothing if review_authenticity_triage was never set -- the ordinary
+    case, since this pipeline has no automated review-fetching mechanism;
+    it only runs when a caller supplies pre-collected reviews (see
+    run_company_charter's `reviews` param and --reviews-file)."""
+    triage = facts.get("review_authenticity_triage")
+    if not triage:
+        return
+
+    heading_style = doc.paragraphs[4].style
+
+    doc.add_page_break()
+    heading_para = doc.add_paragraph("Review Authenticity Triage (Code-Computed Heuristics)")
+    heading_para.style = heading_style
+    doc.add_paragraph(
+        "Five heuristic checks over reviews supplied for this run -- a red-flag surfacing aid for a "
+        "human to look at, NOT a fabrication verdict. True fabrication-probability scoring would need "
+        "platform-internal data (poster IP/device clustering, account history) this project has no "
+        "access to. There is no automated review-fetching mechanism in this pipeline; the reviews "
+        "analyzed here were supplied directly to this run."
+    )
+    doc.add_paragraph(f"Total reviews analyzed: {triage.get('total_reviews_analyzed', 0)}")
+
+    polarization = triage.get("rating_polarization", {})
+    if polarization.get("total"):
+        doc.add_paragraph(
+            f"Rating polarization: {polarization['pct_extreme']}% of ratings sit at the extremes "
+            f"(1 or 5 stars) rather than the middle -- a heavily bimodal split is a directional red "
+            f"flag (fabricated reviews skew to the extremes), not proof on its own."
+        )
+
+    bursts = triage.get("burst_clusters", [])
+    if bursts:
+        doc.add_paragraph(f"Review bursts detected ({len(bursts)}): {len(bursts)} cluster(s) of 5+ reviews posted within a 7-day window:")
+        for b in bursts:
+            doc.add_paragraph(f"  - {b['count']} reviews between {b['start_date']} and {b['end_date']}")
+
+    dupes = triage.get("near_duplicate_pairs", [])
+    if dupes:
+        doc.add_paragraph(
+            f"Near-duplicate review text: {len(dupes)} pair(s) of reviews with near-identical "
+            f"(templated/copy-pasted) language -- see facts.json for the full text of each pair."
+        )
+
+    one_hit = triage.get("one_hit_wonder_reviewers", [])
+    if one_hit:
+        doc.add_paragraph(
+            f"One-hit-wonder reviewers: {len(one_hit)} reviewer(s) whose only review anywhere is this "
+            f"one -- a documented pattern for accounts that exist solely to post a single review."
+        )
+
+    claims = triage.get("claim_cross_reference", [])
+    if claims:
+        doc.add_paragraph(
+            "Possession-delay claims cross-referenced against this project's own confirmed "
+            "proposed_completion_date:"
+        )
+        table = doc.add_table(rows=1, cols=3)
+        _set_table_borders(table)
+        header_cells = table.rows[0].cells
+        for i, text in enumerate(("Claimed year", "Project record year", "Verdict")):
+            header_cells[i].text = text
+            _shade_cell(header_cells[i], "D9E2F3")
+            for p in header_cells[i].paragraphs:
+                for run in p.runs:
+                    run.bold = True
+        for item in claims:
+            row = table.add_row()
+            row.cells[0].text = str(item.get("claimed_year", ""))
+            row.cells[1].text = str(item.get("project_year", "")) if item.get("project_year") is not None else "n/a"
+            row.cells[2].text = item.get("verdict", "")
+
+
 def _append_authenticity_page(doc, facts: dict) -> None:
     """Appends a new, code-computed section (not model-authored) summarizing
     what tier each cited source falls into and how many claims remain
@@ -1989,7 +2073,11 @@ def _append_authenticity_page(doc, facts: dict) -> None:
     same underlying data already visible in the Sources/Gaps sections,
     rather than trusting a self-assessment."""
     summary = _compute_authenticity_summary(facts)
-    confidence = _compute_confidence_score(facts, summary)
+    confidence = _compute_documentation_confidence_score(facts, summary)
+    # Stored back onto facts (not just rendered here) so callers building a
+    # separate output from the same facts dict -- e.g. report.py's PDF --
+    # can show the same score without recomputing it.
+    facts["documentation_confidence_score"] = confidence
 
     # This template's heading styles were created via docx-js, not Word --
     # python-docx's add_heading() looks up a style named "Heading 1" and
@@ -2001,7 +2089,7 @@ def _append_authenticity_page(doc, facts: dict) -> None:
     heading_style = doc.paragraphs[4].style  # "Methodology Note" -- a known Heading 1 in the template
 
     doc.add_page_break()
-    heading_para = doc.add_paragraph("Data Authenticity & Confidence Summary")
+    heading_para = doc.add_paragraph("Documentation Authenticity & Confidence Summary")
     heading_para.style = heading_style
     doc.add_paragraph(
         "This page is generated directly from the same sources and gaps already listed earlier in "
@@ -2013,15 +2101,20 @@ def _append_authenticity_page(doc, facts: dict) -> None:
     from docx.shared import Pt
 
     score_para = doc.add_paragraph()
-    score_run = score_para.add_run(f"Data Confidence Score: {confidence['overall']}/100 -- {confidence['band']}")
+    score_run = score_para.add_run(f"Documentation Confidence Score: {confidence['overall']}/100 -- {confidence['band']}")
     score_run.bold = True
     score_run.font.size = Pt(14)
     doc.add_paragraph(
-        "This score is a weighted average of six criteria computed below from this document's own "
-        "sources and gaps -- it is informed by the structure of CRISIL's real-estate methodology "
-        "(a small number of named factors rather than one flat checklist) but is NOT a replica of any "
-        "CRISIL formula: CRISIL does not publish a numeric weighting scheme for any of its three "
-        "real-estate products, and the weights used here are this project's own calibration."
+        "This score rates how well-sourced and verified THIS DOCUMENT's own claims are -- source "
+        "quality, completeness, cross-corroboration, recency, and re-check success -- it is NOT a "
+        "rating of the underlying project's quality, safety, or investment merit. A project with a "
+        "genuinely poor track record whose problems are thoroughly documented can score HIGH here; a "
+        "genuinely sound project with little public paper trail to verify against can score LOW. It "
+        "is a weighted average of six criteria computed below from this document's own sources and "
+        "gaps -- informed by the structure of CRISIL's real-estate methodology (a small number of "
+        "named factors rather than one flat checklist) but NOT a replica of any CRISIL formula: CRISIL "
+        "does not publish a numeric weighting scheme for any of its three real-estate products, and "
+        "the weights used here are this project's own calibration."
     )
 
     score_table = doc.add_table(rows=1, cols=4)
@@ -2138,7 +2231,14 @@ def run_company_charter(
     output_dir: str = config.OUTPUT_ROOT,
     complaint_orders_manifest: list | None = None,
     complaint_orders_dir: str | None = None,
-) -> str:
+    reviews: list | None = None,
+    review_source_label: str | None = None,
+) -> tuple[str, dict]:
+    """Returns (out_path, facts) -- facts is the complete, code-and-model
+    -assembled Charter data (same content as the .facts.json written
+    alongside the docx), so callers can build a separate output (e.g.
+    report.py's PDF) from the same source data without re-reading it from
+    disk."""
     if not os.path.exists(TEMPLATE_PATH):
         raise FileNotFoundError(f"Template not found at {TEMPLATE_PATH}")
 
@@ -2231,6 +2331,19 @@ def run_company_charter(
                 "accessed_date": datetime.now().strftime("%Y-%m-%d"),
             })
 
+    # No automated review-fetching mechanism exists in this pipeline (see
+    # run_review_authenticity_triage's own module note) -- this only runs
+    # when a caller supplies pre-collected reviews, e.g. via --reviews-file.
+    if reviews:
+        facts["review_authenticity_triage"] = run_review_authenticity_triage(reviews, facts)
+        facts.setdefault("sources", []).append({
+            "label": review_source_label or "User reviews (authenticity triage)",
+            "ref": f"{len(reviews)} review(s) analyzed for authenticity signals",
+            "topic": "review_authenticity",
+            "published_date": "unknown",
+            "accessed_date": datetime.now().strftime("%Y-%m-%d"),
+        })
+
     land = facts.get("land_identification", {})
     origin_locality = (land.get("village_locality") or {}).get("value", "")
     origin_district = (land.get("mandal_taluka_district") or {}).get("value", "")
@@ -2260,13 +2373,29 @@ def run_company_charter(
     with open(facts_path, "w", encoding="utf-8") as f:
         json.dump(facts, f, indent=2, ensure_ascii=False)
 
-    return out_path
+    return out_path, facts
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Generate a Company Charter docx for an already-scraped project.")
     parser.add_argument("reg_no", help="MahaRERA registration number whose output/ folder already exists.")
     parser.add_argument("--output-dir", default=config.OUTPUT_ROOT)
+    parser.add_argument(
+        "--reviews-file",
+        default=None,
+        help=(
+            "Optional path to a JSON file containing a list of pre-collected reviews "
+            "({rating, date, text, reviewer_name, reviewer_review_count}) to run the "
+            "review-authenticity heuristic triage against. There is no automated "
+            "review-fetching mechanism in this pipeline -- reviews must be collected "
+            "and saved to this file separately."
+        ),
+    )
+    parser.add_argument(
+        "--reviews-source-label",
+        default=None,
+        help="Label for the reviews source shown in the Charter's Sources list (e.g. 'MouthShut.com'). Defaults to a generic label.",
+    )
     args = parser.parse_args()
 
     project_out_dir = os.path.join(args.output_dir, args.reg_no)
@@ -2283,8 +2412,18 @@ def main() -> int:
     research_path = os.path.join(project_out_dir, "research", "deep_research.json")
     research_data = json.load(open(research_path, encoding="utf-8")) if os.path.exists(research_path) else None
 
+    reviews = None
+    if args.reviews_file:
+        if not os.path.exists(args.reviews_file):
+            print(f"[ERROR] --reviews-file not found: {args.reviews_file}")
+            return 1
+        reviews = json.load(open(args.reviews_file, encoding="utf-8"))
+
     print(f"[..] Generating Company Charter for {args.reg_no} (model={MODEL})")
-    out_path = run_company_charter(args.reg_no, category_data, documents_manifest, documents_dir, research_data, args.output_dir)
+    out_path, _facts = run_company_charter(
+        args.reg_no, category_data, documents_manifest, documents_dir, research_data, args.output_dir,
+        reviews=reviews, review_source_label=args.reviews_source_label,
+    )
     print(f"[OK] Company Charter written to {out_path}")
     return 0
 
