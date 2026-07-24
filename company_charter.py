@@ -42,6 +42,7 @@ on any failure.
 """
 
 import argparse
+import concurrent.futures
 import json
 import os
 import re
@@ -816,25 +817,30 @@ def _check_document_grounding(facts: dict, extracted_docs: dict, category_data: 
 # Live-tested end to end against "Godrej Properties Limited" -- returned
 # real, current ratings (ICRA A1+ commercial paper, AA+ (Stable) long-term).
 #
-# Deliberately ICRA-only for now: CRISIL's equivalent company-rating search
-# was not confirmed reverse-engineerable in the time spent on it this pass
-# (its site exposes an SME-specific autocomplete on a different product,
-# not the main corporate-rating search) -- rather than build against an
-# unconfirmed mechanism, this is scoped to what actually works. CRISIL
-# coverage can be added later if a working search endpoint is found.
+# As of this pass, ICRA is no longer the only agency checked -- see
+# _lookup_infomerics_rating below, added after ICRA-only coverage produced
+# a real, misleading "not found" for a promoter's sister entity that was
+# actually rated (by Infomerics, not ICRA). CRISIL's equivalent
+# company-rating search still wasn't confirmed reverse-engineerable in the
+# time spent on it (its site exposes an SME-specific autocomplete on a
+# different product, not the main corporate-rating search) -- rather than
+# build against an unconfirmed mechanism, coverage stays scoped to what
+# actually works. CRISIL/CARE/India Ratings coverage can be added later if
+# a working search endpoint is found for any of them.
 #
-# Matches ONLY on an exact (case-insensitive) name match against ICRA's own
-# company list -- never a fuzzy "probably the same company" guess, since
-# misattributing a rating to the wrong legal entity would be a serious
-# factual error in a due-diligence document. A promoter/SPV having no
-# public rating is the NORMAL case, not a red flag: ICRA only rates
-# developers that sought a public rating (typically larger, listed, or
-# NCD-issuing entities) -- most MahaRERA promoters are too small/private to
-# ever be rated. Callers who also want to check a distinct parent/group
-# entity (e.g. "Godrej Properties Limited" for promoter "Godrej Skyline
-# Developers Limited") must call this a second time with that name
-# explicitly and label the result as the PARENT's rating, never as if it
-# were the promoter's own -- this function does not guess a parent itself.
+# Matches ONLY on an exact (case-insensitive) name match against each
+# agency's own company list -- never a fuzzy "probably the same company"
+# guess, since misattributing a rating to the wrong legal entity would be
+# a serious factual error in a due-diligence document. A promoter/SPV
+# having no public rating from either agency is the NORMAL case, not a red
+# flag: both only rate developers that sought a public rating (typically
+# larger, listed, or NCD-issuing entities) -- most MahaRERA promoters are
+# too small/private to ever be rated. Callers who also want to check a
+# distinct parent/group entity (e.g. "Godrej Properties Limited" for
+# promoter "Godrej Skyline Developers Limited") must call this a second
+# time with that name explicitly and label the result as the PARENT's
+# rating, never as if it were the promoter's own -- this function does not
+# guess a parent itself.
 # ---------------------------------------------------------------------------
 
 _ICRA_SEARCH_URL = "https://www.icra.in/Rating/GetRatingCompanys"
@@ -875,14 +881,7 @@ def _icra_fetch_rating_detail(company_id: str, company_name: str) -> dict:
     return {"instruments": instruments, "url": url}
 
 
-def lookup_credit_rating(company_name: str) -> dict:
-    """Checks ICRA's public rating database for an exact match on
-    `company_name`. Returns either:
-      {"found": True, "agency": "ICRA", "company_name": <matched label>,
-       "instruments": [{"instrument": ..., "rating": ...}, ...], "url": ...}
-    or
-      {"found": False, "note": "..."} -- an honest explanation, not an
-      error, when nothing matches or a request fails."""
+def _lookup_icra_rating(company_name: str) -> dict:
     try:
         matches = _icra_search_companies(company_name)
     except (requests.RequestException, ValueError) as e:
@@ -893,15 +892,7 @@ def lookup_credit_rating(company_name: str) -> dict:
         None,
     )
     if not exact:
-        return {
-            "found": False,
-            "note": (
-                "No public ICRA rating found for this exact legal entity name. This is NOT itself a "
-                "red flag -- ICRA only rates developers that sought a public rating (typically larger, "
-                "listed, or NCD-issuing entities); most MahaRERA promoters are too small or private to "
-                "ever be rated."
-            ),
-        }
+        return {"found": False, "note": "No public ICRA rating found for this exact legal entity name."}
 
     try:
         detail = _icra_fetch_rating_detail(exact["id"], exact["label"])
@@ -918,25 +909,180 @@ def lookup_credit_rating(company_name: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Infomerics credit-rating lookup -- confirmed live against Infomerics'
+# real public rating database (infomerics.com), added specifically because
+# ICRA-only coverage produced a misleading "not found" for a real MahaRERA
+# promoter's sister entity (Pranami Estates Private Limited) that turned
+# out to be actively rated by Infomerics, not ICRA -- a materially
+# different result (a live downgrade trajectory: BBB- in 2021 down to
+# BB (INC), Negative outlook, by March 2026) that ICRA-only checking would
+# have silently missed and reported as "no rating found."
+#
+# Mechanism: the site's header search box (id="search") is a plain
+# client-side filter over a public autocomplete API --
+# cms.infomerics.com/api/companies/autocomplete?query=<name> -- returning
+# [{CompanyName, slug, documentId}, ...]; the matched `slug` then fetches
+# cms.infomerics.com/api/companies/<slug> for the CURRENT instrument
+# rating(s) (instrument, amount, rating, outlook, date). Both are plain,
+# unauthenticated JSON GETs -- no CAPTCHA, no session, confirmed with a
+# bare requests.get() (no custom headers needed, unlike ICRA's
+# X-Requested-With quirk). Only the CURRENT rating is fetched here, not
+# the full historical rationale table also shown on the site's own
+# press-release page -- that would need a second, not-yet-identified
+# endpoint, and current-only already matches ICRA's own scope above.
+# ---------------------------------------------------------------------------
+
+_INFOMERICS_AUTOCOMPLETE_URL = "https://cms.infomerics.com/api/companies/autocomplete"
+_INFOMERICS_COMPANY_URL = "https://cms.infomerics.com/api/companies/{slug}"
+
+
+def _infomerics_search_companies(name: str) -> list:
+    resp = requests.get(_INFOMERICS_AUTOCOMPLETE_URL, params={"query": name}, timeout=config.REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _infomerics_fetch_rating_detail(slug: str) -> dict:
+    url = _INFOMERICS_COMPANY_URL.format(slug=slug)
+    resp = requests.get(url, timeout=config.REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    data = resp.json()
+
+    instruments = []
+    for inst in data.get("companyInstrument", []):
+        if inst.get("isPast"):
+            continue
+        rating = inst.get("Rating", "")
+        outlook = (inst.get("outlook") or {}).get("Title")
+        if outlook:
+            rating = f"{rating} (Outlook: {outlook})"
+        instruments.append({
+            "instrument": f"{inst.get('InstrumentTitle', '')} ({inst.get('InstrumentAmount', '')})".strip(),
+            "rating": rating,
+        })
+
+    return {"instruments": instruments, "url": f"https://www.infomerics.com/pressrelease/{slug}"}
+
+
+def _lookup_infomerics_rating(company_name: str) -> dict:
+    try:
+        matches = _infomerics_search_companies(company_name)
+    except (requests.RequestException, ValueError) as e:
+        return {"found": False, "note": f"Infomerics lookup could not run this pass: {e}"}
+
+    exact = next(
+        (m for m in matches if str(m.get("CompanyName", "")).strip().lower() == company_name.strip().lower()),
+        None,
+    )
+    if not exact:
+        return {"found": False, "note": "No public Infomerics rating found for this exact legal entity name."}
+
+    try:
+        detail = _infomerics_fetch_rating_detail(exact["slug"])
+    except requests.RequestException as e:
+        return {"found": False, "note": f"Found a matching Infomerics entity ({exact['CompanyName']}) but could not fetch its rating detail this pass: {e}"}
+
+    return {
+        "found": True,
+        "agency": "Infomerics",
+        "company_name": exact["CompanyName"],
+        "instruments": detail["instruments"],
+        "url": detail["url"],
+    }
+
+
+_CREDIT_RATING_AGENCIES = (
+    ("ICRA", _lookup_icra_rating),
+    ("Infomerics", _lookup_infomerics_rating),
+)
+
+
+def lookup_credit_rating(company_name: str) -> dict:
+    """Checks EVERY agency above (currently ICRA and Infomerics) for a
+    public rating under an EXACT (case-insensitive) match on
+    `company_name` -- never a fuzzy "probably the same company" guess,
+    since misattributing a rating to the wrong legal entity would be a
+    serious factual error in a due-diligence document. Always checks all
+    agencies, even after an earlier one already found something -- so that
+    if two agencies rate the same entity, BOTH ratings surface side by
+    side for comparison, rather than silently showing only the first
+    match. (This costs one extra request per additional agency versus a
+    first-match-wins design, which is negligible next to the value of
+    catching a real disagreement between agencies.) Returns:
+      {"found": True, "ratings": [{"agency": "ICRA" | "Infomerics",
+       "company_name": <matched label>, "instruments": [{"instrument":
+       ..., "rating": ...}, ...], "url": ...}, ...], "not_found_agencies":
+       [<agency names with no match>]}
+        -- `ratings` holds one entry per agency that found something (in
+        agency-check order); `not_found_agencies` names the rest so a
+        reader knows they were checked, not skipped.
+      {"found": False, "note": "..."} -- an honest explanation naming
+      every agency actually checked, not an error, when nothing matches
+      anywhere or every request failed. A promoter/SPV having no public
+      rating from any agency is the NORMAL case, not a red flag: these
+      agencies only rate developers that sought a public rating (typically
+      larger, listed, or NCD-issuing entities); most MahaRERA promoters
+      are too small or private to ever be rated. Callers who also want to
+      check a distinct parent/group entity (e.g. "Godrej Properties
+      Limited" for promoter "Godrej Skyline Developers Limited") must call
+      this a second time with that name explicitly and label the result as
+      the PARENT's rating, never as if it were the promoter's own -- this
+      function does not guess a parent itself."""
+    ratings = []
+    not_found_agencies = []
+    for agency_name, lookup_fn in _CREDIT_RATING_AGENCIES:
+        result = lookup_fn(company_name)
+        if result.get("found"):
+            ratings.append(result)
+        else:
+            not_found_agencies.append(agency_name)
+
+    if ratings:
+        return {"found": True, "ratings": ratings, "not_found_agencies": not_found_agencies}
+
+    agency_list = ", ".join(name for name, _ in _CREDIT_RATING_AGENCIES)
+    return {
+        "found": False,
+        "note": (
+            f"No public rating found for this exact legal entity name from any agency checked "
+            f"({agency_list}). This is NOT itself a red flag -- these agencies only rate developers "
+            f"that sought a public rating (typically larger, listed, or NCD-issuing entities); most "
+            f"MahaRERA promoters are too small or private to ever be rated."
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
 # IBBI insolvency check -- confirmed live against IBBI's real Corporate
 # Debtor Master Data. The site's own search form (/claims/corporate-personals)
 # is CSRF-protected, but submitting it (by CIN) redirects to a plain,
 # directly-linkable detail URL -- https://ibbi.gov.in/claims/inner-process/
 # <CIN> -- which a fresh, cookie-less requests.get() reaches identically
 # (confirmed: no CSRF token or session state needed for this specific URL).
-# Live-tested against Godrej Skyline Developers Limited's real CIN
-# (U45309MH2016PLC287858): returned the clean "ASSIGNMENT NOT APPROVED YET"
-# result -- i.e. no IBC process on record for this CIN, the expected,
-# unremarkable outcome for the large majority of promoters. No real
-# company with an ACTIVE/PAST insolvency process was available to test the
-# positive-match case against, so that path surfaces the raw extracted
-# status text for a human to read rather than attempting to classify or
-# summarize content this function was never validated against.
+# Also confirmed to accept an LLPIN in the same URL slot (e.g. AAI-5299 for
+# Trimity Realty LLP) -- LLPs are "corporate persons" under the IBC too, and
+# the identifier isn't validated by format, just passed through.
+#
+# IMPORTANT CORRECTION (found while testing the LLPIN path): the "no
+# process" result is WEAKER evidence than earlier phrasing here implied.
+# Feeding this endpoint a deliberately fake identifier (e.g. "ZZZ-0000")
+# returns the exact same "ASSIGNMENT NOT APPROVED YET" page as a real,
+# genuine CIN/LLPIN with no insolvency history -- the page does not
+# validate or discriminate its input at all. So "found_process: False"
+# confirms only that IBBI has no ACTIVE PROCESS PAGE at that URL; it is NOT
+# proof the identifier itself was recognized as a real, existing entity.
+# That confirmation has to come from elsewhere (ZaubaCorp/registry mirror),
+# same as always. No real company/LLP with an ACTIVE/PAST insolvency
+# process was available to test the positive-match case against, so that
+# path still surfaces the raw extracted status text for a human to read
+# rather than attempting to classify or summarize content this function was
+# never validated against.
 # ---------------------------------------------------------------------------
 
 _IBBI_INNER_PROCESS_URL = "https://ibbi.gov.in/claims/inner-process/{cin}"
 _IBBI_NO_PROCESS_PHRASE = "ASSIGNMENT NOT APPROVED YET"
 _CIN_RE = re.compile(r"\b[UL]\d{5}[A-Z]{2}\d{4}[A-Z]{3}\d{6}\b")
+_LLPIN_RE = re.compile(r"\b[A-Z]{3}-\d{4}\b")
 
 
 def extract_cin(text: str) -> str | None:
@@ -949,18 +1095,36 @@ def extract_cin(text: str) -> str | None:
     return match.group(0) if match else None
 
 
+def extract_llpin(text: str) -> str | None:
+    """Pulls a standard-format Indian LLPIN (e.g. AAI-5299) out of a
+    free-text field, the LLP counterpart of extract_cin() above. A
+    completely different format from CIN (3 letters, a hyphen, 4 digits,
+    vs. CIN's 21-character U/L-prefixed code) -- confirmed live against
+    Trimity Realty LLP's real LLPIN (AAI-5299), and confirmed NOT to
+    false-positive-match on real CIN text (extract_cin's own format never
+    contains a bare "XXX-9999" substring)."""
+    match = _LLPIN_RE.search(text or "")
+    return match.group(0) if match else None
+
+
 def lookup_ibbi_insolvency_status(cin: str) -> dict:
     """Checks IBBI's public Corporate Debtor Master Data for an insolvency
-    process tied to `cin`. Returns:
+    process tied to `cin` (a CIN or an LLPIN -- confirmed live against
+    both). Returns:
       {"found_process": False, "status_text": "ASSIGNMENT NOT APPROVED YET", "url": ...}
-        -- the ordinary, clean case: no IBC process recorded against this CIN.
+        -- the ordinary, clean case: no IBC process recorded against this
+        identifier. NOTE: this same result is also what IBBI returns for a
+        completely fake/nonexistent identifier (confirmed live) -- it is
+        NOT proof the identifier itself is real, only that no active
+        process page exists at that URL. Confirm the entity's existence
+        via a registry mirror (ZaubaCorp) separately, not via this result.
       {"found_process": True, "status_text": <raw extracted text>, "url": ...}
         -- something other than the known "no process" phrase was found;
         the raw text is surfaced rather than classified, since this
         function's positive-match path was never validated against a real
         example (see module note above) -- a human should read it directly.
       {"found_process": None, "note": "..."} -- the lookup itself failed,
-        or no CIN was available to check."""
+        or no identifier was available to check."""
     if not cin or not cin.strip():
         return {"found_process": None, "note": "no CIN provided to check"}
     url = _IBBI_INNER_PROCESS_URL.format(cin=cin.strip())
@@ -1186,6 +1350,103 @@ def find_group_companies_by_cin(cin: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# CTS -> land-record lookup (Maha Bhulekh Property Card, see mahabhumi.py).
+# Deliberately NOT wired to run automatically like the CIN checks above:
+# mahabhumi.fetch_property_card() opens a visible browser and blocks waiting
+# for a human to solve a fresh CAPTCHA on every single call (that site
+# grants no reusable session -- see mahabhumi.py's own module note), so
+# running it unconditionally would silently stall every automated Charter
+# pass for up to CAPTCHA_TIMEOUT_SECONDS. Instead this follows the exact
+# same opt-in convention already used for reviews.json just above: it does
+# nothing unless a human has dropped output/<reg_no>/cts_lookup_input.json
+# with the office/village already resolved to the site's exact Marathi
+# labels (via `python mahabhumi.py offices/villages ...`) -- this never
+# guesses one, for the same reason ZaubaCorp's CIN lookup never fuzzy-
+# matches a company name.
+# ---------------------------------------------------------------------------
+
+def run_cts_land_lookup(facts: dict, reg_no: str, output_dir: str = config.OUTPUT_ROOT) -> dict:
+    """Runs the CTS -> Property Card lookup only if output/<reg_no>/
+    cts_lookup_input.json exists, containing:
+      {"district": "Pune", "office": "<exact Marathi label from
+       mahabhumi.list_offices>", "village": "<exact Marathi label from
+       mahabhumi.list_villages>", "cts_number": "100", "mobile": "..."}
+    Silently returns facts unchanged if that file is absent -- the ordinary
+    case for every automated run. When present, opens a visible browser and
+    blocks for up to CAPTCHA_TIMEOUT_SECONDS waiting for a human to solve
+    the CAPTCHA (see mahabhumi.fetch_property_card)."""
+    input_path = os.path.join(output_dir, reg_no, "cts_lookup_input.json")
+    if not os.path.exists(input_path):
+        return facts
+
+    import mahabhumi
+
+    with open(input_path, "r", encoding="utf-8") as f:
+        cts_input = json.load(f)
+
+    required = ("district", "office", "village", "cts_number", "mobile")
+    missing = [k for k in required if not cts_input.get(k)]
+    if missing:
+        facts["cts_land_record_check"] = {"found": False, "note": f"{input_path} is missing required field(s): {', '.join(missing)}"}
+        return facts
+
+    recorded_cts = ((facts.get("land_identification", {}).get("survey_cts_plot_numbers") or {}).get("value") or "")
+    if recorded_cts and cts_input["cts_number"] not in recorded_cts:
+        facts.setdefault("gaps", []).append(
+            f"CTS land-record lookup: cts_lookup_input.json's CTS number ({cts_input['cts_number']}) does not "
+            f"appear in this Charter's own recorded survey_cts_plot_numbers ({recorded_cts!r}) -- confirm "
+            f"these refer to the same plot before trusting the Property Card result below."
+        )
+
+    print(f"\n[INFO] {input_path} found -- resolving CTS {cts_input['cts_number']} candidates...")
+    try:
+        candidates_result = mahabhumi.search_cts_candidates(
+            cts_input["district"], cts_input["office"], cts_input["village"], cts_input["cts_number"]
+        )
+    except Exception as e:
+        facts["cts_land_record_check"] = {"found": False, "note": f"CTS candidate search could not run this pass: {e}"}
+        return facts
+
+    if not candidates_result.get("found"):
+        facts["cts_land_record_check"] = {"found": False, "note": candidates_result.get("note", "CTS candidate search failed")}
+        return facts
+
+    candidates = candidates_result["candidates"]
+    if cts_input["cts_number"] not in candidates:
+        facts["cts_land_record_check"] = {
+            "found": False,
+            "note": (
+                f"CTS number {cts_input['cts_number']!r} is not an exact match against the site's own "
+                f"candidates for this village ({candidates}) -- update cts_lookup_input.json with the exact "
+                f"value and re-run rather than guessing."
+            ),
+        }
+        return facts
+
+    print(f"[INFO] Opening a browser to fetch the Property Card -- please solve the CAPTCHA when it appears.")
+    try:
+        result = mahabhumi.fetch_property_card(
+            cts_input["district"], cts_input["office"], cts_input["village"],
+            cts_input["cts_number"], cts_input["mobile"],
+        )
+    except (mahabhumi.CaptchaTimeoutError, mahabhumi.BrowserClosedError, mahabhumi.AmbiguousSelectionError) as e:
+        result = {"found": False, "note": f"CTS Property Card lookup did not complete: {e}"}
+    except Exception as e:
+        result = {"found": False, "note": f"CTS Property Card lookup could not run this pass: {e}"}
+
+    facts["cts_land_record_check"] = result
+    if result.get("found"):
+        facts.setdefault("sources", []).append({
+            "label": "Maha Bhulekh Property Card",
+            "ref": f"CTS {cts_input['cts_number']}, {cts_input['village']} -- {result.get('url', '')}",
+            "topic": "land_record",
+            "published_date": "unknown",
+            "accessed_date": datetime.now().strftime("%Y-%m-%d"),
+        })
+    return facts
+
+
+# ---------------------------------------------------------------------------
 # MahaRERA Orders/Judgments search -- confirmed live and scriptable with no
 # browser needed. maharera.maharashtra.gov.in/orders-judgements is a Drupal
 # form (POST, requires a fresh form_build_id read from a prior GET -- no
@@ -1272,29 +1533,73 @@ def _maharera_orders_search_once(project_name: str, complaint_type: str) -> list
     return results
 
 
+def _maharera_orders_search_with_retry(project_name: str, complaint_type: str, max_attempts: int) -> list:
+    """One complaint type's search, retried against the documented BigPipe
+    flakiness -- structured to keep the common (non-flaky) case cheap
+    while still speeding up genuine retries: tries once, and only if THAT
+    comes back empty does it fire the remaining (max_attempts - 1) tries
+    CONCURRENTLY, returning as soon as any one of them succeeds rather
+    than waiting for all of them in sequence. This was the dominant cost
+    of the whole Phase 2 check batch (confirmed live: ~41s of a ~45s
+    total, vs. under 2.2s for each of the other four checks combined --
+    see the concurrent Phase 2 checks above _safe_credit_rating) precisely
+    because it could burn up to `max_attempts` sequential round-trips per
+    complaint type. A clean project (no flakiness this pass) still costs
+    exactly 1 request, identical to the old fully-sequential version; a
+    flaky one now costs at most 2 sequential rounds (1 + 1 concurrent
+    batch) instead of up to `max_attempts`."""
+    try:
+        results = _maharera_orders_search_once(project_name, complaint_type)
+    except requests.RequestException:
+        results = []
+    if results or max_attempts <= 1:
+        return results
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_attempts - 1)
+    try:
+        futures = [executor.submit(_maharera_orders_search_once, project_name, complaint_type) for _ in range(max_attempts - 1)]
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                retry_results = future.result()
+            except requests.RequestException:
+                retry_results = []
+            if retry_results:
+                return retry_results
+        return []
+    finally:
+        # Deliberately wait=False: once a good result is found (or every
+        # retry is exhausted empty), there's no reason to block returning
+        # to the caller on some other still-in-flight retry finishing --
+        # it'll just complete and be discarded in the background.
+        executor.shutdown(wait=False)
+
+
 def search_maharera_judgments(project_name: str, max_attempts: int = 3) -> list:
     """Searches MahaRERA's public Orders/Judgments page for `project_name`
     under both categories that can carry a genuine adjudicated outcome
     ("Rulings of MahaRERA" and "Judgements by Adjudicating Officers" --
-    "Non-Registration Rulings" is a different, irrelevant category). Retries
-    each category up to `max_attempts` times to work around the BigPipe
-    flakiness documented above. A project with no published judgment yet
-    returns [] after exhausting retries -- this is the expected, common
-    case (most complaints/appeals are still pending), not a failure; there
-    is no way from this function alone to distinguish "genuinely nothing
-    published" from "every retry hit the flaky empty-shell response", so
-    callers should not treat an empty result as a confirmed absence for a
-    project with very few realistic search attempts left in a budget."""
-    all_results = []
-    for complaint_type in _MAHARERA_COMPLAINT_TYPES:
-        for _attempt in range(max_attempts):
-            try:
-                results = _maharera_orders_search_once(project_name, complaint_type)
-            except requests.RequestException:
-                results = []
-            if results:
-                all_results.extend(results)
-                break
+    "Non-Registration Rulings" is a different, irrelevant category). Both
+    categories are searched CONCURRENTLY (they're independent of each
+    other), and each one's own retries against the BigPipe flakiness
+    (see _maharera_orders_search_with_retry) are themselves partly
+    concurrent -- so the worst case here is roughly 2 sequential
+    round-trips, not up to `max_attempts` x 2 sequential round-trips as in
+    the original fully-sequential version. A project with no published
+    judgment yet returns [] after exhausting retries -- this is the
+    expected, common case (most complaints/appeals are still pending), not
+    a failure; there is no way from this function alone to distinguish
+    "genuinely nothing published" from "every retry hit the flaky
+    empty-shell response", so callers should not treat an empty result as
+    a confirmed absence for a project with very few realistic search
+    attempts left in a budget."""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(_MAHARERA_COMPLAINT_TYPES)) as executor:
+        futures = [
+            executor.submit(_maharera_orders_search_with_retry, project_name, complaint_type, max_attempts)
+            for complaint_type in _MAHARERA_COMPLAINT_TYPES
+        ]
+        all_results = []
+        for future in futures:
+            all_results.extend(future.result())
     return all_results
 
 
@@ -1726,6 +2031,7 @@ def _fill_template(reg_no: str, facts: dict, out_path: str) -> None:
     _append_ibbi_check_section(doc, facts)
     _append_company_profile_section(doc, facts)
     _append_group_companies_section(doc, facts)
+    _append_cts_land_record_section(doc, facts)
     _append_appeal_judgments_section(doc, facts)
     _append_review_authenticity_section(doc, facts)
     _append_authenticity_page(doc, facts)
@@ -2169,11 +2475,47 @@ def _append_complaint_outcomes_section(doc, facts: dict) -> None:
     )
 
 
+def _add_rating_comparison_table(doc, rating_result: dict) -> None:
+    """Renders every agency's rating(s) for one entity into a SINGLE
+    Agency | Instrument | Rating table -- deliberately one table, not one
+    per agency, so that if two agencies rate the same entity differently
+    (or agree), a reader sees both rows side by side instead of having to
+    flip between separate mini-sections to compare them."""
+    ratings = rating_result.get("ratings", [])
+    for r in ratings:
+        doc.add_paragraph(f"Match found ({r['agency']}): {r['company_name']} ({r['url']})")
+
+    table = doc.add_table(rows=1, cols=3)
+    _set_table_borders(table)
+    header_cells = table.rows[0].cells
+    header_cells[0].text = "Agency"
+    header_cells[1].text = "Instrument"
+    header_cells[2].text = "Rating"
+    for cell in header_cells:
+        _shade_cell(cell, "D9E2F3")
+        for p in cell.paragraphs:
+            for run in p.runs:
+                run.bold = True
+    for r in ratings:
+        for item in r.get("instruments", []):
+            row = table.add_row()
+            row.cells[0].text = r["agency"]
+            row.cells[1].text = item["instrument"]
+            row.cells[2].text = item["rating"]
+
+    not_found = rating_result.get("not_found_agencies", [])
+    if not_found:
+        doc.add_paragraph(f"No public rating found from: {', '.join(not_found)}.")
+
+
 def _append_credit_rating_section(doc, facts: dict) -> None:
-    """Appends a section reporting the code-computed ICRA credit-rating
-    check on the promoter's exact legal name (see lookup_credit_rating).
-    Silently does nothing if credit_rating_check was never set (e.g. no
-    promoter name was available to check against)."""
+    """Appends a section reporting the code-computed credit-rating check
+    on the promoter's exact legal name across every agency checked (see
+    lookup_credit_rating) -- if more than one agency rates the same
+    entity, all of their ratings are shown together for direct comparison,
+    rather than just the first match found. Silently does nothing if
+    credit_rating_check was never set (e.g. no promoter name was available
+    to check against)."""
     check = facts.get("credit_rating_check")
     if not check:
         return
@@ -2184,30 +2526,19 @@ def _append_credit_rating_section(doc, facts: dict) -> None:
     heading_para = doc.add_paragraph("Credit Rating Check (Code-Computed)")
     heading_para.style = heading_style
     doc.add_paragraph(
-        "Checked directly against ICRA's public rating database for an exact match on the promoter's "
-        "own legal name -- not a fuzzy or \"probably the same company\" guess, since attributing a "
-        "rating to the wrong legal entity would itself be a serious error. A promoter having no public "
-        "rating is the ordinary case, not a red flag: ICRA only rates developers that sought a public "
-        "rating (typically larger, listed, or NCD-issuing entities)."
+        "Checked directly against every rating agency's public database (currently ICRA and Infomerics) "
+        "for an exact match on the promoter's own legal name -- not a fuzzy or \"probably the same "
+        "company\" guess, since attributing a rating to the wrong legal entity would itself be a serious "
+        "error. Every agency is checked regardless of whether an earlier one already found something, so "
+        "that if two agencies rate the same entity, both ratings are shown here for comparison rather "
+        "than silently reporting only one. A promoter having no public rating anywhere is the ordinary "
+        "case, not a red flag: these agencies only rate developers that sought a public rating (typically "
+        "larger, listed, or NCD-issuing entities)."
     )
 
     promoter_result = check.get("promoter", {})
     if promoter_result.get("found"):
-        doc.add_paragraph(f"Match found: {promoter_result['company_name']} ({promoter_result['url']})")
-        table = doc.add_table(rows=1, cols=2)
-        _set_table_borders(table)
-        header_cells = table.rows[0].cells
-        header_cells[0].text = "Instrument"
-        header_cells[1].text = "Rating"
-        for cell in header_cells:
-            _shade_cell(cell, "D9E2F3")
-            for p in cell.paragraphs:
-                for run in p.runs:
-                    run.bold = True
-        for item in promoter_result.get("instruments", []):
-            row = table.add_row()
-            row.cells[0].text = item["instrument"]
-            row.cells[1].text = item["rating"]
+        _add_rating_comparison_table(doc, promoter_result)
     else:
         doc.add_paragraph(promoter_result.get("note", "No result recorded."))
 
@@ -2220,21 +2551,7 @@ def _append_credit_rating_section(doc, facts: dict) -> None:
             "be conflated."
         )
         if parent_result.get("found"):
-            doc.add_paragraph(f"Parent/group match found: {parent_result['company_name']} ({parent_result['url']})")
-            table = doc.add_table(rows=1, cols=2)
-            _set_table_borders(table)
-            header_cells = table.rows[0].cells
-            header_cells[0].text = "Instrument"
-            header_cells[1].text = "Rating"
-            for cell in header_cells:
-                _shade_cell(cell, "D9E2F3")
-                for p in cell.paragraphs:
-                    for run in p.runs:
-                        run.bold = True
-            for item in parent_result.get("instruments", []):
-                row = table.add_row()
-                row.cells[0].text = item["instrument"]
-                row.cells[1].text = item["rating"]
+            _add_rating_comparison_table(doc, parent_result)
         else:
             doc.add_paragraph(parent_result.get("note", "No result recorded."))
 
@@ -2367,6 +2684,58 @@ def _append_group_companies_section(doc, facts: dict) -> None:
         row.cells[0].text = company.get("name", "")
         row.cells[1].text = company.get("cin", "")
         row.cells[2].text = "; ".join(company.get("basis", []))
+
+    doc.add_paragraph()
+    doc.add_paragraph(f"Source: {check.get('url', '')}")
+
+
+def _append_cts_land_record_section(doc, facts: dict) -> None:
+    """Appends a section reporting the CTS -> Property Card lookup (see
+    run_cts_land_lookup / mahabhumi.fetch_property_card). Silently does
+    nothing if cts_land_record_check was never set (the ordinary case --
+    it only runs when a human has supplied cts_lookup_input.json) or found
+    no result."""
+    check = facts.get("cts_land_record_check")
+    if not check or not check.get("found"):
+        return
+
+    heading_style = doc.paragraphs[4].style
+
+    doc.add_page_break()
+    heading_para = doc.add_paragraph("Land Record Check -- Maha Bhulekh Property Card (Code-Assisted, Human-Verified)")
+    heading_para.style = heading_style
+    doc.add_paragraph(
+        "Fetched directly from bhulekh.mahabhumi.gov.in, Maharashtra's official land-records portal, by "
+        "exact CTS number -- every field/office/village selection leading up to this was an exact match, "
+        "never a guess, and a human read and solved the site's own CAPTCHA to reveal this record."
+    )
+
+    fields = check.get("fields") or {}
+    if fields:
+        table = doc.add_table(rows=1, cols=2)
+        _set_table_borders(table)
+        header_cells = table.rows[0].cells
+        header_cells[0].text = "Field"
+        header_cells[1].text = "Value"
+        for cell in header_cells:
+            _shade_cell(cell, "D9E2F3")
+            for p in cell.paragraphs:
+                for run in p.runs:
+                    run.bold = True
+        for k, v in fields.items():
+            row = table.add_row()
+            row.cells[0].text = k
+            row.cells[1].text = v
+    else:
+        # This lookup's result-page structure was never independently
+        # confirmed live (see mahabhumi.py's module note) -- when no
+        # structured fields could be pulled out, the full raw page text is
+        # shown instead of silently dropping the result.
+        doc.add_paragraph(
+            "This lookup's result page could not be parsed into structured fields this pass -- the raw "
+            "page text is reproduced below for a human to read directly:"
+        )
+        doc.add_paragraph((check.get("raw_text") or "")[:4000])
 
     doc.add_paragraph()
     doc.add_paragraph(f"Source: {check.get('url', '')}")
@@ -2642,6 +3011,58 @@ def _diff_mortgage_lender(facts: dict, prior_facts: dict | None) -> str | None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Phase 2 checks run concurrently, not sequentially -- confirmed safe: each
+# of the 5 checks below hits a different external site (ICRA, Infomerics,
+# IBBI, ZaubaCorp x2, MahaRERA Orders) via its own plain requests.get/post
+# call, and none of them share module-level session state (the one
+# requests.Session() in this file, inside _maharera_orders_search_once, is
+# a local variable created fresh per call) or depend on each other's
+# results -- so running them in a thread pool is safe and shortens the
+# wall-clock cost of this step from the SUM of all 5 calls to roughly the
+# SLOWEST single one. Each wrapper below swallows its own exceptions into
+# the same honest {"found": False, "note": ...}-shaped result the
+# sequential code already produced, so a future's .result() never raises
+# and one check's failure still can't affect any other's.
+# ---------------------------------------------------------------------------
+
+def _safe_credit_rating(promoter_name: str) -> dict:
+    try:
+        return lookup_credit_rating(promoter_name)
+    except Exception as e:
+        return {"found": False, "note": f"Credit rating lookup could not run this pass: {e}"}
+
+
+def _safe_ibbi_check(identifier: str) -> dict:
+    try:
+        return lookup_ibbi_insolvency_status(identifier)
+    except Exception as e:
+        return {"found_process": None, "note": f"IBBI lookup could not run this pass: {e}"}
+
+
+def _safe_company_profile(identifier: str) -> dict:
+    try:
+        return lookup_company_by_cin(identifier)
+    except Exception as e:
+        return {"found": False, "note": f"ZaubaCorp company-profile lookup could not run this pass: {e}"}
+
+
+def _safe_group_companies(identifier: str) -> dict:
+    try:
+        return find_group_companies_by_cin(identifier)
+    except Exception as e:
+        return {"found": False, "note": f"ZaubaCorp group-companies crosswalk could not run this pass: {e}"}
+
+
+def _safe_judgments_search(project_name: str) -> tuple:
+    """Returns (judgments, error_note) instead of raising, matching the
+    other _safe_* wrappers -- error_note is None on success."""
+    try:
+        return search_maharera_judgments(project_name), None
+    except Exception as e:
+        return [], f"MahaRERA Orders/Judgments search for appeal-level outcomes could not run this pass: {e}"
+
+
 def run_company_charter(
     reg_no: str,
     category_data: dict,
@@ -2695,50 +3116,72 @@ def run_company_charter(
         facts["complaint_outcomes_summary"] = summarize_complaint_outcomes(complaint_orders_manifest, complaint_orders_dir)
 
     promoter_name_for_rating = (facts.get("corporate_identity", {}).get("promoter_name") or {}).get("value", "")
-    if promoter_name_for_rating:
-        try:
-            rating_result = lookup_credit_rating(promoter_name_for_rating)
-        except Exception as e:
-            # A network hiccup or an ICRA-side change to the endpoints above
-            # must not take down Company Charter generation over an optional
-            # enrichment -- same policy as every other external check here.
-            rating_result = {"found": False, "note": f"ICRA lookup could not run this pass: {e}"}
+
+    # Prefer a CIN when both are present in the text (the common case for a
+    # company); fall back to an LLPIN for LLP promoters (e.g. Trimity Realty
+    # LLP), which have no CIN at all. Confirmed live that every check below
+    # accepts either format identically -- IBBI's URL slot and ZaubaCorp's
+    # redirect-by-identifier trick both work the same way for a CIN or an
+    # LLPIN (see lookup_ibbi_insolvency_status / lookup_company_by_cin's own
+    # module notes) -- so one identifier drives all three checks either way.
+    identity_text = (facts.get("corporate_identity", {}).get("cin_llpin") or {}).get("value", "")
+    corp_identifier = extract_cin(identity_text) or extract_llpin(identity_text)
+    identifier_label = "CIN" if extract_cin(identity_text) else "LLPIN"
+
+    project_name_for_judgments = (facts.get("rera_core_fields", {}) or {}).get("project_name", "")
+
+    # All 5 checks below hit different external sites and don't depend on
+    # each other -- run them concurrently rather than one after another
+    # (see the module note above _safe_credit_rating). Each is gated on the
+    # same input-availability condition the sequential version used, so a
+    # check is simply never submitted (not run at all, not run-and-discarded)
+    # when e.g. no CIN/LLPIN was extractable.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {}
+        if promoter_name_for_rating:
+            futures["rating"] = executor.submit(_safe_credit_rating, promoter_name_for_rating)
+        if corp_identifier:
+            futures["ibbi"] = executor.submit(_safe_ibbi_check, corp_identifier)
+            futures["profile"] = executor.submit(_safe_company_profile, corp_identifier)
+            futures["group"] = executor.submit(_safe_group_companies, corp_identifier)
+        if project_name_for_judgments:
+            futures["judgments"] = executor.submit(_safe_judgments_search, project_name_for_judgments)
+
+        results = {key: future.result() for key, future in futures.items()}
+
+    # From here on, everything is pure in-memory processing of already-fetched
+    # results (facts assignment, source bookkeeping) -- fast enough that
+    # doing it sequentially costs nothing worth parallelizing further.
+    if "rating" in results:
+        rating_result = results["rating"]
         facts["credit_rating_check"] = {"promoter": rating_result}
-        if rating_result.get("found"):
+        # One source entry PER agency that found a rating -- both agencies
+        # checking the same entity is exactly the comparison case this is
+        # meant to surface, so each gets credited as its own source rather
+        # than collapsing into one generic "credit rating" entry.
+        for agency_rating in rating_result.get("ratings", []):
             facts.setdefault("sources", []).append({
-                "label": "ICRA credit rating",
-                "ref": f"{rating_result['company_name']} -- {rating_result['url']}",
+                "label": f"{agency_rating['agency']} credit rating",
+                "ref": f"{agency_rating['company_name']} -- {agency_rating['url']}",
                 "topic": "credit_rating",
                 "published_date": "unknown",
                 "accessed_date": datetime.now().strftime("%Y-%m-%d"),
             })
 
-    cin_for_ibbi = extract_cin((facts.get("corporate_identity", {}).get("cin_llpin") or {}).get("value", ""))
-    if cin_for_ibbi:
-        try:
-            ibbi_result = lookup_ibbi_insolvency_status(cin_for_ibbi)
-        except Exception as e:
-            ibbi_result = {"found_process": None, "note": f"IBBI lookup could not run this pass: {e}"}
+    if "ibbi" in results:
+        ibbi_result = results["ibbi"]
         facts["ibbi_insolvency_check"] = ibbi_result
         if ibbi_result.get("found_process") is not None:
             facts.setdefault("sources", []).append({
                 "label": "IBBI Corporate Debtor Master Data",
-                "ref": f"CIN {cin_for_ibbi} -- {ibbi_result.get('url', '')}",
+                "ref": f"{identifier_label} {corp_identifier} -- {ibbi_result.get('url', '')}",
                 "topic": "insolvency_status",
                 "published_date": "unknown",
                 "accessed_date": datetime.now().strftime("%Y-%m-%d"),
             })
 
-        # Same CIN, two more code-computed checks (see lookup_company_by_cin /
-        # find_group_companies_by_cin's own module note): the promoter's own
-        # registration profile, and its likely corporate group via shared
-        # directors/registered office. Both reuse the identical ZaubaCorp
-        # page fetch internally, so this costs one extra HTTP round-trip
-        # total, not two.
-        try:
-            profile_result = lookup_company_by_cin(cin_for_ibbi)
-        except Exception as e:
-            profile_result = {"found": False, "note": f"ZaubaCorp company-profile lookup could not run this pass: {e}"}
+    if "profile" in results:
+        profile_result = results["profile"]
         facts["company_profile_check"] = profile_result
         if profile_result.get("found"):
             facts.setdefault("sources", []).append({
@@ -2749,29 +3192,22 @@ def run_company_charter(
                 "accessed_date": datetime.now().strftime("%Y-%m-%d"),
             })
 
-        try:
-            group_result = find_group_companies_by_cin(cin_for_ibbi)
-        except Exception as e:
-            group_result = {"found": False, "note": f"ZaubaCorp group-companies crosswalk could not run this pass: {e}"}
+    if "group" in results:
+        group_result = results["group"]
         facts["group_companies_check"] = group_result
         if group_result.get("found") and group_result.get("companies"):
             facts.setdefault("sources", []).append({
                 "label": "ZaubaCorp director/address crosswalk",
-                "ref": f"CIN {cin_for_ibbi} -- {group_result.get('url', '')} -- {len(group_result['companies'])} linked entit(y/ies)",
+                "ref": f"{identifier_label} {corp_identifier} -- {group_result.get('url', '')} -- {len(group_result['companies'])} linked entit(y/ies)",
                 "topic": "group_companies",
                 "published_date": "unknown",
                 "accessed_date": datetime.now().strftime("%Y-%m-%d"),
             })
 
-    project_name_for_judgments = (facts.get("rera_core_fields", {}) or {}).get("project_name", "")
-    if project_name_for_judgments:
-        try:
-            judgments = search_maharera_judgments(project_name_for_judgments)
-        except Exception as e:
-            judgments = []
-            facts.setdefault("gaps", []).append(
-                f"MahaRERA Orders/Judgments search for appeal-level outcomes could not run this pass: {e}"
-            )
+    if "judgments" in results:
+        judgments, judgments_error = results["judgments"]
+        if judgments_error:
+            facts.setdefault("gaps", []).append(judgments_error)
         appeals_data = category_data.get("appeals") or []
         matched_judgments = cross_reference_appeals(judgments, appeals_data)
         matched_judgments = _save_appeal_judgment_pdfs(reg_no, matched_judgments, output_dir)
@@ -2797,6 +3233,8 @@ def run_company_charter(
             "published_date": "unknown",
             "accessed_date": datetime.now().strftime("%Y-%m-%d"),
         })
+
+    facts = run_cts_land_lookup(facts, reg_no, output_dir)
 
     land = facts.get("land_identification", {})
     origin_locality = (land.get("village_locality") or {}).get("value", "")

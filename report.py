@@ -449,15 +449,22 @@ def _render_charter_highlights_section(charter_facts: dict | None) -> list:
 
     credit = charter_facts.get("credit_rating_check")
     if credit:
-        flowables.append(Paragraph("Credit Rating Check (ICRA)", _SUBSECTION_STYLE))
+        flowables.append(Paragraph("Credit Rating Check (ICRA + Infomerics)", _SUBSECTION_STYLE))
         for role, key in (("Promoter", "promoter"), ("Parent/group entity (separate -- not the promoter above)", "parent_group")):
             result = credit.get(key)
             if not result:
                 continue
             if result.get("found"):
-                flowables.append(Paragraph(f"<b>{_esc(role)}:</b> {_esc(result['company_name'])}", _BODY_STYLE))
-                for item in result.get("instruments", []):
-                    flowables.append(Paragraph(f"• {_esc(item['instrument'])}: {_esc(item['rating'])}", _BODY_STYLE))
+                # Every agency that found a rating is listed -- if two agencies
+                # rate the same entity, both appear here for direct comparison
+                # rather than only the first match.
+                for agency_rating in result.get("ratings", []):
+                    flowables.append(Paragraph(f"<b>{_esc(role)} ({_esc(agency_rating['agency'])}):</b> {_esc(agency_rating['company_name'])}", _BODY_STYLE))
+                    for item in agency_rating.get("instruments", []):
+                        flowables.append(Paragraph(f"• {_esc(item['instrument'])}: {_esc(item['rating'])}", _BODY_STYLE))
+                not_found = result.get("not_found_agencies", [])
+                if not_found:
+                    flowables.append(Paragraph(f"No public rating found from: {_esc(', '.join(not_found))}.", _NOTE_STYLE))
             elif key == "promoter":
                 flowables.append(Paragraph(f"<b>{_esc(role)}:</b> {_esc(result.get('note', 'No result recorded.'))}", _NOTE_STYLE))
         flowables.append(Spacer(1, 8))
