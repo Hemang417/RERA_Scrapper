@@ -195,6 +195,20 @@ def _select_documents_for_extraction(documents_manifest: list, documents_dir: st
             all_labels.append({"document_name": label, "status": f"Not available ({entry.get('status')})"})
             continue
 
+        if label in extracted:
+            # Multiple manifest entries can share the exact same generic
+            # label (e.g. MahaRERA's own catch-all "Other -- Legal" bucket
+            # covering many distinct sale deeds/orders) -- extracting a
+            # second one would silently overwrite the first in `extracted`
+            # (same dict key) while still burning the shared char budget,
+            # starving out later, distinctly-labeled, higher-value documents
+            # (a real bug, confirmed live: it silently dropped the Title
+            # Report and Form B for a project whose library happened to have
+            # a dozen same-labeled documents ahead of them). Keep only the
+            # first document under a given label; skip re-extracting the rest.
+            all_labels.append({"document_name": label, "status": "Not opened this pass -- another document already opened under this same shared label"})
+            continue
+
         is_priority = any(k in label.lower() for k in _HIGH_PRIORITY_DOC_KEYWORDS) or any(
             k in (entry["saved_filename"] or "").lower() for k in _HIGH_PRIORITY_DOC_KEYWORDS
         )
@@ -971,6 +985,207 @@ def lookup_ibbi_insolvency_status(cin: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# CIN -> company profile / director-group lookup (ZaubaCorp). Confirmed live
+# and scriptable with no browser needed: ZaubaCorp's company page URL only
+# needs a correct CIN in the second path segment -- the company-name segment
+# is cosmetic and can be any placeholder ("X"), and a real CIN 200s and
+# redirects to the true canonical URL (e.g. /company/X/U45500MH2016PTC286108
+# -> /WATERTIGHT-DEVELOPERS-PRIVATE-LIMITED-U45500MH2016PTC286108). A CIN
+# with no matching company instead redirects to /companysearchresults/X,
+# which has zero `li.row` detail elements -- a clean, reliable not-found
+# signal. Live-tested against two real, unrelated CINs (Watertight
+# Developers Private Limited, a private SPV; India Homes Limited, a listed
+# public company formerly India Steel Works Limited) and a deliberately
+# fake CIN, confirming both the found and not-found paths.
+#
+# The page's core details sit in `<li class="row"><span>label</span>
+# <label>value</label></li>` pairs -- not a <table> -- which is why earlier
+# passes over this page's `<table>` elements alone missed them. Director
+# and group-affiliation data IS in tables, each preceded by its own heading:
+#   - "Current/Past Directors & Key Managerial Personnel of X" -- this
+#     company's own director roster (DIN, name, designation, dates).
+#   - "Other Directorships of <NAME>" -- one table per director named in
+#     the roster above, listing every OTHER company that same person is or
+#     was a director of. This is the group/board-overlap signal, and it
+#     arrives on the same page fetch -- no per-director follow-up request
+#     is needed.
+#   - "Companies with Similar Address" -- a second, independent
+#     group-affiliation signal (shared registered office, not shared
+#     directors); confirmed several Gupta-family-linked entities share
+#     Watertight's exact registered address.
+#   - "Subsidiaries, Associate Companies & Joint Ventures of X" -- present
+#     for India Homes Limited (a listed company that files this), absent
+#     for Watertight (a private SPV that doesn't); a third signal, this one
+#     naming an actual percentage-of-shares-held figure.
+#
+# Shareholding is deliberately NOT surfaced as a precise ownership
+# breakdown: per-shareholder/promoter percentage holdings are gated behind
+# ZaubaCorp's paid report for every CIN tested here (both the private SPV
+# and the listed company) -- only aggregate authorised/paid-up capital and
+# (for companies that file it) subsidiary/associate stakes are free. Callers
+# needing an actual cap table should treat this the same way the ICRA/IBBI
+# checks treat their own gaps: report what's genuinely available, flag the
+# rest as not publicly obtainable here rather than guessing.
+# ---------------------------------------------------------------------------
+
+_ZAUBACORP_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
+
+
+def _zaubacorp_fetch(cin: str):
+    """Returns (soup, canonical_url) for a real CIN, or None if ZaubaCorp
+    has no company matching it. Raises requests.RequestException on a
+    network/HTTP failure -- callers convert that into an honest gap."""
+    from bs4 import BeautifulSoup
+
+    url = f"https://www.zaubacorp.com/company/X/{cin.strip()}"
+    resp = requests.get(url, headers=_ZAUBACORP_HEADERS, timeout=config.REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    if "companysearchresults" in resp.url:
+        return None
+    soup = BeautifulSoup(resp.text, "html.parser")
+    if not soup.find("li", class_="row"):
+        return None
+    return soup, resp.url
+
+
+def _zaubacorp_core_fields(soup) -> dict:
+    fields = {}
+    for li in soup.find_all("li", class_="row"):
+        parts = li.find_all(["span", "label"])
+        if len(parts) >= 2:
+            fields[parts[0].get_text(strip=True)] = parts[1].get_text(strip=True)
+    return fields
+
+
+def _zaubacorp_director_table(table) -> list:
+    rows = []
+    header_cells = [th.get_text(strip=True) for th in table.find_all("th")]
+    for tr in table.find_all("tr")[1:]:
+        cells = [td.get_text(strip=True) for td in tr.find_all("td")]
+        if len(cells) == len(header_cells) and any(cells):
+            rows.append(dict(zip(header_cells, cells)))
+    return rows
+
+
+_ZAUBACORP_GATED_NOTE = "This information is part of the paid company report.Purchase Report"
+
+
+def _zaubacorp_clean(value: str | None) -> str | None:
+    """None instead of ZaubaCorp's free-tier paywall placeholder, so
+    callers don't mistake "gated" for a genuine reported value."""
+    if value is None or value.strip() == _ZAUBACORP_GATED_NOTE:
+        return None
+    return value
+
+
+def lookup_company_by_cin(cin: str) -> dict:
+    """Looks up a company's own registration profile and director roster
+    from ZaubaCorp by CIN. Returns:
+      {"found": True, "name": ..., "status": ..., "class_of_company": ...,
+       "incorporation_date": ..., "roc": ..., "registered_address": ...,
+       "authorised_capital": ..., "paid_up_capital": ...,
+       "current_directors": [{"din", "name", "designation", "appointment_date"}, ...],
+       "past_directors": [...], "shareholding_note": "...", "url": ...}
+    or {"found": False, "note": "..."} -- either a genuine no-match or a
+    request failure, never guessed."""
+    if not cin or not cin.strip():
+        return {"found": False, "note": "no CIN provided to look up"}
+    try:
+        result = _zaubacorp_fetch(cin)
+    except requests.RequestException as e:
+        return {"found": False, "note": f"ZaubaCorp lookup could not run this pass: {e}"}
+    if result is None:
+        return {"found": False, "note": f"no ZaubaCorp record found for CIN {cin.strip()}"}
+    soup, url = result
+
+    fields = _zaubacorp_core_fields(soup)
+    current_directors, past_directors = [], []
+    for table in soup.find_all("table"):
+        heading = table.find_previous(["h1", "h2", "h3", "h4", "h5"])
+        heading_text = heading.get_text(strip=True) if heading else ""
+        if heading_text.startswith("Current Directors"):
+            current_directors = _zaubacorp_director_table(table)
+        elif heading_text.startswith("Past Directors"):
+            past_directors = _zaubacorp_director_table(table)
+
+    return {
+        "found": True,
+        "name": fields.get("Name"),
+        "cin": fields.get("CIN", cin.strip()),
+        "status": fields.get("Company Status"),
+        "class_of_company": fields.get("Class of Company"),
+        "company_category": fields.get("Company Category"),
+        "roc": fields.get("ROC"),
+        "incorporation_date": fields.get("Date of Incorporation"),
+        "registered_address": fields.get("Address"),
+        "authorised_capital": _zaubacorp_clean(fields.get("Authorised Share Capital")),
+        "paid_up_capital": _zaubacorp_clean(fields.get("Paid-up Share Capital")),
+        "current_directors": current_directors,
+        "past_directors": past_directors,
+        "shareholding_note": (
+            "Per-shareholder/promoter shareholding percentages are gated behind ZaubaCorp's paid "
+            "report and were not available on this pass; only aggregate authorised/paid-up capital "
+            "above is free. This is not itself a red flag for a private company -- detailed cap "
+            "tables are rarely public for unlisted entities."
+        ),
+        "url": url,
+    }
+
+
+def find_group_companies_by_cin(cin: str) -> dict:
+    """Cross-references directors and registered address of the company at
+    `cin` against every OTHER company ZaubaCorp lists them against, to
+    surface a likely corporate group -- without guessing: every entry
+    names the concrete signal (a specific shared director, or a shared
+    registered office) that ties it to the target, so a reader can judge
+    the strength of the link themselves. Returns:
+      {"found": True, "companies": [{"cin", "name", "basis": [...]}, ...], "url": ...}
+    or {"found": False, "note": "..."}."""
+    if not cin or not cin.strip():
+        return {"found": False, "note": "no CIN provided to look up"}
+    try:
+        result = _zaubacorp_fetch(cin)
+    except requests.RequestException as e:
+        return {"found": False, "note": f"ZaubaCorp lookup could not run this pass: {e}"}
+    if result is None:
+        return {"found": False, "note": f"no ZaubaCorp record found for CIN {cin.strip()}"}
+    soup, url = result
+
+    by_cin: dict[str, dict] = {}
+
+    def _add(other_cin: str, name: str, basis: str):
+        other_cin = (other_cin or "").strip()
+        name = (name or "").strip()
+        if not other_cin or not name or other_cin == cin.strip():
+            return
+        entry = by_cin.setdefault(other_cin, {"cin": other_cin, "name": name, "basis": []})
+        entry["basis"].append(basis)
+
+    for table in soup.find_all("table"):
+        heading = table.find_previous(["h1", "h2", "h3", "h4", "h5"])
+        heading_text = heading.get_text(strip=True) if heading else ""
+
+        if heading_text.startswith("Other Directorships of "):
+            director = heading_text[len("Other Directorships of "):].strip()
+            for row in _zaubacorp_director_table(table):
+                designation = row.get("Designation", "").strip()
+                basis = f"shared director: {director}" + (f" ({designation})" if designation else "")
+                _add(row.get("CIN"), row.get("Company Name"), basis)
+
+        elif heading_text == "Companies with Similar Address":
+            for row in _zaubacorp_director_table(table):
+                _add(row.get("CIN"), row.get("Company Name"), "shared registered office")
+
+        elif heading_text.startswith("Subsidiaries, Associate Companies"):
+            for row in _zaubacorp_director_table(table):
+                pct = row.get("Percentage of Shares Held", "").strip()
+                basis = "subsidiary/associate/JV" + (f" ({pct} shares held)" if pct else "")
+                _add(row.get("Company Identifier"), row.get("Name"), basis)
+
+    return {"found": True, "companies": list(by_cin.values()), "url": url}
+
+
+# ---------------------------------------------------------------------------
 # MahaRERA Orders/Judgments search -- confirmed live and scriptable with no
 # browser needed. maharera.maharashtra.gov.in/orders-judgements is a Drupal
 # form (POST, requires a fresh form_build_id read from a prior GET -- no
@@ -1509,6 +1724,8 @@ def _fill_template(reg_no: str, facts: dict, out_path: str) -> None:
     _append_complaint_outcomes_section(doc, facts)
     _append_credit_rating_section(doc, facts)
     _append_ibbi_check_section(doc, facts)
+    _append_company_profile_section(doc, facts)
+    _append_group_companies_section(doc, facts)
     _append_appeal_judgments_section(doc, facts)
     _append_review_authenticity_section(doc, facts)
     _append_authenticity_page(doc, facts)
@@ -1594,6 +1811,111 @@ def _compute_authenticity_summary(facts: dict) -> dict:
         "primary_count": primary_count,
         "total_gaps": len(facts.get("gaps", [])),
     }
+
+
+# ---------------------------------------------------------------------------
+# Cross-corroboration enforcement -- turns the Cross-Corroboration score
+# criterion below (which only ever *measures* what fraction of topics have
+# 2+ sources) into something that actually *acts* on a single-sourced topic,
+# instead of letting it sit silently inside a percentage. For every topic
+# backed by exactly one source, this makes ONE bounded attempt (never
+# retried further, same policy as deep_research._resolve_gaps) to find a
+# genuinely independent second source via an agentic web-search pass. A
+# topic that gets a real second source is upgraded in place; a topic that
+# doesn't gets an explicit, named gap -- so a reader always knows exactly
+# which specific findings in this Charter rest on only one source, rather
+# than having to infer it from the Cross-Corroboration percentage alone.
+# ---------------------------------------------------------------------------
+
+_SECOND_SOURCE_SYSTEM_PROMPT = """You are trying to find a SECOND, INDEPENDENT source that \
+corroborates a claim already sourced from one place. Use web_search to look for a different \
+publisher/site that confirms the same claim -- not a mirror, syndication, or re-post of the same \
+original source, and not the same claim phrased differently by the same underlying publisher.
+
+Your FINAL reply must be ONLY a single raw JSON object -- no prose, no markdown fences -- matching \
+exactly this shape: {"found": true, "label": "publisher name", "ref": "one-line description -- url", \
+"published_date": "YYYY-MM-DD or 'unknown'", "accessed_date": "YYYY-MM-DD"} if a genuinely \
+independent second source was found, or {"found": false, "reason": "one sentence"} if not."""
+
+
+def _find_single_source_topics(facts: dict) -> dict:
+    """Groups facts['sources'] by topic and returns {topic: source} for
+    every topic currently backed by exactly one source."""
+    by_topic = {}
+    for src in facts.get("sources", []):
+        topic = src.get("topic")
+        if not topic:
+            continue
+        by_topic.setdefault(topic, []).append(src)
+    return {topic: srcs[0] for topic, srcs in by_topic.items() if len(srcs) == 1}
+
+
+def _attempt_second_source(topic: str, existing_source: dict) -> dict:
+    """One bounded attempt to find a second, independent source for a claim
+    currently backed by only one. Returns {"found": True, "source": {...}}
+    or {"found": False, "reason": ...} -- a missing ANTHROPIC_API_KEY or any
+    other failure to even run the attempt surfaces honestly as a reason
+    here rather than crashing the caller, same policy as
+    deep_research._verify_claim elsewhere in this codebase."""
+    prompt = (
+        f"Existing source: {existing_source.get('label', '')} -- {existing_source.get('ref', '')}\n"
+        f"Topic: {topic}\n"
+        f"Find one genuinely independent second source that corroborates this."
+    )
+    try:
+        result = deep_research._run_agentic_pass(prompt, _SECOND_SOURCE_SYSTEM_PROMPT)
+    except Exception as e:
+        return {"found": False, "reason": f"verification could not run: {e}"}
+    if not isinstance(result, dict) or "found" not in result:
+        return {"found": False, "reason": "second-source search returned an unrecognized response"}
+    if result.get("found"):
+        return {
+            "found": True,
+            "source": {
+                "label": result.get("label", ""),
+                "ref": result.get("ref", ""),
+                "topic": topic,
+                "published_date": result.get("published_date") or "unknown",
+                "accessed_date": result.get("accessed_date") or datetime.now().strftime("%Y-%m-%d"),
+            },
+        }
+    return {"found": False, "reason": result.get("reason", "no independent second source found")}
+
+
+def verify_cross_corroboration(facts: dict) -> dict:
+    """The code-enforced version of 'verify every material fact from 2+
+    independent angles': finds every topic currently backed by exactly one
+    source, attempts to upgrade each to two sources, and explicitly names
+    the ones that can't be -- rather than leaving single-sourced topics
+    invisible inside the Cross-Corroboration score's percentage. Call this
+    after all other sources have been assembled (credit rating, IBBI,
+    judgments, Maps, etc.), so the single-source topics found here are the
+    real final set, not a mid-assembly snapshot."""
+    single_source_topics = _find_single_source_topics(facts)
+    gaps = list(facts.get("gaps", []))
+    attempted = 0
+    upgraded = 0
+    for topic, existing_source in single_source_topics.items():
+        attempted += 1
+        attempt = _attempt_second_source(topic, existing_source)
+        if attempt["found"]:
+            facts.setdefault("sources", []).append(attempt["source"])
+            upgraded += 1
+        else:
+            gaps.append(
+                f"Cross-corroboration: the '{topic}' topic is backed by only one source "
+                f"({existing_source.get('label', 'unknown')}) -- one independent-second-source "
+                f"retry attempt did not find a genuinely separate corroborating source "
+                f"({attempt['reason']}). Treat this specific finding with more caution than "
+                f"multi-sourced ones in this Charter."
+            )
+    facts["gaps"] = gaps
+    facts.setdefault("_verification_stats", {})["cross_corroboration"] = {
+        "single_source_topics_found": len(single_source_topics),
+        "attempted": attempted,
+        "upgraded_to_two_sources": upgraded,
+    }
+    return facts
 
 
 # ---------------------------------------------------------------------------
@@ -1950,6 +2272,104 @@ def _append_ibbi_check_section(doc, facts: dict) -> None:
         )
         doc.add_paragraph(check.get("status_text", ""))
         doc.add_paragraph(f"Source: {check.get('url', '')}")
+
+
+def _append_company_profile_section(doc, facts: dict) -> None:
+    """Appends a section reporting the code-computed company registration
+    profile from ZaubaCorp (see lookup_company_by_cin). Silently does
+    nothing if company_profile_check was never set or found no record."""
+    check = facts.get("company_profile_check")
+    if not check or not check.get("found"):
+        return
+
+    heading_style = doc.paragraphs[4].style
+
+    doc.add_page_break()
+    heading_para = doc.add_paragraph("Company Registration Profile (ZaubaCorp, Code-Computed)")
+    heading_para.style = heading_style
+    doc.add_paragraph(
+        "Pulled directly from ZaubaCorp's public company record by CIN -- an exact-identifier lookup, "
+        "not a name-based guess."
+    )
+    doc.add_paragraph(
+        f"{check['name']} ({check['cin']}) -- Status: {check.get('status', 'unknown')}; "
+        f"Class: {check.get('class_of_company', 'unknown')}; "
+        f"Category: {check.get('company_category', 'unknown')}; ROC: {check.get('roc', 'unknown')}"
+    )
+    doc.add_paragraph(f"Incorporated: {check.get('incorporation_date', 'unknown')}")
+    doc.add_paragraph(f"Registered address: {check.get('registered_address', 'unknown')}")
+    doc.add_paragraph(
+        f"Authorised capital: {check.get('authorised_capital') or 'not publicly available'}; "
+        f"Paid-up capital: {check.get('paid_up_capital') or 'not publicly available'}"
+    )
+    doc.add_paragraph(check.get("shareholding_note", ""))
+
+    def _add_director_table(title: str, directors: list):
+        if not directors:
+            return
+        doc.add_paragraph()
+        doc.add_paragraph(title)
+        cols = list(directors[0].keys())
+        table = doc.add_table(rows=1, cols=len(cols))
+        _set_table_borders(table)
+        header_cells = table.rows[0].cells
+        for i, col in enumerate(cols):
+            header_cells[i].text = col
+            _shade_cell(header_cells[i], "D9E2F3")
+            for p in header_cells[i].paragraphs:
+                for run in p.runs:
+                    run.bold = True
+        for director in directors:
+            row = table.add_row()
+            for i, col in enumerate(cols):
+                row.cells[i].text = director.get(col, "")
+
+    _add_director_table("Current Directors & Key Managerial Personnel", check.get("current_directors", []))
+    _add_director_table("Past Directors & Key Managerial Personnel", check.get("past_directors", []))
+    doc.add_paragraph()
+    doc.add_paragraph(f"Source: {check.get('url', '')}")
+
+
+def _append_group_companies_section(doc, facts: dict) -> None:
+    """Appends a section listing companies linked to the promoter via
+    shared directors or a shared registered office (see
+    find_group_companies_by_cin). Silently does nothing if
+    group_companies_check was never set or found nothing."""
+    check = facts.get("group_companies_check")
+    if not check or not check.get("found") or not check.get("companies"):
+        return
+
+    heading_style = doc.paragraphs[4].style
+
+    doc.add_page_break()
+    heading_para = doc.add_paragraph("Group / Affiliated Companies (Code-Computed Director & Address Crosswalk)")
+    heading_para.style = heading_style
+    doc.add_paragraph(
+        "Every entity below shares at least one concrete, named link with the promoter above -- a "
+        "specific director in common, a shared registered office, or a filed subsidiary/associate/JV "
+        "relationship -- rather than being inferred from a name or industry match. The strength of each "
+        "link should be judged from the basis given, not assumed uniform across the list."
+    )
+
+    table = doc.add_table(rows=1, cols=3)
+    _set_table_borders(table)
+    header_cells = table.rows[0].cells
+    header_cells[0].text = "Company Name"
+    header_cells[1].text = "CIN / Identifier"
+    header_cells[2].text = "Basis for Link"
+    for cell in header_cells:
+        _shade_cell(cell, "D9E2F3")
+        for p in cell.paragraphs:
+            for run in p.runs:
+                run.bold = True
+    for company in sorted(check["companies"], key=lambda c: -len(c.get("basis", []))):
+        row = table.add_row()
+        row.cells[0].text = company.get("name", "")
+        row.cells[1].text = company.get("cin", "")
+        row.cells[2].text = "; ".join(company.get("basis", []))
+
+    doc.add_paragraph()
+    doc.add_paragraph(f"Source: {check.get('url', '')}")
 
 
 def _append_appeal_judgments_section(doc, facts: dict) -> None:
@@ -2309,6 +2729,40 @@ def run_company_charter(
                 "accessed_date": datetime.now().strftime("%Y-%m-%d"),
             })
 
+        # Same CIN, two more code-computed checks (see lookup_company_by_cin /
+        # find_group_companies_by_cin's own module note): the promoter's own
+        # registration profile, and its likely corporate group via shared
+        # directors/registered office. Both reuse the identical ZaubaCorp
+        # page fetch internally, so this costs one extra HTTP round-trip
+        # total, not two.
+        try:
+            profile_result = lookup_company_by_cin(cin_for_ibbi)
+        except Exception as e:
+            profile_result = {"found": False, "note": f"ZaubaCorp company-profile lookup could not run this pass: {e}"}
+        facts["company_profile_check"] = profile_result
+        if profile_result.get("found"):
+            facts.setdefault("sources", []).append({
+                "label": "ZaubaCorp company registration profile",
+                "ref": f"{profile_result['name']} -- {profile_result['url']}",
+                "topic": "company_profile",
+                "published_date": "unknown",
+                "accessed_date": datetime.now().strftime("%Y-%m-%d"),
+            })
+
+        try:
+            group_result = find_group_companies_by_cin(cin_for_ibbi)
+        except Exception as e:
+            group_result = {"found": False, "note": f"ZaubaCorp group-companies crosswalk could not run this pass: {e}"}
+        facts["group_companies_check"] = group_result
+        if group_result.get("found") and group_result.get("companies"):
+            facts.setdefault("sources", []).append({
+                "label": "ZaubaCorp director/address crosswalk",
+                "ref": f"CIN {cin_for_ibbi} -- {group_result.get('url', '')} -- {len(group_result['companies'])} linked entit(y/ies)",
+                "topic": "group_companies",
+                "published_date": "unknown",
+                "accessed_date": datetime.now().strftime("%Y-%m-%d"),
+            })
+
     project_name_for_judgments = (facts.get("rera_core_fields", {}) or {}).get("project_name", "")
     if project_name_for_judgments:
         try:
@@ -2350,6 +2804,12 @@ def run_company_charter(
     if origin_locality:
         origin = f"{origin_locality}, {origin_district}, Maharashtra" if origin_district else f"{origin_locality}, Maharashtra"
         facts = _refine_distances_with_maps(facts, origin)
+
+    # Runs last, after every other step above has had its chance to add a
+    # source -- otherwise a topic that only looks single-sourced mid-assembly
+    # (e.g. before the credit-rating/IBBI checks ran) would get a spurious
+    # gap for a corroboration problem that a later step already fixed.
+    facts = verify_cross_corroboration(facts)
 
     # The template is a fixed reference asset checked into the real repo
     # output root regardless of --output-dir; generated charters follow
