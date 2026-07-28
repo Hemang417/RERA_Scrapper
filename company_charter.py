@@ -3215,6 +3215,11 @@ _EXTERNAL_PROSE_SUBSTITUTIONS = (
     (r"this research session", "this review"),
     (r"this session", "this review"),
     (r"this pass", "this review"),
+    # "(per live RERA record)" etc. is an internal sourcing annotation --
+    # useful context for an Internal reviewer (this figure was pulled fresh
+    # from the API, not stale), but reads as an odd internal-process note
+    # to an External/client reader, so it's dropped there rather than kept.
+    (r"\s*\(per live RERA record\)", ""),
 )
 
 # Matches "(see gaps[0])", "(see fsi_interpretation)", "(see local_planning
@@ -3530,12 +3535,12 @@ _FLAG_THRESHOLDS = {
     "appeal_monitor": 5, "appeal_imminent": 15,
     "credit_rating_min_units": 500,  # below this, "no rating found" isn't flagged
 }
-# The Developer Score's 7-criteria AAA-D framework (replaces the earlier
-# 4-pillar composite entirely, per instruction): each criterion is scored
-# independently against its own AAA-D band, converted to an even 0-100
-# tier-equivalent, then combined by equal weight across whichever criteria
-# have real data this pass -- same renormalize-and-skip convention this
-# Charter already uses everywhere a computed value might be unavailable.
+# The Developer Score's 3-bucket / 9-sub-metric AAA-D framework (see
+# _DEVELOPER_SCORE_STRUCTURE below): each sub-metric is scored independently
+# against its own AAA-D band, converted to an even 0-100 tier-equivalent,
+# then combined by its FIXED structural weight -- unlike every other score
+# in this Charter, missing data is never redistributed/renormalized here
+# (see _compute_developer_score's own note).
 _DEVELOPER_SCORE_TIER_SCORES = {"AAA": 100.0, "AA": 83.3, "A": 66.7, "B": 50.0, "C": 33.3, "D": 16.7}
 # Thresholds sit at the midpoint between adjacent tier-equivalents, used to
 # map a combined composite (which can land between two tiers once several
@@ -4044,20 +4049,30 @@ def _classify_flags(facts: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Developer Score -- a composite read on the PROMOTER's own standing, scored
-# against a fixed 7-criteria industry rubric (track record years, team
-# strength, past area developed, area developed within 5km, financial
-# strength/debt structure, past default count, entity/organization type),
-# each independently banded AAA/AA/A/B/C/D. Distinct from
+# Developer Score -- a composite read on the PROMOTER's own standing,
+# scored against a fixed 3-bucket / 9-sub-metric industry rubric:
+#   Operational Strength (50%): Team Strength, Influence in Micromarket
+#     (area within 5km), Past Experience - Area, Track Record -- 12.5% each.
+#   Financial Strength (20%): Financial Strength (debt structure) -- one
+#     sub-metric, the whole bucket.
+#   Governance Strength (30%): RERA Compliance, GST/TDS Compliance, Cases
+#     (Past Defaults), Entity Rating -- 7.5% each.
+# Each sub-metric independently banded AAA/AA/A/B/C/D. Distinct from
 # _compute_documentation_confidence_score above (which scores this
-# DOCUMENT's sourcing, not the promoter). Same renormalization philosophy
-# as everywhere else in this Charter: a criterion with no underlying data
-# is skipped and the remaining criteria are combined by equal weight,
-# rather than faking a neutral or zero score for data that was never
-# gathered. Two of the seven criteria (team strength; financial strength's
-# debt ratios) have no public source this pipeline can check at all today
-# -- they're included for completeness, not left out, so a reader always
-# sees why they're missing rather than wondering if they were forgotten.
+# DOCUMENT's sourcing, not the promoter).
+#
+# Unlike every other score/count in this Charter, this rubric does NOT
+# renormalize when data is missing: each sub-metric's weight is fixed
+# (12.5%/20%/7.5%) whether or not it actually scores, and an unscored
+# sub-metric's weight is simply never redistributed to the others or
+# excluded from the composite's denominator -- so incomplete public
+# disclosure structurally lowers the composite, rather than a promoter
+# with less available data being scored purely on the strength of
+# whatever little IS known. Three sub-metrics (Team Strength; Financial
+# Strength's debt ratios; RERA/GST-TDS Compliance, not yet built) have no
+# wired-in data source today -- included for completeness, not left out,
+# so a reader always sees why they're missing rather than wondering if
+# they were forgotten.
 # ---------------------------------------------------------------------------
 
 
@@ -4217,38 +4232,80 @@ def _score_entity_rating(facts: dict) -> dict:
     return {"score": None, "tier": None, "reason": f"organization_type ('{org_type}') did not match a recognized entity-type category (Private/Public Limited, LLP, or Partnership)."}
 
 
+def _score_rera_compliance(facts: dict) -> dict:
+    """Governance sub-metric: RERA compliance history (registration
+    timeliness, extension/penalty record). Not yet computed as a scored
+    metric by this pipeline -- unlike Team Strength (no public source
+    exists at all), this is a pending build: a real data source (e.g. a
+    structured read of MahaRERA's own extension/penalty filings across the
+    promoter's portfolio) would need to be wired in before this can score
+    anything, so it's an honest "not yet built" gap, not a permanent
+    public-data limitation."""
+    return {"score": None, "tier": None, "reason": "RERA compliance history (registration timeliness, extension/penalty record) is not yet computed as a scored metric -- no data source has been wired in for this criterion yet; a pending build, not a permanent public-data gap."}
+
+
+def _score_gst_tds_compliance(facts: dict) -> dict:
+    """Governance sub-metric: GST/TDS statutory compliance. Same "pending
+    build" status as _score_rera_compliance -- no data source (e.g. a GST
+    portal lookup or filed-return record) is wired in yet."""
+    return {"score": None, "tier": None, "reason": "GST/TDS compliance is not yet computed as a scored metric -- no data source has been wired in for this criterion yet; a pending build, not a permanent public-data gap."}
+
+
+# Three fixed-weight buckets, each holding a fixed number of sub-metrics
+# that split the bucket's weight EQUALLY -- but that split is structural,
+# not a renormalization: a sub-metric's weight (12.5% / 20% / 7.5%) is the
+# same whether or not it actually has data this pass. When a sub-metric is
+# unscored, its weight simply contributes nothing to the composite -- it is
+# NOT redistributed to the other sub-metrics, and the composite is NOT
+# divided by the sum of only the available weights. This is a deliberate
+# choice (over the equal-weight-renormalized approach used elsewhere in
+# this Charter): a promoter with less publicly-verifiable data structurally
+# scores lower, even if everything that IS available is top-tier, rather
+# than have missing disclosure quietly get "filled in" by inflating what
+# little is known.
+_DEVELOPER_SCORE_STRUCTURE = (
+    ("Operational Strength", 50.0, (
+        ("team_strength", "Team Strength", _score_team_strength),
+        ("area_within_5km", "Influence in Micromarket", _score_area_within_5km),
+        ("past_area_developed", "Past Experience - Area", _score_past_area_developed),
+        ("track_record_years", "Track Record", _score_track_record_years),
+    )),
+    ("Financial Strength", 20.0, (
+        ("financial_strength_debt", "Financial Strength", _score_financial_strength_debt),
+    )),
+    ("Governance Strength", 30.0, (
+        ("rera_compliance", "RERA Compliance", _score_rera_compliance),
+        ("gst_tds_compliance", "GST/TDS Compliance", _score_gst_tds_compliance),
+        ("past_default_count", "Cases (Past Defaults)", _score_past_default_count),
+        ("entity_rating", "Entity Rating", _score_entity_rating),
+    )),
+)
+
+
 def _compute_developer_score(facts: dict, flags: dict) -> dict:
     """Returns {"composite": 0-100, "grade": one of AAA/AA/A/B/C/D,
-    "criteria": {name: {"score", "tier", "weight", "note"} or {"score":
-    None, "tier": None, "weight": None, "reason"}}}. All seven criteria
-    always appear in `criteria` -- computed ones carry a score/tier/weight/
-    note, uncomputable ones carry an explicit reason instead, so a reader
-    always sees all seven named, never silently missing. Combines whichever
-    criteria have real data by equal weight (renormalized) -- the same
-    skip-and-renormalize convention this Charter uses everywhere else,
-    rather than faking a neutral value for data that was never gathered."""
-    criteria = {
-        "track_record_years": _score_track_record_years(facts),
-        "team_strength": _score_team_strength(facts),
-        "past_area_developed": _score_past_area_developed(facts),
-        "area_within_5km": _score_area_within_5km(facts),
-        "financial_strength_debt": _score_financial_strength_debt(facts),
-        "past_default_count": _score_past_default_count(facts),
-        "entity_rating": _score_entity_rating(facts),
-    }
+    "criteria": {name: {"score", "tier", "weight", "bucket",
+    "display_name", "note"} or {"score": None, "tier": None, "weight":
+    <fixed %>, "bucket", "display_name", "reason"}}}. All nine sub-metrics
+    (see _DEVELOPER_SCORE_STRUCTURE) always appear in `criteria`, each
+    carrying its FIXED structural weight regardless of whether it actually
+    scored -- see _DEVELOPER_SCORE_STRUCTURE's own note on why missing
+    weight is never redistributed or renormalized away."""
+    criteria = {}
+    composite = 0.0
+    for bucket_name, bucket_weight, metrics in _DEVELOPER_SCORE_STRUCTURE:
+        sub_weight = round(bucket_weight / len(metrics), 2)
+        for key, display_name, score_fn in metrics:
+            result = score_fn(facts)
+            result["weight"] = sub_weight
+            result["bucket"] = bucket_name
+            result["display_name"] = display_name
+            criteria[key] = result
+            if result["score"] is not None:
+                composite += result["score"] * sub_weight / 100.0
 
-    scored = {k: v for k, v in criteria.items() if v["score"] is not None}
-    if not scored:
-        composite = 0.0
-    else:
-        composite = sum(v["score"] for v in scored.values()) / len(scored)
-        for k in scored:
-            criteria[k]["weight"] = round(100 / len(scored), 1)
-    for k, v in criteria.items():
-        if v["score"] is None:
-            v["weight"] = None
-
-    grade = _tier_from_score(composite) if scored else "D"
+    any_scored = any(v["score"] is not None for v in criteria.values())
+    grade = _tier_from_score(composite) if any_scored else "D"
     if flags.get("imminent") and grade in ("AAA", "AA"):
         # Hard cap: an imminent-tier flag means this can never be graded
         # better than A, regardless of how strong the composite otherwise
@@ -4421,7 +4478,7 @@ def _append_overview_section(doc, facts: dict, flags: dict) -> None:
         row.cells[0].text = label
         cell = row.cells[1]
         cell.text = ""
-        run = cell.paragraphs[0].add_run(str(value or ""))
+        run = cell.paragraphs[0].add_run(_externalize_prose(facts, str(value or "")))
         if label == "Proposed Completion Date" and _parse_completion_slippage(facts)[1]:
             # Only colored when this project's own text documents a real
             # slippage (original date vs. the extended one(s)) -- an
@@ -4448,7 +4505,7 @@ def _append_overview_section(doc, facts: dict, flags: dict) -> None:
     value_cells[0].text = f"{grade or 'N/A'} ({developer_score.get('composite', 'N/A')}/100)"
     value_cells[1].text = f"{band or 'N/A'} ({doc_confidence.get('overall', 'N/A')}/100)"
     value_cells[2].text = f"{imminent_count} / {len(flags.get('structural', []))} / {len(flags.get('monitor', []))}"
-    value_cells[3].text = str(core.get("project_status", ""))
+    value_cells[3].text = _externalize_prose(facts, str(core.get("project_status", "")))
     for cell, fill in (
         (header_cells[0], _grade_fill(grade)),
         (header_cells[1], _band_fill(band)),
@@ -4499,10 +4556,10 @@ def _append_overview_section(doc, facts: dict, flags: dict) -> None:
 
 def _append_developer_score_section(doc, facts: dict) -> None:
     """Renders facts["developer_score"] (see _compute_developer_score) as a
-    per-criterion table against the 7-criteria AAA-D industry rubric --
-    silently does nothing if it was never computed (defensive only; the
-    normal pipeline always sets it via _append_overview_section before
-    this is called)."""
+    per-sub-metric table against the 3-bucket / 9-sub-metric AAA-D
+    industry rubric -- silently does nothing if it was never computed
+    (defensive only; the normal pipeline always sets it via
+    _append_overview_section before this is called)."""
     developer_score = facts.get("developer_score")
     if not developer_score:
         return
@@ -4514,37 +4571,42 @@ def _append_developer_score_section(doc, facts: dict) -> None:
     heading_para.style = heading_style
     doc.add_paragraph(
         f"Composite: {developer_score['composite']}/100 -- Grade {developer_score['grade']}. Scored "
-        "against a fixed 7-criteria industry rubric (track record years, team strength, past area "
-        "developed, area developed within 5km, financial strength/debt structure, past default count, "
-        "entity/organization type), each independently banded AAA/AA/A/B/C/D, then combined by equal "
-        "weight across whatever criteria had underlying data this pass -- a criterion with none is "
-        "explicitly skipped below, never faked as neutral or zero. An imminent-tier flag (see Overview "
-        "& Flags) caps this grade at A regardless of the composite, unless the composite alone already "
-        "bands lower than that."
+        "against a fixed 3-bucket rubric -- Operational Strength (50%: Team Strength, Influence in "
+        "Micromarket, Past Experience - Area, Track Record, 12.5% each), Financial Strength (20%: debt "
+        "structure), Governance Strength (30%: RERA Compliance, GST/TDS Compliance, Cases/Past Defaults, "
+        "Entity Rating, 7.5% each) -- each sub-metric independently banded AAA/AA/A/B/C/D. Every sub-"
+        "metric's weight below is fixed and always shown, even when it couldn't be scored this pass: "
+        "unscored weight is never redistributed to the others or excluded from the composite's "
+        "denominator, so incomplete public disclosure structurally lowers the composite rather than "
+        "being scored purely on the strength of whatever little is known. An imminent-tier flag (see "
+        "Overview & Flags) caps the grade at A regardless of the composite, unless the composite alone "
+        "already bands lower than that."
     )
 
-    table = doc.add_table(rows=1, cols=5)
+    table = doc.add_table(rows=1, cols=6)
     _set_table_borders(table)
     header_cells = table.rows[0].cells
-    for i, label in enumerate(("Criterion", "Tier", "Score", "Weight", "Note / Reason")):
+    for i, label in enumerate(("Bucket", "Sub-metric", "Tier", "Score", "Weight", "Note / Reason")):
         header_cells[i].text = label
         _shade_cell(header_cells[i], "D9E2F3")
         for para in header_cells[i].paragraphs:
             for run in para.runs:
                 run.bold = True
-    for name, criterion in developer_score.get("criteria", {}).items():
-        row = table.add_row()
-        row.cells[0].text = name.replace("_", " ").title()
-        if criterion.get("score") is None:
-            row.cells[1].text = "N/A"
-            row.cells[2].text = "N/A"
-            row.cells[3].text = "N/A"
-            row.cells[4].text = _externalize_prose(facts, criterion.get("reason", ""))
-        else:
-            row.cells[1].text = criterion["tier"]
-            row.cells[2].text = str(criterion["score"])
-            row.cells[3].text = f"{criterion['weight']}%"
-            row.cells[4].text = _externalize_prose(facts, criterion.get("note", ""))
+    for bucket_name, _bucket_weight, metrics in _DEVELOPER_SCORE_STRUCTURE:
+        for key, _display_name, _fn in metrics:
+            criterion = developer_score.get("criteria", {}).get(key, {})
+            row = table.add_row()
+            row.cells[0].text = bucket_name
+            row.cells[1].text = criterion.get("display_name", key.replace("_", " ").title())
+            row.cells[4].text = f"{criterion.get('weight', '')}%"
+            if criterion.get("score") is None:
+                row.cells[2].text = "N/A"
+                row.cells[3].text = "N/A"
+                row.cells[5].text = _externalize_prose(facts, criterion.get("reason", ""))
+            else:
+                row.cells[2].text = criterion["tier"]
+                row.cells[3].text = str(criterion["score"])
+                row.cells[5].text = _externalize_prose(facts, criterion.get("note", ""))
 
 
 def _append_counterparty_summary(doc, facts: dict) -> None:
