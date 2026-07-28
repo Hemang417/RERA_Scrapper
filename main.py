@@ -389,7 +389,9 @@ def main() -> int:
             complaint_orders_manifest=complaint_orders_manifest, complaint_orders_dir=complaint_orders_dir,
             reviews=reviews, promoter_portfolio=portfolio,
         )
-        print(f"[OK] Company Charter written to {charter_path}")
+        external_charter_path = charter_path.replace("_Internal.docx", "_External.docx")
+        print(f"[OK] Company Charter (Internal) written to {charter_path}")
+        print(f"[OK] Company Charter (External) written to {external_charter_path}")
     except Exception as e:
         # Same policy as deep research: a missing API key, template mismatch,
         # or a corrupt/unreadable document must not take down the scrape.

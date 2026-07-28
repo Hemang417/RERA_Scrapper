@@ -43,6 +43,7 @@ on any failure.
 
 import argparse
 import concurrent.futures
+import copy
 import json
 import os
 import re
@@ -1878,7 +1879,21 @@ def run_review_authenticity_triage(reviews: list, facts: dict) -> dict:
 # Template filling
 # ---------------------------------------------------------------------------
 
+# Set only for the duration of an "external"-variant _fill_template call
+# (via a try/finally there -- never left set across calls). _set_paragraph_text
+# is the one low-level primitive nearly everything in this file funnels
+# through to write text into the document (directly, or via _set_cell/
+# _set_row_cell) -- checking it here, rather than threading a `facts`
+# parameter through this function's ~70 call sites individually, is what
+# makes External's prose cleanup reach text built from hardcoded Python
+# f-strings (flag/reason text assembled at render time, not stored in
+# facts.json) as well as facts.json's own free-text fields.
+_ACTIVE_EXTERNAL_FACTS: dict | None = None
+
+
 def _set_paragraph_text(paragraph, text: str) -> None:
+    if _ACTIVE_EXTERNAL_FACTS is not None:
+        text = _externalize_prose(_ACTIVE_EXTERNAL_FACTS, str(text))
     for run in paragraph.runs[1:]:
         run.text = ""
     if paragraph.runs:
@@ -1930,12 +1945,47 @@ def _fill_variable_paragraphs(doc, start_index: int, slot_count: int, texts: lis
         last = new_para
 
 
-def _fill_template(reg_no: str, facts: dict, out_path: str) -> None:
+def _fill_template(reg_no: str, facts: dict, out_path: str, doc_variant: str = "internal") -> None:
+    """doc_variant is "internal" (default -- today's behavior: inline
+    "(label)" citations, "(Code-Computed)" labels, verbatim prose) or
+    "external" (deduped, sequentially-numbered "[N]" citations resolving
+    to a generic-language Sources list at the end, no "(Code-Computed)"
+    labels, and known internal-process phrases generalized in prose --
+    see _citation_text/_generic_one_label/_externalize_prose). Reset
+    fresh on every call (not merely defaulted) so two calls against the
+    same `facts` dict -- once per variant, the normal calling pattern --
+    never leak state from one into the other."""
     import docx
+
+    if doc_variant == "external":
+        # A deep copy, not an in-place rewrite: the caller's own `facts`
+        # dict (run_company_charter persists it to .facts.json after
+        # rendering) must keep the real, un-rewritten internal content
+        # regardless of whether/when an External pass runs against it --
+        # see _externalized_facts_copy's own docstring.
+        facts = _externalized_facts_copy(facts)
+    facts["_doc_variant"] = doc_variant
+    facts["_citation_registry"] = {"order": [], "index": {}}
 
     shutil.copy2(TEMPLATE_PATH, out_path)
     doc = docx.Document(out_path)
     p = doc.paragraphs
+
+    global _ACTIVE_EXTERNAL_FACTS
+    _ACTIVE_EXTERNAL_FACTS = facts if doc_variant == "external" else None
+    if doc_variant == "external":
+        # doc.add_paragraph(...) is how every _append_*_section function
+        # writes NEW content (as opposed to _set_paragraph_text filling a
+        # pre-existing template slot, covered by _ACTIVE_EXTERNAL_FACTS
+        # above) -- patching this one fresh, single-use `doc` instance's
+        # bound method reaches all of them uniformly, the same reasoning
+        # as _ACTIVE_EXTERNAL_FACTS, without touching each call site.
+        _real_add_paragraph = doc.add_paragraph
+
+        def _add_paragraph_external(text="", *args, **kwargs):
+            return _real_add_paragraph(_externalize_prose(facts, str(text)), *args, **kwargs)
+
+        doc.add_paragraph = _add_paragraph_external
 
     li = facts["land_identification"]
     ci = facts["corporate_identity"]
@@ -1957,9 +2007,9 @@ def _fill_template(reg_no: str, facts: dict, out_path: str) -> None:
     _set_paragraph_text(p[7], facts["executive_summary"])
     _set_paragraph_text(p[12], facts["address_discrepancy_note"])
     _set_paragraph_text(p[13], facts["corporate_registry_cross_check"])
-    litigation_citation = _clean_source_label(src(facts, "litigation_status"))
+    litigation_citation = _citation_text(facts, _clean_source_label(src(facts, "litigation_status")))
     litigation_text = fld(facts, "litigation_status")
-    _set_paragraph_text(p[15], f"{litigation_text} ({litigation_citation})" if litigation_citation else litigation_text)
+    _set_paragraph_text(p[15], f"{litigation_text} {litigation_citation}" if litigation_citation else litigation_text)
     _set_paragraph_text(p[17], _cite(facts["location_coordinates_note"], "distance", facts=facts))
     _set_paragraph_text(p[18], "Map screenshot not embedded -- a live map cannot be fetched programmatically, so distances below were sourced from mapping-service queries instead (see Sources).")
     _set_paragraph_text(p[24], _cite(f"Road: {conn.get('road', '')}", "distance", facts=facts))
@@ -2001,7 +2051,7 @@ def _fill_template(reg_no: str, facts: dict, out_path: str) -> None:
         # The template's own "Source" column showed the raw output/<reg_no>/...
         # path verbatim -- cleaned to a short label here, same convention as
         # every other citation added below.
-        _set_cell(t[0], row, 2, _clean_source_label(src(li, key)) or "")
+        _set_cell(t[0], row, 2, _citation_text(facts, _clean_source_label(src(li, key))) or "")
 
     for row, key in zip(range(1, 10), (
         "promoter_name", "organization_type", "cin_llpin", "registered_office_main",
@@ -2012,8 +2062,8 @@ def _fill_template(reg_no: str, facts: dict, out_path: str) -> None:
         # Identification) -- each fact carries a real source in facts.json
         # that was never shown anywhere, so it's appended inline instead.
         value = fld(ci, key)
-        citation = _clean_source_label(src(ci, key))
-        _set_cell(t[1], row, 1, f"{value} ({citation})" if value and citation else value)
+        citation = _citation_text(facts, _clean_source_label(src(ci, key)))
+        _set_cell(t[1], row, 1, f"{value} {citation}" if value and citation else value)
 
     for row, key in zip(range(1, 5), ("east", "west", "north", "south")):
         _set_cell(t[2], row, 1, _cite(nb.get(key, ""), "project_registration", "legal_documents", facts=facts))
@@ -2033,8 +2083,8 @@ def _fill_template(reg_no: str, facts: dict, out_path: str) -> None:
         # _CHARTER_FACTS_SCHEMA note) and the template predates it.
         lender_row = t[4].add_row()
         _set_row_cell(lender_row, 0, "Mortgage lender (if disclosed)")
-        lender_citation = _clean_source_label(src(fsi_m, "mortgage_lender"))
-        _set_row_cell(lender_row, 1, f"{mortgage_lender_value} ({lender_citation})" if lender_citation else mortgage_lender_value)
+        lender_citation = _citation_text(facts, _clean_source_label(src(fsi_m, "mortgage_lender")))
+        _set_row_cell(lender_row, 1, f"{mortgage_lender_value} {lender_citation}" if lender_citation else mortgage_lender_value)
     lender_history_note = facts.get("mortgage_lender_history_note")
     if lender_history_note:
         history_row = t[4].add_row()
@@ -2084,7 +2134,16 @@ def _fill_template(reg_no: str, facts: dict, out_path: str) -> None:
             line += f' [published: {published or "unknown"}, accessed: {accessed or "unknown"}]'
         return line
 
-    sources = [_format_source_line(s) for s in facts.get("sources", [])]
+    if facts.get("_doc_variant") == "external":
+        # Every "[N]" marker in the body was registered against this exact
+        # list, in this exact order (see _register_citation) -- replaces
+        # facts["sources"] entirely for External, since that list's
+        # internal topic/date bookkeeping isn't what the numbered
+        # in-body citations actually point to.
+        registry = facts["_citation_registry"]
+        sources = [f"[{i + 1}] {label}" for i, label in enumerate(registry["order"])]
+    else:
+        sources = [_format_source_line(s) for s in facts.get("sources", [])]
     _fill_variable_paragraphs(doc, 69, 8, sources)
 
     # ---------------------------------------------------------------------
@@ -2277,6 +2336,15 @@ def _fill_template(reg_no: str, facts: dict, out_path: str) -> None:
     p[5]._p.getparent().remove(p[5]._p)
 
     doc.save(out_path)
+    _ACTIVE_EXTERNAL_FACTS = None
+
+    # For doc_variant="internal", `facts` above is the caller's own object
+    # (only "external" works on a deep copy), so these two rendering-only
+    # keys must be stripped before returning -- otherwise they'd leak into
+    # whatever the caller persists (run_company_charter dumps this same
+    # dict to .facts.json right after calling us).
+    facts.pop("_doc_variant", None)
+    facts.pop("_citation_registry", None)
 
 
 # ---------------------------------------------------------------------------
@@ -2374,18 +2442,220 @@ def _clean_source_label(raw_source: str) -> str | None:
     return "; ".join(_clean_one(p) for p in pieces)
 
 
+# Keyword rules for _generic_one_label, tried in order (most specific
+# first) -- map an Internal-doc cleaned label (an internal artifact
+# filename or a bare domain) to a generic, client-facing description for
+# the External doc. Matched against the lowercased label with any trailing
+# "(annotation)" stripped off entirely (never reattached); see
+# _generic_one_label.
+_MAHARERA_JSON_GENERIC = (
+    ("partners.json", "MahaRERA promoter/partner filing"),
+    ("complaints.json", "MahaRERA complaint record"),
+    ("appeals.json", "MahaRERA appeal record"),
+    ("past_experiences.json", "MahaRERA past-experience filing"),
+    ("projects.json", "MahaRERA project filing"),
+)
+_DOMAIN_GENERIC = (
+    ("zaubacorp.com", "ZaubaCorp (Corporate Registry)"),
+    ("ibbi.gov.in", "IBBI (Insolvency and Bankruptcy Board of India)"),
+    ("maharerait.maharashtra.gov.in", "MahaRERA"),
+    ("maharera.maharashtra.gov.in", "MahaRERA"),
+)
+_DOCUMENT_KEYWORD_GENERIC = (
+    ("form b", "Form B Declaration"),
+    ("title report", "Title Report"),
+    ("supplemental title", "Title Report"),
+    ("non encubrance", "Non-Encumbrance Declaration"),
+    ("non-encumbrance", "Non-Encumbrance Declaration"),
+    ("layout", "Sanctioned Layout Drawing"),
+    ("iod", "IOD (Intimation of Disapproval)"),
+    ("encumbrance", "Encumbrance Certificate"),
+)
+
+
+def _generic_one_label(label: str) -> str:
+    """Maps ONE source label (see _clean_source_label/_topic_citation) to
+    a generic, client-facing description for the External doc -- never a
+    literal internal filename/path. Any trailing "(annotation)" (e.g.
+    "(First Schedule -- exact phrase found on re-extraction after fixing
+    this session's OCR pipeline)") is dropped entirely, not reworded --
+    that kind of internal-QA precision note isn't something a numbered
+    external citation needs to carry, and some of it is exactly the
+    internal-process language this variant exists to keep out. A label
+    that's already generic (an organization/product name from a
+    facts['sources'] entry, e.g. "99acres, accessed 2026-07-17", "Google
+    Maps, accessed ...") is kept as-is. Falls back to "Project record"
+    for an unrecognized document filename rather than showing it
+    verbatim."""
+    m = re.search(r"\s*\([^)]*\)\s*$", label)
+    core = label[: m.start()].strip() if m else label
+    lowered = core.lower()
+
+    for keyword, generic in _MAHARERA_JSON_GENERIC:
+        if keyword in lowered:
+            return generic
+    for domain, generic in _DOMAIN_GENERIC:
+        if domain in lowered:
+            return generic
+    for keyword, generic in _DOCUMENT_KEYWORD_GENERIC:
+        if keyword in lowered:
+            return generic
+    if lowered.endswith(".pdf") or lowered.endswith(".json"):
+        return "Project record"
+    return core
+
+
+def _register_citation(facts: dict, generic_label: str) -> str:
+    """External-variant only: returns "[N]" for `generic_label`, assigning
+    the next sequential number the first time this exact generic label is
+    seen this document and reusing that same number every later time the
+    same source is cited -- a deduped bibliography, never two different
+    numbers for one source."""
+    registry = facts["_citation_registry"]
+    if generic_label not in registry["index"]:
+        registry["index"][generic_label] = len(registry["order"]) + 1
+        registry["order"].append(generic_label)
+    return f"[{registry['index'][generic_label]}]"
+
+
+def _citation_text(facts: dict, cleaned_label: str | None) -> str | None:
+    """Renders a cleaned source label (see _clean_source_label/
+    _topic_citation -- possibly several joined with "; ", when one fact
+    cites more than one source) into the citation representation for this
+    Charter's doc_variant. "internal": the literal label in parentheses
+    (today's behavior, unchanged). "external": each individual source is
+    generalized and registered separately -- so a source already cited
+    elsewhere keeps the SAME number even when it's now combined with a
+    different second source -- and the resulting numbers are joined with
+    no separator ("[6][11]"), standard multi-citation style; a citation
+    combining two sources that generalize to the SAME description (e.g.
+    two different MahaRERA filings of the same category) shows that
+    number only once. Returns None (never a fabricated citation) if
+    there's no label to cite in the first place."""
+    if not cleaned_label:
+        return None
+    if facts.get("_doc_variant") != "external":
+        return f"({cleaned_label})"
+    markers = []
+    for piece in (p.strip() for p in cleaned_label.split(";")):
+        if not piece:
+            continue
+        marker = _register_citation(facts, _generic_one_label(piece))
+        if marker not in markers:
+            markers.append(marker)
+    return "".join(markers) if markers else None
+
+
+# Ordered (most-specific-first) regex substitutions for _externalize_prose
+# -- targets the specific internal-process phrasing actually found in this
+# Charter's own generated prose (mentions of this session's own tooling/
+# bug-fix history, and "this pass"/"this session" as a research-cycle
+# marker). Best-effort pattern matching over KNOWN phrasing, not a
+# guaranteed-exhaustive rewrite -- new prose using different wording could
+# still slip through un-cleaned.
+_EXTERNAL_PROSE_SUBSTITUTIONS = (
+    (r"confirmed on re-extraction after fixing this session's OCR pipeline", "independently re-verified"),
+    (r"re-extraction after fixing this session's OCR pipeline", "independent re-verification"),
+    (r"this session's OCR extraction pipeline \(Tesseract\)", "the OCR process used for this review"),
+    (r"this session's OCR (extraction )?pipeline", "the OCR process used for this review"),
+    (r"documents opened (in )?this pass", "documents reviewed"),
+    (r"opened this pass", "reviewed"),
+    (r"this research session", "this review"),
+    (r"this session", "this review"),
+    (r"this pass", "this review"),
+)
+
+# Matches "(see gaps[0])", "(see fsi_interpretation)", "(see local_planning
+# note on ...)" -- a raw facts.json field path (snake_case and/or dotted/
+# bracketed) used as an internal QA cross-reference. Requires the token
+# right after "see " to contain an underscore, dot, or bracket so genuine
+# in-document references like "(see Sources)" or "(see the tier table
+# above...)" are left untouched -- those start uppercase or are plain
+# English words with no internal-identifier shape.
+_INTERNAL_FIELD_ANNOTATION_RE = re.compile(
+    r"\s*\(see (?=[a-z][a-z0-9_.\[\]]*[_.\[])[a-z][a-z0-9_]*(?:\.[a-z0-9_]+|\[\d+\])*[^)]*\)"
+)
+
+
+def _externalize_prose(facts: dict, text: str) -> str:
+    """Best-effort cleanup of known internal-process phrasing in `text`
+    for the External variant only -- Internal returns `text` verbatim.
+    Preserves the original match's capitalization (so a sentence-initial
+    "This pass..." becomes "This review...", not a lowercase "this
+    review..." mid-sentence-looking fragment)."""
+    if not text or facts.get("_doc_variant") != "external":
+        return text
+
+    def _replace_preserving_case(pattern: str, replacement: str, s: str) -> str:
+        def _repl(m: re.Match) -> str:
+            matched = m.group(0)
+            return replacement[0].upper() + replacement[1:] if matched[:1].isupper() else replacement
+        return re.sub(pattern, _repl, s, flags=re.IGNORECASE)
+
+    for pattern, replacement in _EXTERNAL_PROSE_SUBSTITUTIONS:
+        text = _replace_preserving_case(pattern, replacement, text)
+    text = _INTERNAL_FIELD_ANNOTATION_RE.sub("", text)
+    return text
+
+
+def _externalized_facts_copy(facts: dict) -> dict:
+    """Returns a deep copy of `facts` with every string value passed
+    through _externalize_prose -- used once, at the top of _fill_template,
+    only for doc_variant="external". A deep copy (not an in-place walk)
+    is deliberate: _fill_template's caller (run_company_charter) persists
+    its own `facts` dict to .facts.json after rendering, and that
+    persisted copy must stay the real, un-rewritten internal content --
+    the lossy External phrasing must never leak into it, however many
+    times or in whatever order the two variants get rendered."""
+    copied = copy.deepcopy(facts)
+
+    def _walk(obj):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if isinstance(v, str):
+                    obj[k] = _externalize_prose(copied, v)
+                else:
+                    _walk(v)
+        elif isinstance(obj, list):
+            for i, v in enumerate(obj):
+                if isinstance(v, str):
+                    obj[i] = _externalize_prose(copied, v)
+                else:
+                    _walk(v)
+
+    _walk(copied)
+    return copied
+
+
+def _external_heading(facts: dict, heading_text: str) -> str:
+    """Drops the phrase "Code-Computed" from a section heading for the
+    External variant -- Internal keeps it unchanged. Removes it together
+    with an adjacent comma so "(Code-Computed)" disappears entirely
+    (parens included), "(ZaubaCorp, Code-Computed)" becomes
+    "(ZaubaCorp)", and "(Code-Computed Director & Address Crosswalk)"
+    becomes "(Director & Address Crosswalk)" -- the rest of a
+    parenthetical (an org name, a description of what the section is)
+    is real content, not internal-process language, and stays."""
+    if facts.get("_doc_variant") != "external":
+        return heading_text
+    cleaned = re.sub(r",?\s*Code-Computed\s*,?", "", heading_text)
+    cleaned = re.sub(r"\(\s*\)", "", cleaned)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
 def _topic_citation(facts: dict, topic: str) -> str | None:
     """Looks up facts['sources'] for the first entry tagged with `topic`
-    and formats it as a plain-text inline citation, e.g. "(99acres,
-    accessed 2026-07-17)". Returns None if no source carries that topic --
-    never invents one just to fill a paragraph."""
+    and returns its bare citation label, e.g. "99acres, accessed
+    2026-07-17" (no surrounding punctuation -- see _citation_text for how
+    this gets wrapped for the doc's variant). Returns None if no source
+    carries that topic -- never invents one just to fill a paragraph."""
     for s in facts.get("sources", []) or []:
         if s.get("topic") == topic:
             label = s.get("label") or s.get("ref") or "source"
             accessed = s.get("accessed_date")
             if accessed and accessed != "unknown":
-                return f"({label}, accessed {accessed})"
-            return f"({label})"
+                return f"{label}, accessed {accessed}"
+            return label
     return None
 
 
@@ -2397,7 +2667,7 @@ def _cite(text: str, *topics: str, facts: dict) -> str:
     if not text:
         return text
     for topic in topics:
-        citation = _topic_citation(facts, topic)
+        citation = _citation_text(facts, _topic_citation(facts, topic))
         if citation:
             return f"{text} {citation}"
     return text
@@ -3558,7 +3828,15 @@ def _append_overview_section(doc, facts: dict, flags: dict) -> None:
             return
         for item in items:
             line = doc.add_paragraph()
-            run = line.add_run(f"• {item['text']} (see {item['field']})")
+            if facts.get("_doc_variant") == "external":
+                # "(see gaps[0])" / "(see rera_core_fields.litigations_per_record)"
+                # are raw internal facts.json paths -- meaningless (and
+                # unprofessional-looking) to a client, so External drops the
+                # annotation entirely rather than trying to reword it.
+                raw_text = f"• {item['text']}"
+            else:
+                raw_text = f"• {item['text']} (see {item['field']})"
+            run = line.add_run(_externalize_prose(facts, raw_text))
             if text_color:
                 _color_run(run, text_color)
 
@@ -3580,7 +3858,7 @@ def _append_developer_score_section(doc, facts: dict) -> None:
     heading_style = doc.paragraphs[4].style
 
     doc.add_page_break()
-    heading_para = doc.add_paragraph("Developer Score (Code-Computed)")
+    heading_para = doc.add_paragraph(_external_heading(facts, "Developer Score (Code-Computed)"))
     heading_para.style = heading_style
     doc.add_paragraph(
         f"Composite: {developer_score['composite']}/100 -- Grade {developer_score['grade']}. Scored "
@@ -3609,12 +3887,12 @@ def _append_developer_score_section(doc, facts: dict) -> None:
             row.cells[1].text = "N/A"
             row.cells[2].text = "N/A"
             row.cells[3].text = "N/A"
-            row.cells[4].text = criterion.get("reason", "")
+            row.cells[4].text = _externalize_prose(facts, criterion.get("reason", ""))
         else:
             row.cells[1].text = criterion["tier"]
             row.cells[2].text = str(criterion["score"])
             row.cells[3].text = f"{criterion['weight']}%"
-            row.cells[4].text = criterion.get("note", "")
+            row.cells[4].text = _externalize_prose(facts, criterion.get("note", ""))
 
 
 def _append_counterparty_summary(doc, facts: dict) -> None:
@@ -3756,7 +4034,7 @@ def _append_complaint_outcomes_section(doc, facts: dict) -> None:
     )
 
 
-def _add_rating_comparison_table(doc, rating_result: dict) -> None:
+def _add_rating_comparison_table(doc, rating_result: dict, facts: dict) -> None:
     """Renders every agency's rating(s) for one entity into a SINGLE
     Agency | Instrument | Rating table -- deliberately one table, not one
     per agency, so that if two agencies rate the same entity differently
@@ -3764,7 +4042,8 @@ def _add_rating_comparison_table(doc, rating_result: dict) -> None:
     flip between separate mini-sections to compare them."""
     ratings = rating_result.get("ratings", [])
     for r in ratings:
-        doc.add_paragraph(f"Match found ({r['agency']}): {r['company_name']} ({_clean_source_label(r['url']) or r['url']})")
+        citation = _citation_text(facts, _clean_source_label(r["url"]) or r["url"])
+        doc.add_paragraph(f"Match found ({r['agency']}): {r['company_name']} {citation}")
 
     table = doc.add_table(rows=1, cols=3)
     _set_table_borders(table)
@@ -3804,7 +4083,7 @@ def _append_credit_rating_section(doc, facts: dict) -> None:
     heading_style = doc.paragraphs[4].style
 
     doc.add_page_break()
-    heading_para = doc.add_paragraph("Credit Rating Check (Code-Computed)")
+    heading_para = doc.add_paragraph(_external_heading(facts, "Credit Rating Check (Code-Computed)"))
     heading_para.style = heading_style
     doc.add_paragraph(
         "Checked directly against every rating agency's public database (currently ICRA and Infomerics) "
@@ -3819,7 +4098,7 @@ def _append_credit_rating_section(doc, facts: dict) -> None:
 
     promoter_result = check.get("promoter", {})
     if promoter_result.get("found"):
-        _add_rating_comparison_table(doc, promoter_result)
+        _add_rating_comparison_table(doc, promoter_result, facts)
     else:
         doc.add_paragraph(promoter_result.get("note", "No result recorded."))
 
@@ -3832,7 +4111,7 @@ def _append_credit_rating_section(doc, facts: dict) -> None:
             "be conflated."
         )
         if parent_result.get("found"):
-            _add_rating_comparison_table(doc, parent_result)
+            _add_rating_comparison_table(doc, parent_result, facts)
         else:
             doc.add_paragraph(parent_result.get("note", "No result recorded."))
 
@@ -3849,7 +4128,7 @@ def _append_ibbi_check_section(doc, facts: dict) -> None:
     heading_style = doc.paragraphs[4].style
 
     doc.add_page_break()
-    heading_para = doc.add_paragraph("Insolvency Check -- IBBI Corporate Debtor Master Data (Code-Computed)")
+    heading_para = doc.add_paragraph(_external_heading(facts, "Insolvency Check -- IBBI Corporate Debtor Master Data (Code-Computed)"))
     heading_para.style = heading_style
     doc.add_paragraph(
         "Checked directly against the Insolvency and Bankruptcy Board of India's public Corporate "
@@ -3857,10 +4136,10 @@ def _append_ibbi_check_section(doc, facts: dict) -> None:
         "guess."
     )
     if check["found_process"] is False:
-        ibbi_citation = _clean_source_label(check.get("url", "")) or check.get("url", "")
+        ibbi_citation = _citation_text(facts, _clean_source_label(check.get("url", "")) or check.get("url", ""))
         doc.add_paragraph(
             f"Result: \"{check['status_text']}\" -- no insolvency process is recorded against this CIN "
-            f"in IBBI's public database. ({ibbi_citation})"
+            f"in IBBI's public database. {ibbi_citation}"
         )
     else:
         doc.add_paragraph(
@@ -3870,7 +4149,7 @@ def _append_ibbi_check_section(doc, facts: dict) -> None:
             "attempt to summarize or classify this content itself:"
         )
         doc.add_paragraph(check.get("status_text", ""))
-        doc.add_paragraph(f"Source: {_clean_source_label(check.get('url', '')) or check.get('url', '')}")
+        doc.add_paragraph(f"Source: {_citation_text(facts, _clean_source_label(check.get('url', '')) or check.get('url', ''))}")
 
 
 def _append_company_profile_section(doc, facts: dict) -> None:
@@ -3884,18 +4163,18 @@ def _append_company_profile_section(doc, facts: dict) -> None:
     heading_style = doc.paragraphs[4].style
 
     doc.add_page_break()
-    heading_para = doc.add_paragraph("Company Registration Profile (ZaubaCorp, Code-Computed)")
+    heading_para = doc.add_paragraph(_external_heading(facts, "Company Registration Profile (ZaubaCorp, Code-Computed)"))
     heading_para.style = heading_style
     doc.add_paragraph(
         "Pulled directly from ZaubaCorp's public company record by CIN -- an exact-identifier lookup, "
         "not a name-based guess."
     )
-    profile_citation = _clean_source_label(check.get("url", ""))
+    profile_citation = _citation_text(facts, _clean_source_label(check.get("url", "")))
     doc.add_paragraph(
         f"{check['name']} ({check['cin']}) -- Status: {check.get('status', 'unknown')}; "
         f"Class: {check.get('class_of_company', 'unknown')}; "
         f"Category: {check.get('company_category', 'unknown')}; ROC: {check.get('roc', 'unknown')}"
-        + (f" ({profile_citation})" if profile_citation else "")
+        + (f" {profile_citation}" if profile_citation else "")
     )
     doc.add_paragraph(f"Incorporated: {check.get('incorporation_date', 'unknown')}")
     doc.add_paragraph(f"Registered address: {check.get('registered_address', 'unknown')}")
@@ -3928,7 +4207,7 @@ def _append_company_profile_section(doc, facts: dict) -> None:
     _add_director_table("Current Directors & Key Managerial Personnel", check.get("current_directors", []))
     _add_director_table("Past Directors & Key Managerial Personnel", check.get("past_directors", []))
     doc.add_paragraph()
-    doc.add_paragraph(f"Source: {check.get('url', '')}")
+    doc.add_paragraph(f"Source: {_citation_text(facts, _clean_source_label(check.get('url', '')) or check.get('url', ''))}")
 
 
 def _build_director_company_links(facts: dict) -> list:
@@ -4038,7 +4317,7 @@ def _append_group_companies_section(doc, facts: dict) -> None:
     heading_style = doc.paragraphs[4].style
 
     doc.add_page_break()
-    heading_para = doc.add_paragraph("Group / Affiliated Companies (Code-Computed Director & Address Crosswalk)")
+    heading_para = doc.add_paragraph(_external_heading(facts, "Group / Affiliated Companies (Code-Computed Director & Address Crosswalk)"))
     heading_para.style = heading_style
     doc.add_paragraph(
         "Every entity below shares at least one concrete, named link with the promoter above -- a "
@@ -4101,7 +4380,7 @@ def _append_group_companies_section(doc, facts: dict) -> None:
         row.cells[2].text = "; ".join(company.get("basis", []))
 
     doc.add_paragraph()
-    doc.add_paragraph(f"Source: {check.get('url', '')}")
+    doc.add_paragraph(f"Source: {_citation_text(facts, _clean_source_label(check.get('url', '')) or check.get('url', ''))}")
 
 
 def _append_cts_land_record_section(doc, facts: dict) -> None:
@@ -4153,7 +4432,7 @@ def _append_cts_land_record_section(doc, facts: dict) -> None:
         doc.add_paragraph((check.get("raw_text") or "")[:4000])
 
     doc.add_paragraph()
-    doc.add_paragraph(f"Source: {check.get('url', '')}")
+    doc.add_paragraph(f"Source: {_citation_text(facts, _clean_source_label(check.get('url', '')) or check.get('url', ''))}")
 
 
 def _append_appeal_judgments_section(doc, facts: dict) -> None:
@@ -4209,7 +4488,7 @@ def _append_review_authenticity_section(doc, facts: dict) -> None:
     heading_style = doc.paragraphs[4].style
 
     doc.add_page_break()
-    heading_para = doc.add_paragraph("Review Authenticity Triage (Code-Computed Heuristics)")
+    heading_para = doc.add_paragraph(_external_heading(facts, "Review Authenticity Triage (Code-Computed Heuristics)"))
     heading_para.style = heading_style
     doc.add_paragraph(
         "Five heuristic checks over reviews supplied for this run -- a red-flag surfacing aid for a "
@@ -4346,12 +4625,12 @@ def _append_authenticity_page(doc, facts: dict) -> None:
             row.cells[0].text = label
             row.cells[1].text = f"{round(c['score'])}/100"
             row.cells[2].text = f"{c['weight']}%"
-            row.cells[3].text = c["note"]
+            row.cells[3].text = _externalize_prose(facts, c["note"])
         else:
             row.cells[0].text = label
             row.cells[1].text = "N/A"
             row.cells[2].text = "excluded"
-            row.cells[3].text = "Not applicable this pass -- excluded rather than scored as a failure; remaining weights renormalized to still sum to 100%."
+            row.cells[3].text = _externalize_prose(facts, "Not applicable this pass -- excluded rather than scored as a failure; remaining weights renormalized to still sum to 100%.")
 
     doc.add_paragraph()
 
@@ -4688,8 +4967,22 @@ def run_company_charter(
     if lender_history_note:
         facts["mortgage_lender_history_note"] = lender_history_note
 
-    out_path = os.path.join(out_dir, f"Company_Charter_{project_name}_{reg_no}.docx")
-    _fill_template(reg_no, facts, out_path)
+    # Two documents from the same underlying facts: Internal (today's
+    # existing behavior -- inline "(label)" citations, "(Code-Computed)"
+    # labels, verbatim prose) for the team's own diligence use, and
+    # External (numbered "[N]" citations resolving to a generic-language
+    # Sources list, no internal-process labels/phrasing) for sharing
+    # outside it. Internal renders FIRST and on the real `facts` dict --
+    # it's the one that computes developer_score/documentation_confidence_
+    # score etc. and must be what gets persisted to .facts.json below.
+    # External renders from an internal deep copy (see
+    # _externalized_facts_copy) and never touches the real `facts` dict,
+    # however many times or in whatever order the two variants render.
+    out_path = os.path.join(out_dir, f"Company_Charter_{project_name}_{reg_no}_Internal.docx")
+    _fill_template(reg_no, facts, out_path, doc_variant="internal")
+
+    external_out_path = os.path.join(out_dir, f"Company_Charter_{project_name}_{reg_no}_External.docx")
+    _fill_template(reg_no, facts, external_out_path, doc_variant="external")
 
     facts_path = os.path.join(out_dir, f"Company_Charter_{project_name}_{reg_no}.facts.json")
     with open(facts_path, "w", encoding="utf-8") as f:
