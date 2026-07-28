@@ -1,8 +1,14 @@
 """
 Verifies company_charter._classify_flags() against a real, previously-generated
 Charter: Company_Charter_GodrejParkGreens_P52100019639.facts.json, whose flag
-split (4 imminent / 5 structural / 5 monitor) was worked out by hand in
-docs/Company_Charter_GodrejParkGreens_REDESIGNED_v3.docx (Section 1).
+split (4 imminent / 5 structural / 7 monitor) was worked out by hand in
+docs/Company_Charter_GodrejParkGreens_REDESIGNED_v3.docx (Section 1), plus 2
+more monitor flags added afterward for the MCA-mirror-chain's director-roster
+disagreement gaps (ZaubaCorp vs. InstaFinancials disagreeing on Aspy Dady
+Cooper/Abhishek Sahaya's current-director status -- see
+_merge_director_rosters) -- confirmed as monitor-severity, not structural,
+since it's a data-reconciliation flag to re-check, not a standing
+characteristic to raise with the developer directly.
 
 That facts.json predates this session's promoter_portfolio wiring (Step 1), so
 it has no "promoter_portfolio" key of its own -- the real portfolio data for
@@ -38,7 +44,7 @@ def test_godrej_park_greens_matches_hand_worked_split():
 
     assert len(result["imminent"]) == 4, f"expected 4 imminent, got {len(result['imminent'])}: {result['imminent']}"
     assert len(result["structural"]) == 5, f"expected 5 structural, got {len(result['structural'])}: {result['structural']}"
-    assert len(result["monitor"]) == 5, f"expected 5 monitor, got {len(result['monitor'])}: {result['monitor']}"
+    assert len(result["monitor"]) == 7, f"expected 7 monitor, got {len(result['monitor'])}: {result['monitor']}"
 
     # Every item must carry both a human-readable line and the facts.json
     # field it came from -- never just a bare label.

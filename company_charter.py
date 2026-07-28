@@ -1401,6 +1401,536 @@ def find_group_companies_by_cin(cin: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# CIN -> company profile, MCA-mirror redundancy chain (ZaubaCorp -> Tofler ->
+# InstaFinancials). All three are free-tier scriptable with no login/CAPTCHA
+# for the fields below (live-tested against Godrej Skyline Developers
+# Limited's real CIN, both its current PLC and superseded PTC variants):
+#   - Tofler: CIN resolved via POST /cnamesearch (mode="SCBC", the same web
+#     service the site's own JS search bar calls), returning
+#     "{internal_id};{NAME};{CIN};{is_previous_name};{state};{city};{status};
+#     {type_flag}" plus a ready-made profile "url" field. Unlike ZaubaCorp,
+#     Tofler's URL slug is NOT cosmetic -- a placeholder slug 404s -- so it
+#     must come from this search response, never guessed. Registered Details
+#     (CIN/incorporation/capital) sit in clean <h3>label</h3><span>value
+#     </span> pairs inside #registered-details-module; the People table
+#     (Designation/Name/DIN-PAN/Tenure) is a normal server-rendered <table>
+#     under #people-module; the registered address is populated
+#     client-side from an inline `const locationsTableData = [...]` JSON
+#     array (the server-rendered table body is empty), extracted here by
+#     regex instead of DOM parsing. Tofler's "Network" tab (other-
+#     directorships/shared-address crosswalk) is an interactive JS graph
+#     widget, not scrapable HTML -- so Tofler contributes to the company-
+#     PROFILE chain only, not the group-companies crosswalk below.
+#   - InstaFinancials: CIN resolved via POST
+#     /ajax-caller.aspx/GetCompanyNames (mode="SCBC"), returning the same
+#     kind of semicolon-delimited record (no ready-made URL this time --
+#     built from the slugified name + CIN, mirroring the exact JS in
+#     setCompanyName()/new-index.js). The profile page's
+#     #companyHighlightsDataContainer table and .highlight-card /
+#     .capital-bar-item elements are fully server-rendered (CIN, ROC,
+#     capital, status, address); its "/company-directors" sub-page has a
+#     clean #currentDirectorsArticle table (exact appointment dates, DINs)
+#     and a #signatoriesArticle table for KMPs (Company Secretary/CFO/
+#     Manager). InstaFinancials' financials are paywalled like ZaubaCorp's,
+#     and its own per-director "other directorships" list is login-gated
+#     (confirmed: the director page's DirectorshipTable div is empty
+#     server-side, behind a "Login to View Full Profile" link) -- so it,
+#     too, only contributes to the company-profile chain, not
+#     group-companies.
+#
+# Real-world value of the redundancy, confirmed live against this same CIN:
+# the three sources do NOT agree on the current director roster --
+# ZaubaCorp lists Aspy Dady Cooper as the third director, Tofler lists
+# Abhishek Sahaya only as a KMP (not a director), and InstaFinancials lists
+# Abhishek Sahaya as a director appointed 07-10-2025. _run_mca_profile_chain
+# below surfaces exactly this kind of cross-source disagreement as an
+# unresolved gap rather than silently picking one source's answer.
+# ---------------------------------------------------------------------------
+
+_TOFLER_HEADERS = _ZAUBACORP_HEADERS
+_INSTAFINANCIALS_HEADERS = _ZAUBACORP_HEADERS
+
+
+def _tofler_resolve(cin: str, company_name: str):
+    """Resolves `cin` to a Tofler profile URL. Confirmed live that Tofler's
+    /cnamesearch web service rejects a direct POST with HTTP 401
+    "Unauthorized access" -- reproduced identically via plain requests
+    (with a real session cookie, matching Referer/Origin/X-Requested-With
+    headers, and even the exact non-standard unquoted-key body its own JS
+    sends) AND via a raw Playwright page.evaluate(fetch(...)) call, so this
+    is not a simple missing-header fix. What DOES work, confirmed live: the
+    same endpoint hit via the page's own real keyup-triggered jQuery
+    request (i.e. actually typing into the visible #searchbox in a loaded
+    browser session) -- so this resolves by NAME through a real headless
+    Chromium session (Playwright, already a project dependency -- see
+    session_auth.py/mahabhumi.py) and verifies the returned CIN matches
+    `cin` exactly before accepting the match, the same "never fuzzy-match,
+    always confirm the identifier" principle _zaubacorp_fetch's CIN-based
+    URL trick already relies on. Returns {"name", "cin", "status", "url"},
+    or None if no company-name search result's CIN matches."""
+    if not company_name or not company_name.strip():
+        return None
+
+    from playwright.sync_api import sync_playwright
+
+    responses = []
+
+    def _capture(resp):
+        if "cnamesearch" in resp.url and resp.status == 200:
+            try:
+                responses.append(resp.text())
+            except Exception:
+                pass
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+        page.on("response", _capture)
+        page.goto("https://www.tofler.in/", timeout=config.REQUEST_TIMEOUT * 1000)
+        page.wait_for_timeout(800)
+        page.click("#searchbox")
+        page.type("#searchbox", company_name.strip(), delay=40)
+        page.wait_for_timeout(1200)
+        browser.close()
+
+    for text in reversed(responses):
+        try:
+            results = json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        for r in results:
+            if r.get("value", "").strip().upper() == cin.strip().upper():
+                return {
+                    "name": r["label"], "cin": r["value"],
+                    "status": r.get("status", ""), "url": f"https://www.tofler.in{r['url']}",
+                }
+    return None
+
+
+def _tofler_fetch(cin: str, company_name: str):
+    """Returns (soup, html_text, canonical_url, resolved_name) for a real
+    CIN, or None if Tofler has no matching company. html_text is kept
+    alongside soup because the registered address lives in an inline JS
+    array, not the DOM (see _tofler_registered_address); resolved_name
+    comes from the search match itself (the exact record Tofler filed it
+    under), not a page scrape."""
+    from bs4 import BeautifulSoup
+
+    match = _tofler_resolve(cin, company_name)
+    if match is None:
+        return None
+    resp = requests.get(match["url"], headers=_TOFLER_HEADERS, timeout=config.REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    return BeautifulSoup(resp.text, "html.parser"), resp.text, match["url"], match["name"]
+
+
+def _tofler_core_fields(soup) -> dict:
+    fields = {}
+    module = soup.find(id="registered-details-module")
+    if not module:
+        return fields
+    for box in module.select(".flex-col.gap-2"):
+        label, value = box.find("h3"), box.find("span")
+        if label and value:
+            fields[label.get_text(strip=True)] = " ".join(value.get_text(strip=True).split())
+    type_label = module.find("h3", string="Type")
+    if type_label:
+        badges_container = type_label.find_next_sibling("div")
+        if badges_container:
+            badges = [b.get_text(strip=True) for b in badges_container.select(".badge")]
+            if badges:
+                fields["Type"] = ", ".join(badges)
+    return fields
+
+
+def _tofler_registered_address(html_text: str) -> str | None:
+    """Tofler's registered-office address is populated client-side from an
+    inline `const locationsTableData = [...]` JSON array -- the static
+    server-rendered <table> body is empty, so there's nothing to parse in
+    the DOM itself."""
+    m = re.search(r"const locationsTableData = (\[.*?\]);", html_text)
+    if not m:
+        return None
+    try:
+        locations = json.loads(m.group(1))
+    except json.JSONDecodeError:
+        return None
+    if not locations:
+        return None
+    for loc in locations:
+        if loc.get("type") == "Registered Office" and loc.get("address"):
+            return " ".join(loc["address"].split())
+    return " ".join((locations[0].get("address") or "").split()) or None
+
+
+def _tofler_director_table(soup) -> tuple[list, list]:
+    """Returns (directors, kmp) from Tofler's People table, normalized to
+    the same dict keys ZaubaCorp's own director tables use ("Director
+    Name", "Designation", "DIN", "Appointment Date", "Cessation") so
+    existing renderers/cross-references written against
+    lookup_company_by_cin's shape work unchanged. Tofler only gives a
+    relative "Tenure" string (e.g. "3 years"), never an exact date, so
+    "Appointment Date"/"Cessation" are left as "-" -- never guessed from
+    the tenure string. "Director"-designation rows go to `directors`,
+    everything else (Kmp, etc.) to `kmp`."""
+    module = soup.find(id="people-module")
+    if not module:
+        return [], []
+    table = module.find("table")
+    if not table or not table.find("tbody"):
+        return [], []
+    directors, kmp = [], []
+    for tr in table.find("tbody").find_all("tr"):
+        cells = [td.get_text(strip=True) for td in tr.find_all("td")]
+        if len(cells) < 4:
+            continue
+        designation, name, din, tenure = cells[0], cells[1], cells[2], cells[3]
+        row = {
+            "Director Name": name, "Designation": designation,
+            "DIN": din if din and din != "<HIDDEN>" else "",
+            "Appointment Date": "-", "Cessation": "-", "Tenure": tenure,
+        }
+        (directors if designation.lower() == "director" else kmp).append(row)
+    return directors, kmp
+
+
+def lookup_company_tofler(cin: str, company_name: str = "") -> dict:
+    """Same return shape as lookup_company_by_cin (plus an extra "kmp" key
+    for Tofler's non-director People rows), sourced from Tofler instead of
+    ZaubaCorp -- see the module note above this section. "name"/"status"/
+    "company_category"/"roc" are left None here (not exposed in the fields
+    this scrape covers) rather than guessed; _run_mca_profile_chain fills
+    them from whichever other source in the chain has them. Unlike
+    ZaubaCorp/InstaFinancials, Tofler can only be resolved by NAME (see
+    _tofler_resolve's own note on why its CIN-search endpoint can't be
+    called directly) -- `company_name` is required; without it this is
+    reported as an honest gap rather than attempted blind."""
+    if not cin or not cin.strip():
+        return {"found": False, "note": "no CIN provided to look up"}
+    if not company_name or not company_name.strip():
+        return {"found": False, "note": "no company name provided -- Tofler can only be resolved by name, see _tofler_resolve"}
+    try:
+        result = _tofler_fetch(cin, company_name)
+    except requests.RequestException as e:
+        return {"found": False, "note": f"Tofler lookup could not run this pass: {e}"}
+    if result is None:
+        return {"found": False, "note": f"no Tofler record found for CIN {cin.strip()} under name \"{company_name.strip()}\""}
+    soup, html_text, url, resolved_name = result
+    fields = _tofler_core_fields(soup)
+    current_directors, kmp = _tofler_director_table(soup)
+
+    incorporation = fields.get("Incorporation", "")
+    incorporation_year = incorporation.split(",")[0].strip() or None if incorporation else None
+
+    return {
+        "found": True,
+        "name": resolved_name,
+        "cin": fields.get("CIN", cin.strip()),
+        "status": None,
+        "class_of_company": fields.get("Type"),
+        "company_category": None,
+        "roc": None,
+        "incorporation_date": incorporation_year,
+        "registered_address": _tofler_registered_address(html_text),
+        "authorised_capital": fields.get("Authorised Capital"),
+        "paid_up_capital": fields.get("Paid up Capital"),
+        "current_directors": current_directors,
+        "past_directors": [],
+        "kmp": kmp,
+        "shareholding_note": None,
+        "url": url,
+    }
+
+
+def _instafinancials_resolve(cin: str):
+    """POSTs InstaFinancials' own ASP.NET web service for `cin` (mode
+    "SCBC"). Returns {"name", "cin", "status", "url"} for a real CIN, or
+    None if InstaFinancials has no match. The profile URL isn't returned by
+    the API (unlike Tofler) -- it's built here from the slugified name +
+    CIN, replicating setCompanyName()'s exact JS in new-index.js."""
+    resp = requests.post(
+        "https://www.instafinancials.com/ajax-caller.aspx/GetCompanyNames",
+        json={"strSearch": cin.strip(), "mode": "SCBC"},
+        headers=_INSTAFINANCIALS_HEADERS, timeout=config.REQUEST_TIMEOUT,
+    )
+    resp.raise_for_status()
+    records = resp.json().get("d", [])
+    if not records:
+        return None
+    parts = records[0].split(";")
+    if len(parts) < 7:
+        return None
+    name, found_cin, status = parts[1], parts[2], parts[6]
+    slug = re.sub(r"[^0-9a-zA-Z-]", "-", name.lower().replace("'", "")).replace("--", "-", 1)
+    return {"name": name, "cin": found_cin, "status": status, "url": f"https://www.instafinancials.com/company/{slug}-{found_cin}"}
+
+
+def _instafinancials_fetch(cin: str):
+    """Returns (profile_soup, directors_soup, canonical_url, resolved_name)
+    for a real CIN, or None if InstaFinancials has no matching company."""
+    from bs4 import BeautifulSoup
+
+    match = _instafinancials_resolve(cin)
+    if match is None:
+        return None
+    profile_resp = requests.get(match["url"], headers=_INSTAFINANCIALS_HEADERS, timeout=config.REQUEST_TIMEOUT)
+    profile_resp.raise_for_status()
+    directors_resp = requests.get(f"{match['url']}/company-directors", headers=_INSTAFINANCIALS_HEADERS, timeout=config.REQUEST_TIMEOUT)
+    directors_resp.raise_for_status()
+    return (
+        BeautifulSoup(profile_resp.text, "html.parser"),
+        BeautifulSoup(directors_resp.text, "html.parser"),
+        match["url"], match["name"],
+    )
+
+
+def _instafinancials_core_fields(soup) -> dict:
+    fields = {}
+    container = soup.find(id="companyHighlightsDataContainer")
+    table = container.find("table") if container else None
+    if table:
+        for tr in table.find_all("tr"):
+            cells = tr.find_all("td")
+            for i in range(0, len(cells) - 1, 2):
+                label = cells[i].get_text(strip=True)
+                if label:
+                    fields[label] = cells[i + 1].get_text(strip=True)
+
+    for card in soup.select(".highlight-card"):
+        h3 = card.find("h3")
+        if not h3:
+            continue
+        value_el = card.select_one(".status") or card.select_one(".value")
+        if value_el:
+            fields[h3.get_text(strip=True)] = " ".join(value_el.get_text(strip=True).split())
+
+    for item in soup.select(".capital-bar-item"):
+        title = item.select_one(".bar-title")
+        fill = item.select_one(".bar-fill")
+        if not title or not fill:
+            continue
+        m = re.match(r"([A-Za-z ]+)", title.get_text(strip=True))
+        if m:
+            fields[m.group(1).strip()] = fill.get_text(strip=True)
+    return fields
+
+
+def _instafinancials_table_rows(soup, article_id: str) -> list:
+    """Generic parser for InstaFinancials' Current Directors / Signatory
+    Details tables -- both are plain <table>s under a named <article>, with
+    one hidden (style='display:none') trailing <th>/<td> pair per row that
+    must be dropped from both sides before zipping, or headers and cells
+    misalign by one column."""
+    article = soup.find(id=article_id)
+    table = article.find("table") if article else None
+    if not table or not table.find("thead") or not table.find("tbody"):
+        return []
+
+    def _visible(cells):
+        return [c for c in cells if "display:none" not in (c.get("style") or "").replace(" ", "")]
+
+    headers = [th.get_text(strip=True) for th in _visible(table.find("thead").find_all("th"))]
+    rows = []
+    for tr in table.find("tbody").find_all("tr"):
+        cells = [td.get_text(strip=True) for td in _visible(tr.find_all("td"))]
+        if len(cells) >= len(headers):
+            rows.append(dict(zip(headers, cells)))
+    return rows
+
+
+def _instafinancials_directors(soup) -> tuple[list, list]:
+    """Returns (directors, kmp) from InstaFinancials' Current Directors +
+    Signatory Details tables, normalized to lookup_company_by_cin's dict
+    keys. Only currently-serving people are exposed by these two tables (no
+    separate past/resigned-directors table was found on this profile) --
+    past_directors is left for the caller to report as [] honestly rather
+    than guessed."""
+    directors = [
+        {
+            "Director Name": r.get("Director Name", ""), "Designation": r.get("Designation", "Director"),
+            "DIN": r.get("Director DIN", ""), "Appointment Date": r.get("Appointment Date", "-"), "Cessation": "-",
+        }
+        for r in _instafinancials_table_rows(soup, "currentDirectorsArticle")
+    ]
+    kmp = [
+        {
+            "Director Name": r.get("Signatory Name", ""), "Designation": r.get("Designation", ""),
+            "DIN": "", "Appointment Date": r.get("Appointment Date", "-"), "Cessation": "-",
+        }
+        for r in _instafinancials_table_rows(soup, "signatoriesArticle")
+    ]
+    return directors, kmp
+
+
+def lookup_company_instafinancials(cin: str) -> dict:
+    """Same return shape as lookup_company_by_cin (plus an extra "kmp" key
+    for the Signatory Details rows), sourced from InstaFinancials instead
+    of ZaubaCorp -- see the module note above this section."""
+    if not cin or not cin.strip():
+        return {"found": False, "note": "no CIN provided to look up"}
+    try:
+        result = _instafinancials_fetch(cin)
+    except requests.RequestException as e:
+        return {"found": False, "note": f"InstaFinancials lookup could not run this pass: {e}"}
+    if result is None:
+        return {"found": False, "note": f"no InstaFinancials record found for CIN {cin.strip()}"}
+    profile_soup, directors_soup, url, resolved_name = result
+    fields = _instafinancials_core_fields(profile_soup)
+    current_directors, kmp = _instafinancials_directors(directors_soup)
+
+    return {
+        "found": True,
+        "name": resolved_name,
+        "cin": fields.get("Company CIN", cin.strip()),
+        "status": fields.get("Company Status"),
+        "class_of_company": fields.get("Company Class"),
+        "company_category": fields.get("Company Category"),
+        "roc": None,
+        "incorporation_date": fields.get("Incorp. Date"),
+        "registered_address": fields.get("Address"),
+        "authorised_capital": fields.get("Authorised Capital"),
+        "paid_up_capital": fields.get("Paid up Capital"),
+        "current_directors": current_directors,
+        "past_directors": [],
+        "kmp": kmp,
+        "shareholding_note": None,
+        "url": url,
+    }
+
+
+# Ordered by confidence/coverage: ZaubaCorp is confirmed most complete
+# (full current+past director history with exact dates AND shareholding
+# note), Tofler second (exact dates for directors it names, but conflates
+# some KMPs, and its resolve step costs a headless-browser launch -- see
+# _tofler_resolve), InstaFinancials third (exact dates and DINs but no
+# past-director history exposed on this profile).
+_MCA_PROFILE_CHAIN = [
+    ("zaubacorp.com", lambda cin, company_name: lookup_company_by_cin(cin)),
+    ("tofler.in", lambda cin, company_name: lookup_company_tofler(cin, company_name)),
+    ("instafinancials.com", lambda cin, company_name: lookup_company_instafinancials(cin)),
+]
+
+_SCALAR_PROFILE_FIELDS = (
+    "name", "status", "class_of_company", "company_category", "roc",
+    "incorporation_date", "registered_address", "authorised_capital", "paid_up_capital",
+)
+
+
+def _normalize_for_compare(value: str) -> str:
+    return re.sub(r"[^0-9a-z]", "", value.lower()) if value else ""
+
+
+_MCA_SOURCE_DISPLAY_NAMES = {
+    "zaubacorp.com": "ZaubaCorp", "tofler.in": "Tofler", "instafinancials.com": "InstaFinancials",
+}
+
+
+def _merge_director_rosters(per_source_directors: list[tuple[str, list]]) -> tuple[list, list]:
+    """Merges each source's `current_directors` list by DIN (falling back
+    to normalized name when a source doesn't expose a DIN, e.g. Tofler's
+    <HIDDEN> DINs) into one deduped roster, and returns (merged_directors,
+    conflict_notes) -- conflict_notes names every director where sources
+    disagree on whether they currently hold the role at all (present in
+    some sources' CURRENT list, absent from others'), since that's exactly
+    the kind of discrepancy live-tested between ZaubaCorp/Tofler/
+    InstaFinancials for this promoter (see the module note above).
+    conflict_notes use each source's human-readable display name, not its
+    raw domain, since these notes render in gaps -- and thus in the
+    External document too (see the doc-variant note in _fill_template) --
+    where a bare "zaubacorp.com" would be exactly the kind of internal-
+    artifact leakage the External variant is meant to avoid."""
+    by_key: dict[str, dict] = {}
+    order: list[str] = []
+    for domain, directors in per_source_directors:
+        for d in directors:
+            name = " ".join((d.get("Director Name") or "").split())
+            if not name:
+                continue
+            key = d.get("DIN") or _normalize_for_compare(name)
+            if key not in by_key:
+                by_key[key] = {"director": dict(d), "confirmed_by": [domain]}
+                order.append(key)
+            else:
+                entry = by_key[key]
+                entry["confirmed_by"].append(domain)
+                if not entry["director"].get("DIN") and d.get("DIN"):
+                    entry["director"]["DIN"] = d["DIN"]
+                if entry["director"].get("Appointment Date") in (None, "-", "") and d.get("Appointment Date") not in (None, "-", ""):
+                    entry["director"]["Appointment Date"] = d["Appointment Date"]
+
+    all_domains = {domain for domain, _ in per_source_directors if _}
+    merged, conflicts = [], []
+    for key in order:
+        entry = by_key[key]
+        merged.append(entry["director"])
+        missing_from = sorted(all_domains - set(entry["confirmed_by"]))
+        if missing_from and len(all_domains) > 1:
+            confirmed_names = [_MCA_SOURCE_DISPLAY_NAMES.get(d, d) for d in sorted(entry["confirmed_by"])]
+            missing_names = [_MCA_SOURCE_DISPLAY_NAMES.get(d, d) for d in missing_from]
+            conflicts.append(
+                f"Director roster disagreement for \"{entry['director']['Director Name']}\": listed as a "
+                f"current director by {', '.join(confirmed_names)}, but not by "
+                f"{', '.join(missing_names)} -- not reconciled, flagged for manual verification "
+                f"rather than assumed correct or incorrect."
+            )
+    return merged, conflicts
+
+
+def _run_mca_profile_chain(cin: str, company_name: str = "") -> dict:
+    """Walks _MCA_PROFILE_CHAIN, querying every configured source (not
+    stopping at the first success) -- conflict detection on the director
+    roster is only possible by comparing sources, and ZaubaCorp/
+    InstaFinancials cost only one cheap HTTP request each (Tofler costs one
+    headless-browser launch -- see _tofler_resolve -- still a single Charter
+    generation's worth of overhead, not a paid lookup). Scalar fields
+    (status/capital/address/etc.) take the first source in chain order that
+    has a non-empty value for that field, since those have never been
+    observed to disagree between sources; the director roster is merged
+    across every responding source via _merge_director_rosters, which DOES
+    surface disagreements (see its own docstring) rather than silently
+    trusting whichever source happened to answer first. `company_name` is
+    required for Tofler's resolve step (see lookup_company_tofler) --
+    without it Tofler is skipped as a gap, ZaubaCorp/InstaFinancials still
+    run normally. Returns the same dict shape as lookup_company_by_cin,
+    plus "sources_used" and "roster_conflicts"."""
+    per_source_results = []
+    for domain, fetch_fn in _MCA_PROFILE_CHAIN:
+        try:
+            result = fetch_fn(cin, company_name)
+        except Exception as e:
+            result = {"found": False, "note": f"{domain} lookup could not run this pass: {e}"}
+        per_source_results.append((domain, result))
+
+    found_results = [(domain, r) for domain, r in per_source_results if r.get("found")]
+    if not found_results:
+        notes = "; ".join(f"{domain}: {r.get('note', 'not found')}" for domain, r in per_source_results)
+        return {"found": False, "note": f"no MCA-mirror record found for CIN {cin.strip()} in any configured source ({notes})"}
+
+    merged: dict = {"found": True, "cin": cin.strip(), "sources_used": [d for d, _ in found_results]}
+    for field in _SCALAR_PROFILE_FIELDS:
+        for domain, r in found_results:
+            if r.get(field):
+                merged[field] = r[field]
+                break
+        merged.setdefault(field, None)
+
+    merged["current_directors"], merged["roster_conflicts"] = _merge_director_rosters(
+        [(domain, r.get("current_directors") or []) for domain, r in found_results]
+    )
+    # Past-director history and the shareholding-gating note are only ever
+    # exposed by ZaubaCorp among the three sources (see each fetcher's own
+    # module note) -- taken from there directly rather than merged.
+    zaubacorp_result = dict(found_results).get("zaubacorp.com", {})
+    merged["past_directors"] = zaubacorp_result.get("past_directors") or []
+    merged["shareholding_note"] = zaubacorp_result.get("shareholding_note")
+    # "url" always favors ZaubaCorp for backward-compatible citation
+    # behavior (existing Charter runs already cite this URL) when present,
+    # otherwise whichever source actually responded.
+    merged["url"] = zaubacorp_result.get("url") or found_results[0][1].get("url")
+    return merged
+
+
+# ---------------------------------------------------------------------------
 # CTS -> land-record lookup (Maha Bhulekh Property Card, see mahabhumi.py).
 # Deliberately NOT wired to run automatically like the CIN checks above:
 # mahabhumi.fetch_property_card() opens a visible browser and blocks waiting
@@ -2146,6 +2676,18 @@ def _fill_template(reg_no: str, facts: dict, out_path: str, doc_variant: str = "
         sources = [_format_source_line(s) for s in facts.get("sources", [])]
     _fill_variable_paragraphs(doc, 69, 8, sources)
 
+    # Source-trust-registry promotions from THIS run are internal pipeline
+    # bookkeeping (see _record_source_hits_and_promote's own module note on
+    # why an algorithmic, frequency-based promotion isn't the same thing as
+    # a manually-vetted trusted source) -- Internal-only, never External.
+    if facts.get("_doc_variant") != "external" and facts.get("source_promotion_notes"):
+        doc.add_paragraph()
+        note_heading = doc.add_paragraph("Source Trust Registry Updates (this run)")
+        for run in note_heading.runs:
+            run.bold = True
+        for note in facts["source_promotion_notes"]:
+            doc.add_paragraph(f"• {note}")
+
     # ---------------------------------------------------------------------
     # Section consolidation -- renames existing template headings to the
     # target vocabulary (docs/Company_Charter_Executive_Design.docx section
@@ -2404,6 +2946,114 @@ def _classify_source_tier(ref: str) -> str:
     return "Other / unclassified source"
 
 
+# ---------------------------------------------------------------------------
+# Cross-run source-trust registry -- the "trusted list vs. web list" design:
+# a source found via open-web research (i.e. any _SOURCE_TIERS marker below
+# the already-trusted MahaRERA/MCA-mirror tiers) that keeps coming up as a
+# corroborating source across separate projects gets auto-promoted once it
+# crosses _SOURCE_PROMOTION_HIT_THRESHOLD distinct projects. Promotion is
+# fully automatic (no human gate), but every promotion is logged with a
+# review note here AND surfaced in the Internal Charter only (see
+# _fill_template) -- an algorithmic promotion is not the same thing as a
+# manually-vetted trusted source, and a reader of the Internal document
+# should be able to see which trust-tier upgrades haven't had a human look
+# at them yet. This is deliberately a plain JSON file at the repo root, not
+# per-project output/ state -- the whole point is that it persists and
+# accumulates ACROSS every project this pipeline ever runs against.
+# ---------------------------------------------------------------------------
+
+_SOURCE_TRUST_REGISTRY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "source_trust_registry.json")
+_SOURCE_PROMOTION_HIT_THRESHOLD = 5
+
+# Tiers this pipeline deliberately built a dedicated, code-driven lookup
+# for (MahaRERA/MCA records, credit-rating agencies, IBBI/NCLT, live Google
+# Maps) -- these are the "trusted list" and never need promoting, no matter
+# how often they're cited. Only tiers an LLM's own open-web research
+# actually DISCOVERED (aggregators, press, social media, watchdog sites,
+# a developer's own site, Wikipedia) are eligible to graduate into that
+# trusted set via repeated corroboration.
+_ALREADY_TRUSTED_TIERS = frozenset({
+    "Primary regulatory record (MahaRERA/MCA, or a document opened from it)",
+    "Credit rating agency (CRISIL/ICRA/CARE/India Ratings)",
+    "Government legal/insolvency record (IBBI, NCLT, NCDRC, MahaREAT judgments)",
+    "Corporate-registry mirror",
+    "Live Google Maps verification",
+})
+
+
+def _load_source_trust_registry() -> dict:
+    if not os.path.exists(_SOURCE_TRUST_REGISTRY_PATH):
+        return {"domains": {}}
+    try:
+        with open(_SOURCE_TRUST_REGISTRY_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {"domains": {}}
+
+
+def _save_source_trust_registry(registry: dict) -> None:
+    with open(_SOURCE_TRUST_REGISTRY_PATH, "w", encoding="utf-8") as f:
+        json.dump(registry, f, indent=2, ensure_ascii=False)
+
+
+def _extract_open_web_domain(ref: str) -> str | None:
+    """Returns the specific _SOURCE_TIERS marker (e.g. "99acres.com") that
+    `ref` matches, restricted to tiers NOT already considered trusted --
+    i.e. only a genuine open-web source is eligible for promotion, never a
+    MahaRERA/MCA-mirror source that's trusted by design already."""
+    ref_lower = (ref or "").lower()
+    for tier_name, markers in _SOURCE_TIERS:
+        if tier_name in _ALREADY_TRUSTED_TIERS:
+            continue
+        for marker in markers:
+            if marker.lower() in ref_lower:
+                return marker
+    return None
+
+
+def _record_source_hits_and_promote(facts: dict, reg_no: str) -> list[str]:
+    """Tallies each of this run's cited open-web sources into the
+    persistent, cross-run source_trust_registry.json (one hit per distinct
+    project a domain has corroborated, not one per Charter re-run of the
+    same project), auto-promoting any domain that reaches
+    _SOURCE_PROMOTION_HIT_THRESHOLD. Returns review-note strings for
+    promotions that happened on THIS run specifically, for Internal-only
+    rendering. The registry write itself is unconditional regardless of
+    doc_variant -- it's cross-run pipeline state, not document content, so
+    it happens once per run_company_charter call, not once per variant."""
+    registry = _load_source_trust_registry()
+    domains = registry.setdefault("domains", {})
+    promotion_notes = []
+    seen_this_run = set()
+
+    for s in facts.get("sources", []) or []:
+        domain = _extract_open_web_domain(s.get("ref") or s.get("label") or "")
+        if not domain or domain in seen_this_run:
+            continue
+        seen_this_run.add(domain)
+        entry = domains.setdefault(domain, {
+            "hit_count": 0, "projects": [], "promoted": False,
+            "promoted_on_project": None, "review_note": None,
+        })
+        if reg_no not in entry["projects"]:
+            entry["projects"].append(reg_no)
+            entry["hit_count"] = len(entry["projects"])
+        if not entry["promoted"] and entry["hit_count"] >= _SOURCE_PROMOTION_HIT_THRESHOLD:
+            entry["promoted"] = True
+            entry["promoted_on_project"] = reg_no
+            note = (
+                f"Source \"{domain}\" auto-promoted to trusted status after {entry['hit_count']} "
+                f"corroborating uses across separate projects (most recently {reg_no}) -- this was an "
+                "automatic, frequency-based promotion, not a manual accuracy review; recommend a "
+                "one-time spot-check of this source's reliability."
+            )
+            entry["review_note"] = note
+            promotion_notes.append(note)
+
+    _save_source_trust_registry(registry)
+    return promotion_notes
+
+
 def _clean_source_label(raw_source: str) -> str | None:
     """Turns a _FIELD_WITH_SOURCE value's raw `source` string -- a
     filesystem path under output/<reg_no>/, a URL, or several of either
@@ -2457,6 +3107,8 @@ _MAHARERA_JSON_GENERIC = (
 )
 _DOMAIN_GENERIC = (
     ("zaubacorp.com", "ZaubaCorp (Corporate Registry)"),
+    ("tofler.in", "Tofler (Corporate Registry)"),
+    ("instafinancials.com", "InstaFinancials (Corporate Registry)"),
     ("ibbi.gov.in", "IBBI (Insolvency and Bankruptcy Board of India)"),
     ("maharerait.maharashtra.gov.in", "MahaRERA"),
     ("maharera.maharashtra.gov.in", "MahaRERA"),
@@ -4154,20 +4806,25 @@ def _append_ibbi_check_section(doc, facts: dict) -> None:
 
 def _append_company_profile_section(doc, facts: dict) -> None:
     """Appends a section reporting the code-computed company registration
-    profile from ZaubaCorp (see lookup_company_by_cin). Silently does
-    nothing if company_profile_check was never set or found no record."""
+    profile merged from the MCA-mirror chain (ZaubaCorp -> Tofler ->
+    InstaFinancials; see _run_mca_profile_chain). Silently does nothing if
+    company_profile_check was never set or found no record."""
     check = facts.get("company_profile_check")
     if not check or not check.get("found"):
         return
 
     heading_style = doc.paragraphs[4].style
+    sources_used = check.get("sources_used") or ["ZaubaCorp"]
+    sources_label = ", ".join(s.replace(".com", "").replace(".in", "").title() for s in sources_used)
 
     doc.add_page_break()
-    heading_para = doc.add_paragraph(_external_heading(facts, "Company Registration Profile (ZaubaCorp, Code-Computed)"))
+    heading_para = doc.add_paragraph(_external_heading(facts, f"Company Registration Profile ({sources_label}, Code-Computed)"))
     heading_para.style = heading_style
     doc.add_paragraph(
-        "Pulled directly from ZaubaCorp's public company record by CIN -- an exact-identifier lookup, "
-        "not a name-based guess."
+        f"Pulled directly from {len(sources_used)} independent public company-registry mirror(s) by "
+        "CIN -- an exact-identifier lookup, not a name-based guess -- and cross-checked against each "
+        "other; any disagreement between them on the current director roster is called out under "
+        "Gaps & Limitations rather than silently resolved."
     )
     profile_citation = _citation_text(facts, _clean_source_label(check.get("url", "")))
     doc.add_paragraph(
@@ -4734,11 +5391,11 @@ def _safe_ibbi_check(identifier: str) -> dict:
         return {"found_process": None, "note": f"IBBI lookup could not run this pass: {e}"}
 
 
-def _safe_company_profile(identifier: str) -> dict:
+def _safe_company_profile(identifier: str, promoter_name: str = "") -> dict:
     try:
-        return lookup_company_by_cin(identifier)
+        return _run_mca_profile_chain(identifier, promoter_name)
     except Exception as e:
-        return {"found": False, "note": f"ZaubaCorp company-profile lookup could not run this pass: {e}"}
+        return {"found": False, "note": f"MCA-mirror company-profile chain could not run this pass: {e}"}
 
 
 def _safe_group_companies(identifier: str) -> dict:
@@ -4845,7 +5502,7 @@ def run_company_charter(
             futures["rating"] = executor.submit(_safe_credit_rating, promoter_name_for_rating)
         if corp_identifier:
             futures["ibbi"] = executor.submit(_safe_ibbi_check, corp_identifier)
-            futures["profile"] = executor.submit(_safe_company_profile, corp_identifier)
+            futures["profile"] = executor.submit(_safe_company_profile, corp_identifier, promoter_name_for_rating)
             futures["group"] = executor.submit(_safe_group_companies, corp_identifier)
         if project_name_for_judgments:
             futures["judgments"] = executor.submit(_safe_judgments_search, project_name_for_judgments)
@@ -4887,13 +5544,22 @@ def run_company_charter(
         profile_result = results["profile"]
         facts["company_profile_check"] = profile_result
         if profile_result.get("found"):
+            sources_used = profile_result.get("sources_used") or ["zaubacorp.com"]
             facts.setdefault("sources", []).append({
-                "label": "ZaubaCorp company registration profile",
+                "label": f"MCA-mirror company registration profile ({', '.join(sources_used)})",
                 "ref": f"{profile_result['name']} -- {profile_result['url']}",
                 "topic": "company_profile",
                 "published_date": "unknown",
                 "accessed_date": datetime.now().strftime("%Y-%m-%d"),
             })
+            # Director-roster disagreements between the MCA mirrors queried
+            # above (e.g. one lists a director the others don't) are
+            # genuine data-quality signal for a reader, not internal
+            # process narration -- surfaced via the existing gaps
+            # convention so they render in both Charter variants (see
+            # _merge_director_rosters).
+            for conflict in profile_result.get("roster_conflicts") or []:
+                facts.setdefault("gaps", []).append(conflict)
 
     if "group" in results:
         group_result = results["group"]
@@ -4966,6 +5632,11 @@ def run_company_charter(
     lender_history_note = _diff_mortgage_lender(facts, prior_charter_facts)
     if lender_history_note:
         facts["mortgage_lender_history_note"] = lender_history_note
+
+    # Cross-run source-trust bookkeeping (see _record_source_hits_and_promote's
+    # own module note) -- always recorded regardless of doc_variant; only
+    # rendered in the Internal document below.
+    facts["source_promotion_notes"] = _record_source_hits_and_promote(facts, reg_no)
 
     # Two documents from the same underlying facts: Internal (today's
     # existing behavior -- inline "(label)" citations, "(Code-Computed)"

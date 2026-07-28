@@ -1,0 +1,51 @@
+{
+  "domains": {
+    "99acres.com": {
+      "hit_count": 2,
+      "projects": [
+        "P52100019639",
+        "P51800077150"
+      ],
+      "promoted": false,
+      "promoted_on_project": null,
+      "review_note": null
+    },
+    "nobroker.in": {
+      "hit_count": 2,
+      "projects": [
+        "P52100019639",
+        "P51800077150"
+      ],
+      "promoted": false,
+      "promoted_on_project": null,
+      "review_note": null
+    },
+    "facebook.com": {
+      "hit_count": 1,
+      "projects": [
+        "P52100019639"
+      ],
+      "promoted": false,
+      "promoted_on_project": null,
+      "review_note": null
+    },
+    "sproutsnews.com": {
+      "hit_count": 1,
+      "projects": [
+        "P52100019639"
+      ],
+      "promoted": false,
+      "promoted_on_project": null,
+      "review_note": null
+    },
+    "wikipedia.org": {
+      "hit_count": 1,
+      "projects": [
+        "P51800077150"
+      ],
+      "promoted": false,
+      "promoted_on_project": null,
+      "review_note": null
+    }
+  }
+}
