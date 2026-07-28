@@ -298,7 +298,10 @@ with tab_run:
                 with st.spinner(f"Building promoter portfolio for '{promoter_name}'..."):
                     try:
                         with requests.Session() as s:
-                            portfolio = promoter_portfolio_mod.build_promoter_portfolio(promoter_name, s, token, headless=not headed_search)
+                            portfolio = promoter_portfolio_mod.build_promoter_portfolio(
+                            promoter_name, s, token, headless=not headed_search,
+                            subject_project_partners_data=category_data.get("partners"), subject_reg_no=reg_no,
+                        )
                         promoter_dir = os.path.join(project_out_dir, "promoter")
                         os.makedirs(promoter_dir, exist_ok=True)
                         with open(os.path.join(promoter_dir, "portfolio.json"), "w", encoding="utf-8") as f:
@@ -338,7 +341,7 @@ with tab_run:
                     charter_path, charter_facts = company_charter.run_company_charter(
                         reg_no, category_data, documents_manifest, documents_dir, research_data,
                         complaint_orders_manifest=complaint_orders_manifest, complaint_orders_dir=complaint_orders_dir,
-                        reviews=reviews,
+                        reviews=reviews, promoter_portfolio=portfolio,
                     )
                     st.success(f"Company Charter written to `{charter_path}`")
                 except Exception as e:

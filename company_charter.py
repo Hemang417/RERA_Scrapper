@@ -232,6 +232,7 @@ _FIELD_WITH_SOURCE = {
     "required": ["value", "source"],
 }
 _PLAIN_FIELD = {"type": "string"}
+_INT_FIELD = {"type": "integer"}
 
 _CHARTER_FACTS_SCHEMA = {
     "type": "object",
@@ -332,12 +333,36 @@ _CHARTER_FACTS_SCHEMA = {
         "area_intelligence_trend": _PLAIN_FIELD,
         "rera_core_fields": {
             "type": "object",
-            "properties": {k: _PLAIN_FIELD for k in (
-                "project_name", "registration_number", "promoter_name", "authority",
-                "plan_approval_number", "project_status", "approved_date",
-                "proposed_completion_date", "project_type", "litigations_per_record",
-                "promoter_land_owner_investor", "collection_bank_account", "total_building_units",
-            )},
+            "properties": {
+                **{k: _PLAIN_FIELD for k in (
+                    "project_name", "registration_number", "promoter_name", "authority",
+                    "plan_approval_number", "project_status", "approved_date",
+                    "proposed_completion_date", "project_type", "litigations_per_record",
+                    "promoter_land_owner_investor", "collection_bank_account", "total_building_units",
+                )},
+                # Structured companions to the prose fields above, so downstream scoring/KPI-card
+                # code can read the real number directly instead of regexing free text (see the
+                # _SYSTEM_PROMPT rule on these -- a project's exact phrasing shouldn't determine
+                # whether its own clean record silently drops out of the Developer Score).
+                "total_complaints_count": _INT_FIELD,
+                "total_appeals_count": _INT_FIELD,
+                "units_total": _INT_FIELD,
+                "units_sold": _INT_FIELD,
+                "completion_date_current": _PLAIN_FIELD,
+                "completion_date_original": _PLAIN_FIELD,
+            },
+        },
+        # Feeds the code-computed Developer Score's "track record years" criterion --
+        # deliberately its own top-level object, not nested under rera_core_fields, since
+        # MahaRERA's own record never carries this (it's promoter/group history, not a
+        # RERA-filed fact). Omit this object entirely if it can't be confirmed -- see the
+        # _SYSTEM_PROMPT rule below -- rather than guessing a number.
+        "developer_track_record": {
+            "type": "object",
+            "properties": {
+                "years_in_industry": _INT_FIELD,
+                "years_in_industry_basis": _PLAIN_FIELD,
+            },
         },
         "unit_summary_note": _PLAIN_FIELD,
         "blocks": {
@@ -362,7 +387,7 @@ _CHARTER_FACTS_SCHEMA = {
                 "properties": {
                     "label": {"type": "string"},
                     "ref": {"type": "string"},
-                    "topic": {"type": "string", "description": "Short category this source backs -- e.g. 'land_title', 'corporate_identity', 'litigation', 'pricing', 'distance'. Used to check whether a material topic is backed by more than one independent source, not just one."},
+                    "topic": {"type": "string", "description": "Short category this source backs. Used both to check whether a material topic is backed by more than one independent source, AND to automatically render an inline citation next to any paragraph on that topic -- so use EXACTLY one of these known values whenever it applies (a value outside this list still gets a source-count check, but will NOT get an automatic inline citation anywhere): 'land_title', 'corporate_identity', 'litigation', 'pricing', 'market_trend', 'distance', 'project_registration' (any fact drawn from MahaRERA's own project record -- rera_core_fields, rules_statutory, local_planning, neighbourhood, unit_summary_note all draw from this), 'legal_documents', 'reputation', 'credit_rating', 'insolvency_status', 'company_profile', 'group_companies'."},
                     "published_date": {"type": "string", "description": "The date the underlying information was published or last updated, as YYYY-MM-DD if the source discloses one, or the literal string 'unknown' if it does not (e.g. a live database record with no publish date shown) -- never guessed or invented."},
                     "accessed_date": {"type": "string", "description": "The date this specific source was actually retrieved/read during this research pass, as YYYY-MM-DD."},
                 },
@@ -390,6 +415,15 @@ project, following a fixed template structure.
 Rules:
 - Every field must be either a real, sourced fact or an explicit statement that it could not \
 be confirmed (put those in `gaps`, do not leave a field blank or guess).
+- `rera_core_fields.total_complaints_count`, `total_appeals_count`, `units_total`, and \
+`units_sold` must be the literal integers your own `litigations_per_record`/`total_building_units` \
+prose describes -- not a restatement of the prose, the actual number a downstream scoring step \
+can read directly. `completion_date_current` is the current proposed completion date as \
+YYYY-MM-DD; `completion_date_original` is the ORIGINAL declared date as YYYY-MM-DD if it has ever \
+been extended/pushed back, or the exact literal empty string "" if it has never been extended \
+(same as current) -- never omit these because the prose already covers it, and never guess a \
+number you can't confirm (state the uncertainty in the prose field instead, and leave the count \
+fields out of your JSON entirely for that one project rather than invent a number).
 - Distances/routes: you do NOT have a live Maps browsing tool here -- use web_search to find \
 driving distances/times and state plainly in `location_coordinates_note` that these are \
 web-search estimates, not live Maps-verified routes (this template explicitly wants that kind \
@@ -412,11 +446,27 @@ immediately-adjacent same-developer extension as a comparable; it is the same pr
 market comparable). State the approximate distance for each comparable in `distance_km`. If no \
 genuinely independent comparable exists within that radius, say so in `gaps` rather than \
 substituting a same-complex neighbor or a locality-wide average as if it satisfied the radius.
-- Every entry in `sources` needs a `topic` (which fact area it backs -- land_title, \
-corporate_identity, litigation, pricing, distance, etc.), a `published_date` (YYYY-MM-DD if the \
-source states one, or literally "unknown" if it does not -- never invent one), and an \
-`accessed_date` (YYYY-MM-DD, when you actually looked at it this pass). These feed a later, \
-code-computed confidence score -- an omitted or fabricated date is worse than an honest "unknown".
+- Use web_search to find how many years this promoter (or its parent group, if this is a \
+group-affiliated SPV incorporated recently for one project) has actually been active in real- \
+estate development, and fill `developer_track_record.years_in_industry` (a plain integer) with \
+`years_in_industry_basis` stating what start event you counted from (e.g. "group's first \
+recorded project launch in 1998, per the group's own corporate website") and its source. If you \
+cannot confirm this from any source, omit `developer_track_record` entirely rather than guessing \
+a number or assuming the SPV's own incorporation date equals the group's real experience.
+- Every entry in `sources` needs a `topic` (see the exact known values listed on that field), a \
+`published_date` (YYYY-MM-DD if the source states one, or literally "unknown" if it does not -- \
+never invent one), and an `accessed_date` (YYYY-MM-DD, when you actually looked at it this pass). \
+These feed a later, code-computed confidence score -- an omitted or fabricated date is worse than \
+an honest "unknown".
+- A later, code-only step renders an inline citation next to several prose fields (rules_statutory, \
+local_planning, unit_summary_note, neighbourhood, connectivity, micro_market_overview, \
+area_intelligence_trend, location_coordinates_note) by matching that field's likely topic against \
+`sources[].topic`. It does NOT read your prose to figure out what backs it -- if a fact in one of \
+those fields came from a source, tag that source with the matching known topic value (see the field \
+description on `sources[].topic`) or it will render with no citation at all, even though you did \
+have a source. The `_FIELD_WITH_SOURCE` fields (land_identification, corporate_identity, \
+litigation_status, fsi_metrics.mortgage_lender) work differently: their own `source` value is shown \
+directly, so just make sure it's a real, specific document name/URL, not a vague description.
 - Use web_search as many times as you need across multiple turns. Once you have everything \
 you need, your FINAL reply must be ONLY a single raw JSON object -- no prose, no markdown \
 code fences, nothing before or after it -- matching exactly this JSON Schema: \
@@ -1907,18 +1957,20 @@ def _fill_template(reg_no: str, facts: dict, out_path: str) -> None:
     _set_paragraph_text(p[7], facts["executive_summary"])
     _set_paragraph_text(p[12], facts["address_discrepancy_note"])
     _set_paragraph_text(p[13], facts["corporate_registry_cross_check"])
-    _set_paragraph_text(p[15], fld(facts, "litigation_status"))
-    _set_paragraph_text(p[17], facts["location_coordinates_note"])
-    _set_paragraph_text(p[18], "Map screenshot not embedded -- see the Methodology Note above for how distances below were sourced (this template's own instructions note a live map cannot be fetched programmatically).")
-    _set_paragraph_text(p[24], f"Road: {conn.get('road', '')}")
-    _set_paragraph_text(p[25], f"Rail: {conn.get('rail', '')}")
-    _set_paragraph_text(p[26], f"Metro: {conn.get('metro', '')}")
-    _set_paragraph_text(p[27], f"Air: {conn.get('air', '')}")
+    litigation_citation = _clean_source_label(src(facts, "litigation_status"))
+    litigation_text = fld(facts, "litigation_status")
+    _set_paragraph_text(p[15], f"{litigation_text} ({litigation_citation})" if litigation_citation else litigation_text)
+    _set_paragraph_text(p[17], _cite(facts["location_coordinates_note"], "distance", facts=facts))
+    _set_paragraph_text(p[18], "Map screenshot not embedded -- a live map cannot be fetched programmatically, so distances below were sourced from mapping-service queries instead (see Sources).")
+    _set_paragraph_text(p[24], _cite(f"Road: {conn.get('road', '')}", "distance", facts=facts))
+    _set_paragraph_text(p[25], _cite(f"Rail: {conn.get('rail', '')}", "distance", facts=facts))
+    _set_paragraph_text(p[26], _cite(f"Metro: {conn.get('metro', '')}", "distance", facts=facts))
+    _set_paragraph_text(p[27], _cite(f"Air: {conn.get('air', '')}", "distance", facts=facts))
     _set_paragraph_text(p[30], facts["social_infrastructure"])
     _set_paragraph_text(p[32], facts["fsi_governing_framework"])
     _set_paragraph_text(p[33], facts["fsi_interpretation"])
-    _set_paragraph_text(p[36], f"Governing act: {rs.get('governing_act', '')}")
-    _set_paragraph_text(p[37], f"Planning approval sequence: {rs.get('planning_approval_sequence', '')}")
+    _set_paragraph_text(p[36], _cite(f"Governing act: {rs.get('governing_act', '')}", "project_registration", facts=facts))
+    _set_paragraph_text(p[37], _cite(f"Planning approval sequence: {rs.get('planning_approval_sequence', '')}", "project_registration", facts=facts))
     _set_paragraph_text(p[38], f"Allotment mechanics: {rs.get('allotment_mechanics', '')}")
     _set_paragraph_text(p[41], rc.get("registration_summary", ""))
     _set_paragraph_text(p[42], f"Collection Account of the Project (100%): {rc.get('collection_account', '')}")
@@ -1926,13 +1978,13 @@ def _fill_template(reg_no: str, facts: dict, out_path: str) -> None:
     _set_paragraph_text(p[44], f"Litigations/complaints/appeals related to the project: {rc.get('litigations_complaints_appeals', '')}")
     _set_paragraph_text(p[45], rc.get("statutory_declaration", ""))
     _set_paragraph_text(p[46], f"Construction progress: {rc.get('construction_progress', '')}")
-    _set_paragraph_text(p[49], f"Authority of record: {lp.get('authority_of_record', '')}")
-    _set_paragraph_text(p[50], f"Project type: {lp.get('project_type', '')}")
-    _set_paragraph_text(p[51], f"Professionals of record: {lp.get('professionals_of_record', '')}")
-    _set_paragraph_text(p[54], facts["micro_market_overview"])
-    _set_paragraph_text(p[56], facts["area_intelligence_trend"])
+    _set_paragraph_text(p[49], _cite(f"Authority of record: {lp.get('authority_of_record', '')}", "project_registration", facts=facts))
+    _set_paragraph_text(p[50], _cite(f"Project type: {lp.get('project_type', '')}", "project_registration", facts=facts))
+    _set_paragraph_text(p[51], _cite(f"Professionals of record: {lp.get('professionals_of_record', '')}", "project_registration", facts=facts))
+    _set_paragraph_text(p[54], _cite(facts["micro_market_overview"], "pricing", "market_trend", facts=facts))
+    _set_paragraph_text(p[56], _cite(facts["area_intelligence_trend"], "market_trend", "pricing", facts=facts))
     _set_paragraph_text(p[58], facts.get("rera_scraping_note", f"Extracted directly from the live MahaRERA public project page for registration number {reg_no}."))
-    _set_paragraph_text(p[61], facts["unit_summary_note"])
+    _set_paragraph_text(p[61], _cite(facts["unit_summary_note"], "project_registration", facts=facts))
     _set_paragraph_text(p[63], facts["documents_reviewed_note"])
     _set_paragraph_text(p[64], facts["documents_absent_note"])
 
@@ -1946,17 +1998,25 @@ def _fill_template(reg_no: str, facts: dict, out_path: str) -> None:
         "pincode", "total_gross_area", "area_affected", "net_area",
     )):
         _set_cell(t[0], row, 1, fld(li, key))
-        _set_cell(t[0], row, 2, src(li, key))
+        # The template's own "Source" column showed the raw output/<reg_no>/...
+        # path verbatim -- cleaned to a short label here, same convention as
+        # every other citation added below.
+        _set_cell(t[0], row, 2, _clean_source_label(src(li, key)) or "")
 
     for row, key in zip(range(1, 10), (
         "promoter_name", "organization_type", "cin_llpin", "registered_office_main",
         "registered_office_board_resolution", "registered_office_planning_stage",
         "authorized_signatory", "partners_directors", "landowner_investor",
     )):
-        _set_cell(t[1], row, 1, fld(ci, key))
+        # This table has no Source column in the template (unlike Land
+        # Identification) -- each fact carries a real source in facts.json
+        # that was never shown anywhere, so it's appended inline instead.
+        value = fld(ci, key)
+        citation = _clean_source_label(src(ci, key))
+        _set_cell(t[1], row, 1, f"{value} ({citation})" if value and citation else value)
 
     for row, key in zip(range(1, 5), ("east", "west", "north", "south")):
-        _set_cell(t[2], row, 1, nb.get(key, ""))
+        _set_cell(t[2], row, 1, _cite(nb.get(key, ""), "project_registration", "legal_documents", facts=facts))
 
     def _fill_distance_row(row, item):
         _set_row_cell(row, 0, item["landmark"])
@@ -1973,7 +2033,8 @@ def _fill_template(reg_no: str, facts: dict, out_path: str) -> None:
         # _CHARTER_FACTS_SCHEMA note) and the template predates it.
         lender_row = t[4].add_row()
         _set_row_cell(lender_row, 0, "Mortgage lender (if disclosed)")
-        _set_row_cell(lender_row, 1, mortgage_lender_value)
+        lender_citation = _clean_source_label(src(fsi_m, "mortgage_lender"))
+        _set_row_cell(lender_row, 1, f"{mortgage_lender_value} ({lender_citation})" if lender_citation else mortgage_lender_value)
     lender_history_note = facts.get("mortgage_lender_history_note")
     if lender_history_note:
         history_row = t[4].add_row()
@@ -2026,15 +2087,194 @@ def _fill_template(reg_no: str, facts: dict, out_path: str) -> None:
     sources = [_format_source_line(s) for s in facts.get("sources", [])]
     _fill_variable_paragraphs(doc, 69, 8, sources)
 
-    _append_complaint_outcomes_section(doc, facts)
-    _append_credit_rating_section(doc, facts)
-    _append_ibbi_check_section(doc, facts)
-    _append_company_profile_section(doc, facts)
-    _append_group_companies_section(doc, facts)
-    _append_cts_land_record_section(doc, facts)
-    _append_appeal_judgments_section(doc, facts)
-    _append_review_authenticity_section(doc, facts)
-    _append_authenticity_page(doc, facts)
+    # ---------------------------------------------------------------------
+    # Section consolidation -- renames existing template headings to the
+    # target vocabulary (docs/Company_Charter_Executive_Design.docx section
+    # 3's 9-section table) and regroups content to match, without touching
+    # any of the prose-generation logic above or in any _append_* function.
+    # Three kinds of change, all via the same two primitives (retext an
+    # EXISTING heading paragraph, or capture-then-relocate NEWLY appended
+    # content -- the latter already proven safe for the checks bolted onto
+    # the end in the previous pass):
+    #   1. Renames: "1. Legal Identifiers..." -> "Counterparty", "2. Location
+    #      Map" -> "The Asset", "4. Rules" -> "Compliance & Legal Detail",
+    #      "5. Area Intelligence" -> "Market & Area Intelligence", "6. RERA
+    #      Scraping..." -> "RERA Core Data", "Gaps & Limitations..." ->
+    #      "Gaps & Sources". "3. FSI", "Document Library Contents", and
+    #      "Sources" are demoted from Heading 1 to Heading 2, becoming
+    #      subsections of "The Asset" / a new "Diligence Appendix" / the
+    #      merged "Gaps & Sources" respectively, instead of standalone
+    #      top-level sections.
+    #   2. Land Identification is pulled out from under the old combined
+    #      "Legal Identifiers" heading to sit under "The Asset" instead,
+    #      alongside Location Map/FSI -- the one case here of relocating
+    #      EXISTING template content, not newly-appended content.
+    #   3. The 5 check sections (credit rating/IBBI/company profile/group
+    #      companies/Developer Score) get a short, one-line-each SUMMARY
+    #      under Counterparty (_append_counterparty_summary, new) instead
+    #      of their full detail sitting there -- the full tables move into
+    #      a new "Diligence Appendix" (alongside Document Library and Data
+    #      Authenticity), demoted to Heading 2 subsections of it. Complaint
+    #      Order Outcomes and Appeal-Level Judgments move into "Compliance
+    #      & Legal Detail" (same anchor Appeal Judgments already used).
+    # ---------------------------------------------------------------------
+
+    from docx.oxml.ns import qn
+    from docx.text.paragraph import Paragraph as _Paragraph
+
+    _set_paragraph_text(p[8], "Counterparty")
+    _set_paragraph_text(p[16], "The Asset")
+    _set_paragraph_text(p[34], "Compliance & Legal Detail")
+    _set_paragraph_text(p[52], "Market & Area Intelligence")
+    _set_paragraph_text(p[57], "RERA Core Data")
+    _set_paragraph_text(p[65], "Gaps & Sources")
+
+    h1_style = p[8].style
+    h2_style = p[9].style  # "Land Identification" -- a known Heading 2
+    _set_paragraph_text(p[31], "FSI (Floor Space Index)")
+    p[31].style = h2_style  # was Heading 1 ("3. FSI...") -- now a subsection of "The Asset"
+    p[62].style = h2_style  # "Document Library Contents..." -- now a subsection of the new Diligence Appendix
+    p[68].style = h2_style  # "Sources" -- now a subsection of the merged "Gaps & Sources"
+
+    # Every _append_* function below appends new content at the document's
+    # true end (doc.add_paragraph()/doc.add_table()), same as they always
+    # have -- several of them internally look up doc.paragraphs[4] fresh
+    # for heading style, so ALL of them must run before anything gets
+    # relocated below; relocating first would shift a fresh paragraphs[4]
+    # lookup onto whatever new content happened to land there instead of
+    # the real "Methodology Note" heading. `p` (captured at the top of this
+    # function, before any of this) stays valid as a relocation anchor
+    # throughout, since it holds resolved Paragraph objects, not indices
+    # that shift as new paragraphs are inserted elsewhere in the tree --
+    # true whether that paragraph's own text/style was just edited above
+    # too, since neither changes which _p element `p[N]` wraps.
+    body = doc.element.body
+    sectPr = body[-1]
+
+    def _capture_batch(append_fn) -> list:
+        """Runs append_fn() (which appends new paragraphs/tables at the
+        document's true end via doc.add_paragraph()/doc.add_table()) and
+        returns exactly the elements it just added, in document order --
+        found via XML tree navigation (getnext/getprevious), not Python
+        object identity, since lxml doesn't guarantee stable proxy objects
+        across separate accesses to the same underlying node."""
+        marker = sectPr.getprevious()
+        append_fn()
+        new_elements = []
+        el = marker.getnext() if marker is not None else (body[0] if body[0] is not sectPr else None)
+        while el is not None and el is not sectPr:
+            new_elements.append(el)
+            el = el.getnext()
+        return new_elements
+
+    def _demote_first_heading(batch: list, new_style) -> None:
+        """Finds the first Heading-1-styled paragraph in a captured batch
+        (every _append_*_section function's own heading, since each was
+        written as a standalone top-level section) and demotes it to
+        `new_style` -- turns it into a subsection of whatever umbrella
+        heading it's being relocated under, without touching that
+        section's own rendering code at all."""
+        for el in batch:
+            if el.tag == qn("w:p"):
+                para = _Paragraph(el, doc._body)
+                if para.style and para.style.name == "Heading 1":
+                    para.style = new_style
+                    return
+
+    # facts["developer_score"] must exist before _append_developer_score_section
+    # / _append_counterparty_summary read it -- computed once here (Overview
+    # needs the same flags/score too).
+    flags = _classify_flags(facts)
+    facts["developer_score"] = _compute_developer_score(facts, flags)
+
+    overview_batch = _capture_batch(lambda: _append_overview_section(doc, facts, flags))
+
+    # The material-findings cards (Completion Slippage/Units Sold/
+    # Litigation Load/Land Title) land right under the Executive Summary's
+    # own prose (p[7]) -- captured separately from Overview & Flags so it
+    # can anchor at a different spot (immediately before p[8],
+    # "Counterparty") while Overview & Flags (which carries its own,
+    # differently-scoped scorecard) anchors at p[6].
+    exec_summary_kpi_batch = _capture_batch(lambda: _append_executive_summary_kpis(doc, facts, flags))
+
+    # Short summaries under Counterparty -- full detail lives in the
+    # Diligence Appendix batch built right after.
+    counterparty_summary_batch = _capture_batch(lambda: _append_counterparty_summary(doc, facts))
+
+    diligence_appendix_batch = []
+    for append_fn in (
+        lambda: _append_credit_rating_section(doc, facts),
+        lambda: _append_ibbi_check_section(doc, facts),
+        lambda: _append_company_profile_section(doc, facts),
+        lambda: _append_group_companies_section(doc, facts),
+        lambda: _append_developer_score_section(doc, facts),
+    ):
+        batch = _capture_batch(append_fn)
+        _demote_first_heading(batch, h2_style)
+        diligence_appendix_batch.extend(batch)
+
+    def _add_diligence_appendix_heading() -> None:
+        heading_para = doc.add_paragraph("Diligence Appendix")
+        heading_para.style = h1_style
+
+    diligence_appendix_heading_batch = _capture_batch(_add_diligence_appendix_heading)
+
+    # Compliance & Legal Detail gains the full litigation/complaint detail
+    # -- Complaint Order Outcomes joins Appeal-Level Judgments there (same
+    # anchor the latter already used in the previous pass). Both are
+    # demoted to Heading 2, same reasoning as the Diligence Appendix
+    # checks: each was written as its own standalone top-level section, so
+    # becoming a subsection of an umbrella heading needs its own demotion.
+    complaint_outcomes_batch = _capture_batch(lambda: _append_complaint_outcomes_section(doc, facts))
+    _demote_first_heading(complaint_outcomes_batch, h2_style)
+    _append_cts_land_record_section(doc, facts)  # unmoved, same relative position as before
+    appeal_judgments_only_batch = _capture_batch(lambda: _append_appeal_judgments_section(doc, facts))
+    _demote_first_heading(appeal_judgments_only_batch, h2_style)
+    compliance_batch = complaint_outcomes_batch + appeal_judgments_only_batch
+
+    _append_review_authenticity_section(doc, facts)  # unmoved
+
+    authenticity_batch = _capture_batch(lambda: _append_authenticity_page(doc, facts))
+    _demote_first_heading(authenticity_batch, h2_style)
+    diligence_appendix_batch.extend(authenticity_batch)
+
+    # Relocate each batch now that every _append_* call above is done, so
+    # none of them could have been tripped up by an earlier relocation --
+    # p[4]/p[16]/p[17]/p[48]/p[62]/p[65] are still exactly the same
+    # paragraph objects as when this function started, since nothing has
+    # moved yet (only text/style on some of them changed, which doesn't
+    # affect their position).
+    # Overview & Flags anchors at p[6] ("Executive Summary" heading), not
+    # p[4] -- the Methodology Note (p[4]/p[5]) is removed entirely below,
+    # so the batch lands directly before Executive Summary instead of
+    # before what used to be the Methodology Note.
+    for el in overview_batch:
+        p[6]._p.addprevious(el)
+    for el in exec_summary_kpi_batch:
+        p[8]._p.addprevious(el)
+    for el in counterparty_summary_batch:
+        p[16]._p.addprevious(el)
+    for el in diligence_appendix_heading_batch:
+        p[62]._p.addprevious(el)
+    for el in diligence_appendix_batch:
+        p[65]._p.addprevious(el)
+    for el in compliance_batch:
+        p[48]._p.addprevious(el)
+
+    # Land Identification -- the one relocation of EXISTING template
+    # content rather than newly-appended content: pulled from under
+    # Counterparty (where it used to anchor the old combined "Legal
+    # Identifiers" section) to sit under "The Asset" instead, right before
+    # its first piece of content (location_coordinates_note).
+    for el in (p[9]._p, t[0]._tbl, p[10]._p):
+        p[17]._p.addprevious(el)
+
+    # Methodology Note removed entirely, per request -- safe only now that
+    # every _append_*_section call above is done (several of them looked up
+    # doc.paragraphs[4].style fresh for their own heading style, so this
+    # element had to survive until the very last _append_* call finished).
+    p[4]._p.getparent().remove(p[4]._p)
+    p[5]._p.getparent().remove(p[5]._p)
 
     doc.save(out_path)
 
@@ -2094,6 +2334,73 @@ def _classify_source_tier(ref: str) -> str:
         if any(marker.lower() in ref_lower for marker in markers):
             return tier_name
     return "Other / unclassified source"
+
+
+def _clean_source_label(raw_source: str) -> str | None:
+    """Turns a _FIELD_WITH_SOURCE value's raw `source` string -- a
+    filesystem path under output/<reg_no>/, a URL, or several of either
+    joined with "; " -- into a short, plain-text inline citation. Strips
+    the output/<reg_no>/documents|raw/ path prefix down to just the
+    filename (prefixing a bare raw/*.json file with "MahaRERA", since
+    that's literally what those files are), reduces a URL to its domain,
+    and preserves any trailing parenthetical annotation the source itself
+    already carries (e.g. "(First Schedule)"). Returns None for a source
+    that explicitly says it's an unconfirmed gap ("gap -- see Gaps
+    section") -- there is nothing to cite there, not a citation to
+    invent."""
+    if not raw_source or not raw_source.strip():
+        return None
+    if raw_source.strip().lower().startswith("gap"):
+        return None
+
+    def _clean_one(piece: str) -> str:
+        piece = piece.strip()
+        annotation = ""
+        m = re.search(r"\s*(\([^)]*\))\s*$", piece)
+        if m:
+            annotation = " " + m.group(1)
+            piece = piece[: m.start()].strip()
+        if piece.lower().startswith(("http://", "https://")):
+            domain = re.sub(r"^https?://(www\.)?", "", piece).split("/")[0]
+            return domain + annotation
+        piece = piece.replace("\\", "/")
+        name = piece.split("/")[-1]
+        folder = piece.rsplit("/", 2)[-2] if "/" in piece else ""
+        if folder == "raw" and name.endswith(".json"):
+            name = f"MahaRERA {name}"
+        return name + annotation
+
+    pieces = [p for p in raw_source.split(";") if p.strip()]
+    return "; ".join(_clean_one(p) for p in pieces)
+
+
+def _topic_citation(facts: dict, topic: str) -> str | None:
+    """Looks up facts['sources'] for the first entry tagged with `topic`
+    and formats it as a plain-text inline citation, e.g. "(99acres,
+    accessed 2026-07-17)". Returns None if no source carries that topic --
+    never invents one just to fill a paragraph."""
+    for s in facts.get("sources", []) or []:
+        if s.get("topic") == topic:
+            label = s.get("label") or s.get("ref") or "source"
+            accessed = s.get("accessed_date")
+            if accessed and accessed != "unknown":
+                return f"({label}, accessed {accessed})"
+            return f"({label})"
+    return None
+
+
+def _cite(text: str, *topics: str, facts: dict) -> str:
+    """Appends the first matching topic citation (tried in the given
+    order) to `text`, or returns `text` unchanged if none of the topics
+    has a matching source -- never invents a citation just to fill a
+    paragraph."""
+    if not text:
+        return text
+    for topic in topics:
+        citation = _topic_citation(facts, topic)
+        if citation:
+            return f"{text} {citation}"
+    return text
 
 
 def _compute_authenticity_summary(facts: dict) -> dict:
@@ -2262,23 +2569,95 @@ _TIER_WEIGHTS = {
 }
 
 _DOC_CONFIDENCE_WEIGHTS = {
-    "source_tier_quality": 0.30,
-    "primary_tier_density": 0.20,
-    "completeness_rate": 0.20,
+    "source_tier_quality": 0.20,
+    "primary_tier_density": 0.15,
+    "completeness_rate": 0.05,  # was 0.15 -- 0.10 moved to financial_figures_confirmed (Step 5)
     "cross_corroboration": 0.15,
-    "recency": 0.10,
-    "verification_rate": 0.05,
+    "recency_legal": 0.05,
+    "recency_other": 0.05,
+    "verification_rate": 0.25,
+    "financial_figures_confirmed": 0.10,  # was 0.00/TBD -- implemented in Step 5
 }
 
 _RECENCY_WINDOW_MONTHS = 18  # this project's own calibration, not a disclosed CRISIL threshold
+_RECENCY_WINDOW_MONTHS_LEGAL = 3  # legal/litigation sources are held to a much tighter freshness bar
+
+# The four core investment-case figures financial_figures_confirmed checks
+# for, and the gap-text markers used to detect each is still an open,
+# unconfirmed gap rather than something read from a primary document.
+_FINANCIAL_FIGURE_MARKERS = {
+    "fsi": (r"\bfsi\b",),
+    "land_built_up_area": (r"built-up area", r"built up area", r"\bbua\b"),
+    "unit_counts": (r"unit breakdown", r"unit count", r"unit mix", r"number of units"),
+    "pricing": (r"\bpricing\b", r"per-sq\.?ft", r"per sq\.?ft", r"\bprice\b"),
+}
+
+# ---------------------------------------------------------------------------
+# Groundwork constants for the upcoming Developer Score / risk-flagging
+# feature -- every number that currently lives only in the design memo, moved
+# here so later steps import from one place instead of re-hardcoding it.
+# Establishing the constants only: nothing below is wired into scoring or
+# flagging logic yet (see _compute_documentation_confidence_score, which
+# still computes a single "recency" criterion and has no
+# "financial_figures_confirmed" criterion -- that wiring, and the
+# corresponding _DOC_CONFIDENCE_WEIGHTS key split above, are a later step).
+# ---------------------------------------------------------------------------
+
+_FLAG_THRESHOLDS = {
+    "complaint_monitor": 15, "complaint_imminent": 40,
+    "appeal_monitor": 5, "appeal_imminent": 15,
+    "credit_rating_min_units": 500,  # below this, "no rating found" isn't flagged
+}
+# The Developer Score's 7-criteria AAA-D framework (replaces the earlier
+# 4-pillar composite entirely, per instruction): each criterion is scored
+# independently against its own AAA-D band, converted to an even 0-100
+# tier-equivalent, then combined by equal weight across whichever criteria
+# have real data this pass -- same renormalize-and-skip convention this
+# Charter already uses everywhere a computed value might be unavailable.
+_DEVELOPER_SCORE_TIER_SCORES = {"AAA": 100.0, "AA": 83.3, "A": 66.7, "B": 50.0, "C": 33.3, "D": 16.7}
+# Thresholds sit at the midpoint between adjacent tier-equivalents, used to
+# map a combined composite (which can land between two tiers once several
+# criteria are averaged) back onto a single overall letter grade.
+_DEVELOPER_SCORE_TIER_THRESHOLDS = (("AAA", 91.65), ("AA", 75.0), ("A", 58.35), ("B", 41.65), ("C", 25.0))  # D below C
+_DATA_AUTHENTICITY_BANDS = {"High": 70, "Moderate": 45}  # Limited below Moderate
 
 
 def _band_label(score: float) -> str:
-    if score >= 80:
+    if score >= _DATA_AUTHENTICITY_BANDS["High"]:
         return "High"
-    if score >= 50:
+    if score >= _DATA_AUTHENTICITY_BANDS["Moderate"]:
         return "Moderate"
     return "Limited"
+
+
+# Shared red/amber/green convention so a grade, a band, and a flag all read
+# the same way wherever they appear -- fills for KPI cards, text colors for
+# flag lines and headline score runs.
+_FILL_RED = "F8CBAD"
+_FILL_AMBER = "FFE699"
+_FILL_GREEN = "C6E0B4"
+_FILL_NEUTRAL = "D9E2F3"
+_TEXT_RED = "C00000"
+_TEXT_AMBER = "BF8F00"
+_TEXT_GREEN = "375623"
+
+
+def _grade_fill(grade: str) -> str:
+    return {
+        "AAA": _FILL_GREEN, "AA": _FILL_GREEN,
+        "A": _FILL_AMBER, "B": _FILL_AMBER,
+        "C": _FILL_RED, "D": _FILL_RED,
+    }.get(grade, _FILL_NEUTRAL)
+
+
+def _band_fill(band: str) -> str:
+    return {"High": _FILL_GREEN, "Moderate": _FILL_AMBER, "Limited": _FILL_RED}.get(band, _FILL_NEUTRAL)
+
+
+def _color_run(run, hex_color: str) -> None:
+    from docx.shared import RGBColor
+
+    run.font.color.rgb = RGBColor.from_string(hex_color)
 
 
 def _months_since(date_str: str) -> float | None:
@@ -2337,7 +2716,11 @@ def _compute_documentation_confidence_score(facts: dict, authenticity_summary: d
     # 4. Independent Verification Rate -- combines the URL-based re-check
     # (_verify_material_claims) and the document-grounding re-check
     # (_check_document_grounding); N/A if neither ever ran (nothing sourced
-    # from a URL or a checkable local document this pass).
+    # from a URL or a checkable local document this pass). Zero attempts is
+    # NOT just renormalized away silently, unlike every other N/A criterion
+    # here -- it's a distinct, worse signal (nothing in this Charter was
+    # independently re-checked at all) that gets its own override below,
+    # after `overall`/`band` are otherwise computed.
     v = facts.get("_verification_stats", {})
     url_stats = v.get("url", {"attempted": 0, "confirmed": 0})
     doc_stats = v.get("document", {"attempted": 0, "confirmed": 0})
@@ -2366,20 +2749,58 @@ def _compute_documentation_confidence_score(facts: dict, authenticity_summary: d
     # own) accessed/published within _RECENCY_WINDOW_MONTHS. Sources with
     # no parseable date at all (both fields "unknown" or missing) are
     # excluded from the denominator, not counted as stale -- there's
-    # nothing to assess.
-    ages = []
+    # nothing to assess. Split legal vs. other (not one blended "recency"
+    # criterion) because a stale legal/insolvency source is a materially
+    # different risk than a stale pricing/press source -- a legal record
+    # going 18 months without a re-check is a real gap; a market-pricing
+    # figure that old is a much smaller one. "Legal" is judged by the
+    # source's own topic (litigation/insolvency/appeal-adjudication ones)
+    # or, failing that, its classified tier being the government
+    # legal/insolvency record tier -- everything else is "other". Each
+    # half is independently omittable (renormalized away) if that half
+    # simply has no dated sources this pass, same as every other criterion
+    # here.
+    _LEGAL_TOPICS = {"legal_documents", "litigation", "insolvency_status", "appeal_judgments"}
+    _LEGAL_TIER = "Government legal/insolvency record (IBBI, NCLT, NCDRC, MahaREAT judgments)"
+    legal_ages, other_ages = [], []
     for s in sources:
         age = _months_since(s.get("published_date", ""))
         if age is None:
             age = _months_since(s.get("accessed_date", ""))
-        if age is not None:
-            ages.append(age)
-    if ages:
-        fresh = sum(1 for a in ages if a <= _RECENCY_WINDOW_MONTHS)
-        criteria["recency"] = {
-            "score": 100 * fresh / len(ages),
-            "note": f"{fresh} of {len(ages)} dated sources are within this document's {_RECENCY_WINDOW_MONTHS}-month freshness window (this project's own calibration, not a disclosed external standard).",
+        if age is None:
+            continue
+        is_legal = s.get("topic") in _LEGAL_TOPICS or _classify_source_tier(s.get("ref", "")) == _LEGAL_TIER
+        (legal_ages if is_legal else other_ages).append(age)
+
+    if legal_ages:
+        fresh = sum(1 for a in legal_ages if a <= _RECENCY_WINDOW_MONTHS_LEGAL)
+        criteria["recency_legal"] = {
+            "score": 100 * fresh / len(legal_ages),
+            "note": f"{fresh} of {len(legal_ages)} dated legal/litigation/insolvency sources are within this document's tighter {_RECENCY_WINDOW_MONTHS_LEGAL}-month freshness window for legal sources (this project's own calibration, not a disclosed external standard).",
         }
+    if other_ages:
+        fresh = sum(1 for a in other_ages if a <= _RECENCY_WINDOW_MONTHS)
+        criteria["recency_other"] = {
+            "score": 100 * fresh / len(other_ages),
+            "note": f"{fresh} of {len(other_ages)} other dated sources (pricing, corporate identity, distances, etc.) are within this document's {_RECENCY_WINDOW_MONTHS}-month freshness window.",
+        }
+
+    # 7. Financial Figures Confirmed -- % of the four core investment-case
+    # figures (FSI, land/built-up area, unit counts, pricing) that are NOT
+    # named in facts["gaps"] -- i.e. confirmed from a primary document
+    # rather than left an open gap. Unlike every other criterion above,
+    # this one always has something to say (facts["gaps"] is always at
+    # least an empty list), so it's never skipped/renormalized away.
+    gaps_blob = " ".join(facts.get("gaps", [])).lower()
+    unconfirmed_figures = [name for name, patterns in _FINANCIAL_FIGURE_MARKERS.items() if any(re.search(p, gaps_blob) for p in patterns)]
+    confirmed_count = len(_FINANCIAL_FIGURE_MARKERS) - len(unconfirmed_figures)
+    note = f"{confirmed_count} of {len(_FINANCIAL_FIGURE_MARKERS)} core figures (FSI, land/built-up area, unit counts, pricing) have no unresolved gap against them"
+    if unconfirmed_figures:
+        note += f" -- flagged as an open gap: {', '.join(unconfirmed_figures)}"
+    criteria["financial_figures_confirmed"] = {
+        "score": 100 * confirmed_count / len(_FINANCIAL_FIGURE_MARKERS),
+        "note": note,
+    }
 
     applicable_weight = sum(_DOC_CONFIDENCE_WEIGHTS[k] for k in criteria)
     if applicable_weight == 0:
@@ -2389,13 +2810,873 @@ def _compute_documentation_confidence_score(facts: dict, authenticity_summary: d
         for k in criteria:
             criteria[k]["weight"] = round(100 * _DOC_CONFIDENCE_WEIGHTS[k] / applicable_weight, 1)
 
-    skipped = sorted(set(_DOC_CONFIDENCE_WEIGHTS) - set(criteria))
-    return {
+    band = _band_label(overall)
+    result = {
         "overall": round(overall, 1),
-        "band": _band_label(overall),
+        "band": band,
         "criteria": criteria,
-        "skipped_criteria": skipped,
+        "skipped_criteria": sorted(set(_DOC_CONFIDENCE_WEIGHTS) - set(criteria)),
     }
+
+    # Zero-verification safeguard: 0 independently-checkable claims is a
+    # materially worse signal than "N/A, renormalize away" -- nothing in
+    # this Charter was ever re-checked against an independent source, so
+    # the band is capped at "Moderate" regardless of what every other
+    # criterion computes (restrains a High down to Moderate; a Limited
+    # stays Limited -- same "never worsen, only restrain" cap pattern as
+    # the Developer Score's imminent-flag override).
+    if total_attempted == 0:
+        result["verification_warning"] = "0 claims were independently re-checked this pass."
+        if band == "High":
+            result["band"] = "Moderate"
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Flag classification -- reads the already-assembled facts dict (nothing new
+# fetched here) and sorts every material risk signal into exactly one of
+# three urgency tiers: imminent (act before proceeding), structural (a
+# standing characteristic, raise directly with the developer), or monitor
+# (re-check on a future pass). Ported from this project's design memo and
+# validated against Company_Charter_GodrejParkGreens_P52100019639.facts.json,
+# whose known-correct split (4 imminent / 5 structural / 5 monitor) is
+# asserted in test_classify_flags.py.
+#
+# Two rules below go beyond what the memo states outright, both found
+# necessary to reproduce that validated split and flagged here rather than
+# silently invented:
+#   1. "Near-sellout despite an extended completion date -> imminent" --
+#      the memo's rule list has no explicit slot for this, but the reference
+#      Charter's 4th Imminent flag is exactly this signal (a project that is
+#      ~99% sold against a completion date already pushed back twice is a
+#      real, high-urgency exposure for almost the entire buyer base). Gated
+#      on _NEAR_SELLOUT_PCT below, a local threshold (not in _FLAG_THRESHOLDS,
+#      since the memo's dict has no key for it).
+#   2. Two specific gap texts (the one about complaint SUBSTANCE being
+#      unconfirmable, and the one about no independent market comparable
+#      being confirmable) are promoted to structural rather than falling to
+#      the "any remaining gap -> monitor" default. Both describe a STANDING
+#      limitation of the data source/market (not closable by a future
+#      documents pass), versus every other unmatched gap here, which is
+#      closable by more work. That distinction is judgment, not a clean
+#      keyword rule -- _STRUCTURAL_GAP_PHRASES below is deliberately narrow
+#      (calibrated to the one validated example, not claimed to generalize)
+#      rather than pretending a broader heuristic was validated.
+# ---------------------------------------------------------------------------
+
+_NEAR_SELLOUT_PCT = 90  # this project's own calibration, not from the memo's threshold dict
+
+_KNOWN_LISTED_GROUP_MARKERS = (
+    "godrej", "dlf", "oberoi", "prestige", "sobha", "brigade", "lodha", "macrotech",
+    "puravankara", "sunteck", "kolte", "mahindra lifespace", "shapoorji", "tata housing",
+)
+
+_FSI_AREA_GAP_MARKERS = ("fsi", "bua", "built-up area", "built up area")
+
+# Deliberately narrow, matched to this one validated Charter's own wording --
+# see the module note above.
+_STRUCTURAL_GAP_PHRASES = ("complaint substance", "genuinely independent comparable")
+
+_ESCROW_GAP_MARKERS = ("escrow", "collection account")
+
+
+def _first_int(text: str, pattern: str) -> int | None:
+    match = re.search(pattern, text or "", re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        return int(match.group(1).replace(",", ""))
+    except ValueError:
+        return None
+
+
+def _parse_complaint_appeal_counts(facts: dict) -> tuple[int | None, int | None]:
+    """Returns (complaint_count, appeal_count). Reads rera_core_fields'
+    structured total_complaints_count/total_appeals_count companions first
+    -- exact by construction, no regex involved -- and only falls back to
+    parsing litigations_per_record's prose for older facts.json files that
+    predate those fields. The prose-parsing fallback tries the specific
+    phrasing first (e.g. "67 total complaint-category filings ..., 18
+    appeals on record ..."), then a plainer "N complaints"/"N appeals"
+    match (e.g. "0 complaints, 0 appeals on MahaRERA's own record ...") --
+    a genuinely clean 0/0 record must parse just as confidently as a high
+    one, or it silently drops out of the Developer Score's legal_compliance
+    pillar. Either return value is None only if nothing above could
+    confidently resolve it -- never a guessed number."""
+    core = facts.get("rera_core_fields", {}) or {}
+    complaint_count = core.get("total_complaints_count")
+    appeal_count = core.get("total_appeals_count")
+    if isinstance(complaint_count, int) and isinstance(appeal_count, int):
+        return complaint_count, appeal_count
+
+    text = core.get("litigations_per_record", "") or ""
+    if not isinstance(complaint_count, int):
+        complaint_count = _first_int(text, r"([\d,]+)\s+total complaint")
+        if complaint_count is None:
+            complaint_count = _first_int(text, r"([\d,]+)\s+complaints?\b")
+    if not isinstance(appeal_count, int):
+        appeal_count = _first_int(text, r"([\d,]+)\s+appeals?\s+on record")
+        if appeal_count is None:
+            appeal_count = _first_int(text, r"([\d,]+)\s+appeals?\b")
+    return complaint_count, appeal_count
+
+
+def _parse_total_units_and_sold(facts: dict) -> tuple[int | None, int | None]:
+    """Returns (total_units, sold_units). Reads rera_core_fields'
+    structured units_total/units_sold companions first, falling back to
+    regexing total_building_units's prose only for older facts.json files
+    that predate those fields. Either is None if not confidently
+    resolvable -- never a guessed number."""
+    core = facts.get("rera_core_fields", {}) or {}
+    total = core.get("units_total")
+    sold = core.get("units_sold")
+    if isinstance(total, int) and isinstance(sold, int):
+        return total, sold
+
+    text = core.get("total_building_units", "") or ""
+    if not isinstance(total, int):
+        total = _first_int(text, r"([\d,]+)\s+total units")
+    if not isinstance(sold, int):
+        sold = _first_int(text, r"([\d,]+)\s+sold")
+    return total, sold
+
+
+def _matches_known_listed_group(promoter_name: str) -> bool:
+    name = (promoter_name or "").lower()
+    return any(marker in name for marker in _KNOWN_LISTED_GROUP_MARKERS)
+
+
+def _credit_rating_applies(facts: dict, total_units: int | None) -> bool:
+    """A missing credit rating is only worth flagging for a project large
+    enough, or a promoter well-known enough, that a rating would plausibly
+    exist -- small LLPs are not expected to have one (see
+    lookup_credit_rating's own module note)."""
+    if total_units is not None and total_units > _FLAG_THRESHOLDS["credit_rating_min_units"]:
+        return True
+    promoter_name = ((facts.get("corporate_identity", {}) or {}).get("promoter_name") or {}).get("value", "")
+    return _matches_known_listed_group(promoter_name)
+
+
+def _classify_ibbi_hit(note_text: str) -> tuple[str, str]:
+    """Reads an IBBI status_text/note for whether a positive hit is against
+    the exact promoter entity and whether it's open or closed/settled.
+    Returns (severity, reason) where severity is "imminent", "structural",
+    or "unclear" -- this text is freeform, so anything not confidently
+    readable is treated as "unclear" (caller flags it structural and says
+    so explicitly) rather than guessed at."""
+    text = (note_text or "").lower()
+    is_affiliated_not_itself = "affiliated" in text or "not " in text and " itself" in text
+    is_closed = any(term in text for term in ("closure", "settlement", "settled", "12a", "withdrawn"))
+    if is_closed or is_affiliated_not_itself:
+        return "structural", "the IBBI record reads as either a closed/settled matter or tied to an affiliated (not the exact promoter) entity"
+    if "open" in text or "ongoing" in text or "pending" in text:
+        return "imminent", "the IBBI record reads as an open matter against the exact promoter entity"
+    return "unclear", "whether this IBBI hit is open/closed or against the exact promoter entity could not be confidently determined from the freeform status text"
+
+
+def _classify_flags(facts: dict) -> dict:
+    """Sorts every material risk signal already present in `facts` into
+    {"imminent": [...], "structural": [...], "monitor": [...]} -- each item
+    is {"text": str, "field": str}. Never fetches anything new; purely a
+    read-and-classify pass over data this Charter already assembled."""
+    imminent, structural, monitor = [], [], []
+
+    core = facts.get("rera_core_fields", {}) or {}
+    corp = facts.get("corporate_identity", {}) or {}
+    land = facts.get("land_identification", {}) or {}
+
+    # 1. RERA registration number
+    reg_no = (core.get("registration_number") or "").strip()
+    if not reg_no:
+        imminent.append({
+            "text": "No MahaRERA registration number could be resolved for this project.",
+            "field": "rera_core_fields.registration_number",
+        })
+
+    # 2. CTS/plot number
+    cts_value = (land.get("survey_cts_plot_numbers") or {}).get("value", "") or ""
+    if not cts_value.strip() or cts_value.strip().lower().startswith(("not found", "not disclosed", "not confirmed", "not available")):
+        net_area = (land.get("net_area") or {}).get("value", "") or ""
+        blocks_entirely = not net_area.strip() or net_area.strip().lower().startswith(("not found", "not disclosed", "not confirmed", "not available"))
+        target = imminent if blocks_entirely else structural
+        target.append({
+            "text": "No CTS/plot number could be confirmed for this project's land" + (
+                " -- and with no area figure available either, land verification is blocked entirely." if blocks_entirely
+                else ", though area figures are otherwise available."
+            ),
+            "field": "land_identification.survey_cts_plot_numbers",
+        })
+
+    # 3. CIN/LLPIN
+    cin_llpin_text = (corp.get("cin_llpin") or {}).get("value", "") or ""
+    if not extract_cin(cin_llpin_text) and not extract_llpin(cin_llpin_text):
+        structural.append({
+            "text": "No CIN or LLPIN could be confirmed for the promoter.",
+            "field": "corporate_identity.cin_llpin",
+        })
+
+    # 4 & 8. IBBI insolvency + credit rating -- handled together since,
+    # when NEITHER ran this pass at all, the memo's reference Charter
+    # reports them as a single combined "not checked" structural note
+    # rather than two near-duplicate items.
+    total_units, sold_units = _parse_total_units_and_sold(facts)
+    promoter_name = (corp.get("promoter_name") or {}).get("value", "")
+    ibbi_check = facts.get("ibbi_insolvency_check")
+    credit_check = facts.get("credit_rating_check")
+
+    if ibbi_check is None and credit_check is None:
+        if _credit_rating_applies(facts, total_units):
+            structural.append({
+                "text": "Credit rating and IBBI insolvency status were not checked in this Charter pass -- a process gap, not a finding.",
+                "field": "ibbi_insolvency_check / credit_rating_check",
+            })
+    else:
+        if ibbi_check is not None and ibbi_check.get("found_process") is True:
+            note_text = ibbi_check.get("status_text") or ibbi_check.get("note") or ""
+            severity, reason = _classify_ibbi_hit(note_text)
+            if severity == "imminent":
+                imminent.append({"text": f"IBBI insolvency record found against the exact promoter entity, appearing open: {reason}.", "field": "ibbi_insolvency_check.status_text"})
+            else:
+                prefix = "IBBI insolvency record found" if severity == "structural" else "IBBI insolvency record found, but"
+                structural.append({"text": f"{prefix} -- {reason}; shown here rather than suppressed.", "field": "ibbi_insolvency_check.status_text"})
+        elif ibbi_check is not None and ibbi_check.get("found_process") is None:
+            monitor.append({"text": f"IBBI insolvency check could not run this pass: {ibbi_check.get('note', 'reason not recorded')}.", "field": "ibbi_insolvency_check.note"})
+
+        if credit_check is not None:
+            promoter_result = (credit_check.get("promoter") or {})
+            if promoter_result.get("found"):
+                ratings_text = " ".join(
+                    item.get("rating", "") for agency in promoter_result.get("ratings", []) for item in agency.get("instruments", [])
+                ).lower()
+                sub_investment_grade = bool(re.search(r"\b(bb|b|c|d)\b", ratings_text)) and "bbb" not in ratings_text
+                if "downgraded" in ratings_text or sub_investment_grade:
+                    imminent.append({
+                        "text": "Credit rating found is below investment grade or was downgraded versus a prior run.",
+                        "field": "credit_rating_check.promoter.ratings",
+                    })
+            elif _credit_rating_applies(facts, total_units):
+                structural.append({
+                    "text": "No public credit rating was found for the promoter, despite this project's scale/promoter profile making one plausible.",
+                    "field": "credit_rating_check.promoter.note",
+                })
+
+    # 5. Complaint count vs thresholds
+    complaint_count, appeal_count = _parse_complaint_appeal_counts(facts)
+    if complaint_count is not None:
+        if complaint_count > _FLAG_THRESHOLDS["complaint_imminent"]:
+            imminent.append({"text": f"Complaint volume: {complaint_count} total filings against this project -- above the imminent threshold ({_FLAG_THRESHOLDS['complaint_imminent']}).", "field": "rera_core_fields.litigations_per_record"})
+        elif complaint_count > _FLAG_THRESHOLDS["complaint_monitor"]:
+            monitor.append({"text": f"Complaint volume: {complaint_count} total filings against this project -- above the monitor threshold ({_FLAG_THRESHOLDS['complaint_monitor']}) but not yet at the imminent level.", "field": "rera_core_fields.litigations_per_record"})
+        elif complaint_count >= 1:
+            structural.append({"text": f"Complaint volume: {complaint_count} total filing(s) on record against this project -- a visible floor worth noting, not blended into zero.", "field": "rera_core_fields.litigations_per_record"})
+
+    # 6. Appeal count vs thresholds -- same pattern
+    if appeal_count is not None:
+        if appeal_count > _FLAG_THRESHOLDS["appeal_imminent"]:
+            imminent.append({"text": f"Appeal volume: {appeal_count} appeals on record -- above the imminent threshold ({_FLAG_THRESHOLDS['appeal_imminent']}).", "field": "rera_core_fields.litigations_per_record"})
+        elif appeal_count > _FLAG_THRESHOLDS["appeal_monitor"]:
+            monitor.append({"text": f"Appeal volume: {appeal_count} appeals on record -- above the monitor threshold ({_FLAG_THRESHOLDS['appeal_monitor']}) but not yet at the imminent level.", "field": "rera_core_fields.litigations_per_record"})
+        elif appeal_count >= 1:
+            structural.append({"text": f"Appeal volume: {appeal_count} appeal(s) on record -- a visible floor worth noting, not blended into zero.", "field": "rera_core_fields.litigations_per_record"})
+
+    # 7. Promoter portfolio total -- always structural, never colour-scored
+    portfolio = facts.get("promoter_portfolio")
+    if portfolio:
+        portfolio_total_complaints = (portfolio.get("totals", {}) or {}).get("total_complaints")
+        text = f"Promoter portfolio: {portfolio.get('projects_analyzed', 0)} MahaRERA-registered project(s) tied to this promoter."
+        if portfolio_total_complaints and complaint_count is not None and portfolio_total_complaints > 0:
+            concentration_pct = round(100 * complaint_count / portfolio_total_complaints, 1)
+            text += f" This project alone accounts for {complaint_count} of {portfolio_total_complaints} total complaints across that portfolio ({concentration_pct}%)."
+        structural.append({"text": text, "field": "promoter_portfolio.totals"})
+
+    # Near-sellout despite an extended completion date -- see module note
+    # above (a memo-gap-filling addition, not stated in the original rules).
+    proposed_completion_text = (core.get("proposed_completion_date") or "").lower()
+    if total_units and sold_units and total_units > 0 and "extend" in proposed_completion_text:
+        sold_pct = 100 * sold_units / total_units
+        if sold_pct >= _NEAR_SELLOUT_PCT:
+            imminent.append({
+                "text": f"Completion timeline has been extended, against a project that is {round(sold_pct, 1)}% sold -- nearly the entire buyer base is exposed to this delay.",
+                "field": "rera_core_fields.proposed_completion_date",
+            })
+
+    # 10, 11, 12, 13. Mortgage lender change, escrow gap, FSI/area figures,
+    # and the remaining gaps -- monitor by default.
+    if facts.get("mortgage_lender_history_note"):
+        monitor.append({"text": facts["mortgage_lender_history_note"], "field": "mortgage_lender_history_note"})
+
+    for i, gap_text in enumerate(facts.get("gaps", [])):
+        lowered = gap_text.lower()
+        field = f"gaps[{i}]"
+        if any(marker in lowered for marker in _ESCROW_GAP_MARKERS):
+            structural.append({"text": gap_text, "field": field})
+        elif any(marker in lowered for marker in _FSI_AREA_GAP_MARKERS):
+            imminent.append({"text": gap_text, "field": field})
+        elif any(phrase in lowered for phrase in _STRUCTURAL_GAP_PHRASES):
+            structural.append({"text": gap_text, "field": field})
+        else:
+            monitor.append({"text": gap_text, "field": field})
+
+    return {"imminent": imminent, "structural": structural, "monitor": monitor}
+
+
+# ---------------------------------------------------------------------------
+# Developer Score -- a composite read on the PROMOTER's own standing, scored
+# against a fixed 7-criteria industry rubric (track record years, team
+# strength, past area developed, area developed within 5km, financial
+# strength/debt structure, past default count, entity/organization type),
+# each independently banded AAA/AA/A/B/C/D. Distinct from
+# _compute_documentation_confidence_score above (which scores this
+# DOCUMENT's sourcing, not the promoter). Same renormalization philosophy
+# as everywhere else in this Charter: a criterion with no underlying data
+# is skipped and the remaining criteria are combined by equal weight,
+# rather than faking a neutral or zero score for data that was never
+# gathered. Two of the seven criteria (team strength; financial strength's
+# debt ratios) have no public source this pipeline can check at all today
+# -- they're included for completeness, not left out, so a reader always
+# sees why they're missing rather than wondering if they were forgotten.
+# ---------------------------------------------------------------------------
+
+
+def _tier_from_score(score: float) -> str:
+    for tier, threshold in _DEVELOPER_SCORE_TIER_THRESHOLDS:
+        if score >= threshold:
+            return tier
+    return "D"
+
+
+def _score_track_record_years(facts: dict) -> dict:
+    """Criterion 1: years this promoter (or its parent group, if this is a
+    group-affiliated SPV) has been in the real-estate industry. Reads
+    developer_track_record.years_in_industry -- a field the deep-research
+    promoter-profile step is expected to populate with a sourced start
+    date; not yet wired into every pipeline run, so this is commonly N/A
+    today, not a parsing failure."""
+    years = (facts.get("developer_track_record") or {}).get("years_in_industry")
+    if not isinstance(years, (int, float)):
+        return {"score": None, "tier": None, "reason": "Years in the industry not confirmed this pass -- needs a sourced start date for the promoter or its parent group from the deep-research profile step."}
+    if years > 20:
+        tier = "AAA"
+    elif years >= 17:
+        tier = "AA"
+    elif years >= 13:
+        tier = "A"
+    elif years >= 9:
+        tier = "B"
+    elif years >= 5:
+        tier = "C"
+    else:
+        tier = "D"
+    return {"score": _DEVELOPER_SCORE_TIER_SCORES[tier], "tier": tier, "note": f"{years} years in the industry"}
+
+
+def _score_team_strength(facts: dict) -> dict:
+    """Criterion 2: strength/experience of the Liaisoning, Project
+    Development, and Sales & CRM teams. No public source (MahaRERA,
+    ZaubaCorp, or general web search) discloses a promoter's internal
+    headcount by function -- this is a permanent, structural gap, not a
+    pending build, unless a specific internal data feed is wired in."""
+    return {"score": None, "tier": None, "reason": "No public source discloses internal team headcounts by function (Liaisoning / Project Development / Sales & CRM) -- a structural limitation of publicly-available data, not something a future pass can close."}
+
+
+def _score_past_area_developed(facts: dict) -> dict:
+    """Criterion 3: total area (lakh sq ft) this promoter has developed and
+    delivered in the past, across its MahaRERA-registered portfolio.
+    Reads promoter_portfolio.totals.total_area_developed_lakh_sqft --
+    requires per-project area figures aggregated across the promoter's
+    other registered projects, not yet computed by every pipeline run."""
+    area = ((facts.get("promoter_portfolio") or {}).get("totals") or {}).get("total_area_developed_lakh_sqft")
+    if not isinstance(area, (int, float)):
+        return {"score": None, "tier": None, "reason": "promoter_portfolio.totals.total_area_developed_lakh_sqft not available -- requires area figures aggregated across the promoter's other MahaRERA-registered projects, not yet computed this pass."}
+    if area > 120:
+        tier = "AAA"
+    elif area >= 81:
+        tier = "AA"
+    elif area >= 51:
+        tier = "A"
+    elif area >= 21:
+        tier = "B"
+    elif area >= 6:
+        tier = "C"
+    else:
+        tier = "D"
+    return {"score": _DEVELOPER_SCORE_TIER_SCORES[tier], "tier": tier, "note": f"~{area} lakh sq ft developed across the promoter's MahaRERA-registered portfolio"}
+
+
+def _score_area_within_5km(facts: dict) -> dict:
+    """Criterion 4: this promoter's own total developed area (lakh sq ft)
+    within a 5km radius of THIS project -- a read on promoter influence in
+    the micro-market, not a competitor/all-developer figure. Reads
+    promoter_portfolio.totals.area_within_5km_lakh_sqft, geo-filtered from
+    the same portfolio data as criterion 3."""
+    area = ((facts.get("promoter_portfolio") or {}).get("totals") or {}).get("area_within_5km_lakh_sqft")
+    if not isinstance(area, (int, float)):
+        return {"score": None, "tier": None, "reason": "promoter_portfolio.totals.area_within_5km_lakh_sqft not available -- this pass's promoter_portfolio.json predates the geocoding-based 5km filter (build_promoter_portfolio's subject_project_partners_data/subject_reg_no params), or no subject location could be geocoded. Re-run the pipeline to compute it, rather than treating this as a permanent gap."}
+    if area > 50:
+        tier = "AAA"
+    elif area >= 21:
+        tier = "AA"
+    elif area >= 6:
+        tier = "A"
+    elif area >= 2:
+        tier = "B"
+    elif area >= 1:
+        tier = "C"
+    else:
+        tier = "D"
+    return {"score": _DEVELOPER_SCORE_TIER_SCORES[tier], "tier": tier, "note": f"~{area} lakh sq ft developed by this promoter within 5km of this project"}
+
+
+def _score_financial_strength_debt(facts: dict) -> dict:
+    """Criterion 5: a combined 1-50 point score across % debt in total
+    capital employed, % secured debt in total debt, and past-default
+    occurrence (LOWER points = stronger, per the rubric). Requires actual
+    balance-sheet debt structure -- MahaRERA and ZaubaCorp's public profile
+    (authorised/paid-up capital only) don't disclose this; only resolvable
+    when a credit-rating agency's rationale or an MCA financial filing
+    states these ratios explicitly, which is uncommon for the private,
+    unrated companies that make up most MahaRERA promoters."""
+    points = (facts.get("developer_track_record") or {}).get("financial_strength_points")
+    if not isinstance(points, (int, float)):
+        return {"score": None, "tier": None, "reason": "Debt-to-capital ratio, secured-debt ratio, and default occurrence are not disclosed by any source this pipeline checks (MahaRERA/ZaubaCorp don't carry balance-sheet debt structure) -- only resolvable when a credit-rating rationale or MCA financial filing states these figures."}
+    if points <= 8:
+        tier = "AAA"
+    elif points <= 17:
+        tier = "AA"
+    elif points <= 26:
+        tier = "A"
+    elif points <= 34:
+        tier = "B"
+    elif points <= 42:
+        tier = "C"
+    else:
+        tier = "D"
+    return {"score": _DEVELOPER_SCORE_TIER_SCORES[tier], "tier": tier, "note": f"{points} combined debt/default points (lower is stronger)"}
+
+
+def _score_past_default_count(facts: dict) -> dict:
+    """Criterion 6: number of past default events. Derived from the IBBI
+    insolvency check (a clean IBBI record scores 0 defaults) cross-checked
+    against the credit-rating agency's own note text when a rating exists
+    -- IBBI alone only catches insolvency proceedings that reached the
+    Board, not every default event, so a rating note that itself flags
+    "default" language blocks this from being scored 0 without a human
+    reading the raw text. Never guesses an exact count beyond 0/unclear."""
+    ibbi_check = facts.get("ibbi_insolvency_check")
+    if ibbi_check is None or ibbi_check.get("found_process") is None:
+        return {"score": None, "tier": None, "reason": "IBBI insolvency check did not run this pass -- nothing to count past defaults from."}
+    if ibbi_check["found_process"] is not False:
+        return {"score": None, "tier": None, "reason": "IBBI returned an insolvency record against this CIN -- see the Insolvency Check section for the raw detail; an exact default count isn't machine-countable from that text, so this is left unscored rather than guessed."}
+    credit_check = facts.get("credit_rating_check") or {}
+    note_text = ((credit_check.get("promoter") or {}).get("note") or "").lower()
+    if "default" in note_text and "no instance of default" not in note_text:
+        return {"score": None, "tier": None, "reason": "IBBI shows no insolvency process, but the credit-rating check's own note mentions \"default\" in a way this checker can't confidently classify as zero -- see the Credit Rating Check section for the raw text rather than guessing a count."}
+    return {"score": _DEVELOPER_SCORE_TIER_SCORES["AAA"], "tier": "AAA", "note": "0 defaults -- IBBI shows no insolvency process against this CIN, and nothing in the credit-rating check (if one ran) states otherwise."}
+
+
+def _score_entity_rating(facts: dict) -> dict:
+    """Criterion 7: entity/organization type. Reads
+    corporate_identity.organization_type -- a Private or Public Limited
+    Company scores AAA outright; an LLP or Partnership's stated
+    "willingness to convert to Pvt Ltd" can't be independently verified
+    from public filings, so both are conservatively scored at the "not
+    willing to convert" band rather than crediting unconfirmed intent."""
+    org_type = ((facts.get("corporate_identity") or {}).get("organization_type") or {}).get("value", "")
+    text = org_type.lower()
+    if not text:
+        return {"score": None, "tier": None, "reason": "corporate_identity.organization_type not confirmed this pass."}
+    if "llp" in text or "liability partnership" in text:
+        return {"score": _DEVELOPER_SCORE_TIER_SCORES["D"], "tier": "D", "note": "LLP with no independently confirmed intent to convert to Pvt Ltd -- conservatively scored at the \"not willing to convert\" band rather than assuming unconfirmed intent."}
+    if "partnership" in text:
+        return {"score": _DEVELOPER_SCORE_TIER_SCORES["D"], "tier": "D", "note": "Partnership with no independently confirmed intent to convert to Pvt Ltd -- conservatively scored at the \"not willing to convert\" band rather than assuming unconfirmed intent."}
+    if "limited" in text:
+        return {"score": _DEVELOPER_SCORE_TIER_SCORES["AAA"], "tier": "AAA", "note": f"Corporatized entity ({org_type.split('(')[0].strip()})."}
+    return {"score": None, "tier": None, "reason": f"organization_type ('{org_type}') did not match a recognized entity-type category (Private/Public Limited, LLP, or Partnership)."}
+
+
+def _compute_developer_score(facts: dict, flags: dict) -> dict:
+    """Returns {"composite": 0-100, "grade": one of AAA/AA/A/B/C/D,
+    "criteria": {name: {"score", "tier", "weight", "note"} or {"score":
+    None, "tier": None, "weight": None, "reason"}}}. All seven criteria
+    always appear in `criteria` -- computed ones carry a score/tier/weight/
+    note, uncomputable ones carry an explicit reason instead, so a reader
+    always sees all seven named, never silently missing. Combines whichever
+    criteria have real data by equal weight (renormalized) -- the same
+    skip-and-renormalize convention this Charter uses everywhere else,
+    rather than faking a neutral value for data that was never gathered."""
+    criteria = {
+        "track_record_years": _score_track_record_years(facts),
+        "team_strength": _score_team_strength(facts),
+        "past_area_developed": _score_past_area_developed(facts),
+        "area_within_5km": _score_area_within_5km(facts),
+        "financial_strength_debt": _score_financial_strength_debt(facts),
+        "past_default_count": _score_past_default_count(facts),
+        "entity_rating": _score_entity_rating(facts),
+    }
+
+    scored = {k: v for k, v in criteria.items() if v["score"] is not None}
+    if not scored:
+        composite = 0.0
+    else:
+        composite = sum(v["score"] for v in scored.values()) / len(scored)
+        for k in scored:
+            criteria[k]["weight"] = round(100 / len(scored), 1)
+    for k, v in criteria.items():
+        if v["score"] is None:
+            v["weight"] = None
+
+    grade = _tier_from_score(composite) if scored else "D"
+    if flags.get("imminent") and grade in ("AAA", "AA"):
+        # Hard cap: an imminent-tier flag means this can never be graded
+        # better than A, regardless of how strong the composite otherwise
+        # looks -- but a composite that already bands to A or below is left
+        # as is, since the cap only restrains a grade that would otherwise
+        # be too generous, never softens one that's already lower.
+        grade = "A"
+
+    return {"composite": round(composite, 1), "grade": grade, "criteria": criteria}
+
+
+def _parse_completion_slippage(facts: dict) -> tuple[str, bool]:
+    """Returns (display text, was_extended). Reads rera_core_fields'
+    structured completion_date_current/completion_date_original companions
+    first -- an empty completion_date_original means "never extended" by
+    construction (see _SYSTEM_PROMPT), not "unknown". Falls back to
+    regexing proposed_completion_date's prose (e.g. "2028-03-30 per the
+    live RERA record (originally 2024-03-30; ...)" -> ("2024-03-30 -> 2028-
+    03-30", True)) only for older facts.json files that predate those
+    fields -- never a guessed date either way."""
+    core = facts.get("rera_core_fields", {}) or {}
+    current = core.get("completion_date_current")
+    original = core.get("completion_date_original")
+    if current:
+        if original and original != current:
+            return f"{original} -> {current}", True
+        return current, False
+
+    text = core.get("proposed_completion_date", "") or ""
+    current_match = re.match(r"(\d{4}-\d{2}-\d{2})", text)
+    original_match = re.search(r"originally\s+(\d{4}-\d{2}-\d{2})", text, re.IGNORECASE)
+    if current_match and original_match and current_match.group(1) != original_match.group(1):
+        return f"{original_match.group(1)} -> {current_match.group(1)}", True
+    return (current_match.group(1) if current_match else "Not confirmed"), False
+
+
+def _land_title_summary(facts: dict) -> tuple[str, str]:
+    """Returns (short display text, fill color) for the land-title portion
+    of litigation_status.value -- green if that text reads as no title
+    litigation/dispute/encumbrance found (checked against several
+    projects' worth of actual phrasing, not just one), amber if
+    litigation_status exists but doesn't read clean, neutral only if
+    litigation_status itself is empty. Never invents a status beyond what
+    that text actually says."""
+    text = ((facts.get("litigation_status") or {}).get("value", "") or "")
+    if not text.strip():
+        return "Not confirmed this pass", _FILL_NEUTRAL
+    lowered = text.lower()
+    clean_signals = (
+        "no litigation affecting the property",
+        "not shown to be under title dispute",
+        "no litigation directly against",
+        "clear, marketable, encumbrance-free title",
+        "no litigation on the land",
+    )
+    if any(signal in lowered for signal in clean_signals):
+        return "Clear (see Litigation Status for source)", _FILL_GREEN
+    return "See Litigation Status -- not a clean read", _FILL_AMBER
+
+
+def _append_executive_summary_kpis(doc, facts: dict, flags: dict) -> None:
+    """Appends the four material-findings cards a reviewer needs inside 60
+    seconds -- Completion Slippage, Units Sold, Litigation Load, Land Title
+    -- extracted from facts this Charter already established (nothing new
+    computed here), each shaded by real severity. Deliberately distinct
+    from the Developer Score/Data Authenticity/Flags/Project Status
+    scorecard, which lives in Overview & Flags -- this card row is about
+    what makes THIS deal specifically notable, not the generic scorecard."""
+    total_units, sold_units = _parse_total_units_and_sold(facts)
+    complaint_count, appeal_count = _parse_complaint_appeal_counts(facts)
+    completion_text, was_extended = _parse_completion_slippage(facts)
+    land_title_text, land_title_fill = _land_title_summary(facts)
+
+    if total_units and sold_units:
+        sold_pct = round(100 * sold_units / total_units, 1)
+        units_text = f"{sold_units:,} / {total_units:,} ({sold_pct}%)"
+        units_fill = _FILL_RED if (was_extended and sold_pct >= _NEAR_SELLOUT_PCT) else _FILL_NEUTRAL
+    else:
+        units_text, units_fill = "Not confirmed", _FILL_NEUTRAL
+
+    if complaint_count is not None and appeal_count is not None:
+        litigation_text = f"{complaint_count} complaints / {appeal_count} appeals"
+        # Colored off this card's own numbers against their own thresholds
+        # -- not off flags["imminent"] in general, which can be entirely
+        # unrelated (e.g. an FSI/BUA gap) and would otherwise paint a
+        # genuinely clean 0/0 record red.
+        if complaint_count > _FLAG_THRESHOLDS["complaint_imminent"] or appeal_count > _FLAG_THRESHOLDS["appeal_imminent"]:
+            litigation_fill = _FILL_RED
+        elif complaint_count > _FLAG_THRESHOLDS["complaint_monitor"] or appeal_count > _FLAG_THRESHOLDS["appeal_monitor"]:
+            litigation_fill = _FILL_AMBER
+        else:
+            litigation_fill = _FILL_GREEN if complaint_count == 0 and appeal_count == 0 else _FILL_NEUTRAL
+    else:
+        litigation_text, litigation_fill = "Not confirmed", _FILL_NEUTRAL
+
+    cards = (
+        ("Completion Slippage", completion_text, _FILL_RED if was_extended else _FILL_NEUTRAL),
+        ("Units Sold", units_text, units_fill),
+        ("Litigation Load", litigation_text, litigation_fill),
+        ("Land Title", land_title_text, land_title_fill),
+    )
+
+    kpi_table = doc.add_table(rows=2, cols=len(cards))
+    _set_table_borders(kpi_table)
+    header_cells = kpi_table.rows[0].cells
+    value_cells = kpi_table.rows[1].cells
+    for i, (label, value, fill) in enumerate(cards):
+        header_cells[i].text = label
+        value_cells[i].text = value
+        _shade_cell(header_cells[i], fill)
+        for para in header_cells[i].paragraphs:
+            for run in para.runs:
+                run.bold = True
+        for para in value_cells[i].paragraphs:
+            for run in para.runs:
+                run.bold = True
+
+    doc.add_paragraph()
+    doc.add_paragraph(
+        "The cards above are the material findings from this Charter's own research -- see Overview & "
+        "Flags below for the full flag detail behind each one."
+    )
+
+
+def _append_overview_section(doc, facts: dict, flags: dict) -> None:
+    """The first substantive thing a reader sees after the title block: a
+    deal snapshot table, the headline KPI scorecard (Developer Score, Data
+    Authenticity, flag counts, project status -- each shaded red/amber/
+    green by its own grade or band), and the full Imminent/Structural/
+    Monitor flag lists from _classify_flags -- each item shown with both
+    its plain-English text and the exact facts.json field it came from,
+    never just a bare label, and colored by severity (red/amber/plain) so
+    risk is visible at a glance. Nothing here is a new data point; it's a
+    new, urgency-ordered arrangement of facts this Charter already
+    established elsewhere."""
+    heading_style = doc.paragraphs[4].style  # a known Heading 1 in the template -- removed from the doc later, but only after every _append_* call finishes
+
+    heading_para = doc.add_paragraph("Overview & Flags")
+    heading_para.style = heading_style
+
+    core = facts.get("rera_core_fields", {}) or {}
+    ci = facts.get("corporate_identity", {}) or {}
+    promoter_name = (ci.get("promoter_name") or {}).get("value", "")
+
+    def _header_row(cells):
+        for cell in cells:
+            _shade_cell(cell, "D9E2F3")
+            for para in cell.paragraphs:
+                for run in para.runs:
+                    run.bold = True
+
+    doc.add_paragraph("Deal snapshot")
+    snapshot_table = doc.add_table(rows=1, cols=2)
+    _set_table_borders(snapshot_table)
+    header_cells = snapshot_table.rows[0].cells
+    header_cells[0].text = "Field"
+    header_cells[1].text = "Value"
+    _header_row(header_cells)
+    for label, key in (
+        ("Project", "project_name"),
+        ("Promoter", None),
+        ("MahaRERA Registration", "registration_number"),
+        ("Project Status", "project_status"),
+        ("Proposed Completion Date", "proposed_completion_date"),
+        ("Total Units", "total_building_units"),
+        ("Litigations on Record", "litigations_per_record"),
+    ):
+        value = promoter_name if key is None else core.get(key, "")
+        row = snapshot_table.add_row()
+        row.cells[0].text = label
+        cell = row.cells[1]
+        cell.text = ""
+        run = cell.paragraphs[0].add_run(str(value or ""))
+        if label == "Proposed Completion Date" and _parse_completion_slippage(facts)[1]:
+            # Only colored when this project's own text documents a real
+            # slippage (original date vs. the extended one(s)) -- an
+            # un-extended date is a plain fact, not a discrepancy, and
+            # must not be colored red just because this field sometimes is.
+            _color_run(run, _TEXT_RED)
+
+    doc.add_paragraph()
+    developer_score = facts.get("developer_score", {}) or {}
+    doc_confidence = facts.get("documentation_confidence_score", {}) or {}
+    imminent_count = len(flags.get("imminent", []))
+    grade = developer_score.get("grade")
+    band = doc_confidence.get("band")
+
+    kpi_table = doc.add_table(rows=2, cols=4)
+    _set_table_borders(kpi_table)
+    header_cells = kpi_table.rows[0].cells
+    for i, label in enumerate(("Developer Score", "Data Authenticity", "Flags (Imminent / Structural / Monitor)", "Project Status")):
+        header_cells[i].text = label
+        for para in header_cells[i].paragraphs:
+            for run in para.runs:
+                run.bold = True
+    value_cells = kpi_table.rows[1].cells
+    value_cells[0].text = f"{grade or 'N/A'} ({developer_score.get('composite', 'N/A')}/100)"
+    value_cells[1].text = f"{band or 'N/A'} ({doc_confidence.get('overall', 'N/A')}/100)"
+    value_cells[2].text = f"{imminent_count} / {len(flags.get('structural', []))} / {len(flags.get('monitor', []))}"
+    value_cells[3].text = str(core.get("project_status", ""))
+    for cell, fill in (
+        (header_cells[0], _grade_fill(grade)),
+        (header_cells[1], _band_fill(band)),
+        (header_cells[2], _FILL_RED if imminent_count else _FILL_GREEN),
+        (header_cells[3], _FILL_NEUTRAL),
+    ):
+        _shade_cell(cell, fill)
+    for cell in value_cells:
+        for para in cell.paragraphs:
+            for run in para.runs:
+                run.bold = True
+
+    doc.add_paragraph()
+    doc.add_paragraph(
+        "Every figure above is drawn directly from the underlying facts already researched for this "
+        "project -- see the flag lists below for detail and the Diligence Appendix for the per-pillar/"
+        "per-check breakdown behind the Developer Score and Data Authenticity figures."
+    )
+
+    def _append_flag_list(title: str, items: list, text_color: str | None) -> None:
+        doc.add_paragraph()
+        list_heading = doc.add_paragraph(f"{title} ({len(items)})")
+        for run in list_heading.runs:
+            run.bold = True
+            if text_color:
+                _color_run(run, text_color)
+        if not items:
+            doc.add_paragraph("None identified this pass.")
+            return
+        for item in items:
+            line = doc.add_paragraph()
+            run = line.add_run(f"• {item['text']} (see {item['field']})")
+            if text_color:
+                _color_run(run, text_color)
+
+    _append_flag_list("Imminent Red Flags -- act on these before proceeding", flags.get("imminent", []), _TEXT_RED)
+    _append_flag_list("Structural Flags -- standing characteristics, raise directly with the developer", flags.get("structural", []), _TEXT_AMBER)
+    _append_flag_list("Monitor Flags -- re-check on a future pass", flags.get("monitor", []), None)
+
+
+def _append_developer_score_section(doc, facts: dict) -> None:
+    """Renders facts["developer_score"] (see _compute_developer_score) as a
+    per-criterion table against the 7-criteria AAA-D industry rubric --
+    silently does nothing if it was never computed (defensive only; the
+    normal pipeline always sets it via _append_overview_section before
+    this is called)."""
+    developer_score = facts.get("developer_score")
+    if not developer_score:
+        return
+
+    heading_style = doc.paragraphs[4].style
+
+    doc.add_page_break()
+    heading_para = doc.add_paragraph("Developer Score (Code-Computed)")
+    heading_para.style = heading_style
+    doc.add_paragraph(
+        f"Composite: {developer_score['composite']}/100 -- Grade {developer_score['grade']}. Scored "
+        "against a fixed 7-criteria industry rubric (track record years, team strength, past area "
+        "developed, area developed within 5km, financial strength/debt structure, past default count, "
+        "entity/organization type), each independently banded AAA/AA/A/B/C/D, then combined by equal "
+        "weight across whatever criteria had underlying data this pass -- a criterion with none is "
+        "explicitly skipped below, never faked as neutral or zero. An imminent-tier flag (see Overview "
+        "& Flags) caps this grade at A regardless of the composite, unless the composite alone already "
+        "bands lower than that."
+    )
+
+    table = doc.add_table(rows=1, cols=5)
+    _set_table_borders(table)
+    header_cells = table.rows[0].cells
+    for i, label in enumerate(("Criterion", "Tier", "Score", "Weight", "Note / Reason")):
+        header_cells[i].text = label
+        _shade_cell(header_cells[i], "D9E2F3")
+        for para in header_cells[i].paragraphs:
+            for run in para.runs:
+                run.bold = True
+    for name, criterion in developer_score.get("criteria", {}).items():
+        row = table.add_row()
+        row.cells[0].text = name.replace("_", " ").title()
+        if criterion.get("score") is None:
+            row.cells[1].text = "N/A"
+            row.cells[2].text = "N/A"
+            row.cells[3].text = "N/A"
+            row.cells[4].text = criterion.get("reason", "")
+        else:
+            row.cells[1].text = criterion["tier"]
+            row.cells[2].text = str(criterion["score"])
+            row.cells[3].text = f"{criterion['weight']}%"
+            row.cells[4].text = criterion.get("note", "")
+
+
+def _append_counterparty_summary(doc, facts: dict) -> None:
+    """A few short, one-line-each summaries of the credit rating,
+    insolvency, company-registration, group-affiliation, and Developer
+    Score checks -- the key figure and nothing more, each pointing to the
+    Diligence Appendix for the full table. Lets Counterparty answer "how
+    strong is this promoter" at a glance without repeating the full detail
+    twice. Silently omits any check that never ran, same as every other
+    _append_*_section here; adds no heading of its own if nothing ran at
+    all (so an empty Counterparty subsection never appears)."""
+    heading_style = doc.paragraphs[9].style  # "Land Identification" -- a known Heading 2
+    heading_added = False
+
+    def _ensure_heading():
+        nonlocal heading_added
+        if not heading_added:
+            heading_para = doc.add_paragraph("Credit Rating, Insolvency & Group Affiliation (Summary)")
+            heading_para.style = heading_style
+            heading_added = True
+
+    credit_check = facts.get("credit_rating_check")
+    if credit_check:
+        _ensure_heading()
+        promoter_result = credit_check.get("promoter") or {}
+        if promoter_result.get("found"):
+            agencies = ", ".join(r["agency"] for r in promoter_result.get("ratings", []))
+            doc.add_paragraph(f"Credit rating: found ({agencies or 'agency unspecified'}) -- see Diligence Appendix for the full instrument/rating detail.")
+        else:
+            doc.add_paragraph(f"Credit rating: {promoter_result.get('note', 'not found')} (full detail in Diligence Appendix).")
+
+    ibbi_check = facts.get("ibbi_insolvency_check")
+    if ibbi_check and ibbi_check.get("found_process") is not None:
+        _ensure_heading()
+        if ibbi_check["found_process"] is False:
+            doc.add_paragraph(f"IBBI insolvency status: clean -- \"{ibbi_check.get('status_text', '')}\" (full detail in Diligence Appendix).")
+        else:
+            doc.add_paragraph("IBBI insolvency status: a record was found against this CIN -- see Diligence Appendix for the raw detail (not auto-classified).")
+
+    profile_check = facts.get("company_profile_check")
+    if profile_check and profile_check.get("found"):
+        _ensure_heading()
+        doc.add_paragraph(
+            f"Company registration: confirmed via ZaubaCorp -- {profile_check.get('status', 'status unknown')}, "
+            f"incorporated {profile_check.get('incorporation_date', 'unknown')} (directors and full detail in Diligence Appendix)."
+        )
+
+    group_check = facts.get("group_companies_check")
+    if group_check and group_check.get("found") and group_check.get("companies"):
+        _ensure_heading()
+        doc.add_paragraph(
+            f"Group affiliation: {len(group_check['companies'])} linked entit(y/ies) via shared directors or "
+            "registered office (full crosswalk in Diligence Appendix)."
+        )
+
+    developer_score = facts.get("developer_score")
+    if developer_score:
+        _ensure_heading()
+        doc.add_paragraph(
+            f"Developer Score: {developer_score['composite']}/100 -- Grade {developer_score['grade']} "
+            "(per-pillar breakdown in Diligence Appendix)."
+        )
 
 
 def _shade_cell(cell, hex_color: str) -> None:
@@ -2483,7 +3764,7 @@ def _add_rating_comparison_table(doc, rating_result: dict) -> None:
     flip between separate mini-sections to compare them."""
     ratings = rating_result.get("ratings", [])
     for r in ratings:
-        doc.add_paragraph(f"Match found ({r['agency']}): {r['company_name']} ({r['url']})")
+        doc.add_paragraph(f"Match found ({r['agency']}): {r['company_name']} ({_clean_source_label(r['url']) or r['url']})")
 
     table = doc.add_table(rows=1, cols=3)
     _set_table_borders(table)
@@ -2576,9 +3857,10 @@ def _append_ibbi_check_section(doc, facts: dict) -> None:
         "guess."
     )
     if check["found_process"] is False:
+        ibbi_citation = _clean_source_label(check.get("url", "")) or check.get("url", "")
         doc.add_paragraph(
             f"Result: \"{check['status_text']}\" -- no insolvency process is recorded against this CIN "
-            f"in IBBI's public database. ({check.get('url', '')})"
+            f"in IBBI's public database. ({ibbi_citation})"
         )
     else:
         doc.add_paragraph(
@@ -2588,7 +3870,7 @@ def _append_ibbi_check_section(doc, facts: dict) -> None:
             "attempt to summarize or classify this content itself:"
         )
         doc.add_paragraph(check.get("status_text", ""))
-        doc.add_paragraph(f"Source: {check.get('url', '')}")
+        doc.add_paragraph(f"Source: {_clean_source_label(check.get('url', '')) or check.get('url', '')}")
 
 
 def _append_company_profile_section(doc, facts: dict) -> None:
@@ -2608,10 +3890,12 @@ def _append_company_profile_section(doc, facts: dict) -> None:
         "Pulled directly from ZaubaCorp's public company record by CIN -- an exact-identifier lookup, "
         "not a name-based guess."
     )
+    profile_citation = _clean_source_label(check.get("url", ""))
     doc.add_paragraph(
         f"{check['name']} ({check['cin']}) -- Status: {check.get('status', 'unknown')}; "
         f"Class: {check.get('class_of_company', 'unknown')}; "
         f"Category: {check.get('company_category', 'unknown')}; ROC: {check.get('roc', 'unknown')}"
+        + (f" ({profile_citation})" if profile_citation else "")
     )
     doc.add_paragraph(f"Incorporated: {check.get('incorporation_date', 'unknown')}")
     doc.add_paragraph(f"Registered address: {check.get('registered_address', 'unknown')}")
@@ -2647,11 +3931,106 @@ def _append_company_profile_section(doc, facts: dict) -> None:
     doc.add_paragraph(f"Source: {check.get('url', '')}")
 
 
+def _build_director_company_links(facts: dict) -> list:
+    """Cross-references company_profile_check's current + past directors
+    against group_companies_check's per-company "shared director: NAME
+    (designation)" basis strings, returning one row per named director --
+    {name, role, tenure, link_count}, sorted by link_count descending.
+    Built entirely from data this Charter already fetched; no new lookup.
+    A director who shows 0 links here genuinely has none among the
+    companies found, not a parsing gap."""
+    from collections import Counter
+
+    cp = facts.get("company_profile_check") or {}
+    gc = facts.get("group_companies_check") or {}
+
+    link_counts = Counter()
+    for company in gc.get("companies") or []:
+        for basis in company.get("basis", []):
+            m = re.match(r"shared director:\s*(.+?)\s*\(", basis)
+            if m:
+                link_counts[" ".join(m.group(1).split())] += 1
+
+    past_sorted = sorted(cp.get("past_directors") or [], key=lambda d: d.get("Cessation") or "", reverse=True)
+    rows, seen = [], set()
+    for status, directors in (("Current", cp.get("current_directors") or []), ("Past", past_sorted)):
+        for d in directors:
+            name = " ".join((d.get("Director Name") or "").split())
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            appointment, cessation = d.get("Appointment Date"), d.get("Cessation")
+            if status == "Current":
+                tenure = f"since {appointment}" if appointment and appointment != "-" else "tenure not confirmed"
+            else:
+                tenure = f"until {cessation}" if cessation and cessation != "-" else "cessation date not confirmed"
+            rows.append({
+                "name": name, "role": f"{status} {d.get('Designation', '')}".strip(),
+                "tenure": tenure, "link_count": link_counts.get(name, 0),
+            })
+    rows.sort(key=lambda r: -r["link_count"])
+    return rows
+
+
+def _render_director_hub_diagram(promoter_name: str, rows: list):
+    """Renders a small hub-and-spoke diagram (promoter at the center, each
+    director with at least one group-company link as a spoke sized by that
+    count) to an in-memory PNG buffer -- returns None if no director has
+    any links (nothing meaningful to draw). The 299 linked companies
+    themselves are deliberately NOT drawn as individual nodes, only counts
+    per director -- a graph with that many nodes would be unreadable, and
+    the point of this diagram is what a reviewer can read in 60 seconds."""
+    linked = [r for r in rows if r["link_count"] > 0]
+    if not linked:
+        return None
+
+    import io
+    import math
+    import textwrap
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(7, 5.6))
+    ax.axis("off")
+    ax.set_xlim(-1.55, 1.55)
+    ax.set_ylim(-1.4, 1.4)
+
+    max_count = max(r["link_count"] for r in linked)
+    n = len(linked)
+    # Offset the first spoke away from due-east/due-west so no line runs
+    # straight through the horizontal midline the center label sits on.
+    angle_offset = math.pi / n
+    for i, r in enumerate(linked):
+        angle = angle_offset + 2 * math.pi * i / n
+        x, y = math.cos(angle), math.sin(angle)
+        weight = r["link_count"] / max_count
+        ax.plot([0, x], [0, y], color="#BF8F00", linewidth=1 + 3 * weight, zorder=1)
+        ax.scatter([x], [y], s=400 + 2200 * weight, color="#FFE699", edgecolor="#BF8F00", zorder=2)
+        ax.text(x * 1.22, y * 1.22, f"{r['name']}\n({r['link_count']} linked)", ha="center", va="center", fontsize=7.5, zorder=4)
+
+    # Drawn after the spokes (not before) so the center disc fully covers
+    # every line's inner end rather than the lines drawing over its edge.
+    ax.scatter([0], [0], s=4200, color="#2E74B5", zorder=3)
+    ax.text(0, 0, textwrap.fill(promoter_name, width=14), ha="center", va="center", color="white", fontsize=7.5, fontweight="bold", zorder=4)
+
+    plt.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
 def _append_group_companies_section(doc, facts: dict) -> None:
     """Appends a section listing companies linked to the promoter via
     shared directors or a shared registered office (see
-    find_group_companies_by_cin). Silently does nothing if
-    group_companies_check was never set or found nothing."""
+    find_group_companies_by_cin), led by a director relationship map (a
+    compact table plus a hub-and-spoke diagram) so a reviewer can read how
+    concentrated the group's leadership is without scanning all 299 rows.
+    Silently does nothing if group_companies_check was never set or found
+    nothing."""
     check = facts.get("group_companies_check")
     if not check or not check.get("found") or not check.get("companies"):
         return
@@ -2667,6 +4046,42 @@ def _append_group_companies_section(doc, facts: dict) -> None:
         "relationship -- rather than being inferred from a name or industry match. The strength of each "
         "link should be judged from the basis given, not assumed uniform across the list."
     )
+
+    director_rows = _build_director_company_links(facts)
+    if any(r["link_count"] for r in director_rows):
+        sub_heading = doc.add_paragraph("Director Relationship Map")
+        for run in sub_heading.runs:
+            run.bold = True
+        doc.add_paragraph(
+            "Each of this promoter's directors, current or past, cross-referenced against how many of "
+            "the group companies below name them as a shared director -- collapses the 299-entity list "
+            "to the thing that actually matters here: how concentrated the group's leadership is around "
+            "a small number of individuals, not a name-by-name read of every affiliated entity."
+        )
+        dir_table = doc.add_table(rows=1, cols=3)
+        _set_table_borders(dir_table)
+        header_cells = dir_table.rows[0].cells
+        for i, label in enumerate(("Director", "Role at This Promoter", "Group Companies Linked (of 299)")):
+            header_cells[i].text = label
+            _shade_cell(header_cells[i], "D9E2F3")
+            for p in header_cells[i].paragraphs:
+                for run in p.runs:
+                    run.bold = True
+        for r in director_rows:
+            row = dir_table.add_row()
+            row.cells[0].text = r["name"]
+            row.cells[1].text = f"{r['role']} ({r['tenure']})"
+            row.cells[2].text = str(r["link_count"])
+
+        promoter_name = ((facts.get("corporate_identity") or {}).get("promoter_name") or {}).get("value") or "This promoter"
+        diagram_buf = _render_director_hub_diagram(promoter_name, director_rows)
+        if diagram_buf is not None:
+            from docx.shared import Inches
+
+            doc.add_paragraph()
+            doc.add_picture(diagram_buf, width=Inches(6))
+
+        doc.add_paragraph()
 
     table = doc.add_table(rows=1, cols=3)
     _set_table_borders(table)
@@ -2875,7 +4290,7 @@ def _append_authenticity_page(doc, facts: dict) -> None:
     # existing heading). Reusing the actual style OBJECT already applied to
     # an existing Heading-1 paragraph in this same document sidesteps the
     # name-lookup mismatch entirely.
-    heading_style = doc.paragraphs[4].style  # "Methodology Note" -- a known Heading 1 in the template
+    heading_style = doc.paragraphs[4].style  # a known Heading 1 in the template -- removed from the doc later, but only after every _append_* call finishes
 
     doc.add_page_break()
     heading_para = doc.add_paragraph("Documentation Authenticity & Confidence Summary")
@@ -3074,6 +4489,7 @@ def run_company_charter(
     complaint_orders_dir: str | None = None,
     reviews: list | None = None,
     review_source_label: str | None = None,
+    promoter_portfolio: dict | None = None,
 ) -> tuple[str, dict]:
     """Returns (out_path, facts) -- facts is the complete, code-and-model
     -assembled Charter data (same content as the .facts.json written
@@ -3108,6 +4524,14 @@ def run_company_charter(
     facts = _verify_material_claims(facts)
     facts = _check_document_grounding(facts, extracted_docs, category_data, documents_manifest)
     facts["document_library"] = doc_library_status  # always the full, code-computed list -- not model-generated
+    if promoter_portfolio is not None:
+        # Also code-computed, never model-authored -- same reasoning as
+        # document_library above: the promoter's cross-project track record
+        # (see promoter_portfolio.build_promoter_portfolio) is already a
+        # deterministic MahaRERA-only computation by the time it reaches
+        # here, so it's attached as-is rather than re-derived or
+        # paraphrased by the model.
+        facts["promoter_portfolio"] = promoter_portfolio
     if complaint_orders_manifest and complaint_orders_dir:
         # Also code-computed, never model-authored -- the same reasoning as
         # document_library above: a real per-complaint outcome breakdown

@@ -94,6 +94,20 @@ def parse_args() -> argparse.Namespace:
         default=config.OUTPUT_ROOT,
         help=f"Root output directory (default: {config.OUTPUT_ROOT})",
     )
+    parser.add_argument(
+        "--project-id",
+        default=None,
+        help=(
+            "Skip the public search-box resolution step entirely and use this internal "
+            "numeric project ID directly -- for when MahaRERA's own search page returns "
+            "'No Records Found' for a registration number that demonstrably still exists "
+            "(confirmed live: the direct getProjectGeneralDetailsByProjectId API can still "
+            "return full data for a project the search box can't currently find -- a site-"
+            "side search-index gap, not a sign the project itself is gone). Only meaningful "
+            "when `query` is a registration number, since that's the only case this script "
+            "would otherwise need to resolve via search."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -105,9 +119,14 @@ def _describe(c: "resolver.ProjectCandidate") -> str:
     return " ".join(bits)
 
 
-def _resolve(query: str, headed: bool) -> tuple[str, str, str]:
+def _resolve(query: str, headed: bool, project_id_override: str | None = None) -> tuple[str, str, str]:
     """Returns (project_id, detail_url, reg_no_for_output_dir)."""
     is_reg_no = bool(re.match(r"^P\d{11}$", query, re.IGNORECASE))
+
+    if is_reg_no and project_id_override:
+        detail_url = config.DETAIL_VIEW_URL_TEMPLATE.format(project_id_override)
+        print(f"[INFO] Skipping search resolution -- using supplied project ID {project_id_override} directly ({detail_url})")
+        return project_id_override, detail_url, query
 
     if is_reg_no:
         print(f"[INFO] Resolving project ID for {query} via public search (no login)...")
@@ -213,7 +232,7 @@ def main() -> int:
     args = parse_args()
     query = args.query.strip()
 
-    project_id, detail_url, reg_no = _resolve(query, headed=args.headed)
+    project_id, detail_url, reg_no = _resolve(query, headed=args.headed, project_id_override=args.project_id)
 
     token, auth_source = ensure_token(project_id, args.token, args.no_auto_auth, args.captcha_timeout)
     print(f"[INFO] Auth source: {_AUTH_SOURCE_LABELS[auth_source]}")
@@ -318,7 +337,8 @@ def main() -> int:
         try:
             with requests.Session() as portfolio_session:
                 portfolio = promoter_portfolio_mod.build_promoter_portfolio(
-                    promoter_name, portfolio_session, token, headless=not args.headed
+                    promoter_name, portfolio_session, token, headless=not args.headed,
+                    subject_project_partners_data=category_data.get("partners"), subject_reg_no=reg_no,
                 )
             promoter_dir = os.path.join(project_out_dir, "promoter")
             os.makedirs(promoter_dir, exist_ok=True)
@@ -367,7 +387,7 @@ def main() -> int:
         charter_path, charter_facts = company_charter.run_company_charter(
             reg_no, category_data, documents_manifest, documents_dir, research_data, args.output_dir,
             complaint_orders_manifest=complaint_orders_manifest, complaint_orders_dir=complaint_orders_dir,
-            reviews=reviews,
+            reviews=reviews, promoter_portfolio=portfolio,
         )
         print(f"[OK] Company Charter written to {charter_path}")
     except Exception as e:
