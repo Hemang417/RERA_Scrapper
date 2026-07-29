@@ -1955,7 +1955,41 @@ def run_cts_land_lookup(facts: dict, reg_no: str, output_dir: str = config.OUTPU
     Silently returns facts unchanged if that file is absent -- the ordinary
     case for every automated run. When present, opens a visible browser and
     blocks for up to CAPTCHA_TIMEOUT_SECONDS waiting for a human to solve
-    the CAPTCHA (see mahabhumi.fetch_property_card)."""
+    the CAPTCHA (see mahabhumi.fetch_property_card).
+
+    Checked FIRST, before any of that: output/<reg_no>/land_record_carryover
+    .json -- written by attach_rera_number when a CTS number reached this
+    pipeline before this reg_no did (see run_cts_lookup_standalone). If
+    present, its already-fetched cts_land_record_check is reused directly
+    (no new browser/CAPTCHA needed), and its CTS number is cross-checked
+    against this Charter's own RERA-sourced survey_cts_plot_numbers -- a
+    genuine mismatch is recorded as facts["cts_mismatch_note"], which
+    _classify_flags promotes to an IMMINENT flag (not a buried gap): a
+    developer-supplied CTS not matching RERA's own official record is
+    exactly the kind of discrepancy the investment team should be able to
+    question the developer about directly, not have it read past unnoticed
+    in a gaps list."""
+    carryover_path = os.path.join(output_dir, reg_no, "land_record_carryover.json")
+    if os.path.exists(carryover_path):
+        with open(carryover_path, "r", encoding="utf-8") as f:
+            carryover = json.load(f)
+
+        recorded_cts = ((facts.get("land_identification", {}).get("survey_cts_plot_numbers") or {}).get("value") or "")
+        carryover_cts = carryover.get("cts_number", "")
+        if recorded_cts and carryover_cts and carryover_cts not in recorded_cts:
+            facts["cts_mismatch_note"] = (
+                f"CTS number mismatch: the CTS/plot number supplied before this project's RERA number was "
+                f"known ({carryover_cts!r}, from {carryover.get('village', 'an unspecified village')}) does not "
+                f"appear in this Charter's own RERA-sourced survey_cts_plot_numbers ({recorded_cts!r}) -- "
+                f"confirm with the developer directly whether these refer to the same plot before trusting "
+                f"either record."
+            )
+
+        facts["cts_land_record_check"] = carryover.get("cts_land_record_check", {"found": False, "note": "carryover record had no cts_land_record_check"})
+        facts.setdefault("sources", []).extend(carryover.get("sources", []))
+        facts.setdefault("gaps", []).extend(carryover.get("gaps", []))
+        return facts
+
     input_path = os.path.join(output_dir, reg_no, "cts_lookup_input.json")
     if not os.path.exists(input_path):
         return facts
@@ -4685,6 +4719,13 @@ def _classify_flags(facts: dict) -> dict:
             "field": "land_identification.survey_cts_plot_numbers",
         })
 
+    # 2b. CTS mismatch between a pre-RERA carryover intake and this
+    # Charter's own RERA-sourced record -- see run_cts_land_lookup's
+    # carryover path. A real discrepancy here, not an absence, so it's
+    # always imminent regardless of whether check #2 above also fired.
+    if facts.get("cts_mismatch_note"):
+        imminent.append({"text": facts["cts_mismatch_note"], "field": "cts_mismatch_note"})
+
     # 3. CIN/LLPIN
     cin_llpin_text = (corp.get("cin_llpin") or {}).get("value", "") or ""
     if not extract_cin(cin_llpin_text) and not extract_llpin(cin_llpin_text):
@@ -6499,6 +6540,92 @@ def run_promoter_intake(cin: str, company_name: str = "", output_dir: str = conf
     return record
 
 
+# ---------------------------------------------------------------------------
+# Phase 3: attaching a pending CIN/CTS-only case to a RERA number once one
+# becomes known for that same promoter/plot. This is an explicit action
+# (never auto-matched/guessed -- same "a human confirms the link, this
+# never fuzzy-matches" policy as every other identifier-linking decision in
+# this file) that copies the pending case's already-fetched records into
+# the reg_no-keyed output tree under fixed, predictable filenames
+# (promoter_profile_carryover.json / land_record_carryover.json) --
+# run_company_charter/run_cts_land_lookup check for those specific
+# filenames (see below) to reuse this data instead of re-fetching, and
+# run_cts_land_lookup's carryover path also runs the CTS cross-check that
+# promotes a genuine mismatch to an imminent flag (see _classify_flags).
+# ---------------------------------------------------------------------------
+
+def attach_rera_number(case_id: str, reg_no: str, output_dir: str = config.OUTPUT_ROOT) -> dict:
+    """Copies whatever promoter_profile.json/land_record.json exist under
+    output/_pending/<case_id>/ into output/<reg_no>/ as *_carryover.json --
+    copies, not moves, so the original pending case stays intact if the
+    same CIN/CTS case later needs attaching to a DIFFERENT reg_no too (a
+    promoter's CIN, in particular, can legitimately apply to more than one
+    of their projects).
+
+    Returns {"attached": bool, "case_id", "reg_no", "had_promoter_profile",
+    "had_land_record", "note"} -- attached is False (with a note, not an
+    exception) if the pending case directory doesn't exist or has neither
+    file, since a typo'd case_id here should surface as an honest "nothing
+    to attach" rather than silently doing nothing indistinguishable from
+    success."""
+    pending_dir = os.path.join(output_dir, "_pending", case_id)
+    if not os.path.isdir(pending_dir):
+        return {
+            "attached": False, "case_id": case_id, "reg_no": reg_no,
+            "had_promoter_profile": False, "had_land_record": False,
+            "note": f"No pending case directory found at {pending_dir}",
+        }
+
+    promoter_profile_path = os.path.join(pending_dir, "promoter_profile.json")
+    land_record_path = os.path.join(pending_dir, "land_record.json")
+    had_promoter_profile = os.path.exists(promoter_profile_path)
+    had_land_record = os.path.exists(land_record_path)
+
+    if not had_promoter_profile and not had_land_record:
+        return {
+            "attached": False, "case_id": case_id, "reg_no": reg_no,
+            "had_promoter_profile": False, "had_land_record": False,
+            "note": f"{pending_dir} exists but has neither promoter_profile.json nor land_record.json",
+        }
+
+    project_dir = os.path.join(output_dir, reg_no)
+    os.makedirs(project_dir, exist_ok=True)
+    if had_promoter_profile:
+        shutil.copy2(promoter_profile_path, os.path.join(project_dir, "promoter_profile_carryover.json"))
+    if had_land_record:
+        shutil.copy2(land_record_path, os.path.join(project_dir, "land_record_carryover.json"))
+
+    return {
+        "attached": True, "case_id": case_id, "reg_no": reg_no,
+        "had_promoter_profile": had_promoter_profile, "had_land_record": had_land_record,
+        "note": f"Copied from {pending_dir} into {project_dir}",
+    }
+
+
+def _load_promoter_carryover(facts: dict, output_dir: str, reg_no: str) -> bool:
+    """If output/<reg_no>/promoter_profile_carryover.json exists (written by
+    attach_rera_number), loads its 4 checks directly into `facts` and
+    returns True -- callers use this to skip re-running the equivalent live
+    CIN-based checks. Straight dict assignment, not a merge: the carryover
+    record was built with the exact same keys/source shape those checks
+    themselves produce (see run_promoter_intake's own docstring), so
+    nothing here needs reshaping. Returns False (facts untouched) when no
+    carryover file exists -- the ordinary case for every project that had
+    its RERA number from the start."""
+    carryover_path = os.path.join(output_dir, reg_no, "promoter_profile_carryover.json")
+    if not os.path.exists(carryover_path):
+        return False
+
+    with open(carryover_path, "r", encoding="utf-8") as f:
+        carryover = json.load(f)
+    for key in ("company_profile_check", "ibbi_insolvency_check", "group_companies_check", "credit_rating_check"):
+        if key in carryover:
+            facts[key] = carryover[key]
+    facts.setdefault("sources", []).extend(carryover.get("sources", []))
+    facts.setdefault("gaps", []).extend(carryover.get("gaps", []))
+    return True
+
+
 def run_company_charter(
     reg_no: str,
     category_data: dict,
@@ -6575,17 +6702,20 @@ def run_company_charter(
 
     project_name_for_judgments = (facts.get("rera_core_fields", {}) or {}).get("project_name", "")
 
+    used_promoter_carryover = _load_promoter_carryover(facts, output_dir, reg_no)
+
     # All 5 checks below hit different external sites and don't depend on
     # each other -- run them concurrently rather than one after another
     # (see the module note above _safe_credit_rating). Each is gated on the
     # same input-availability condition the sequential version used, so a
     # check is simply never submitted (not run at all, not run-and-discarded)
-    # when e.g. no CIN/LLPIN was extractable.
+    # when e.g. no CIN/LLPIN was extractable -- or, now, when a carryover
+    # profile above already answered it.
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         futures = {}
-        if promoter_name_for_rating:
+        if promoter_name_for_rating and not used_promoter_carryover:
             futures["rating"] = executor.submit(_safe_credit_rating, promoter_name_for_rating)
-        if corp_identifier:
+        if corp_identifier and not used_promoter_carryover:
             futures["ibbi"] = executor.submit(_safe_ibbi_check, corp_identifier)
             futures["profile"] = executor.submit(_safe_company_profile, corp_identifier, promoter_name_for_rating)
             futures["group"] = executor.submit(_safe_group_companies, corp_identifier)
