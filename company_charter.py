@@ -2458,6 +2458,44 @@ def _remove_paragraph(paragraph) -> None:
     p_element.getparent().remove(p_element)
 
 
+# --- doc_variant consolidation primitives --------------------------------
+# A whole session's worth of "if doc_variant == external: SHORT else: LONG"
+# blocks accumulated across _fill_template and the _append_*_section
+# functions -- each written by hand, each a fresh chance to bypass
+# _externalize_prose or the paragraph-removal convention by accident (two
+# real bugs this session came from exactly that: a KPI-card cell and a
+# Documentation-Confidence score run that skipped the usual helper and
+# wrote text some other way). These three primitives are the ONE path every
+# variant-aware call site should now go through, so a future field is
+# structurally unable to bypass them the way those two did.
+
+def _variant(facts: dict, internal_value, external_value):
+    """Returns `external_value` for the External variant, `internal_value`
+    otherwise. The one place doc_variant branching happens for a plain
+    value -- every other helper below is built on this."""
+    return external_value if facts.get("_doc_variant") == "external" else internal_value
+
+
+def _variant_paragraph(doc, facts: dict, internal_text: str, external_text: str):
+    """Appends one paragraph with different text per variant. Replaces the
+    ~8 scattered "if variant == external: doc.add_paragraph(SHORT) else:
+    doc.add_paragraph(LONG)" blocks this session added to the Credit
+    Rating/Insolvency/Company Registration/Group Companies/Developer
+    Score/Documentation Confidence sections -- always routes through
+    doc.add_paragraph, which is itself monkey-patched to run
+    _externalize_prose for External (see _fill_template), so this can't
+    silently skip that step the way a stray direct .add_run() could."""
+    return doc.add_paragraph(_variant(facts, internal_text, external_text))
+
+
+def _variant_sep(facts: dict) -> str:
+    """The ":" vs " -- " choice repeated at every dynamic-value call site
+    (a score, a grade, a CIN) where the surrounding dash can't be reached
+    by the literal-text _EXTERNAL_DASH_REWRITES dict because a variable
+    sits right where the dash does."""
+    return _variant(facts, " --", ":")
+
+
 def _fix_bullet_hanging_indent(doc) -> None:
     """The template's own numbering.xml defines the bullet list every
     "List Paragraph" in this document uses (abstractNum id 2, referenced by
@@ -2614,42 +2652,12 @@ def _fill_template(reg_no: str, facts: dict, out_path: str, doc_variant: str = "
     _set_paragraph_text(p[1], f'Project: {core.get("project_name", "[Unknown]")} | Promoter: {fld(ci, "promoter_name") or "[Unknown]"}')
     _set_paragraph_text(p[2], "Public Web-Sourced Edition -- Adapted for Maharashtra (MahaRERA)")
     _month_year = datetime.now().strftime('%B %Y')
-    if doc_variant == "external":
-        _set_paragraph_text(p[3], f"Deep Market Research (Prepared {_month_year})")
-    else:
-        _set_paragraph_text(p[3], f"Deep Market Research -- Prepared {_month_year}")
+    _set_paragraph_text(p[3], f"Deep Market Research (Prepared {_month_year})" if doc_variant == "external" else f"Deep Market Research -- Prepared {_month_year}")
     _set_paragraph_text(p[5], facts["methodology_note"])
     _set_paragraph_text(p[7], facts["executive_summary"])
-    if facts.get("_doc_variant") == "external":
-        # Both are QA cross-check narrations ("we compared N sources and
-        # they agree/disagree") -- an actual disagreement worth knowing
-        # about already surfaces as a flag or gap elsewhere; as standalone
-        # paragraphs these only restate facts already sitting in the
-        # Corporate Identity table below (CIN, registered office, entity
-        # type, partner/director names) while adding audit-trail detail
-        # ("independently retrieved", "fully corroborated") that documents
-        # this pipeline's own research process, not the promoter. Internal
-        # keeps both in full -- that process detail IS the point there.
-        # Deleted outright (not just emptied) so no blank bullet/line is
-        # left behind in these template slots.
-        _paragraphs_to_remove.append(p[13])
-        _paragraphs_to_remove.append(p[12])
-    else:
-        _set_paragraph_text(p[12], facts["address_discrepancy_note"])
-        _set_paragraph_text(p[13], facts["corporate_registry_cross_check"])
     litigation_citation = _citation_text(facts, _clean_source_label(src(facts, "litigation_status")))
     litigation_text = fld(facts, "litigation_status")
     _set_paragraph_text(p[15], f"{litigation_text} {litigation_citation}" if litigation_citation else litigation_text)
-    if facts.get("_doc_variant") == "external":
-        # Both lines are pure measurement-methodology caveats (no map was
-        # plotted; distances are estimated from the locality, not an exact
-        # pin) -- no decision-relevant content for a reader who has the
-        # actual Distances table right below. Internal keeps both in full.
-        _paragraphs_to_remove.append(p[18])
-        _paragraphs_to_remove.append(p[17])
-    else:
-        _set_paragraph_text(p[17], _cite(facts["location_coordinates_note"], "distance", facts=facts))
-        _set_paragraph_text(p[18], "Map screenshot not embedded -- a live map cannot be fetched programmatically, so distances below were sourced from mapping-service queries instead (see Sources).")
     _set_paragraph_text(p[24], _cite(f"Road: {conn.get('road', '')}", "distance", facts=facts))
     _set_paragraph_text(p[25], _cite(f"Rail: {conn.get('rail', '')}", "distance", facts=facts))
     _set_paragraph_text(p[26], _cite(f"Metro: {conn.get('metro', '')}", "distance", facts=facts))
@@ -2657,25 +2665,8 @@ def _fill_template(reg_no: str, facts: dict, out_path: str, doc_variant: str = "
     _set_paragraph_text(p[30], facts["social_infrastructure"])
     _set_paragraph_text(p[32], facts["fsi_governing_framework"])
     _set_paragraph_text(p[33], facts["fsi_interpretation"])
-    if facts.get("_doc_variant") == "external":
-        # Every MahaRERA-registered project is governed by the same Act by
-        # definition -- this line is identical across every Charter this
-        # pipeline produces, so it carries no signal about THIS project.
-        # Deleted, not emptied, so its bullet doesn't render blank.
-        _paragraphs_to_remove.append(p[36])
-    else:
-        _set_paragraph_text(p[36], _cite(f"Governing act: {rs.get('governing_act', '')}", "project_registration", facts=facts))
     _set_paragraph_text(p[37], _cite(f"Planning approval sequence: {rs.get('planning_approval_sequence', '')}", "project_registration", facts=facts))
     allotment_text = f"Allotment mechanics: {rs.get('allotment_mechanics', '')}"
-    if facts.get("_doc_variant") == "external" and _externalize_prose(facts, allotment_text) == "":
-        # Only the generic "nothing special disclosed" boilerplate is
-        # suppressed by _EXTERNAL_PROSE_SUBSTITUTIONS (checked here so an
-        # actually-unusual allotment mechanism, which wouldn't match that
-        # exact phrase, still renders normally) -- delete outright rather
-        # than leave a blank bullet.
-        _paragraphs_to_remove.append(p[38])
-    else:
-        _set_paragraph_text(p[38], allotment_text)
     _set_paragraph_text(p[41], rc.get("registration_summary", ""))
     _set_paragraph_text(p[42], f"Collection Account of the Project (100%): {rc.get('collection_account', '')}")
     _set_paragraph_text(p[43], f"Separate/Transaction RERA escrow sub-accounts: {rc.get('escrow_subaccounts', '')}")
@@ -2687,24 +2678,59 @@ def _fill_template(reg_no: str, facts: dict, out_path: str, doc_variant: str = "
     _set_paragraph_text(p[51], _cite(f"Professionals of record: {lp.get('professionals_of_record', '')}", "project_registration", facts=facts))
     _set_paragraph_text(p[54], _cite(facts["micro_market_overview"], "pricing", "market_trend", facts=facts))
     _set_paragraph_text(p[56], _cite(facts["area_intelligence_trend"], "market_trend", "pricing", facts=facts))
-    if facts.get("_doc_variant") == "external":
-        # A sourcing/methodology note ("where did this data come from"),
-        # not a project fact -- suppressed the same way as the other pure
-        # process notes above.
-        _paragraphs_to_remove.append(p[58])
-    else:
-        _set_paragraph_text(p[58], facts.get("rera_scraping_note", f"Extracted directly from the live MahaRERA public project page for registration number {reg_no}."))
     _set_paragraph_text(p[61], _cite(facts["unit_summary_note"], "project_registration", facts=facts))
-    if facts.get("_doc_variant") == "external":
-        # documents_reviewed_note is "which files I personally opened vs.
-        # just confirmed present" -- research-scope bookkeeping, not a
-        # project fact. documents_absent_note stays (a real "was anything
-        # missing" answer matters to a reader), but its own methodology
-        # tail gets trimmed by _EXTERNAL_PROSE_SUBSTITUTIONS below.
-        _paragraphs_to_remove.append(p[63])
-    else:
-        _set_paragraph_text(p[63], facts["documents_reviewed_note"])
     _set_paragraph_text(p[64], facts["documents_absent_note"])
+
+    # Every entry below is "one template paragraph, either rendered with its
+    # Internal text or deleted outright for External" -- previously ~7
+    # separate hand-written if/else blocks, each a fresh chance to bypass
+    # _set_paragraph_text or the removal convention by accident. text_fn is
+    # LAZY (only called when actually used) so a _cite(...) call never
+    # registers a citation for a paragraph about to be deleted -- the exact
+    # behavior the original if/else blocks had by construction. suppress_fn
+    # defaults to "always suppress for External"; only the Allotment
+    # mechanics row overrides it, since only its generic "nothing special
+    # disclosed" boilerplate should disappear, not a genuinely unusual
+    # mechanism that happens to land in the same slot.
+    _always_suppress = lambda _facts: True
+    _external_suppressed_paragraphs = (
+        # (index, text_fn(facts) -> str, suppress_for_external_fn(facts) -> bool, why)
+        (12, lambda f: f["address_discrepancy_note"], _always_suppress),
+        (13, lambda f: f["corporate_registry_cross_check"], _always_suppress),
+        (17, lambda f: _cite(f["location_coordinates_note"], "distance", facts=f), _always_suppress),
+        (18, lambda f: "Map screenshot not embedded -- a live map cannot be fetched programmatically, so distances below were sourced from mapping-service queries instead (see Sources).", _always_suppress),
+        (36, lambda f: _cite(f"Governing act: {rs.get('governing_act', '')}", "project_registration", facts=f), _always_suppress),
+        (38, lambda f: allotment_text, lambda f: _externalize_prose(f, allotment_text) == ""),
+        (58, lambda f: f.get("rera_scraping_note", f"Extracted directly from the live MahaRERA public project page for registration number {reg_no}."), _always_suppress),
+        (63, lambda f: f["documents_reviewed_note"], _always_suppress),
+    )
+    # Why each is suppressed for External (kept here, once, rather than
+    # repeated as a comment on every removed if/else block above):
+    #   12/13 -- QA cross-check narrations ("we compared N sources and they
+    #     agree/disagree"); a real disagreement already surfaces as a flag
+    #     or gap elsewhere, and these two otherwise just restate facts
+    #     already in the Corporate Identity table (CIN, registered office,
+    #     entity type, partner/director names) plus audit-trail detail
+    #     ("independently retrieved", "fully corroborated") about this
+    #     pipeline's own research process, not the promoter.
+    #   17/18 -- pure measurement-methodology caveats (no map was plotted;
+    #     distances are estimated from the locality, not an exact pin) --
+    #     no decision-relevant content given the actual Distances table
+    #     right below.
+    #   36 -- every MahaRERA-registered project is governed by the same Act
+    #     by definition; carries no signal about THIS project.
+    #   38 -- see suppress_fn above.
+    #   58 -- a sourcing/methodology note ("where did this data come
+    #     from"), not a project fact.
+    #   63 -- "which files I personally opened vs. just confirmed present"
+    #     is research-scope bookkeeping, not a project fact.
+    # Internal keeps every one of these in full -- that process detail IS
+    # the point there.
+    for _idx, _text_fn, _suppress_fn in _external_suppressed_paragraphs:
+        if doc_variant == "external" and _suppress_fn(facts):
+            _paragraphs_to_remove.append(p[_idx])
+        else:
+            _set_paragraph_text(p[_idx], _text_fn(facts))
 
     gaps = facts.get("gaps", [])
     if facts.get("_doc_variant") == "external":
@@ -5037,14 +5063,11 @@ def _append_overview_section(doc, facts: dict, flags: dict) -> None:
             return
         for item in items:
             line = doc.add_paragraph()
-            if facts.get("_doc_variant") == "external":
-                # "(see gaps[0])" / "(see rera_core_fields.litigations_per_record)"
-                # are raw internal facts.json paths -- meaningless (and
-                # unprofessional-looking) to a client, so External drops the
-                # annotation entirely rather than trying to reword it.
-                raw_text = f"• {item['text']}"
-            else:
-                raw_text = f"• {item['text']} (see {item['field']})"
+            # "(see gaps[0])" / "(see rera_core_fields.litigations_per_record)"
+            # are raw internal facts.json paths -- meaningless (and
+            # unprofessional-looking) to a client, so External drops the
+            # annotation entirely rather than trying to reword it.
+            raw_text = _variant(facts, f"• {item['text']} (see {item['field']})", f"• {item['text']}")
             run = line.add_run(_externalize_prose(facts, raw_text))
             if text_color:
                 _color_run(run, text_color)
@@ -5069,15 +5092,9 @@ def _append_developer_score_section(doc, facts: dict) -> None:
     doc.add_page_break()
     heading_para = doc.add_paragraph(_external_heading(facts, "Developer Score (Code-Computed)"))
     heading_para.style = heading_style
-    if facts.get("_doc_variant") == "external":
-        doc.add_paragraph(
-            f"Composite: {developer_score['composite']}/100 (Grade {developer_score['grade']}), scored "
-            "across Operational Strength (50%), Financial Strength (20%), and Governance Strength (30%). "
-            "A grade below A signals either weak fundamentals or gaps in public disclosure that could not "
-            "be scored."
-        )
-    else:
-        doc.add_paragraph(
+    _variant_paragraph(
+        doc, facts,
+        internal_text=(
             f"Composite: {developer_score['composite']}/100 -- Grade {developer_score['grade']}. Scored "
             "against a fixed 3-bucket rubric -- Operational Strength (50%: Team Strength, Influence in "
             "Micromarket, Past Experience - Area, Track Record, 12.5% each), Financial Strength (20%: debt "
@@ -5089,7 +5106,14 @@ def _append_developer_score_section(doc, facts: dict) -> None:
             "being scored purely on the strength of whatever little is known. An imminent-tier flag (see "
             "Overview & Flags) caps the grade at A regardless of the composite, unless the composite alone "
             "already bands lower than that."
-        )
+        ),
+        external_text=(
+            f"Composite: {developer_score['composite']}/100 (Grade {developer_score['grade']}), scored "
+            "across Operational Strength (50%), Financial Strength (20%), and Governance Strength (30%). "
+            "A grade below A signals either weak fundamentals or gaps in public disclosure that could not "
+            "be scored."
+        ),
+    )
 
     # External drops the Weight column -- the bucket/composite explanation
     # above already covers how scoring works, and a numeric weight per row
@@ -5151,7 +5175,7 @@ def _append_counterparty_summary(doc, facts: dict) -> None:
     # right where a literal dash would be, so a fixed dict/regex substitution
     # can't reach it -- this separator is built once and spliced in instead.
     # Internal keeps " -- " exactly as before; External gets ":".
-    _sep = ":" if facts.get("_doc_variant") == "external" else " --"
+    _sep = _variant_sep(facts)
 
     credit_check = facts.get("credit_rating_check")
     if credit_check:
@@ -5239,24 +5263,24 @@ def _append_complaint_outcomes_section(doc, facts: dict) -> None:
     heading_style = doc.paragraphs[4].style
 
     doc.add_page_break()
-    heading_text = "Complaint Order Outcomes" if facts.get("_doc_variant") == "external" else "Complaint Order Outcomes (Code-Extracted)"
-    heading_para = doc.add_paragraph(heading_text)
+    heading_para = doc.add_paragraph(_variant(facts, "Complaint Order Outcomes (Code-Extracted)", "Complaint Order Outcomes"))
     heading_para.style = heading_style
-    if facts.get("_doc_variant") == "external":
-        doc.add_paragraph(
-            "Each outcome below is classified directly from the complaint's own order PDF, not "
-            "self-reported. \"Not determinable\" means the classifier couldn't tell from the text; "
-            "it is not a claim the complaint was resolved either way."
-        )
-    else:
-        doc.add_paragraph(
+    _variant_paragraph(
+        doc, facts,
+        internal_text=(
             "Each row below reflects the actual order PDF already on file for that complaint (downloaded "
             "via the same document-retrieval mechanism used for project documents), classified by a small, "
             "named set of outcome keywords -- not a self-reported summary. An outcome of \"not determinable\" "
             "means the extracted text didn't match any of those keywords; it is not a claim that the "
             "complaint was resolved favourably or unfavourably, only that the automated classification "
             "could not tell from the text available."
-        )
+        ),
+        external_text=(
+            "Each outcome below is classified directly from the complaint's own order PDF, not "
+            "self-reported. \"Not determinable\" means the classifier couldn't tell from the text; "
+            "it is not a claim the complaint was resolved either way."
+        ),
+    )
 
     table = doc.add_table(rows=1, cols=2)
     _set_table_borders(table)
@@ -5332,10 +5356,9 @@ def _append_credit_rating_section(doc, facts: dict) -> None:
     doc.add_page_break()
     heading_para = doc.add_paragraph(_external_heading(facts, "Credit Rating Check (Code-Computed)"))
     heading_para.style = heading_style
-    if facts.get("_doc_variant") == "external":
-        doc.add_paragraph("Checked against ICRA and Infomerics for a rating under the promoter's exact legal name.")
-    else:
-        doc.add_paragraph(
+    _variant_paragraph(
+        doc, facts,
+        internal_text=(
             "Checked directly against every rating agency's public database (currently ICRA and Infomerics) "
             "for an exact match on the promoter's own legal name -- not a fuzzy or \"probably the same "
             "company\" guess, since attributing a rating to the wrong legal entity would itself be a serious "
@@ -5344,7 +5367,9 @@ def _append_credit_rating_section(doc, facts: dict) -> None:
             "than silently reporting only one. A promoter having no public rating anywhere is the ordinary "
             "case, not a red flag: these agencies only rate developers that sought a public rating (typically "
             "larger, listed, or NCD-issuing entities)."
-        )
+        ),
+        external_text="Checked against ICRA and Infomerics for a rating under the promoter's exact legal name.",
+    )
 
     promoter_result = check.get("promoter", {})
     if promoter_result.get("found"):
@@ -5380,17 +5405,18 @@ def _append_ibbi_check_section(doc, facts: dict) -> None:
     doc.add_page_break()
     heading_para = doc.add_paragraph(_external_heading(facts, "Insolvency Check -- IBBI Corporate Debtor Master Data (Code-Computed)"))
     heading_para.style = heading_style
-    if facts.get("_doc_variant") == "external":
-        doc.add_paragraph("Checked against IBBI's public Corporate Debtor Master Data by the promoter's own CIN.")
-    else:
-        doc.add_paragraph(
+    _variant_paragraph(
+        doc, facts,
+        internal_text=(
             "Checked directly against the Insolvency and Bankruptcy Board of India's public Corporate "
             "Debtor Master Data, by the promoter's own CIN -- an exact-identifier lookup, not a name-based "
             "guess."
-        )
+        ),
+        external_text="Checked against IBBI's public Corporate Debtor Master Data by the promoter's own CIN.",
+    )
     if check["found_process"] is False:
         ibbi_citation = _citation_text(facts, _clean_source_label(check.get("url", "")) or check.get("url", ""))
-        _sep = ":" if facts.get("_doc_variant") == "external" else " --"
+        _sep = _variant_sep(facts)
         doc.add_paragraph(
             f"Result: \"{check['status_text']}\"{_sep} no insolvency process is recorded against this CIN "
             f"in IBBI's public database. {ibbi_citation}"
@@ -5438,25 +5464,26 @@ def _append_company_profile_section(doc, facts: dict) -> None:
     sources_label = ", ".join(_MCA_SOURCE_DISPLAY_NAMES.get(s, s.replace(".com", "").replace(".in", "").title()) for s in sources_used)
 
     doc.add_page_break()
-    if facts.get("_doc_variant") == "external":
-        # Which registries were cross-checked is methodology detail, not
-        # something a CEO needs in a section heading.
-        heading_text = "Company Registration Profile"
-    else:
-        heading_text = _external_heading(facts, f"Company Registration Profile ({sources_label}, Code-Computed)")
-    heading_para = doc.add_paragraph(heading_text)
+    # Which registries were cross-checked is methodology detail, not
+    # something a CEO needs in a section heading.
+    heading_para = doc.add_paragraph(_variant(
+        facts,
+        _external_heading(facts, f"Company Registration Profile ({sources_label}, Code-Computed)"),
+        "Company Registration Profile",
+    ))
     heading_para.style = heading_style
-    if facts.get("_doc_variant") == "external":
-        doc.add_paragraph(f"Cross-checked across {len(sources_used)} independent company registries by CIN.")
-    else:
-        doc.add_paragraph(
+    _variant_paragraph(
+        doc, facts,
+        internal_text=(
             f"Pulled directly from {len(sources_used)} independent public company-registry mirror(s) by "
             "CIN -- an exact-identifier lookup, not a name-based guess -- and cross-checked against each "
             "other; any disagreement between them on the current director roster is called out under "
             "Gaps & Limitations rather than silently resolved."
-        )
+        ),
+        external_text=f"Cross-checked across {len(sources_used)} independent company registries by CIN.",
+    )
     profile_citation = _citation_text(facts, _clean_source_label(check.get("url", "")))
-    _sep = ":" if facts.get("_doc_variant") == "external" else " --"
+    _sep = _variant_sep(facts)
     doc.add_paragraph(
         f"{check['name']} ({check['cin']}){_sep} Status: {check.get('status', 'unknown')}; "
         f"Class: {check.get('class_of_company', 'unknown')}; "
@@ -5606,36 +5633,38 @@ def _append_group_companies_section(doc, facts: dict) -> None:
     doc.add_page_break()
     heading_para = doc.add_paragraph(_external_heading(facts, "Group / Affiliated Companies (Code-Computed Director & Address Crosswalk)"))
     heading_para.style = heading_style
-    if facts.get("_doc_variant") == "external":
-        doc.add_paragraph(
-            "Each entity below shares a concrete link with the promoter above: a shared director, "
-            "registered office, or a filed subsidiary/associate/JV relationship."
-        )
-    else:
-        doc.add_paragraph(
+    _variant_paragraph(
+        doc, facts,
+        internal_text=(
             "Every entity below shares at least one concrete, named link with the promoter above -- a "
             "specific director in common, a shared registered office, or a filed subsidiary/associate/JV "
             "relationship -- rather than being inferred from a name or industry match. The strength of each "
             "link should be judged from the basis given, not assumed uniform across the list."
-        )
+        ),
+        external_text=(
+            "Each entity below shares a concrete link with the promoter above: a shared director, "
+            "registered office, or a filed subsidiary/associate/JV relationship."
+        ),
+    )
 
     director_rows = _build_director_company_links(facts)
     if any(r["link_count"] for r in director_rows):
         sub_heading = doc.add_paragraph("Director Relationship Map")
         for run in sub_heading.runs:
             run.bold = True
-        if facts.get("_doc_variant") == "external":
-            doc.add_paragraph(
-                "Shows how concentrated the group's leadership is around a small number of individuals, "
-                "based on shared directorships across the 299 linked entities."
-            )
-        else:
-            doc.add_paragraph(
+        _variant_paragraph(
+            doc, facts,
+            internal_text=(
                 "Each of this promoter's directors, current or past, cross-referenced against how many of "
                 "the group companies below name them as a shared director -- collapses the 299-entity list "
                 "to the thing that actually matters here: how concentrated the group's leadership is around "
                 "a small number of individuals, not a name-by-name read of every affiliated entity."
-            )
+            ),
+            external_text=(
+                "Shows how concentrated the group's leadership is around a small number of individuals, "
+                "based on shared directorships across the 299 linked entities."
+            ),
+        )
         dir_table = doc.add_table(rows=1, cols=3)
         _set_table_borders(dir_table)
         header_cells = dir_table.rows[0].cells
@@ -5873,31 +5902,27 @@ def _append_authenticity_page(doc, facts: dict) -> None:
     doc.add_page_break()
     heading_para = doc.add_paragraph("Documentation Authenticity & Confidence Summary")
     heading_para.style = heading_style
-    if facts.get("_doc_variant") == "external":
-        doc.add_paragraph("Reflects how well this Charter's own claims are sourced and cross-verified.")
-    else:
-        doc.add_paragraph(
+    _variant_paragraph(
+        doc, facts,
+        internal_text=(
             "This page is generated directly from the same sources and gaps already listed earlier in "
             "this document -- it is a count, not a self-assessment. A report author claiming its own "
             "work is \"reliable\" would just be another unverified claim; this page instead classifies "
             "every cited source by tier so a reader can judge confidence from the same underlying data."
-        )
+        ),
+        external_text="Reflects how well this Charter's own claims are sourced and cross-verified.",
+    )
 
     from docx.shared import Pt
 
-    _sep = ":" if facts.get("_doc_variant") == "external" else " --"
+    _sep = _variant_sep(facts)
     score_para = doc.add_paragraph()
     score_run = score_para.add_run(f"Documentation Confidence Score: {confidence['overall']}/100{_sep} {confidence['band']}")
     score_run.bold = True
     score_run.font.size = Pt(14)
-    if facts.get("_doc_variant") == "external":
-        doc.add_paragraph(
-            "This score measures how well this report's own claims are documented and verified; it "
-            "does not rate the project itself. A well-documented project with real problems can score "
-            "HIGH here; a genuinely sound project with a thin public paper trail can score LOW."
-        )
-    else:
-        doc.add_paragraph(
+    _variant_paragraph(
+        doc, facts,
+        internal_text=(
             "This score rates how well-sourced and verified THIS DOCUMENT's own claims are -- source "
             "quality, completeness, cross-corroboration, recency, and re-check success -- it is NOT a "
             "rating of the underlying project's quality, safety, or investment merit. A project with a "
@@ -5908,7 +5933,13 @@ def _append_authenticity_page(doc, facts: dict) -> None:
             "named factors rather than one flat checklist) but NOT a replica of any CRISIL formula: CRISIL "
             "does not publish a numeric weighting scheme for any of its three real-estate products, and "
             "the weights used here are this project's own calibration."
-        )
+        ),
+        external_text=(
+            "This score measures how well this report's own claims are documented and verified; it "
+            "does not rate the project itself. A well-documented project with real problems can score "
+            "HIGH here; a genuinely sound project with a thin public paper trail can score LOW."
+        ),
+    )
 
     score_table = doc.add_table(rows=1, cols=4)
     _set_table_borders(score_table)
@@ -5970,18 +6001,9 @@ def _append_authenticity_page(doc, facts: dict) -> None:
     pct_primary = round(100 * primary / total) if total else 0
 
     doc.add_paragraph()
-    if facts.get("_doc_variant") == "external":
-        doc.add_paragraph(
-            f"{primary} of {total} cited sources ({pct_primary}%) are primary-regulatory or "
-            "live-verified; the rest are registry mirrors, aggregators, or press. "
-            f"{gaps} item(s) remain open gaps (see Gaps & Sources)."
-        )
-        doc.add_paragraph(
-            "Treat primary/regulatory findings as confirmed, aggregator/press findings as directional, "
-            "and every listed gap as genuinely open."
-        )
-    else:
-        doc.add_paragraph(
+    _variant_paragraph(
+        doc, facts,
+        internal_text=(
             f"Of {total} cited source(s) in this report, {primary} ({pct_primary}%) come from a primary "
             f"regulatory record, a document opened directly from it, or a live Google Maps route checked "
             f"in this session -- the highest-confidence tier. The remainder are corporate-registry "
@@ -5990,13 +6012,26 @@ def _append_authenticity_page(doc, facts: dict) -> None:
             f"Separately, {gaps} item(s) in this report are recorded as explicit, unresolved gaps -- facts "
             f"that were sought but could not be confirmed, listed in full under \"Gaps & Limitations\" "
             f"earlier in this document -- rather than filled in with an estimate."
-        )
-        doc.add_paragraph(
+        ),
+        external_text=(
+            f"{primary} of {total} cited sources ({pct_primary}%) are primary-regulatory or "
+            "live-verified; the rest are registry mirrors, aggregators, or press. "
+            f"{gaps} item(s) remain open gaps (see Gaps & Sources)."
+        ),
+    )
+    _variant_paragraph(
+        doc, facts,
+        internal_text=(
             "Recommended reading of this summary: treat primary-regulatory-tier and live-Maps findings as "
             "confirmed; treat aggregator/press/social-tier findings as directional and worth an independent "
             "check before any financial or legal decision; treat every listed gap as genuinely open, not as "
             "an implicit \"probably fine.\""
-        )
+        ),
+        external_text=(
+            "Treat primary/regulatory findings as confirmed, aggregator/press findings as directional, "
+            "and every listed gap as genuinely open."
+        ),
+    )
 
 
 def _diff_mortgage_lender(facts: dict, prior_facts: dict | None) -> str | None:
