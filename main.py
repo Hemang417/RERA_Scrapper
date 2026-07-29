@@ -263,6 +263,13 @@ def main() -> int:
 
     os.makedirs(project_out_dir, exist_ok=True)
 
+    # Cleared here, before any Claude API call this run might make -- this
+    # process could otherwise carry over token counts from an unrelated
+    # earlier project (matters for app.py's long-lived Streamlit process
+    # more than this one-shot CLI, but scoping it identically in both keeps
+    # write_usage_log's report accurate to just THIS run).
+    deep_research.reset_usage_log()
+
     print("\n[INFO] Fetching all categories...")
     errors = {}
     category_data = api_client.fetch_all_categories(project_id, raw_dir, token, errors_out=errors)
@@ -455,6 +462,13 @@ def main() -> int:
     print(f"  {'promoter_profile':<20} {'built (' + str(portfolio['totals']['total_projects']) + ' project(s))' if portfolio else 'not available'}")
     print(f"  {'market_research':<20} {'populated' if research_data else 'FAILED this run -- see warning above, or retry with: python deep_research.py ' + reg_no}")
     print(f"  {'company_charter':<20} {'written (' + charter_path + ')' if charter_path else 'FAILED this run -- see warning above, or retry with: python company_charter.py ' + reg_no}")
+
+    usage = deep_research.write_usage_log(args.output_dir, reg_no)
+    total = usage["total"]
+    print(f"  {'claude_api_usage':<20} {total['calls']} call(s), {total['input_tokens'] + total['output_tokens']:,} token(s), ${total['cost_usd']:.4f}")
+    for label, bucket in sorted(usage["by_label"].items(), key=lambda kv: -kv[1]["cost_usd"]):
+        print(f"    {label:<26} {bucket['calls']:>3} call(s)  {bucket['input_tokens'] + bucket['output_tokens']:>8,} tok  ${bucket['cost_usd']:.4f}")
+    print(f"  (full breakdown: {os.path.join(project_out_dir, 'usage_summary.json')})")
 
     if failed:
         print(f"\n[WARN] {len(failed)} categor(ies) failed to fetch: {', '.join(failed)}")

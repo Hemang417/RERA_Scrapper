@@ -478,7 +478,7 @@ def _run_charter_pass(user_prompt: str) -> dict:
     # Delegates to deep_research's tool-runner helper (iterates the
     # BetaToolRunner to its final BetaMessage and parses the raw-JSON reply)
     # rather than duplicating that logic here.
-    return deep_research._run_agentic_pass(user_prompt, _SYSTEM_PROMPT)
+    return deep_research._run_agentic_pass(user_prompt, _SYSTEM_PROMPT, label="charter_pass")
 
 
 _MAPS_SCRAPE_ENV_VAR = "COMPANY_CHARTER_USE_MAPS_SCRAPE"
@@ -597,7 +597,7 @@ def _verify_one_field(field_name: str, field, gaps: list, stats: dict) -> None:
     if not field["source"].startswith("http"):
         return
     stats["attempted"] += 1
-    verdict = deep_research._verify_claim(f"{field_name}: {field['value']}", field["source"])
+    verdict = deep_research._verify_claim(f"{field_name}: {field['value']}", field["source"], label="material_claim_verify")
     status = verdict.get("status")
     if status == "confirmed":
         stats["confirmed"] += 1
@@ -770,7 +770,7 @@ def _verify_document_claim(claim: str, document_text: str) -> dict:
     "verification_error" if neither provider could complete the check."""
     prompt = f"Claim: {claim}\n\nExtracted document text:\n{document_text[:_MAX_CHARS_PER_DOC]}"
     try:
-        result = deep_research._run_agentic_pass(prompt, _DOCUMENT_CLAIM_VERIFY_SYSTEM_PROMPT)
+        result = deep_research._run_agentic_pass(prompt, _DOCUMENT_CLAIM_VERIFY_SYSTEM_PROMPT, label="document_grounding_verify")
         if result.get("status") not in ("confirmed", "unsupported", "stale"):
             return {"status": "unsupported", "reason": "verifier returned an unrecognized status"}
         return result
@@ -4039,7 +4039,7 @@ def _attempt_second_source(topic: str, existing_source: dict) -> dict:
         f"Find one genuinely independent second source that corroborates this."
     )
     try:
-        result = deep_research._run_agentic_pass(prompt, _SECOND_SOURCE_SYSTEM_PROMPT)
+        result = deep_research._run_agentic_pass(prompt, _SECOND_SOURCE_SYSTEM_PROMPT, label="second_source_verify")
     except Exception as e:
         return {"found": False, "reason": f"verification could not run: {e}"}
     if not isinstance(result, dict) or "found" not in result:

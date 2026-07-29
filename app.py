@@ -209,6 +209,13 @@ with tab_run:
 
             os.makedirs(project_out_dir, exist_ok=True)
 
+            # This process stays alive across multiple runs (unlike main.py's
+            # one-shot CLI), so the usage log must be cleared per-run here --
+            # otherwise a second project's usage_summary.json would include
+            # token counts left over from whatever was run before it in this
+            # same Streamlit session.
+            deep_research.reset_usage_log()
+
             # --- auth ---
             token, auth_source = None, "none"
             if explicit_token.strip():
@@ -357,12 +364,14 @@ with tab_run:
             with st.spinner("Building PDF report..."):
                 report.build_pdf(reg_no, project_id, category_data, documents_manifest, pdf_path, auth_source=auth_source, promoter_portfolio=portfolio, research_data=research_data, charter_facts=charter_facts)
 
+            usage = deep_research.write_usage_log(config.OUTPUT_ROOT, reg_no)
+
             st.session_state.run_result = {
                 "reg_no": reg_no, "project_id": project_id, "auth_source": auth_source, "retried": retried,
                 "category_data": category_data, "errors": errors, "documents_manifest": documents_manifest,
                 "downloaded": downloaded, "reused": reused, "portfolio": portfolio, "research_data": research_data,
                 "pdf_path": pdf_path, "documents_dir": documents_dir, "raw_dir": raw_dir,
-                "charter_path": charter_path,
+                "charter_path": charter_path, "usage": usage,
             }
             st.rerun()
 
@@ -372,12 +381,27 @@ with tab_run:
         st.divider()
         st.subheader(f"Results — {res['reg_no']}")
 
-        m1, m2, m3, m4 = st.columns(4)
+        m1, m2, m3, m4, m5 = st.columns(5)
         fetched_ok = sum(1 for cat in config.CATEGORY_ORDER if res["category_data"].get(cat) is not None)
         m1.metric("Categories fetched", f"{fetched_ok}/9")
         m2.metric("Documents", f"{res['downloaded'] + res.get('reused', 0)}/{len(res['documents_manifest'])}")
         m3.metric("Auth source", _AUTH_SOURCE_LABELS[res["auth_source"]] + (" (retried)" if res["retried"] else ""))
         m4.metric("Promoter portfolio", f"{res['portfolio']['totals']['total_projects']} project(s)" if res["portfolio"] else "n/a")
+        usage_total = (res.get("usage") or {}).get("total")
+        m5.metric("Claude API cost", f"${usage_total['cost_usd']:.4f}" if usage_total else "n/a")
+
+        if usage_total:
+            with st.expander(f"Claude API usage detail ({usage_total['calls']} call(s), {usage_total['input_tokens'] + usage_total['output_tokens']:,} token(s))"):
+                by_label = res["usage"]["by_label"]
+                rows = [
+                    {
+                        "Purpose": label, "Calls": b["calls"], "Turns": b["turns"],
+                        "Input tokens": b["input_tokens"], "Output tokens": b["output_tokens"],
+                        "Cost ($)": round(b["cost_usd"], 4),
+                    }
+                    for label, b in sorted(by_label.items(), key=lambda kv: -kv[1]["cost_usd"])
+                ]
+                st.dataframe(rows, hide_index=True, use_container_width=True)
 
         cat_rows = []
         for cat in config.CATEGORY_ORDER:

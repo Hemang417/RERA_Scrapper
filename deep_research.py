@@ -44,6 +44,119 @@ import finalize_report
 
 MODEL = "claude-sonnet-5"
 MAX_GAP_RETRY_ATTEMPTS = 2
+
+# $ per 1M tokens. This is Sonnet 5's intro rate, active through 2026-08-31 --
+# update to the standard $3.00/$15.00 after that date (or sooner, if pricing
+# changes again). Only priced models get a real cost figure back from
+# _record_usage; an unrecognized model still gets its tokens counted, just
+# with cost_usd=0.0 rather than a silently wrong number.
+_PRICING_PER_1M_TOKENS = {
+    "claude-sonnet-5": {"input": 2.00, "output": 10.00},
+}
+
+# Every Claude API call this whole pipeline makes (both this module's own
+# research/verification passes and company_charter.py's Charter-assembly and
+# claim-verification passes, which delegate here) funnels through
+# _run_agentic_pass, so this one module-level list is a complete usage log
+# for the process -- see _record_usage. Callers scope it to one project run
+# via reset_usage_log()/write_usage_log(); nothing here assumes a single
+# project per process, since app.py's Streamlit UI can run several in a row.
+_USAGE_LOG: list[dict] = []
+
+
+def reset_usage_log() -> None:
+    """Clears the in-process usage log -- callers (main.py, app.py) call
+    this right before starting a single project's run, so that run's
+    write_usage_log() reports only its own calls, not a prior project's
+    left over from the same long-lived process."""
+    _USAGE_LOG.clear()
+
+
+def get_usage_log() -> list[dict]:
+    return list(_USAGE_LOG)
+
+
+def usage_summary() -> dict:
+    """Aggregates the current usage log by label (e.g. "charter_pass",
+    "verify_claim", "gap_retry") plus a grand total across all of them --
+    the per-label breakdown is what actually explains where cost goes,
+    since a handful of small calls (one per cited source needing
+    re-verification) dominates far more than the one big Charter-assembly
+    pass."""
+    by_label = {}
+    for record in _USAGE_LOG:
+        bucket = by_label.setdefault(record["label"], {
+            "calls": 0, "turns": 0, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0,
+        })
+        bucket["calls"] += 1
+        bucket["turns"] += record["turns"]
+        bucket["input_tokens"] += record["input_tokens"]
+        bucket["output_tokens"] += record["output_tokens"]
+        bucket["cost_usd"] = round(bucket["cost_usd"] + record["cost_usd"], 6)
+
+    total = {
+        "calls": len(_USAGE_LOG),
+        "turns": sum(r["turns"] for r in _USAGE_LOG),
+        "input_tokens": sum(r["input_tokens"] for r in _USAGE_LOG),
+        "output_tokens": sum(r["output_tokens"] for r in _USAGE_LOG),
+        "cost_usd": round(sum(r["cost_usd"] for r in _USAGE_LOG), 6),
+    }
+    return {"by_label": by_label, "total": total}
+
+
+def write_usage_log(output_dir: str, reg_no: str) -> dict:
+    """Writes output/<reg_no>/usage_summary.json (this run's own breakdown)
+    and appends one rollup line to output/usage_log.jsonl (every run, ever,
+    in this output tree) -- the per-project file answers "what did this
+    project cost", the rollup answers "what has this pipeline cost in
+    total". Returns the summary dict written for the project."""
+    summary = usage_summary()
+    summary["reg_no"] = reg_no
+    summary["generated_at"] = datetime.now().isoformat()
+
+    project_dir = os.path.join(output_dir, reg_no)
+    os.makedirs(project_dir, exist_ok=True)
+    with open(os.path.join(project_dir, "usage_summary.json"), "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+
+    rollup_path = os.path.join(output_dir, "usage_log.jsonl")
+    with open(rollup_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps({
+            "reg_no": reg_no,
+            "generated_at": summary["generated_at"],
+            "total": summary["total"],
+        }, ensure_ascii=False) + "\n")
+
+    return summary
+
+
+def _record_usage(label: str, model: str, messages: list) -> dict:
+    """Sums usage across every BetaMessage a tool_runner pass yielded, not
+    just the final one -- each turn (including every web_search round-trip)
+    is its own billed API call, so counting only the last message would
+    silently undercount every multi-turn pass."""
+    input_tokens = 0
+    output_tokens = 0
+    for message in messages:
+        usage = getattr(message, "usage", None)
+        if usage is None:
+            continue
+        input_tokens += getattr(usage, "input_tokens", 0) or 0
+        output_tokens += getattr(usage, "output_tokens", 0) or 0
+
+    price = _PRICING_PER_1M_TOKENS.get(model, {"input": 0.0, "output": 0.0})
+    cost_usd = (input_tokens * price["input"] + output_tokens * price["output"]) / 1_000_000
+
+    record = {
+        "label": label,
+        "model": model,
+        "turns": len(messages),
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cost_usd": round(cost_usd, 6),
+    }
+    _USAGE_LOG.append(record)
+    return record
 # A same-day (or so) re-run trusts the prior pass's already-`confirmed`
 # sources as-is (no re-verification) and only spends new API calls on gaps
 # that were still open -- see run_deep_research's `prior_research` param.
@@ -159,10 +272,17 @@ def _parse_json_response(message) -> dict:
         raise RuntimeError(f"model did not return valid JSON: {e}\nRaw text (first 500 chars): {text[:500]}") from e
 
 
-def _run_agentic_pass(user_prompt: str, system: str) -> dict:
+def _run_agentic_pass(user_prompt: str, system: str, label: str = "agentic_pass") -> dict:
     """Runs client.beta.messages.tool_runner() to completion. The runner is an
     iterator yielding one BetaMessage per turn -- iterate it fully and read
-    .content off the LAST yielded message, not off the runner itself."""
+    .content off the LAST yielded message, not off the runner itself.
+
+    `label` identifies what this call was FOR (e.g. "charter_pass",
+    "verify_claim", "gap_retry") in the usage log -- every Claude call in
+    this whole pipeline funnels through here (including company_charter.py's,
+    which delegates to this function), so the label is what lets
+    usage_summary() break cost down by purpose instead of one undifferentiated
+    total."""
     runner = _get_client().beta.messages.tool_runner(
         model=MODEL,
         max_tokens=8000,
@@ -170,15 +290,14 @@ def _run_agentic_pass(user_prompt: str, system: str) -> dict:
         tools=[_WEB_SEARCH_TOOL],
         messages=[{"role": "user", "content": user_prompt}],
     )
-    final_message = None
-    for message in runner:
-        final_message = message
-    if final_message is None:
+    messages = list(runner)
+    if not messages:
         raise RuntimeError("tool_runner produced no messages")
-    return _parse_json_response(final_message)
+    _record_usage(label, MODEL, messages)
+    return _parse_json_response(messages[-1])
 
 
-def _verify_claim(claim: str, source_url: str) -> dict:
+def _verify_claim(claim: str, source_url: str, label: str = "verify_claim") -> dict:
     """Returns {"status": ..., "reason": ...}. Status is "confirmed",
     "unsupported", or "stale" for a check that actually ran, or the distinct
     "verification_error" when the check itself could not be attempted at all
@@ -193,7 +312,7 @@ def _verify_claim(claim: str, source_url: str) -> dict:
     unsupported verdict."""
     prompt = f"Claim: {claim}\nCited source: {source_url}"
     try:
-        result = _run_agentic_pass(prompt, _VERIFY_SYSTEM_PROMPT)
+        result = _run_agentic_pass(prompt, _VERIFY_SYSTEM_PROMPT, label=label)
     except Exception as e:
         return {"status": "verification_error", "reason": f"verification could not run: {e}"}
     if result.get("status") not in ("confirmed", "unsupported", "stale"):
@@ -201,7 +320,7 @@ def _verify_claim(claim: str, source_url: str) -> dict:
     return result
 
 
-def _verify_block(block: dict) -> dict:
+def _verify_block(block: dict, label: str = "verify_claim") -> dict:
     """Re-checks every cited source independently. A source that failed a
     real check is demoted into `gaps` (never dropped silently) so
     _resolve_gaps gets a chance to retry it. A source whose check could not
@@ -211,7 +330,7 @@ def _verify_block(block: dict) -> dict:
     kept_sources = []
     demoted_gaps = list(block.get("gaps", []))
     for src in block.get("sources", []):
-        verdict = _verify_claim(src.get("claim", ""), src.get("url", ""))
+        verdict = _verify_claim(src.get("claim", ""), src.get("url", ""), label=label)
         status = verdict.get("status")
         if status == "confirmed":
             kept_sources.append(src)
@@ -242,7 +361,7 @@ def _resolve_gaps(block: dict) -> dict:
                 f"Retry using {strategy}."
             )
             try:
-                result = _run_agentic_pass(prompt, _GAP_RETRY_SYSTEM_PROMPT)
+                result = _run_agentic_pass(prompt, _GAP_RETRY_SYSTEM_PROMPT, label="gap_retry")
             except Exception:
                 # Broad on purpose, same reasoning as _verify_claim: a missing
                 # ANTHROPIC_API_KEY or any other failure here must count as a
@@ -250,7 +369,7 @@ def _resolve_gaps(block: dict) -> dict:
                 result = {}
             attempts_log.append(strategy)
             if result.get("sources"):
-                verified = _verify_block({"sources": result["sources"], "gaps": []})
+                verified = _verify_block({"sources": result["sources"], "gaps": []}, label="gap_retry_verify")
                 if verified["sources"]:
                     block.setdefault("sections", []).extend(result.get("sections", []))
                     block.setdefault("sources", []).extend(verified["sources"])
@@ -311,7 +430,7 @@ def run_deep_research(
             f"Produce macro_market, micro_market, and promoter_external research blocks for "
             f"this project."
         )
-        raw = _run_agentic_pass(user_prompt, _SYSTEM_PROMPT)
+        raw = _run_agentic_pass(user_prompt, _SYSTEM_PROMPT, label="research_generate")
         for key in RESEARCH_KEYS:
             block = _verify_block(raw.get(key, {}))
             block = _resolve_gaps(block)
