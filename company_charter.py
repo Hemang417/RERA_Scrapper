@@ -2027,6 +2027,120 @@ def run_cts_land_lookup(facts: dict, reg_no: str, output_dir: str = config.OUTPU
     return facts
 
 
+def _slugify_for_pending_key(*parts: str) -> str:
+    """Joins the given parts with underscores into a filesystem-safe
+    directory name -- strips characters Windows/NTFS rejects in a path
+    segment and collapses whitespace, but otherwise leaves the exact
+    Marathi office/village labels intact (NTFS handles Unicode names
+    natively, no transliteration needed)."""
+    joined = "_".join(str(p).strip() for p in parts if p)
+    joined = re.sub(r'[<>:"/\\|?*]', "_", joined)
+    joined = re.sub(r"\s+", "_", joined)
+    return joined.strip("_") or "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Standalone CTS/land intake -- runs the same CTS -> Property Card lookup
+# run_cts_land_lookup runs internally, but from bare district/office/
+# village/cts_number/mobile handed to us directly, with no RERA project/
+# reg_no/facts dict required. Exists for the case where a CTS number reaches
+# this pipeline before any RERA number does (land is acquired, and so has a
+# CTS number, well before a project ever registers with RERA).
+#
+# Deliberately duplicates run_cts_land_lookup's candidate-search/fetch logic
+# (rather than refactoring that function to share this code) for the same
+# reason run_promoter_intake duplicates run_company_charter's source-shaping
+# logic: it keeps this addition from touching a single existing line of
+# run_cts_land_lookup, so it stays trivially revertable (delete this
+# function and cts_intake.py, nothing else changes) until this standalone
+# path has actually proven useful.
+#
+# Writes its result under facts.json's own key for this check
+# ("cts_land_record_check") so a later run_cts_land_lookup pass for the same
+# plot can absorb this file with a plain dict assignment, never a reshape.
+# ---------------------------------------------------------------------------
+
+def run_cts_lookup_standalone(
+    district: str, office: str, village: str, cts_number: str, mobile: str,
+    output_dir: str = config.OUTPUT_ROOT,
+) -> dict:
+    """Runs the CTS -> Property Card lookup from a bare identifier set.
+    Candidate search (confirming cts_number is an exact match against the
+    site's own valid list for this village) is headless, no CAPTCHA; the
+    actual Property Card fetch opens a visible browser and blocks waiting
+    for a human to solve a fresh CAPTCHA every call (see mahabhumi.py --
+    that site grants no reusable session).
+
+    Persists to output/_pending/<district>_<village>_<cts_number>/
+    land_record.json (slugified) -- a bare CTS number isn't globally unique
+    (the same number recurs across different villages), so district+
+    village+cts_number together form the key. Returns {"cts_land_record_
+    check": {...}, "sources": [...], "gaps": []} -- the same shape
+    promoter_intake.py's record uses, and the same "cts_land_record_check"
+    key facts.json itself uses for this check.
+
+    Confirmed live (a real CAPTCHA solve completed against Pranami Bliss's
+    own recorded CTS 183 in Aambivali, Mumbai Suburban): the Property Card
+    result page renders as a document/image, not structured HTML text --
+    mahabhumi.fetch_property_card's screenshot_path/OCR support (see its
+    own docstring) is what actually recovers its content, so the screenshot
+    path is computed here BEFORE the CAPTCHA-gated fetch, not after."""
+    import mahabhumi
+
+    out_dir = os.path.join(output_dir, "_pending", _slugify_for_pending_key(district, village, cts_number))
+    os.makedirs(out_dir, exist_ok=True)
+    screenshot_path = os.path.join(out_dir, "property_card_screenshot.png")
+
+    print(f"\n[INFO] Resolving CTS {cts_number} candidates...")
+    try:
+        candidates_result = mahabhumi.search_cts_candidates(district, office, village, cts_number)
+    except Exception as e:
+        result = {"found": False, "note": f"CTS candidate search could not run this pass: {e}"}
+    else:
+        if not candidates_result.get("found"):
+            result = {"found": False, "note": candidates_result.get("note", "CTS candidate search failed")}
+        elif cts_number not in candidates_result["candidates"]:
+            result = {
+                "found": False,
+                "note": (
+                    f"CTS number {cts_number!r} is not an exact match against the site's own "
+                    f"candidates for this village ({candidates_result['candidates']}) -- confirm the "
+                    f"exact value and re-run rather than guessing."
+                ),
+            }
+        else:
+            print("[INFO] Opening a browser to fetch the Property Card -- please solve the CAPTCHA when it appears.")
+            try:
+                result = mahabhumi.fetch_property_card(
+                    district, office, village, cts_number, mobile, screenshot_path=screenshot_path,
+                )
+            except (mahabhumi.CaptchaTimeoutError, mahabhumi.BrowserClosedError, mahabhumi.AmbiguousSelectionError) as e:
+                result = {"found": False, "note": f"CTS Property Card lookup did not complete: {e}"}
+            except Exception as e:
+                result = {"found": False, "note": f"CTS Property Card lookup could not run this pass: {e}"}
+
+    record = {
+        "district": district, "office": office, "village": village,
+        "cts_number": cts_number, "generated_at": datetime.now().isoformat(),
+        "cts_land_record_check": result,
+        "sources": [],
+        "gaps": [],
+    }
+    if result.get("found"):
+        record["sources"].append({
+            "label": "Maha Bhulekh Property Card",
+            "ref": f"CTS {cts_number}, {village} -- {result.get('url', '')}",
+            "topic": "land_record",
+            "published_date": "unknown",
+            "accessed_date": datetime.now().strftime("%Y-%m-%d"),
+        })
+
+    with open(os.path.join(out_dir, "land_record.json"), "w", encoding="utf-8") as f:
+        json.dump(record, f, indent=2, ensure_ascii=False)
+
+    return record
+
+
 # ---------------------------------------------------------------------------
 # MahaRERA Orders/Judgments search -- confirmed live and scriptable with no
 # browser needed. maharera.maharashtra.gov.in/orders-judgements is a Drupal
@@ -6273,6 +6387,116 @@ def _safe_judgments_search(project_name: str) -> tuple:
         return search_maharera_judgments(project_name), None
     except Exception as e:
         return [], f"MahaRERA Orders/Judgments search for appeal-level outcomes could not run this pass: {e}"
+
+
+# ---------------------------------------------------------------------------
+# Standalone promoter intake -- runs the same promoter-side checks
+# run_company_charter runs internally (_safe_company_profile/_safe_ibbi_check/
+# _safe_group_companies/_safe_credit_rating), but from a bare CIN handed to us
+# directly, with no RERA project/reg_no required at all. Exists for the case
+# where a CIN reaches this pipeline before any RERA number does (a promoter's
+# company registration predates their RERA filing by definition).
+#
+# Deliberately writes its result under the SAME facts.json keys
+# run_company_charter already uses for these four checks (see its own
+# "results" handling above: facts["company_profile_check"],
+# facts["ibbi_insolvency_check"], facts["group_companies_check"],
+# facts["credit_rating_check"]) -- so a later run_company_charter pass for
+# the same promoter can absorb this file with a plain dict update, never a
+# reshape. This does duplicate a small amount of the source/gap-shaping
+# logic already in run_company_charter rather than refactoring it out into a
+# shared helper -- deliberate: it keeps this addition from touching a single
+# existing line in that function, so it stays trivially revertable (delete
+# this function and promoter_intake.py, nothing else changes) until this
+# standalone path has actually proven useful.
+# ---------------------------------------------------------------------------
+
+def run_promoter_intake(cin: str, company_name: str = "", output_dir: str = config.OUTPUT_ROOT) -> dict:
+    """Runs the MCA-mirror company-profile chain, IBBI insolvency check, and
+    ZaubaCorp group-companies crosswalk for a bare CIN -- plus a credit
+    rating check if `company_name` is given (rating lookups are name-based,
+    not CIN-based). Persists to output/_pending/<CIN>/promoter_profile.json
+    and returns the same dict.
+
+    `company_name` is optional but improves two of these checks: Tofler's
+    resolve step inside the company-profile chain needs it (skipped as a
+    gap without it, same as run_company_charter's own behavior), and the
+    credit rating check is skipped entirely without it since it has no CIN
+    equivalent to search by."""
+    cin = cin.strip()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {
+            "profile": executor.submit(_safe_company_profile, cin, company_name),
+            "ibbi": executor.submit(_safe_ibbi_check, cin),
+            "group": executor.submit(_safe_group_companies, cin),
+        }
+        if company_name:
+            futures["rating"] = executor.submit(_safe_credit_rating, company_name)
+        results = {key: future.result() for key, future in futures.items()}
+
+    record = {
+        "cin": cin,
+        "company_name": company_name,
+        "generated_at": datetime.now().isoformat(),
+        "sources": [],
+        "gaps": [],
+    }
+    accessed_date = datetime.now().strftime("%Y-%m-%d")
+
+    profile_result = results["profile"]
+    record["company_profile_check"] = profile_result
+    if profile_result.get("found"):
+        sources_used = profile_result.get("sources_used") or ["zaubacorp.com"]
+        record["sources"].append({
+            "label": f"MCA-mirror company registration profile ({', '.join(sources_used)})",
+            "ref": f"{profile_result['name']} -- {profile_result['url']}",
+            "topic": "company_profile",
+            "published_date": "unknown",
+            "accessed_date": accessed_date,
+        })
+        for conflict in profile_result.get("roster_conflicts") or []:
+            record["gaps"].append(conflict)
+
+    ibbi_result = results["ibbi"]
+    record["ibbi_insolvency_check"] = ibbi_result
+    if ibbi_result.get("found_process") is not None:
+        record["sources"].append({
+            "label": "IBBI Corporate Debtor Master Data",
+            "ref": f"CIN {cin} -- {ibbi_result.get('url', '')}",
+            "topic": "insolvency_status",
+            "published_date": "unknown",
+            "accessed_date": accessed_date,
+        })
+
+    group_result = results["group"]
+    record["group_companies_check"] = group_result
+    if group_result.get("found") and group_result.get("companies"):
+        record["sources"].append({
+            "label": "ZaubaCorp director/address crosswalk",
+            "ref": f"CIN {cin} -- {group_result.get('url', '')} -- {len(group_result['companies'])} linked entit(y/ies)",
+            "topic": "group_companies",
+            "published_date": "unknown",
+            "accessed_date": accessed_date,
+        })
+
+    if "rating" in results:
+        rating_result = results["rating"]
+        record["credit_rating_check"] = {"promoter": rating_result}
+        for agency_rating in rating_result.get("ratings", []):
+            record["sources"].append({
+                "label": f"{agency_rating['agency']} credit rating",
+                "ref": f"{agency_rating['company_name']} -- {agency_rating['url']}",
+                "topic": "credit_rating",
+                "published_date": "unknown",
+                "accessed_date": accessed_date,
+            })
+
+    out_dir = os.path.join(output_dir, "_pending", cin)
+    os.makedirs(out_dir, exist_ok=True)
+    with open(os.path.join(out_dir, "promoter_profile.json"), "w", encoding="utf-8") as f:
+        json.dump(record, f, indent=2, ensure_ascii=False)
+
+    return record
 
 
 def run_company_charter(

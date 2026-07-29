@@ -39,19 +39,42 @@ list_offices()/list_villages() return the site's own exact labels for a
 caller (or a human) to choose from explicitly; fetch_property_card() only
 accepts an exact label already confirmed this way.
 
-NOT YET VALIDATED: the actual Property Card page's HTML structure after a
-successful CAPTCHA solve, since completing one was out of scope for this
-pass for the reason above. fetch_property_card()'s parsing step is
-therefore deliberately best-effort and always keeps the full raw page
-text alongside whatever structured fields it manages to find, so nothing
-is silently lost if the real layout differs from what's assumed here --
-the same honesty policy already used for IBBI's never-validated
-positive-match path (see company_charter.lookup_ibbi_insolvency_status).
+CONFIRMED LIVE (this pass, a real CAPTCHA solve completed): the Property
+Card the site reveals after Submit is NOT structured HTML text -- it's a
+rendered document/image, so soup.get_text() on it yields little to nothing
+useful. fetch_property_card() therefore also takes a full-page screenshot
+and runs it through Tesseract OCR (same engine/fallback-path convention as
+company_charter._extract_document_text), keeping the OCR'd text alongside
+whatever structured fields/raw text soup parsing manages to find, so
+nothing is silently lost if a future page happens to render differently.
 """
 
+import os
+import shutil
 import time
 
+import pytesseract
+from PIL import Image
+
 import config
+
+# Mirrors company_charter.py's own Tesseract-path bootstrap exactly (same
+# reasoning: pytesseract shells out to the tesseract binary by name, and on
+# a machine where it's installed but not on PATH -- confirmed the actual
+# state here -- OCR would otherwise fail silently with no usable text).
+# Duplicated rather than imported from company_charter.py so this module
+# still works OCR-capable when run standalone (`python mahabhumi.py ...`),
+# not only when reached via company_charter.run_cts_lookup_standalone
+# (whose own import of company_charter already sets this at import time).
+if not shutil.which("tesseract"):
+    for _candidate in (
+        os.environ.get("TESSERACT_CMD"),
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+    ):
+        if _candidate and os.path.exists(_candidate):
+            pytesseract.pytesseract.tesseract_cmd = _candidate
+            break
 
 _BASE_URL = "https://bhulekh.mahabhumi.gov.in/"
 
@@ -323,26 +346,101 @@ def search_cts_candidates(district_name: str, office_label: str, village_label: 
     return {"found": False, "note": f"Mahabhumi CTS-number search could not run after {max_attempts} attempt(s): {last_error}"}
 
 
-def _scrape_result_page(page) -> dict:
+# Marathi Tesseract language pack (mar.traineddata) is NOT part of the
+# machine-wide Tesseract install here (confirmed live: `tesseract
+# --list-langs` only shows eng/osd), and this project's user has no write
+# access to C:\Program Files\Tesseract-OCR\tessdata -- confirmed live,
+# BUILTIN\Users only has ReadAndExecute there. Rather than requiring an
+# admin-elevated install (which also wouldn't travel with this repo to
+# another machine/office), mar.traineddata is fetched into a project-local
+# tessdata/ directory instead (gitignored -- see .gitignore -- it's a ~3MB
+# vendored binary asset, not source), pointed at via the TESSDATA_PREFIX
+# environment variable rather than pytesseract's `config="--tessdata-dir
+# ..."` -- confirmed live that pytesseract tokenizes `config` with
+# shlex.split(..., posix=False) on Windows, which does NOT strip quote
+# characters the way a real shell would, so a quoted path came through
+# tesseract's argv with the literal quote marks still attached ("...\
+# tessdata" as part of the filename) and failed to open. TESSDATA_PREFIX
+# needs no quoting at all, so this sidesteps that bug entirely. Since
+# --tessdata-dir/TESSDATA_PREFIX REPLACES Tesseract's whole search path
+# rather than merging into it, eng.traineddata is copied in here too --
+# otherwise the combined "mar+eng" lookup would fail with an unrelated
+# "eng not found" error.
+#
+# To set this up on a fresh machine:
+#   mkdir tessdata
+#   curl -L -o tessdata/mar.traineddata https://github.com/tesseract-ocr/tessdata/raw/main/mar.traineddata
+#   copy "C:\Program Files\Tesseract-OCR\tessdata\eng.traineddata" tessdata\eng.traineddata
+_TESSDATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tessdata")
+if os.path.isdir(_TESSDATA_DIR):
+    os.environ["TESSDATA_PREFIX"] = _TESSDATA_DIR
+
+
+def _ocr_image(path: str) -> str:
+    """Marathi ("mar") if that Tesseract language pack is available -- see
+    _TESSDATA_DIR above for where this repo keeps it, since it isn't part
+    of a standard Tesseract install. Without it, Devanagari text OCRs as
+    garbled Latin-letter noise (English glyph-shape guesses for unfamiliar
+    characters), confirmed live against a real Property Card. Falls back
+    to English-only automatically when "mar" isn't available
+    (TesseractError for an unknown language) rather than failing OCR
+    entirely -- still recovers ASCII content (PU-ID numbers, dates) even
+    without it, just not the Devanagari fields."""
+    try:
+        return pytesseract.image_to_string(Image.open(path), lang="mar+eng").strip()
+    except pytesseract.TesseractError:
+        return pytesseract.image_to_string(Image.open(path), lang="eng").strip()
+
+
+def _scrape_result_page(page, screenshot_path: str | None = None) -> dict:
     """Best-effort extraction from whatever page the site shows after a
-    successful CAPTCHA submission -- never independently confirmed live
-    (see module note). Tries the two structural patterns already proven
-    elsewhere in this codebase (ZaubaCorp's li.row pairs, and plain
-    label/value tables); falls back to raw text alone if neither matches,
-    rather than guessing a shape."""
+    successful CAPTCHA submission. Tries the two structural patterns already
+    proven elsewhere in this codebase (ZaubaCorp's li.row pairs, and plain
+    label/value tables) and keeps the raw page text either way.
+
+    Confirmed live: page.content()/raw_text captured the ORIGINAL search-
+    form page, not the Property Card -- while a full-page screenshot (taken
+    on the same `page` at the same moment) correctly showed the real result
+    (its OCR text contained an exact PU-ID number match against what was
+    actually on screen). That mismatch is strong evidence the Property Card
+    renders inside an <iframe>, which page.content() doesn't descend into
+    but a pixel-level screenshot does -- so raw_text/fields now pull from
+    EVERY frame on the page (page.frames always includes the main frame, so
+    this is a no-op on a page with no iframes), not just the top-level
+    document.
+
+    When `screenshot_path` is given, this also takes a full-page screenshot
+    and runs it through Tesseract OCR (see _ocr_image) -- confirmed the more
+    reliable extraction path for this specific site. `ocr_text` is "" (not
+    attempted) when screenshot_path is None, and an honest "[OCR
+    unavailable: ...]" marker -- never a silent blank -- if the screenshot
+    or OCR step itself fails."""
     from bs4 import BeautifulSoup
 
-    html = page.content()
-    soup = BeautifulSoup(html, "html.parser")
-    raw_text = soup.get_text("\n", strip=True)
-
+    raw_text_parts = []
     fields = {}
-    for li in soup.find_all("li", class_="row"):
-        parts = li.find_all(["span", "label"])
-        if len(parts) >= 2:
-            fields[parts[0].get_text(strip=True)] = parts[1].get_text(strip=True)
+    for frame in page.frames:
+        try:
+            html = frame.content()
+        except Exception:
+            continue  # a detached/cross-origin frame mid-navigation -- skip it, not fatal
+        soup = BeautifulSoup(html, "html.parser")
+        raw_text_parts.append(soup.get_text("\n", strip=True))
+        for li in soup.find_all("li", class_="row"):
+            parts = li.find_all(["span", "label"])
+            if len(parts) >= 2:
+                fields[parts[0].get_text(strip=True)] = parts[1].get_text(strip=True)
+    raw_text = "\n".join(part for part in raw_text_parts if part)
 
-    return {"fields": fields, "raw_text": raw_text, "url": page.url}
+    ocr_text = ""
+    if screenshot_path:
+        try:
+            page.screenshot(path=screenshot_path, full_page=True)
+            ocr_text = _ocr_image(screenshot_path)
+        except Exception as e:
+            ocr_text = f"[OCR unavailable: {e}]"
+
+    return {"fields": fields, "raw_text": raw_text, "ocr_text": ocr_text, "url": page.url}
 
 
 def fetch_property_card(
@@ -353,8 +451,14 @@ def fetch_property_card(
     mobile: str,
     timeout_seconds: int = config.CAPTCHA_TIMEOUT_SECONDS,
     poll_interval: float = config.CAPTCHA_POLL_INTERVAL_SECONDS,
+    screenshot_path: str | None = None,
 ) -> dict:
-    """Opens a VISIBLE browser, drives every field up to and including the
+    """`screenshot_path`, if given, is where the post-CAPTCHA result page's
+    full-page screenshot (and its OCR'd text -- see _scrape_result_page) get
+    saved; omit it to skip the screenshot/OCR step entirely (existing
+    callers that don't pass it are unaffected).
+
+    Opens a VISIBLE browser, drives every field up to and including the
     exact CTS number, then waits for a human to read the CAPTCHA, type it,
     and click Submit -- same human-in-the-loop contract as
     session_auth.acquire_token_via_browser, except here a fresh CAPTCHA
@@ -422,14 +526,64 @@ def fetch_property_card(
         elapsed = 0.0
         last_status_at = 0.0
         starting_url = page.url
+        # Confirmed live (a real CAPTCHA solve, content changed in the SAME
+        # window, no new tab, no download -- and a screenshot of the actual
+        # result page): this site's post-submit transition is an ASP.NET
+        # partial postback, same technology as every other dropdown on this
+        # page -- which commonly means the submit button/panel gets hidden
+        # via CSS rather than removed from the DOM, so a bare .count() == 0
+        # check never fires even though a human plainly sees the page
+        # change. The confirmed result page is real structured Devanagari
+        # text (a table headed "मालमत्ता पत्रक" / "PU-ID: ..."), NOT a
+        # scanned image, and ends with a "मागे जा" (Go Back) button that
+        # only exists on that view -- the single most specific, lowest-
+        # false-positive signal available, checked first. The other three
+        # signals (URL change, submit button losing visibility, rendered
+        # text growing substantially) stay as a fallback in case a future
+        # variation of this page doesn't show that exact button.
+        starting_visible_text_len = len(page.inner_text("body"))
         while elapsed < timeout_seconds:
             if page.is_closed():
                 raise BrowserClosedError("Browser window was closed before the CAPTCHA was solved.")
-            if page.url != starting_url or page.locator(_SEL_SUBMIT_BTN).count() == 0:
+            try:
+                current_visible_text_len = len(page.inner_text("body"))
+                page_changed = (
+                    page.get_by_text("मागे जा").count() > 0
+                    or page.get_by_text("PU-ID", exact=False).count() > 0
+                    or page.url != starting_url
+                    or not page.locator(_SEL_SUBMIT_BTN).is_visible()
+                    or abs(current_visible_text_len - starting_visible_text_len) > 200
+                )
+            except Exception:
+                # Confirmed live: the moment a human submits the CAPTCHA, the
+                # resulting postback can destroy Playwright's execution
+                # context mid-check ("Execution context was destroyed, most
+                # likely because of a navigation") -- that error is itself
+                # strong evidence something just happened past the CAPTCHA
+                # gate, not a real failure. Treat it as "still settling":
+                # wait one more poll interval and let the NEXT iteration's
+                # checks run against the now-stable post-navigation page,
+                # rather than surfacing this as a fatal "could not run this
+                # pass" indistinguishable from a genuinely broken lookup.
+                time.sleep(poll_interval)
+                elapsed += poll_interval
+                continue
+            if page_changed:
                 # Either a full postback navigated us on, or the form itself
                 # was replaced by a results view -- either way, something
-                # past the CAPTCHA gate happened.
-                return {"found": True, **_scrape_result_page(page)}
+                # past the CAPTCHA gate happened. Scraping immediately after
+                # can hit the exact same transient "execution context
+                # destroyed" error if the page is still settling -- a couple
+                # of short retries here is cheap insurance against losing an
+                # entire human-in-the-loop CAPTCHA solve to one bad instant.
+                scrape_error = None
+                for _scrape_attempt in range(3):
+                    try:
+                        return {"found": True, **_scrape_result_page(page, screenshot_path)}
+                    except Exception as e:
+                        scrape_error = e
+                        time.sleep(poll_interval)
+                raise scrape_error
 
             time.sleep(poll_interval)
             elapsed += poll_interval
@@ -449,19 +603,31 @@ def fetch_property_card(
 if __name__ == "__main__":
     import sys
 
-    if len(sys.argv) < 5:
-        print(
-            "usage: python mahabhumi.py <district> <office_label> <village_label> <cts_number> [mobile]",
-            file=sys.stderr,
-        )
-        print("       python mahabhumi.py offices <district>", file=sys.stderr)
-        print("       python mahabhumi.py villages <district> <office_label>", file=sys.stderr)
-        sys.exit(2)
+    _USAGE = (
+        "usage: python mahabhumi.py <district> <office_label> <village_label> <cts_number> [mobile]\n"
+        "       python mahabhumi.py offices <district>\n"
+        "       python mahabhumi.py villages <district> <office_label>"
+    )
 
-    if sys.argv[1] == "offices":
+    # The offices/villages subcommands have their own (shorter) arg counts --
+    # checking len(sys.argv) < 5 unconditionally, before dispatching on
+    # sys.argv[1], meant `python mahabhumi.py offices <district>` (3 args)
+    # always hit the usage-and-exit branch and never actually ran. Dispatch
+    # on the subcommand name first; only the bare property-card form still
+    # needs 5 args.
+    if len(sys.argv) >= 2 and sys.argv[1] == "offices":
+        if len(sys.argv) != 3:
+            print(_USAGE, file=sys.stderr)
+            sys.exit(2)
         print(list_offices(sys.argv[2]))
-    elif sys.argv[1] == "villages":
+    elif len(sys.argv) >= 2 and sys.argv[1] == "villages":
+        if len(sys.argv) != 4:
+            print(_USAGE, file=sys.stderr)
+            sys.exit(2)
         print(list_villages(sys.argv[2], sys.argv[3]))
+    elif len(sys.argv) < 5:
+        print(_USAGE, file=sys.stderr)
+        sys.exit(2)
     else:
         district, office, village, cts = sys.argv[1:5]
         mobile = sys.argv[5] if len(sys.argv) > 5 else input("Mobile number to submit: ").strip()
