@@ -2424,12 +2424,71 @@ _ACTIVE_EXTERNAL_FACTS: dict | None = None
 def _set_paragraph_text(paragraph, text: str) -> None:
     if _ACTIVE_EXTERNAL_FACTS is not None:
         text = _externalize_prose(_ACTIVE_EXTERNAL_FACTS, str(text))
-    for run in paragraph.runs[1:]:
-        run.text = ""
+    for extra_run in paragraph.runs[1:]:
+        extra_run.text = ""
+        if _ACTIVE_EXTERNAL_FACTS is not None:
+            from docx.shared import RGBColor
+            extra_run.font.color.rgb = RGBColor.from_string("000000")
+            extra_run.italic = False
     if paragraph.runs:
         paragraph.runs[0].text = text
+        run = paragraph.runs[0]
     else:
-        paragraph.add_run(text)
+        run = paragraph.add_run(text)
+    if _ACTIVE_EXTERNAL_FACTS is not None:
+        # The template's own placeholder runs (this function's normal path
+        # for nearly every body paragraph) carry a grey/italic "note" style
+        # baked in at template-authoring time -- fine for Internal's
+        # analyst working document, but it rendered almost the ENTIRE
+        # External document in low-contrast grey italics, not just the
+        # Gaps & Sources list. External gets plain, fully-readable body
+        # text instead; severity coloring (flags, KPI cells, the Gaps
+        # list) is applied separately, AFTER this runs, so it always wins.
+        from docx.shared import RGBColor
+        run.font.color.rgb = RGBColor.from_string("000000")
+        run.italic = False
+
+
+def _remove_paragraph(paragraph) -> None:
+    """Deletes `paragraph` from the document entirely (not just its text) --
+    a suppressed field that still occupies a bulleted-list template slot
+    would otherwise render as a dangling empty bullet or a blank line, which
+    is exactly the clutter External is trying to remove."""
+    p_element = paragraph._p
+    p_element.getparent().remove(p_element)
+
+
+def _fix_bullet_hanging_indent(doc) -> None:
+    """The template's own numbering.xml defines the bullet list every
+    "List Paragraph" in this document uses (abstractNum id 2, referenced by
+    numId 2) with NO indent at all on its level-0 definition -- unlike a
+    second, unused abstractNum (id 1) that correctly sets a 720/360
+    hanging indent. Word's fallback for a bullet with no indent puts the
+    bullet glyph and first line at the left margin with only a tab before
+    the text, but a wrapped second line has nothing to hang from and falls
+    all the way back to the left margin -- the "text runs off alignment"
+    look throughout every bulleted sub-section. Both doc variants get this
+    fix (it's a genuine template defect, not a content/scope difference)."""
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+
+    numbering_root = doc.part.numbering_part.element
+    for abstract_num in numbering_root.findall(qn("w:abstractNum")):
+        if abstract_num.get(qn("w:abstractNumId")) != "2":
+            continue
+        lvl0 = abstract_num.find(qn("w:lvl"))
+        if lvl0 is None or lvl0.find(qn("w:pPr")) is not None:
+            continue
+        p_pr = OxmlElement("w:pPr")
+        ind = OxmlElement("w:ind")
+        ind.set(qn("w:left"), "720")
+        ind.set(qn("w:hanging"), "360")
+        p_pr.append(ind)
+        lvl_jc = lvl0.find(qn("w:lvlJc"))
+        if lvl_jc is not None:
+            lvl_jc.addnext(p_pr)
+        else:
+            lvl0.append(p_pr)
 
 
 def _set_cell(table, row: int, col: int, text: str) -> None:
@@ -2466,11 +2525,24 @@ def _fill_variable_paragraphs(doc, start_index: int, slot_count: int, texts: lis
     for i in range(len(texts), slot_count):
         slots[i]._element.getparent().remove(slots[i]._element)
 
+    # `style=` only sets pStyle -- it does NOT carry over the bullet's own
+    # <w:numPr> (ilvl/numId), which lives separately in pPr. Past slot_count
+    # items were rendering as plain unbulleted, unindented paragraphs for
+    # exactly that reason. Captured once, before the loop reassigns `last`,
+    # so every overflow paragraph gets the SAME numbering as the real last
+    # template slot, not whatever the immediately-preceding new paragraph
+    # ended up with.
     last = slots[-1] if slots else None
+    num_pr = None
+    if last is not None and last._p.pPr is not None and last._p.pPr.numPr is not None:
+        num_pr = last._p.pPr.numPr
+
     for text in texts[slot_count:]:
         if last is None:
             break
         new_para = last.insert_paragraph_before(text, style=last.style)
+        if num_pr is not None:
+            new_para._p.get_or_add_pPr().append(copy.deepcopy(num_pr))
         last._p.addnext(new_para._p)
         last = new_para
 
@@ -2499,7 +2571,16 @@ def _fill_template(reg_no: str, facts: dict, out_path: str, doc_variant: str = "
 
     shutil.copy2(TEMPLATE_PATH, out_path)
     doc = docx.Document(out_path)
+    _fix_bullet_hanging_indent(doc)
     p = doc.paragraphs
+    # Paragraphs queued for deletion (suppressed External-only content) --
+    # removed in one batch right before save, not as each is decided. Several
+    # OTHER things below (the Sources list, section-consolidation heading
+    # renames) look up doc.paragraphs by a fixed numeric index; deleting
+    # mid-function would shift every later index and break those lookups.
+    # `p` itself stays safe to keep indexing throughout (it holds resolved
+    # Paragraph objects from before any deletion, not positions).
+    _paragraphs_to_remove = []
 
     global _ACTIVE_EXTERNAL_FACTS
     _ACTIVE_EXTERNAL_FACTS = facts if doc_variant == "external" else None
@@ -2532,16 +2613,43 @@ def _fill_template(reg_no: str, facts: dict, out_path: str, doc_variant: str = "
 
     _set_paragraph_text(p[1], f'Project: {core.get("project_name", "[Unknown]")} | Promoter: {fld(ci, "promoter_name") or "[Unknown]"}')
     _set_paragraph_text(p[2], "Public Web-Sourced Edition -- Adapted for Maharashtra (MahaRERA)")
-    _set_paragraph_text(p[3], f"Deep Market Research -- Prepared {datetime.now().strftime('%B %Y')}")
+    _month_year = datetime.now().strftime('%B %Y')
+    if doc_variant == "external":
+        _set_paragraph_text(p[3], f"Deep Market Research (Prepared {_month_year})")
+    else:
+        _set_paragraph_text(p[3], f"Deep Market Research -- Prepared {_month_year}")
     _set_paragraph_text(p[5], facts["methodology_note"])
     _set_paragraph_text(p[7], facts["executive_summary"])
-    _set_paragraph_text(p[12], facts["address_discrepancy_note"])
-    _set_paragraph_text(p[13], facts["corporate_registry_cross_check"])
+    if facts.get("_doc_variant") == "external":
+        # Both are QA cross-check narrations ("we compared N sources and
+        # they agree/disagree") -- an actual disagreement worth knowing
+        # about already surfaces as a flag or gap elsewhere; as standalone
+        # paragraphs these only restate facts already sitting in the
+        # Corporate Identity table below (CIN, registered office, entity
+        # type, partner/director names) while adding audit-trail detail
+        # ("independently retrieved", "fully corroborated") that documents
+        # this pipeline's own research process, not the promoter. Internal
+        # keeps both in full -- that process detail IS the point there.
+        # Deleted outright (not just emptied) so no blank bullet/line is
+        # left behind in these template slots.
+        _paragraphs_to_remove.append(p[13])
+        _paragraphs_to_remove.append(p[12])
+    else:
+        _set_paragraph_text(p[12], facts["address_discrepancy_note"])
+        _set_paragraph_text(p[13], facts["corporate_registry_cross_check"])
     litigation_citation = _citation_text(facts, _clean_source_label(src(facts, "litigation_status")))
     litigation_text = fld(facts, "litigation_status")
     _set_paragraph_text(p[15], f"{litigation_text} {litigation_citation}" if litigation_citation else litigation_text)
-    _set_paragraph_text(p[17], _cite(facts["location_coordinates_note"], "distance", facts=facts))
-    _set_paragraph_text(p[18], "Map screenshot not embedded -- a live map cannot be fetched programmatically, so distances below were sourced from mapping-service queries instead (see Sources).")
+    if facts.get("_doc_variant") == "external":
+        # Both lines are pure measurement-methodology caveats (no map was
+        # plotted; distances are estimated from the locality, not an exact
+        # pin) -- no decision-relevant content for a reader who has the
+        # actual Distances table right below. Internal keeps both in full.
+        _paragraphs_to_remove.append(p[18])
+        _paragraphs_to_remove.append(p[17])
+    else:
+        _set_paragraph_text(p[17], _cite(facts["location_coordinates_note"], "distance", facts=facts))
+        _set_paragraph_text(p[18], "Map screenshot not embedded -- a live map cannot be fetched programmatically, so distances below were sourced from mapping-service queries instead (see Sources).")
     _set_paragraph_text(p[24], _cite(f"Road: {conn.get('road', '')}", "distance", facts=facts))
     _set_paragraph_text(p[25], _cite(f"Rail: {conn.get('rail', '')}", "distance", facts=facts))
     _set_paragraph_text(p[26], _cite(f"Metro: {conn.get('metro', '')}", "distance", facts=facts))
@@ -2549,9 +2657,25 @@ def _fill_template(reg_no: str, facts: dict, out_path: str, doc_variant: str = "
     _set_paragraph_text(p[30], facts["social_infrastructure"])
     _set_paragraph_text(p[32], facts["fsi_governing_framework"])
     _set_paragraph_text(p[33], facts["fsi_interpretation"])
-    _set_paragraph_text(p[36], _cite(f"Governing act: {rs.get('governing_act', '')}", "project_registration", facts=facts))
+    if facts.get("_doc_variant") == "external":
+        # Every MahaRERA-registered project is governed by the same Act by
+        # definition -- this line is identical across every Charter this
+        # pipeline produces, so it carries no signal about THIS project.
+        # Deleted, not emptied, so its bullet doesn't render blank.
+        _paragraphs_to_remove.append(p[36])
+    else:
+        _set_paragraph_text(p[36], _cite(f"Governing act: {rs.get('governing_act', '')}", "project_registration", facts=facts))
     _set_paragraph_text(p[37], _cite(f"Planning approval sequence: {rs.get('planning_approval_sequence', '')}", "project_registration", facts=facts))
-    _set_paragraph_text(p[38], f"Allotment mechanics: {rs.get('allotment_mechanics', '')}")
+    allotment_text = f"Allotment mechanics: {rs.get('allotment_mechanics', '')}"
+    if facts.get("_doc_variant") == "external" and _externalize_prose(facts, allotment_text) == "":
+        # Only the generic "nothing special disclosed" boilerplate is
+        # suppressed by _EXTERNAL_PROSE_SUBSTITUTIONS (checked here so an
+        # actually-unusual allotment mechanism, which wouldn't match that
+        # exact phrase, still renders normally) -- delete outright rather
+        # than leave a blank bullet.
+        _paragraphs_to_remove.append(p[38])
+    else:
+        _set_paragraph_text(p[38], allotment_text)
     _set_paragraph_text(p[41], rc.get("registration_summary", ""))
     _set_paragraph_text(p[42], f"Collection Account of the Project (100%): {rc.get('collection_account', '')}")
     _set_paragraph_text(p[43], f"Separate/Transaction RERA escrow sub-accounts: {rc.get('escrow_subaccounts', '')}")
@@ -2563,13 +2687,58 @@ def _fill_template(reg_no: str, facts: dict, out_path: str, doc_variant: str = "
     _set_paragraph_text(p[51], _cite(f"Professionals of record: {lp.get('professionals_of_record', '')}", "project_registration", facts=facts))
     _set_paragraph_text(p[54], _cite(facts["micro_market_overview"], "pricing", "market_trend", facts=facts))
     _set_paragraph_text(p[56], _cite(facts["area_intelligence_trend"], "market_trend", "pricing", facts=facts))
-    _set_paragraph_text(p[58], facts.get("rera_scraping_note", f"Extracted directly from the live MahaRERA public project page for registration number {reg_no}."))
+    if facts.get("_doc_variant") == "external":
+        # A sourcing/methodology note ("where did this data come from"),
+        # not a project fact -- suppressed the same way as the other pure
+        # process notes above.
+        _paragraphs_to_remove.append(p[58])
+    else:
+        _set_paragraph_text(p[58], facts.get("rera_scraping_note", f"Extracted directly from the live MahaRERA public project page for registration number {reg_no}."))
     _set_paragraph_text(p[61], _cite(facts["unit_summary_note"], "project_registration", facts=facts))
-    _set_paragraph_text(p[63], facts["documents_reviewed_note"])
+    if facts.get("_doc_variant") == "external":
+        # documents_reviewed_note is "which files I personally opened vs.
+        # just confirmed present" -- research-scope bookkeeping, not a
+        # project fact. documents_absent_note stays (a real "was anything
+        # missing" answer matters to a reader), but its own methodology
+        # tail gets trimmed by _EXTERNAL_PROSE_SUBSTITUTIONS below.
+        _paragraphs_to_remove.append(p[63])
+    else:
+        _set_paragraph_text(p[63], facts["documents_reviewed_note"])
     _set_paragraph_text(p[64], facts["documents_absent_note"])
 
     gaps = facts.get("gaps", [])
-    _set_paragraph_text(p[66], "\n".join(f"• {g}" for g in gaps) if gaps else "No additional gaps identified beyond the standing gap below.")
+    if facts.get("_doc_variant") == "external":
+        # External: show ONLY gaps that were serious enough to also earn an
+        # Imminent/Structural flag above (see _classify_flags), colored to
+        # match that same severity -- a long, uniformly grey/italic list of
+        # every minor caveat wasn't legible or prioritized for a reader who
+        # skips straight to this section. Monitor-only/unflagged gaps are
+        # dropped from THIS section entirely, not lost -- they're still
+        # visible in Overview & Flags' own Monitor list. _classify_flags is
+        # a pure reader of facts with no side effects, safe to call again
+        # here rather than threading its result through the call chain.
+        gap_severity = {}
+        flags_for_gaps = _classify_flags(facts)
+        for severity in ("structural", "imminent"):  # imminent checked last so it wins on the (should never happen) double-tag case
+            for item in flags_for_gaps.get(severity, []):
+                m = re.match(r"gaps\[(\d+)\]$", item.get("field", ""))
+                if m:
+                    gap_severity[int(m.group(1))] = severity
+
+        for run in list(p[66].runs):
+            run.text = ""
+            run._r.getparent().remove(run._r)
+        material = [(i, g) for i, g in enumerate(gaps) if i in gap_severity]
+        if not material:
+            p[66].add_run(_externalize_prose(facts, "No additional material gaps identified beyond the standing gap below."))
+        else:
+            for idx, (i, g) in enumerate(material):
+                run = p[66].add_run(_externalize_prose(facts, f"• {g}"))
+                _color_run(run, _TEXT_RED if gap_severity[i] == "imminent" else _TEXT_AMBER)
+                if idx < len(material) - 1:
+                    run.add_break()
+    else:
+        _set_paragraph_text(p[66], "\n".join(f"• {g}" for g in gaps) if gaps else "No additional gaps identified beyond the standing gap below.")
     # p[67] (the permanent standing gap) is left untouched deliberately.
 
     t = doc.tables
@@ -2594,6 +2763,15 @@ def _fill_template(reg_no: str, facts: dict, out_path: str, doc_variant: str = "
         value = fld(ci, key)
         citation = _citation_text(facts, _clean_source_label(src(ci, key)))
         _set_cell(t[1], row, 1, f"{value} {citation}" if value and citation else value)
+
+    if facts.get("_doc_variant") == "external":
+        # The "Field" column (col 0) is static text baked directly into the
+        # template docx -- unlike col 1 above, nothing ever calls _set_cell
+        # on it, so it never passes through _externalize_prose on its own.
+        # This one row's static label happens to use " -- ", so it needs an
+        # explicit touch here. Internal leaves the template's own text
+        # completely alone, as always.
+        _set_cell(t[1], 3, 0, _externalize_prose(facts, t[1].rows[3].cells[0].text))
 
     for row, key in zip(range(1, 5), ("east", "west", "north", "south")):
         _set_cell(t[2], row, 1, _cite(nb.get(key, ""), "project_registration", "legal_documents", facts=facts))
@@ -2648,11 +2826,19 @@ def _fill_template(reg_no: str, facts: dict, out_path: str, doc_variant: str = "
 
     _fill_variable_rows(t[7], 1, facts.get("blocks", []), _fill_block_row)
 
-    def _fill_doc_library_row(row, item):
-        _set_row_cell(row, 0, item["document_name"])
-        _set_row_cell(row, 1, item["status"])
+    if facts.get("_doc_variant") == "external":
+        # A 50-70-row table that's "Downloaded" repeated over and over is
+        # diligence bookkeeping, not a finding -- drops the heading and the
+        # whole table for External. Internal keeps the full per-document
+        # checklist.
+        _paragraphs_to_remove.append(p[62])
+        t[8]._tbl.getparent().remove(t[8]._tbl)
+    else:
+        def _fill_doc_library_row(row, item):
+            _set_row_cell(row, 0, item["document_name"])
+            _set_row_cell(row, 1, item["status"])
 
-    _fill_variable_rows(t[8], 1, facts.get("document_library", []), _fill_doc_library_row)
+        _fill_variable_rows(t[8], 1, facts.get("document_library", []), _fill_doc_library_row)
 
     def _format_source_line(s: dict) -> str:
         line = f'{s.get("label", "")} -- {s.get("ref", "")}'
@@ -2877,6 +3063,14 @@ def _fill_template(reg_no: str, facts: dict, out_path: str, doc_variant: str = "
     p[4]._p.getparent().remove(p[4]._p)
     p[5]._p.getparent().remove(p[5]._p)
 
+    # Deferred from wherever they were decided above (see the comment by
+    # `_paragraphs_to_remove`'s declaration) -- last thing before save, once
+    # every fixed-index doc.paragraphs[...] lookup (Sources list, section
+    # consolidation, Methodology Note removal) is done depending on stable
+    # positions.
+    for paragraph in _paragraphs_to_remove:
+        _remove_paragraph(paragraph)
+
     doc.save(out_path)
     _ACTIVE_EXTERNAL_FACTS = None
 
@@ -3088,8 +3282,33 @@ def _clean_source_label(raw_source: str) -> str | None:
             name = f"MahaRERA {name}"
         return name + annotation
 
-    pieces = [p for p in raw_source.split(";") if p.strip()]
+    pieces = [p for p in _split_outside_parens(raw_source, ";") if p.strip()]
     return "; ".join(_clean_one(p) for p in pieces)
+
+
+def _split_outside_parens(text: str, sep: str) -> list[str]:
+    """Splits `text` on `sep`, but only where `sep` sits outside any
+    "(...)" span -- a real bug this caught: a single source string like
+    "Title Report.pdf (First Schedule; land-title chain; 30-year
+    litigation search)" has semicolons INSIDE its own trailing
+    parenthetical (several related concepts, not several sources), and a
+    plain str.split(";") tore it into 3 fake separate citations, one of
+    them left with a dangling, unmatched ")"."""
+    pieces = []
+    depth = 0
+    current = []
+    for ch in text:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        if ch == sep and depth == 0:
+            pieces.append("".join(current))
+            current = []
+        else:
+            current.append(ch)
+    pieces.append("".join(current))
+    return pieces
 
 
 # Keyword rules for _generic_one_label, tried in order (most specific
@@ -3189,7 +3408,7 @@ def _citation_text(facts: dict, cleaned_label: str | None) -> str | None:
     if facts.get("_doc_variant") != "external":
         return f"({cleaned_label})"
     markers = []
-    for piece in (p.strip() for p in cleaned_label.split(";")):
+    for piece in (p.strip() for p in _split_outside_parens(cleaned_label, ";")):
         if not piece:
             continue
         marker = _register_citation(facts, _generic_one_label(piece))
@@ -3197,6 +3416,280 @@ def _citation_text(facts: dict, cleaned_label: str | None) -> str | None:
             markers.append(marker)
     return "".join(markers) if markers else None
 
+
+# Exact-text rewrites of known facts.json prose, applied via plain
+# substring replacement (not regex -- these are long, literal, already-
+# written sentences, not patterns) before _EXTERNAL_PROSE_SUBSTITUTIONS
+# runs. Purpose: External wants no " -- " (em-dash-style) punctuation
+# anywhere, per explicit request -- but a blind regex swap of every " -- "
+# for a comma would produce comma splices and broken grammar in a good
+# fraction of cases (a dash sometimes joins two independent clauses, which
+# needs a period/semicolon, not a comma). Each entry here is a hand-checked,
+# grammatically-correct rewrite of one specific known sentence, keyed by
+# its exact original text -- Internal is untouched (this dict is only ever
+# consulted when doc_variant == "external", same as every other transform
+# in _externalize_prose). Not exhaustive against future/unseen prose (see
+# _EXTERNAL_PROSE_SUBSTITUTIONS's own note below on that same limitation);
+# new fields written with " -- " will need a new entry added here.
+_EXTERNAL_DASH_REWRITES = {
+    # --- static template labels/headings, hardcoded in this file (not
+    # facts.json), shared by every Charter this pipeline generates ---
+    "Public Web-Sourced Edition -- Adapted for Maharashtra (MahaRERA)":
+        "Public Web-Sourced Edition: Adapted for Maharashtra (MahaRERA)",
+    "Every figure above is drawn directly from the underlying facts already researched for this project -- see the flag lists below for detail and the Diligence Appendix for the per-pillar/per-check breakdown behind the Developer Score and Data Authenticity figures.":
+        "Every figure above is drawn directly from the underlying facts already researched for this project; see the flag lists below for detail and the Diligence Appendix for the per-pillar/per-check breakdown behind the Developer Score and Data Authenticity figures.",
+    "Imminent Red Flags -- act on these before proceeding": "Imminent Red Flags: act on these before proceeding",
+    "Structural Flags -- standing characteristics, raise directly with the developer": "Structural Flags: standing characteristics, raise directly with the developer",
+    "Monitor Flags -- re-check on a future pass": "Monitor Flags: re-check on a future review",
+    "The cards above are the material findings from this Charter's own research -- see Overview & Flags below for the full flag detail behind each one.":
+        "The cards above are the material findings from this Charter's own research; see Overview & Flags below for the full flag detail behind each one.",
+    "Insolvency Check -- IBBI Corporate Debtor Master Data": "Insolvency Check: IBBI Corporate Debtor Master Data",
+    "Checked directly against the Insolvency and Bankruptcy Board of India's public Corporate Debtor Master Data, by the promoter's own CIN -- an exact-identifier lookup, not a name-based guess.":
+        "Checked directly against the Insolvency and Bankruptcy Board of India's public Corporate Debtor Master Data, by the promoter's own CIN: an exact-identifier lookup, not a name-based guess.",
+    "Checked directly against every rating agency's public database (currently ICRA and Infomerics) for an exact match on the promoter's own legal name -- not a fuzzy or \"probably the same company\" guess, since attributing a rating to the wrong legal entity would itself be a serious error.":
+        "Checked directly against every rating agency's public database (currently ICRA and Infomerics) for an exact match on the promoter's own legal name, not a fuzzy or \"probably the same company\" guess, since attributing a rating to the wrong legal entity would itself be a serious error.",
+    "Pulled directly from 3 independent public company-registry mirror(s) by CIN -- an exact-identifier lookup, not a name-based guess -- and cross-checked against each other; any disagreement between them on the current director roster is called out under Gaps & Limitations rather than silently resolved.":
+        "Pulled directly from 3 independent public company-registry mirror(s) by CIN, an exact-identifier lookup rather than a name-based guess, and cross-checked against each other; any disagreement between them on the current director roster is called out under Gaps & Limitations rather than silently resolved.",
+    "Every entity below shares at least one concrete, named link with the promoter above -- a specific director in common, a shared registered office, or a filed subsidiary/associate/JV relationship -- rather than being inferred from a name or industry match.":
+        "Every entity below shares at least one concrete, named link with the promoter above (a specific director in common, a shared registered office, or a filed subsidiary/associate/JV relationship) rather than being inferred from a name or industry match.",
+    "Each of this promoter's directors, current or past, cross-referenced against how many of the group companies below name them as a shared director -- collapses the 299-entity list to the thing that actually matters here: how concentrated the group's leadership is around a small number of individuals, not a name-by-name read of every affiliated entity.":
+        "Each of this promoter's directors, current or past, is cross-referenced against how many of the group companies below name them as a shared director. This collapses the 299-entity list to the thing that actually matters here: how concentrated the group's leadership is around a small number of individuals, not a name-by-name read of every affiliated entity.",
+    "This page is generated directly from the same sources and gaps already listed earlier in this document -- it is a count, not a self-assessment.":
+        "This page is generated directly from the same sources and gaps already listed earlier in this document. It is a count, not a self-assessment.",
+    "This score rates how well-sourced and verified THIS DOCUMENT's own claims are -- source quality, completeness, cross-corroboration, recency, and re-check success -- it is NOT a rating of the underlying project's quality, safety, or investment merit.":
+        "This score rates how well-sourced and verified this document's own claims are (source quality, completeness, cross-corroboration, recency, and re-check success). It is not a rating of the underlying project's quality, safety, or investment merit.",
+    "It is a weighted average of six criteria computed below from this document's own sources and gaps -- informed by the structure of CRISIL's real-estate methodology (a small number of named factors rather than one flat checklist) but NOT a replica of any CRISIL formula: CRISIL does not publish a numeric weighting scheme for any of its three real-estate products, and the weights used here are this project's own calibration.":
+        "It is a weighted average of six criteria computed below from this document's own sources and gaps, informed by the structure of CRISIL's real-estate methodology (a small number of named factors rather than one flat checklist) but not a replica of any CRISIL formula: CRISIL does not publish a numeric weighting scheme for any of its three real-estate products, and the weights used here are this project's own calibration.",
+    "Checked directly against every rating agency's public database (currently ICRA and Infomerics) for an exact match on the promoter's own legal name -- not a fuzzy or \"probably the same company\" guess, since attributing a rating to the wrong legal entity would itself be a serious error. Every agency is checked regardless of whether an earlier one already found something, so that if two agencies rate the same entity, both ratings are shown here for comparison rather than silently reporting only one.":
+        "Checked directly against every rating agency's public database (currently ICRA and Infomerics) for an exact match on the promoter's own legal name, not a fuzzy or \"probably the same company\" guess, since attributing a rating to the wrong legal entity would itself be a serious error. Every agency is checked regardless of whether an earlier one already found something, so that if two agencies rate the same entity, both ratings are shown here for comparison rather than silently reporting only one.",
+    "Each row below reflects the actual order PDF already on file for that complaint (downloaded via the same document-retrieval mechanism used for project documents), classified by a small, named set of outcome keywords -- not a self-reported summary.":
+        "Each row below reflects the actual order PDF already on file for that complaint (downloaded via the same document-retrieval mechanism used for project documents), classified by a small, named set of outcome keywords rather than a self-reported summary.",
+    "Of 10 cited source(s) in this report, 3 (30%) come from a primary regulatory record, a document opened directly from it, or a live Google Maps route checked in this review -- the highest-confidence tier.":
+        "Of 10 cited source(s) in this report, 3 (30%) come from a primary regulatory record, a document opened directly from it, or a live Google Maps route checked in this review: the highest-confidence tier.",
+    "Of 8 cited source(s) in this report, 2 (25%) come from a primary regulatory record, a document opened directly from it, or a live Google Maps route checked in this review -- the highest-confidence tier.":
+        "Of 8 cited source(s) in this report, 2 (25%) come from a primary regulatory record, a document opened directly from it, or a live Google Maps route checked in this review: the highest-confidence tier.",
+    "facts that were sought but could not be confirmed, listed in full under \"Gaps & Limitations\" earlier in this document -- rather than filled in with an estimate.":
+        "facts that were sought but could not be confirmed, listed in full under \"Gaps & Limitations\" earlier in this document, rather than filled in with an estimate.",
+    "CIN / LLPIN (if incorporated -- note: N/A for an unincorporated Partnership)":
+        "CIN / LLPIN (if incorporated; N/A for an unincorporated Partnership)",
+    "See Litigation Status -- not a clean read": "See Litigation Status: not a clean read",
+    "promoter_portfolio.totals.area_within_5km_lakh_sqft not available -- this pass's promoter_portfolio.json predates the geocoding-based 5km filter (build_promoter_portfolio's subject_project_partners_data/subject_reg_no params), or no subject location could be geocoded. Re-run the pipeline to compute it, rather than treating this as a permanent gap.":
+        "Not available. This review's portfolio data predates the geocoding-based 5km filter, or no subject location could be geocoded. This can be computed on a future review rather than treated as a permanent gap.",
+    "promoter_portfolio.totals.total_area_developed_lakh_sqft not available -- requires area figures aggregated across the promoter's other MahaRERA-registered projects, not yet computed this pass.":
+        "Not available. This requires area figures aggregated across the promoter's other MahaRERA-registered projects, not yet computed this review.",
+    "Not applicable this pass -- excluded rather than scored as a failure; remaining weights renormalized to still sum to 100%.":
+        "Not applicable this review: excluded rather than scored as a failure; remaining weights renormalized to still sum to 100%.",
+    "Complaint volume: 3 total filing(s) on record against this project -- a visible floor worth noting, not blended into zero.":
+        "Complaint volume: 3 total filing(s) on record against this project, a visible floor worth noting, not blended into zero.",
+    "Entity Rating, 7.5% each) -- each sub-metric independently banded AAA/AA/A/B/C/D.":
+        "Entity Rating, 7.5% each), each sub-metric independently banded AAA/AA/A/B/C/D.",
+
+    # --- shared across both fixtures (identical boilerplate text) ---
+    "Available -- downloaded": "Downloaded",
+    "Form B declares the standard 70% construction/land-cost escrow undertaking (Clause under Rule 5) -- exact bank/branch not disclosed in the documents reviewed.":
+        "Form B declares the standard 70% construction/land-cost escrow undertaking (Clause under Rule 5); exact bank/branch is not disclosed in the documents reviewed.",
+    "No public rating found for this exact legal entity name from any agency checked (ICRA, Infomerics). This is NOT itself a red flag -- these agencies only rate developers that sought a public rating (typically larger, listed, or NCD-issuing entities); most MahaRERA promoters are too small or private to ever be rated.":
+        "No public rating found for this exact legal entity name from any agency checked (ICRA, Infomerics). This is not itself a red flag: these agencies only rate developers that sought a public rating (typically larger, listed, or NCD-issuing entities), and most MahaRERA promoters are too small or private to ever be rated.",
+    "Portfolio is based on a name match against MahaRERA's own Promoters-tab search -- punctuation/suffix variants (e.g. 'Pvt Ltd', typos) may cause under-counting; cross-check manually if more projects are expected.":
+        "Portfolio is based on a name match against MahaRERA's own Promoters-tab search. Punctuation or suffix variants (e.g. 'Pvt Ltd', typos) may cause under-counting; cross-check manually if more projects are expected.",
+    "MahaRERA's Promoters-tab search has no Registered/Revoked toggle (unlike the Projects tab) -- 'lapsed_or_flagged_count' is a best-effort signal from each project's own status field, not an independently confirmed revocation count.":
+        "MahaRERA's Promoters-tab search has no Registered/Revoked toggle (unlike the Projects tab); the flagged-project count is a best-effort signal from each project's own status field, not an independently confirmed revocation count.",
+    "Mortgage lender is NOT tracked here across a promoter's portfolio: none of MahaRERA's structured project category APIs (projects, partners, professionals, sro_details, past_experiences, documents, complaints, appeals, spocs -- checked exhaustively) expose a bank/lender/mortgage/finance field anywhere. Lender identity is only ever recoverable as free text inside a project's own documents (see company_charter.py's mortgage_lender field, sourced from a per-project document read), which this deterministic, document-free portfolio scan does not open. Building cross-project lender tracking would require downloading and OCR/reading documents for every project in a promoter's portfolio -- a different, much heavier architecture, out of scope for this pass.":
+        "Mortgage lender is not tracked here across a promoter's portfolio: none of MahaRERA's structured project category APIs (projects, partners, professionals, sro_details, past_experiences, documents, complaints, appeals, spocs, checked exhaustively) expose a bank, lender, mortgage, or finance field anywhere. Lender identity is only ever recoverable as free text inside a project's own documents, which this deterministic, document-free portfolio scan does not open. Building cross-project lender tracking would require downloading and reading documents for every project in a promoter's portfolio, a different, much heavier approach, out of scope for this review.",
+    "Past-experience completion dates (on_time_rate_pct and friends) are self-reported by the promoter to MahaRERA, not independently verified against any external record -- treat this as the promoter's own claimed track record, not a confirmed one.":
+        "Past-experience completion dates are self-reported by the promoter to MahaRERA, not independently verified against any external record; treat this as the promoter's own claimed track record, not a confirmed one.",
+    "total_area_developed_lakh_sqft and area_within_5km_lakh_sqft are both summed from each portfolio project's own past_experiences.landArea (self-reported, sqm, converted to lakh sq ft), excluding the subject project's own entry -- if the promoter declared the SAME historical project's area under more than one of its current registrations, that area is counted once per declaration, not deduplicated (the same limitation already applies to on_time_count/delayed_count above).":
+        "Total area developed and area within 5km figures are both summed from each portfolio project's own reported land area (self-reported, converted to lakh sq ft), excluding the subject project's own entry. If the promoter declared the same historical project's area under more than one of its current registrations, that area is counted once per declaration, not deduplicated.",
+    "area_within_5km_lakh_sqft additionally requires geocoding: the subject project's own locality (from its partners category data, if supplied) is resolved via OpenStreetMap's public Nominatim API -- a free, no-API-key service, rate-limited to ~1 request/second per its usage policy. Each past_experiences entry's own address is geocoded by preference on any 6-digit Indian pincode found inside it (confirmed live: MahaRERA's own `address` field is often a full legal land description -- survey numbers, stray commas -- that Nominatim's free-form search fails on entirely, even when the correct locality name is embedded in it; the pincode alone resolves reliably), falling back to the raw address text, then to the portfolio project's district, if no pincode is present. An entry that still can't be geocoded is excluded from the 5km sum entirely (never guessed in or out), and a pincode covers a small area, not a point, so this figure is a reasonable estimate, not a surveyed one. If no subject location was supplied at all, or it can't be geocoded, area_within_5km_lakh_sqft stays None entirely.":
+        "The area-within-5km figure additionally requires geocoding: the subject project's own locality is resolved via OpenStreetMap's public Nominatim API, a free, no-API-key service, rate-limited to roughly 1 request per second. Each portfolio entry's own address is geocoded by preference on any 6-digit Indian pincode found inside it, since MahaRERA's own address field is often a full legal land description (survey numbers, stray commas) that free-form search fails on, while the pincode alone resolves reliably, falling back to the raw address text and then to the project's district if no pincode is present. An entry that still cannot be geocoded is excluded from the 5km sum entirely, and a pincode covers a small area rather than a point, so this figure is a reasonable estimate, not a surveyed one. If no subject location was supplied at all, or it cannot be geocoded, this figure is left blank entirely.",
+    "No public source discloses internal team headcounts by function (Liaisoning / Project Development / Sales & CRM) -- a structural limitation of publicly-available data, not something a future pass can close.":
+        "No public source discloses internal team headcounts by function (Liaisoning / Project Development / Sales & CRM). This is a structural limitation of publicly available data, not something a future review can close.",
+    "Debt-to-capital ratio, secured-debt ratio, and default occurrence are not disclosed by any source this pipeline checks (MahaRERA/ZaubaCorp don't carry balance-sheet debt structure) -- only resolvable when a credit-rating rationale or MCA financial filing states these figures.":
+        "Debt-to-capital ratio, secured-debt ratio, and default occurrence are not disclosed by any source checked (MahaRERA and ZaubaCorp do not carry balance-sheet debt structure). This is only resolvable when a credit-rating rationale or MCA financial filing states these figures.",
+    "RERA compliance history (registration timeliness, extension/penalty record) is not yet computed as a scored metric -- no data source has been wired in for this criterion yet; a pending build, not a permanent public-data gap.":
+        "RERA compliance history (registration timeliness, extension/penalty record) is not yet computed as a scored metric. No data source has been wired in for this criterion yet; this is a pending build, not a permanent public-data gap.",
+    "GST/TDS compliance is not yet computed as a scored metric -- no data source has been wired in for this criterion yet; a pending build, not a permanent public-data gap.":
+        "GST/TDS compliance is not yet computed as a scored metric. No data source has been wired in for this criterion yet; this is a pending build, not a permanent public-data gap.",
+    "Nearest metro station -- estimated via web search, not a live driving-route lookup.":
+        "Nearest metro station, estimated via web search, not a live driving-route lookup.",
+
+    # --- Pranami Bliss ---
+    "Pranami Bliss (MahaRERA P51800077150) is a 234-unit residential redevelopment on Veera Desai Road, Azad Nagar, Andheri West, Mumbai, by Pranami Neev Realty Limited -- a Mumbai-market SPV (incorporated 2022) of the longer-established Pranami Group (Ranchi, founded 2002).":
+        "Pranami Bliss (MahaRERA P51800077150) is a 234-unit residential redevelopment on Veera Desai Road, Azad Nagar, Andheri West, Mumbai, by Pranami Neev Realty Limited, a Mumbai-market SPV (incorporated 2022) of the longer-established Pranami Group (Ranchi, founded 2002).",
+    "Amalgamated plot CTS No. 183(pt), Village Mauje Aambivali -- comprising Property No. 49 (Survey No. 133(part) / City Survey No. 630-B(part)) and Property No. 50 (Survey No. 132(part) / City Survey No. 183(part))":
+        "Amalgamated plot CTS No. 183(pt), Village Mauje Aambivali, comprising Property No. 49 (Survey No. 133(part) / City Survey No. 630-B(part)) and Property No. 50 (Survey No. 132(part) / City Survey No. 183(part))",
+    "None disclosed in the Title Report -- no acquisition/reservation affecting this land was found in the 30-year search":
+        "None disclosed in the Title Report: no acquisition or reservation affecting this land was found in the 30-year search",
+    "1,674.63 sq.m (same as total gross area -- no deductions disclosed in the Title Report)":
+        "1,674.63 sq.m (same as total gross area; no deductions disclosed in the Title Report)",
+    "Public Limited Company (per ZaubaCorp/InstaFinancials -- Company limited by shares, Non-government)":
+        "Public Limited Company (per ZaubaCorp/InstaFinancials: company limited by shares, non-government)",
+    "U70109MH2022PLC385473 -- confirmed identically across ZaubaCorp, Tofler, and InstaFinancials, and on the company's own PAN card":
+        "U70109MH2022PLC385473, confirmed identically across ZaubaCorp, Tofler, and InstaFinancials, and on the company's own PAN card",
+    "Not separately disclosed -- Form B's authorizing resolution (2 Feb 2024) does not itself restate a registered-office address distinct from the MCA record above":
+        "Not separately disclosed. Form B's authorizing resolution (2 Feb 2024) does not itself restate a registered-office address distinct from the MCA record above.",
+    "Not applicable -- no separate planning-stage address disclosed anywhere in this project's documents":
+        "Not applicable: no separate planning-stage address is disclosed anywhere in this project's documents.",
+    "Mr. Sundeep Poddar, Director -- signs both the Form B declaration and the Non-Encumbrance/Legal declarations on the company's behalf":
+        "Mr. Sundeep Poddar, Director, signs both the Form B declaration and the Non-Encumbrance/Legal declarations on the company's behalf.",
+    "Bijay Kumar Agarwal (DIN 00448678, appointed 2022-09-07), Nitish Kumar Agarwal (DIN 02750231, appointed 2022-06-27), Sundeep Poddar (DIN 05217062, appointed 2022-06-27) -- current directors, confirmed identically by ZaubaCorp, Tofler, and InstaFinancials (no cross-source disagreement, unlike some other promoters checked)":
+        "Bijay Kumar Agarwal (DIN 00448678, appointed 2022-09-07), Nitish Kumar Agarwal (DIN 02750231, appointed 2022-06-27), and Sundeep Poddar (DIN 05217062, appointed 2022-06-27) are the current directors, confirmed identically by ZaubaCorp, Tofler, and InstaFinancials with no cross-source disagreement.",
+    "Land owner of record: Maharashtra Housing and Area Development Authority (MHADA), via two lessee societies -- Azad Nagar Sai-Chhaya CHS Ltd. (Property 49) and Azad Nagar Himalaya CHS Ltd. (Property 50), merged into one society by Deputy Registrar order dated 6 March 2024.":
+        "Land owner of record: Maharashtra Housing and Area Development Authority (MHADA), via two lessee societies: Azad Nagar Sai-Chhaya CHS Ltd. (Property 49) and Azad Nagar Himalaya CHS Ltd. (Property 50), merged into one society by Deputy Registrar order dated 6 March 2024.",
+    "Two distinct matters, kept separate rather than blended into one verdict: (1) LAND TITLE litigation -- the Title Report's own 30-year search (1994-2023, Bombay High Court, Bombay City Civil Court Dindoshi, Small Causes Court Bandra, Debt Recovery Tribunal) found no litigation directly against Property 49 or 50, save for a Notice of Lis Pendens (20 Dec 2017) concerning an adjacent, unrelated society (Azad Nagar Krupa Sagar CHS) with no relief sought against this subject property. Form B additionally declares \"we have no litigation on the said Land.\" (2) RERA CONSUMER COMPLAINTS/APPEALS -- MahaRERA's own live record shows 0 complaints and 0 appeals against this project as of this pass. Neither the land itself nor the promoter's delivery/compliance record shows disclosed litigation risk at this time.":
+        "Two distinct matters, kept separate rather than blended into one verdict. (1) Land title litigation: the Title Report's own 30-year search (1994-2023, Bombay High Court, Bombay City Civil Court Dindoshi, Small Causes Court Bandra, Debt Recovery Tribunal) found no litigation directly against Property 49 or 50, save for a Notice of Lis Pendens (20 Dec 2017) concerning an adjacent, unrelated society (Azad Nagar Krupa Sagar CHS) with no relief sought against this subject property. Form B additionally declares \"we have no litigation on the said Land.\" (2) RERA consumer complaints and appeals: MahaRERA's own live record shows 0 complaints and 0 appeals against this project as of this review. Neither the land itself nor the promoter's delivery/compliance record shows disclosed litigation risk at this time.",
+    "Andheri West / Oshiwara residential-commercial corridor -- proximate to":
+        "Andheri West / Oshiwara residential-commercial corridor, proximate to",
+    "Governed by MHADA's redevelopment framework for the two amalgamated cessed/MHADA-lease buildings (Bldg. 49 -- Azad Nagar Sai-Chhaya CHS; Bldg. 50 -- Azad Nagar Himalaya CHS) on CTS 183(pt), Village Ambivali, under DCPR 2034 -- confirmed via the MHADA Intimation of Approval (IOA) chain (initial \"Zero FSI\" IOA dated 18-Sep-2023, amended 28-Mar-2025 for \"FSI Potential\").":
+        "Governed by MHADA's redevelopment framework for the two amalgamated cessed/MHADA-lease buildings (Bldg. 49, Azad Nagar Sai-Chhaya CHS; Bldg. 50, Azad Nagar Himalaya CHS) on CTS 183(pt), Village Ambivali, under DCPR 2034. Confirmed via the MHADA Intimation of Approval (IOA) chain (initial \"Zero FSI\" IOA dated 18-Sep-2023, amended 28-Mar-2025 for \"FSI Potential\").",
+    "The project's approvals moved from an initial \"Zero FSI\" IOA (18-Sep-2023 -- approving the redevelopment in principle without quoting specific FSI/BUA figures) to an amended IOA (28-Mar-2025) for \"FSI Potential\" -- also without the amendment letter itself quoting the specific area/FSI numbers being unlocked.":
+        "The project's approvals moved from an initial \"Zero FSI\" IOA (18-Sep-2023, approving the redevelopment in principle without quoting specific FSI/BUA figures) to an amended IOA (28-Mar-2025) for \"FSI Potential,\" also without the amendment letter itself quoting the specific area/FSI numbers being unlocked.",
+    "1,674.63 sq.m (per Title Report -- see Land Identification)":
+        "1,674.63 sq.m (per Title Report; see Land Identification)",
+    "Not stated in the documents reviewed -- the Zero-FSI IOA and its 28-Mar-2025 amendment both approve the redevelopment/amended plan in principle without quoting a specific BUA figure.":
+        "Not stated in the documents reviewed. The Zero-FSI IOA and its 28-Mar-2025 amendment both approve the redevelopment in principle without quoting a specific BUA figure.",
+    "Not applicable -- no mortgage was disclosed as currently existing (see mortgage_lender below); LLDPL holds a contractual RIGHT to mortgage the free-sale area under the Supplemental Agreements, not a disclosed existing charge.":
+        "Not applicable. No mortgage was disclosed as currently existing; LLDPL holds a contractual right to mortgage the free-sale area under the Supplemental Agreements, not a disclosed existing charge.",
+    "Not computed -- BUA figure unavailable from the documents reviewed (see fsi_interpretation).":
+        "Not computed. BUA figure unavailable from the documents reviewed.",
+    "No lender/bank named in either Non-Encumbrance declaration reviewed -- both are self-declarations by the promoter (\"free from all sort of encumbrances\", \"free from all sort of legal encumbrances\") with no financial institution identified.":
+        "No lender or bank is named in either Non-Encumbrance declaration reviewed. Both are self-declarations by the promoter (\"free from all sort of encumbrances\", \"free from all sort of legal encumbrances\") with no financial institution identified.",
+    "Registered 2024-07-23 (acknowledgement REA51800155212), currently \"Certificate Signed\" status, proposed completion 2027-04-15 (unchanged since original registration -- no extension on record).":
+        "Registered 2024-07-23 (acknowledgement REA51800155212), currently \"Certificate Signed\" status, proposed completion 2027-04-15 (unchanged since original registration; no extension on record).",
+    "Not independently confirmed from the documents reviewed this pass (see Gaps) -- MahaRERA's own project API does not expose a bank/account-number field.":
+        "Not independently confirmed from the documents reviewed this review (see Gaps). MahaRERA's own project API does not expose a bank or account-number field.",
+    "Form B declares no litigation on the land, holds a legal title report, and commits to the 15-Apr-2027 completion date -- signed by Sundeep Poddar, Director, under a board resolution dated 2-Feb-2024.":
+        "Form B declares no litigation on the land, holds a legal title report, and commits to the 15-Apr-2027 completion date, signed by Sundeep Poddar, Director, under a board resolution dated 2-Feb-2024.",
+    "specific to this micro-pocket was found -- the figures above are real-estate-aggregator averages":
+        "specific to this micro-pocket was found. The figures above are real-estate-aggregator averages",
+    "Price on request -- not disclosed": "Price on request (not disclosed)",
+    "tracked by one aggregator) -- consistent with an actively developing":
+        "tracked by one aggregator), consistent with an actively developing",
+    "2027-04-15 -- unchanged since original registration, no extension on record":
+        "2027-04-15, unchanged since original registration, no extension on record",
+    "Per Pranami Group's own website (pranamigroup.com/about), the group was founded in 2002 by Bijay Kumar Agarwal (~23-24 years active as of 2026), operating primarily in Ranchi and Gurgaon, citing 24+ projects and 5M+ sq ft delivered -- self-reported by the group, not independently audited. Pranami Neev Realty Limited itself (the RERA-registered promoter entity for this specific project) was only incorporated 2022-06-27, consistent with being a newer Mumbai-market SPV of the longer-established group rather than the group's founding entity -- confirmed via an August 2023 announcement of a Rs. 225 crore Integrow investment partnership covering Pranami Group's newly-acquired Andheri/Ghatkopar developments, of which this project is one.":
+        "Per Pranami Group's own website (pranamigroup.com/about), the group was founded in 2002 by Bijay Kumar Agarwal (roughly 23-24 years active as of 2026), operating primarily in Ranchi and Gurgaon, citing 24+ projects and 5M+ sq ft delivered; this is self-reported by the group, not independently audited. Pranami Neev Realty Limited itself (the RERA-registered promoter entity for this specific project) was only incorporated 2022-06-27, consistent with being a newer Mumbai-market SPV of the longer-established group rather than the group's founding entity. This is confirmed via an August 2023 announcement of a Rs. 225 crore Integrow investment partnership covering Pranami Group's newly-acquired Andheri/Ghatkopar developments, of which this project is one.",
+    "Per-building sold/unsold carpet-area figures (not unit counts) are disclosed in the promoter's own quarterly Sold/Unsold Inventory filings -- see RERA Compliance's construction_progress note for the Jun-2025 to Dec-2025 trend.":
+        "Per-building sold/unsold carpet-area figures (not unit counts) are disclosed in the promoter's own quarterly Sold/Unsold Inventory filings; see RERA Compliance for the Jun-2025 to Dec-2025 trend.",
+    "Per-building/wing floor counts and unit-type breakdowns were not confirmed from the documents reviewed this pass -- see Gaps.":
+        "Per-building/wing floor counts and unit-type breakdowns were not confirmed from the documents reviewed this review (see Gaps).",
+    "No documents from the MahaRERA-listed library are absent -- all 60 listed documents downloaded successfully this pass.":
+        "No documents from the MahaRERA-listed library are absent: all 60 listed documents downloaded successfully this review.",
+    "No independent third-party market-research report (Knight Frank/ANAROCK/CBRE-style) specific to the Veera Desai Road/Azad Nagar micro-pocket was found -- the cited pricing/trend figures are real-estate-aggregator averages, not an audited report.":
+        "No independent third-party market-research report (Knight Frank/ANAROCK/CBRE-style) specific to the Veera Desai Road/Azad Nagar micro-pocket was found. The cited pricing and trend figures are real-estate-aggregator averages, not an audited report.",
+    "The exact list of Pranami Group's other projects and their current completion status could not be independently verified -- the group's own project-list webpage marks all entries \"archived\" with no visible per-project completion dates.":
+        "The exact list of Pranami Group's other projects and their current completion status could not be independently verified. The group's own project-list webpage marks all entries \"archived\" with no visible per-project completion dates.",
+    "Director Sundeep Poddar could not be conclusively matched to an independent director-profile record beyond the MCA-mirror data already cited -- a similarly-named \"Sandeep Kumar Poddar\" (different DIN) linked to unrelated companies was found and explicitly NOT assumed to be the same person.":
+        "Director Sundeep Poddar could not be conclusively matched to an independent director-profile record beyond the MCA-mirror data already cited. A similarly named \"Sandeep Kumar Poddar\" (different DIN) linked to unrelated companies was found and explicitly not assumed to be the same person.",
+    "No public credit rating was found for this exact legal entity from any agency checked (ICRA, Infomerics) -- not itself a red flag; most MahaRERA promoters are too small or private to be rated.":
+        "No public credit rating was found for this exact legal entity from any agency checked (ICRA, Infomerics). This is not itself a red flag; most MahaRERA promoters are too small or private to be rated.",
+    "promoter_portfolio's cross-project totals (area developed, area within 5km) are not available -- MahaRERA's own Promoters-tab name search matched only this one project under this exact promoter name, so portfolio-based Developer Score criteria 3/4 are unscored gaps, not zero.":
+        "This promoter's cross-project totals (area developed, area within 5km) are not available. MahaRERA's own Promoters-tab name search matched only this one project under this exact promoter name, so the portfolio-based Developer Score criteria are unscored gaps, not zero.",
+    "0 defaults -- IBBI shows no insolvency process against this CIN, and nothing in the credit-rating check (if one ran) states otherwise.":
+        "0 defaults. IBBI shows no insolvency process against this CIN, and nothing in the credit-rating check states otherwise.",
+    "1 of 4 core figures (FSI, land/built-up area, unit counts, pricing) have no unresolved gap against them -- flagged as an open gap: fsi, land_built_up_area, pricing":
+        "1 of 4 core figures (FSI, land/built-up area, unit counts, pricing) have no unresolved gap against them. Flagged as open gaps: FSI, land/built-up area, pricing.",
+    "Per-shareholder/promoter shareholding percentages are gated behind ZaubaCorp's paid report and were not available on this pass; only aggregate authorised/paid-up capital above is free. This is not itself a red flag for a private company -- detailed cap tables are rarely public for unlisted entities.":
+        "Per-shareholder shareholding percentages are not publicly available for this private company (normal for unlisted entities); aggregate authorised/paid-up capital is shown above.",
+
+    # --- IRA Insignia ---
+    "None disclosed as a current acquisition/reservation in the Title Report itself -- a separate ~65 sq.ft strip was purchased from Chandresh Vastu CHS Ltd in 2019 for road access, already folded into the land assembly.":
+        "None disclosed as a current acquisition or reservation in the Title Report itself. A separate approximately 65 sq. ft. strip was purchased from Chandresh Vastu CHS Ltd in 2019 for road access, already folded into the land assembly.",
+    "Partnership Firm -- confirmed via the 4th character of its PAN (AAHFI1448M; 'F' denotes Firm, not 'C' for Company or 'P' for Individual/proprietorship), and independently corroborated by the Title Report's and Commencement Certificate's own repeated references to 'M/s. Ira Homes Partnership Firm'. No CIN or LLPIN exists for this entity -- partnership firms are not required to register with the MCA.":
+        "Partnership Firm, confirmed via the 4th character of its PAN (AAHFI1448M; 'F' denotes Firm, not 'C' for Company or 'P' for Individual/proprietorship), and independently corroborated by the Title Report's and Commencement Certificate's own repeated references to 'M/s. Ira Homes Partnership Firm'. No CIN or LLPIN exists for this entity: partnership firms are not required to register with the MCA.",
+    "Not applicable -- IRA Homes is an unregistered (non-LLP) partnership firm; no CIN/LLPIN exists to look up.":
+        "Not applicable. IRA Homes is an unregistered (non-LLP) partnership firm; no CIN/LLPIN exists to look up.",
+    "Not applicable -- a partnership firm has no board resolution; Form B is instead executed by partner Hiren Kantilal Vador under the firm's own authority.":
+        "Not applicable. A partnership firm has no board resolution; Form B is instead executed by partner Hiren Kantilal Vador under the firm's own authority.",
+    "Hiren Kantilal Vador, Partner -- signs Form B (notarized 2021-09-28). Ketan Kantilal Vador, Partner -- named on the Title Report, NA Tax Conversion letter, and Commencement Certificate as the firm's representative.":
+        "Hiren Kantilal Vador, Partner, signs Form B (notarized 2021-09-28). Ketan Kantilal Vador, Partner, is named on the Title Report, NA Tax Conversion letter, and Commencement Certificate as the firm's representative.",
+    "Hiren Kantilal Vador and Ketan Kantilal Vador, Partners of M/s. Ira Homes Partnership Firm -- named across the Title Report, PAN card, Form B, NA Tax Conversion letter, and Commencement Certificate consistently. No MCA/ROC filing exists to independently cross-check this roster (partnership, not a company/LLP), so this is based entirely on the firm's own project documents, not a third-party registry.":
+        "Hiren Kantilal Vador and Ketan Kantilal Vador, Partners of M/s. Ira Homes Partnership Firm, are named across the Title Report, PAN card, Form B, NA Tax Conversion letter, and Commencement Certificate consistently. No MCA/ROC filing exists to independently cross-check this roster (partnership, not a company or LLP), so this is based entirely on the firm's own project documents, not a third-party registry.",
+    "then reassigned in 2019 -- with Shah Builders/Kanti Ratanshi Shah as a CONFIRMING PARTY -- to M/s. Ira Homes Partnership Firm.":
+        "then reassigned in 2019, with Shah Builders/Kanti Ratanshi Shah as a confirming party, to M/s. Ira Homes Partnership Firm.",
+    "The project site pincode (421204) and the promoter's registered-office pincode (421201) differ -- both are Dombivli East localities and this is common for a project-site-vs-registered-office split, not necessarily an inconsistency, but it was not independently reconciled this pass.":
+        "The project site pincode (421204) and the promoter's registered-office pincode (421201) differ. Both are Dombivli East localities, and this is common for a project-site-versus-registered-office split, not necessarily an inconsistency, but it was not independently reconciled this review.",
+    "No MCA/ROC cross-check is possible -- IRA Homes is a partnership firm (PAN 4th character 'F'), not a company or LLP, and carries no CIN/LLPIN.":
+        "No MCA/ROC cross-check is possible. IRA Homes is a partnership firm (PAN 4th character 'F'), not a company or LLP, and carries no CIN/LLPIN.",
+    "Two distinct matters. (1) LAND TITLE: the Title Report's advocate opines title is clear and marketable, but the underlying 30-year Search Report itself shows real gaps -- records were unavailable/not indexed for 1995-2002 and 2017-2020, so the title's own supporting search could not verify those years, not a clean confirmed record. No specific litigation against the land itself is stated in the Title Report. (2) MAHARERA COMPLAINTS -- 3 on record, a materially different picture from a clean project: (a) Kanti Shah vs. Ira Homes (CC12400706) -- Shah, a predecessor developer under the 2007 Development Agreement who surrendered his rights in the 2019 settlement, alleged Ira Homes built ~9 floors beyond its sanctioned Commencement Certificate (constructing up to ~33 floors when only up to the 5th floor -- G+5 -- was sanctioned at the time), sold 80+ flats without permission, and misrepresented the project's sanctioned floor count on MahaRERA's own portal. MahaRERA DISMISSED this complaint ON JURISDICTIONAL GROUNDS ONLY -- Shah was held not to be an \"allottee\" under RERA (his flats were compensation under a private settlement, a civil matter outside MahaRERA's remit) -- NOT on the merits of whether the construction itself was authorized. MahaRERA separately noted the promoter obtained a revised building permission up to the 21st floor on 2025-02-17, stating the CC-violation issue \"does not survive as on date\" -- but this does not affirmatively establish the earlier construction (before that revision) WAS authorized; it was never adjudicated on the merits. (b) Amit Salaskar vs. Ira Homes (CC12500570) -- alleged construction \"stalled since 2021\" with no progress since booking, sought a full refund; MahaRERA rejected the delay/refund claim as premature (declared completion date is 2026-12-31, no formal allotment letter existed to trigger Section 18(1)) but ordered a refund of the amount paid, minus a standard 2% cancellation deduction. (c) Mohan Rajkumar Kumhar vs. Ira Homes (CC12602499, filed 2026-04-29) -- no order yet on record as of this pass; substance not yet known.":
+        "Two distinct matters. (1) Land title: the Title Report's advocate opines title is clear and marketable, but the underlying 30-year Search Report itself shows real gaps. Records were unavailable or not indexed for 1995-2002 and 2017-2020, so the title's own supporting search could not verify those years; this is not a clean, confirmed record. No specific litigation against the land itself is stated in the Title Report. (2) MahaRERA complaints: 3 on record, a materially different picture from a clean project. (a) Kanti Shah vs. Ira Homes (CC12400706): Shah, a predecessor developer under the 2007 Development Agreement who surrendered his rights in the 2019 settlement, alleged Ira Homes built roughly 9 floors beyond its sanctioned Commencement Certificate (constructing up to roughly 33 floors when only up to the 5th floor, G+5, was sanctioned at the time), sold 80+ flats without permission, and misrepresented the project's sanctioned floor count on MahaRERA's own portal. MahaRERA dismissed this complaint on jurisdictional grounds only: Shah was held not to be an \"allottee\" under RERA (his flats were compensation under a private settlement, a civil matter outside MahaRERA's remit), not on the merits of whether the construction itself was authorized. MahaRERA separately noted the promoter obtained a revised building permission up to the 21st floor on 2025-02-17, stating the CC-violation issue \"does not survive as on date,\" but this does not affirmatively establish that the earlier construction, before that revision, was authorized; it was never adjudicated on the merits. (b) Amit Salaskar vs. Ira Homes (CC12500570): alleged construction \"stalled since 2021\" with no progress since booking, and sought a full refund. MahaRERA rejected the delay/refund claim as premature (declared completion date is 2026-12-31, and no formal allotment letter existed to trigger Section 18(1)), but ordered a refund of the amount paid, minus a standard 2% cancellation deduction. (c) Mohan Rajkumar Kumhar vs. Ira Homes (CC12602499, filed 2026-04-29): no order yet on record as of this review; substance not yet known.",
+    "(boundary marker, per MahaRERA's own record -- no named landmark disclosed)":
+        "(boundary marker per MahaRERA's own record; no named landmark disclosed)",
+    "Governed by the Kalyan-Dombivli Municipal Corporation (KDMC) under the Maharashtra Regional and Town Planning Act, 1966 (Section 45) read with the Maharashtra Municipal Corporations Act, 1949 (Section 253) -- confirmed via the Commencement Certificate (Office No. KDMC/TPD/BP/27Village/2021-22/14, sanctioned 2021-07-30) and the accompanying sanctioned Layout/Building Plans of the same date.":
+        "Governed by the Kalyan-Dombivli Municipal Corporation (KDMC) under the Maharashtra Regional and Town Planning Act, 1966 (Section 45), read with the Maharashtra Municipal Corporations Act, 1949 (Section 253). Confirmed via the Commencement Certificate (Office No. KDMC/TPD/BP/27Village/2021-22/14, sanctioned 2021-07-30) and the accompanying sanctioned Layout/Building Plans of the same date.",
+    "across Buildings 1, 2, and 3 -- i.e. a low-rise sanction at that stage,":
+        "across Buildings 1, 2, and 3, a low-rise sanction at that stage,",
+    "that revised sanction itself was not among the documents reviewed this pass, so the current, post-revision FSI/floor count could not be independently confirmed -- only the original 2021 sanction was directly read.":
+        "that revised sanction itself was not among the documents reviewed this review, so the current, post-revision FSI and floor count could not be independently confirmed; only the original 2021 sanction was directly read.",
+    "Approx. 8,824.99 sq.m proposed built-up area per the 2021 Layout Plan's own area statement -- figures across the scanned plan set are fragmented and not fully reconcilable against a separate ~2,982-2,992 sq.m \"FSI combined\" figure also referenced in the same documents; treated as an approximate, not a precisely confirmed figure.":
+        "Approx. 8,824.99 sq.m proposed built-up area per the 2021 Layout Plan's own area statement. Figures across the scanned plan set are fragmented and not fully reconcilable against a separate approximately 2,982-2,992 sq.m \"FSI combined\" figure also referenced in the same documents; treated as an approximate, not a precisely confirmed figure.",
+    "Not precisely reconcilable from the documents reviewed -- see approved_bua's note on the two differing figures found in the same plan set.":
+        "Not precisely reconcilable from the documents reviewed; see the note above on the two differing figures found in the same plan set.",
+    "Not computed -- the underlying BUA figures could not be reconciled to a single confirmed number (see approved_bua).":
+        "Not computed. The underlying BUA figures could not be reconciled to a single confirmed number.",
+    "3 complaints on record (Kanti Shah -- dismissed on jurisdictional grounds; Amit Salaskar -- partly allowed, refund ordered minus 2% cancellation; Mohan Rajkumar Kumhar -- filed 2026-04-29, no order yet). 0 appeals.":
+        "3 complaints on record (Kanti Shah: dismissed on jurisdictional grounds; Amit Salaskar: partly allowed, refund ordered minus 2% cancellation; Mohan Rajkumar Kumhar: filed 2026-04-29, no order yet). 0 appeals.",
+    "Form B declares the standard title/encumbrance/RERA-compliance undertakings and commits to a 2026-12-31 completion date -- signed by Hiren Kantilal Vador, Partner, notarized 2021-09-28.":
+        "Form B declares the standard title, encumbrance, and RERA-compliance undertakings and commits to a 2026-12-31 completion date, signed by Hiren Kantilal Vador, Partner, notarized 2021-09-28.",
+    "Only 1 of 338 total units sold as of this pass, despite registration since 2021-10-23 (over 4 years) -- consistent with the Salaskar complaint's own allegation of construction \"stalled since 2021.\" The Kanti Shah order references a revised building permission obtained up to the 21st floor as of 2025-02-17, indicating construction has progressed further than the original 2021 low-rise sanction at some point, but current physical progress was not independently verified this pass beyond what these two complaint orders describe.":
+        "Only 1 of 338 total units sold as of this review, despite registration since 2021-10-23 (over 4 years), consistent with the Salaskar complaint's own allegation of construction \"stalled since 2021.\" The Kanti Shah order references a revised building permission obtained up to the 21st floor as of 2025-02-17, indicating construction has progressed further than the original 2021 low-rise sanction at some point, but current physical progress was not independently verified this review beyond what these two complaint orders describe.",
+    "MahaRERA (project registration); Kalyan-Dombivli Municipal Corporation -- KDMC (building/layout plan sanction, under DCPR); Tahsildar, Kalyan (NA land-use conversion).":
+        "MahaRERA (project registration); Kalyan-Dombivli Municipal Corporation, KDMC (building/layout plan sanction, under DCPR); Tahsildar, Kalyan (NA land-use conversion).",
+    "2026-12-31 -- unchanged since original registration, no extension on record":
+        "2026-12-31, unchanged since original registration, no extension on record",
+    "Estimated via web search, not a live driving-route lookup -- exact distance from Shankeshwar Nagar/Bhopar specifically not independently confirmed.":
+        "Estimated via web search, not a live driving-route lookup; exact distance from Shankeshwar Nagar/Bhopar specifically was not independently confirmed.",
+    "Located off Bhopar Road, Shankeshwar Nagar Phase-3, Dombivli East -- within the Kalyan-Dombivli Municipal Corporation limits.":
+        "Located off Bhopar Road, Shankeshwar Nagar Phase-3, Dombivli East, within the Kalyan-Dombivli Municipal Corporation limits.",
+    "No operational metro line serves Dombivli East directly as of this pass -- planned/upcoming extensions were referenced in general market research but not independently confirmed for this specific pocket.":
+        "No operational metro line serves Dombivli East directly as of this review. Planned or upcoming extensions were referenced in general market research but not independently confirmed for this specific pocket.",
+    "Dombivli East residential belt within Kalyan-Dombivli Municipal Corporation limits -- an affordable-to-mid-tier suburb":
+        "Dombivli East residential belt within Kalyan-Dombivli Municipal Corporation limits, an affordable-to-mid-tier suburb",
+    "plus planned metro extensions -- no source quantified":
+        "plus planned metro extensions. No source quantified",
+    "1BHK from INR 30L, 2BHK from INR 45L (possession projected Dec 2029 -- a notably long horizon)":
+        "1BHK from INR 30L, 2BHK from INR 45L (possession projected Dec 2029, a notably long horizon)",
+    "neither a conspicuous premium nor discount -- though this was not independently verified against a specific unit size and configuration this pass.":
+        "neither a conspicuous premium nor discount, though this was not independently verified against a specific unit size and configuration this review.",
+    "IRA Homes (the partnership firm itself, PAN AAHFI1448M) was formed 2018-06-18 per its own PAN card -- 8 years old as of this pass. Multiple listing sites (Dwello, ira-insignia.in) describe \"IRA\" as a brand of a broader \"Vador Group\" with a longer history, and a company called \"Vador Properties Private Limited\" (CIN U70102MH2010PTC210775, incorporated 2010) was found on ZaubaCorp -- but no source confirms this CIN is the same corporate lineage as the Ira Insignia promoter, so that longer history is NOT credited here; only the firm's own confirmed formation date is used, deliberately conservative rather than assuming an unconfirmed parent-group link.":
+        "IRA Homes (the partnership firm itself, PAN AAHFI1448M) was formed 2018-06-18 per its own PAN card, 8 years old as of this review. Multiple listing sites (Dwello, ira-insignia.in) describe \"IRA\" as a brand of a broader \"Vador Group\" with a longer history, and a company called \"Vador Properties Private Limited\" (CIN U70102MH2010PTC210775, incorporated 2010) was found on ZaubaCorp. However, no source confirms this CIN is the same corporate lineage as the Ira Insignia promoter, so that longer history is not credited here; only the firm's own confirmed formation date is used, deliberately conservative rather than assuming an unconfirmed parent-group link.",
+    "One third-party listing (99acres) instead shows 385 units across 3 towers/28 floors for this same project -- a discrepancy against MahaRERA's own 338-unit figure that could not be reconciled this pass; MahaRERA's own record is treated as authoritative here, but the discrepancy itself is flagged as a gap.":
+        "One third-party listing (99acres) instead shows 385 units across 3 towers/28 floors for this same project, a discrepancy against MahaRERA's own 338-unit figure that could not be reconciled this review. MahaRERA's own record is treated as authoritative here, but the discrepancy itself is flagged as a gap.",
+    "338 total (RERA record) -- see unit_summary_note on a conflicting 385-unit third-party figure":
+        "338 total (RERA record); see the note above on a conflicting 385-unit third-party figure",
+    "The Title Report's own 30-year search has real gaps -- records were unavailable/not indexed for 1995-2002 and 2017-2020 -- so the advocate's \"clear and marketable\" opinion rests on an incomplete underlying search for those years.":
+        "The Title Report's own 30-year search has real gaps: records were unavailable or not indexed for 1995-2002 and 2017-2020, so the advocate's \"clear and marketable\" opinion rests on an incomplete underlying search for those years.",
+    "The Kanti Shah complaint's core allegation (that construction proceeded materially beyond the sanctioned Commencement Certificate before a 2025-02-17 revision) was never adjudicated on the merits -- MahaRERA dismissed the complaint on jurisdictional grounds (Shah wasn't an allottee) rather than ruling on whether the construction itself was authorized at the time it occurred.":
+        "The Kanti Shah complaint's core allegation, that construction proceeded materially beyond the sanctioned Commencement Certificate before a 2025-02-17 revision, was never adjudicated on the merits. MahaRERA dismissed the complaint on jurisdictional grounds (Shah wasn't an allottee) rather than ruling on whether the construction itself was authorized at the time it occurred.",
+    "The revised building permission -- reportedly approving construction up to the 21st floor, obtained on 2025-02-17 per MahaRERA's own order -- was not available in the documents reviewed, so the current, post-revision sanctioned floor count and FSI could not be independently confirmed.":
+        "The revised building permission (reportedly approving construction up to the 21st floor, obtained on 2025-02-17 per MahaRERA's own order) was not available in the documents reviewed, so the current, post-revision sanctioned floor count and FSI could not be independently confirmed.",
+    "A third MahaRERA complaint (Mohan Rajkumar Kumhar, CC12602499, filed 2026-04-29) has no order on record yet -- its substance is not yet known.":
+        "A third MahaRERA complaint (Mohan Rajkumar Kumhar, CC12602499, filed 2026-04-29) has no order on record yet; its substance is not yet known.",
+    "No CIN/LLPIN exists for IRA Homes (an unregistered partnership firm) -- the MCA-mirror company-profile chain, IBBI insolvency check, and ZaubaCorp group-companies crosswalk this pipeline otherwise runs for corporate promoters could not run at all; there is no company/LLP registry record to check.":
+        "No CIN or LLPIN exists for IRA Homes (an unregistered partnership firm), so the MCA-mirror company-profile chain, IBBI insolvency check, and ZaubaCorp group-companies crosswalk otherwise run for corporate promoters could not run at all; there is no company or LLP registry record to check.",
+    "Whether \"Ira Homes\" is the same corporate lineage as the longer-established \"Vador Group\"/\"Vador Properties Private Limited\" (CIN U70102MH2010PTC210775, found via ZaubaCorp) could not be confirmed -- treated as an unconfirmed lead, not credited toward this promoter's track record.":
+        "Whether \"Ira Homes\" is the same corporate lineage as the longer-established \"Vador Group\"/\"Vador Properties Private Limited\" (CIN U70102MH2010PTC210775, found via ZaubaCorp) could not be confirmed. It is treated as an unconfirmed lead, not credited toward this promoter's track record.",
+    "A third-party listing (99acres) shows 385 units/3 towers/28 floors for this project, conflicting with MahaRERA's own live record of 338 total units -- not reconciled this pass.":
+        "A third-party listing (99acres) shows 385 units across 3 towers/28 floors for this project, conflicting with MahaRERA's own live record of 338 total units; not reconciled this review.",
+    "No independent news coverage, forum discussion, or review-site commentary corroborating (or contradicting) the 3 known MahaRERA complaints was found -- an explicit search gap (MahaRERA's own complaint records are not generally indexed by search engines), not evidence the underlying issues are resolved or absent.":
+        "No independent news coverage, forum discussion, or review-site commentary corroborating or contradicting the 3 known MahaRERA complaints was found. This is an explicit search gap (MahaRERA's own complaint records are not generally indexed by search engines), not evidence the underlying issues are resolved or absent.",
+    "Only 1 of 338 units sold as of this pass, over 4 years after registration -- consistent with the Salaskar complaint's allegation of stalled construction, but current physical construction progress was not independently site-verified this pass beyond what the two complaint orders describe.":
+        "Only 1 of 338 units sold as of this review, over 4 years after registration, consistent with the Salaskar complaint's allegation of stalled construction. Current physical construction progress was not independently site-verified this review beyond what the two complaint orders describe.",
+    "IRA Insignia (MahaRERA P51700031409) is a 338-unit residential project in Shankeshwar Nagar, Dombivli East, by IRA Homes -- an unregistered partnership firm (no CIN/LLPIN) formed 2018, apparently operating under a broader \"Vador Group\" brand whose exact corporate relationship to this promoter could not be confirmed.":
+        "IRA Insignia (MahaRERA P51700031409) is a 338-unit residential project in Shankeshwar Nagar, Dombivli East, by IRA Homes, an unregistered partnership firm (no CIN/LLPIN) formed 2018, apparently operating under a broader \"Vador Group\" brand whose exact corporate relationship to this promoter could not be confirmed.",
+    "Most notably, a predecessor developer's complaint (Kanti Shah) alleged the promoter constructed roughly 9 floors beyond its original sanctioned Commencement Certificate and misrepresented the project's sanctioned floor count on MahaRERA's own portal -- MahaRERA dismissed this complaint on jurisdictional grounds only (the complainant wasn't an allottee), never ruling on whether the construction itself was authorized at the time.":
+        "Most notably, a predecessor developer's complaint (Kanti Shah) alleged the promoter constructed roughly 9 floors beyond its original sanctioned Commencement Certificate and misrepresented the project's sanctioned floor count on MahaRERA's own portal. MahaRERA dismissed this complaint on jurisdictional grounds only (the complainant wasn't an allottee), never ruling on whether the construction itself was authorized at the time.",
+    "No CIN exists for the MCA-mirror/IBBI checks this pipeline otherwise runs to apply to.":
+        "No CIN exists for the MCA-mirror or IBBI checks otherwise run for corporate promoters to apply to.",
+    "All 70 listed documents downloaded successfully this pass -- none absent. Two files listed under MahaRERA's \"Others\" category (\"DOC1.pdf\", \"File1.pdf\") were opened and found to be effectively blank placeholders (a single page reading only \"Ira homes\", no letterhead/signature/substantive content) -- confirmed empty, not a download failure.":
+        "All 70 listed documents downloaded successfully this review; none absent. Two files listed under MahaRERA's \"Others\" category (\"DOC1.pdf\", \"File1.pdf\") were opened and found to be effectively blank placeholders (a single page reading only \"Ira homes,\" no letterhead, signature, or substantive content), confirmed empty rather than a download failure.",
+    "IBBI insolvency check did not run this pass -- nothing to count past defaults from.":
+        "IBBI insolvency check did not run this review; there is nothing to count past defaults from.",
+    "LLP with no independently confirmed intent to convert to Pvt Ltd -- conservatively scored at the \"not willing to convert\" band rather than assuming unconfirmed intent.":
+        "LLP with no independently confirmed intent to convert to Pvt Ltd. Conservatively scored at the \"not willing to convert\" band rather than assuming unconfirmed intent.",
+    "2 of 4 core figures (FSI, land/built-up area, unit counts, pricing) have no unresolved gap against them -- flagged as an open gap: fsi, land_built_up_area":
+        "2 of 4 core figures (FSI, land/built-up area, unit counts, pricing) have no unresolved gap against them. Flagged as open gaps: FSI, land/built-up area.",
+}
 
 # Ordered (most-specific-first) regex substitutions for _externalize_prose
 # -- targets the specific internal-process phrasing actually found in this
@@ -3206,6 +3699,9 @@ def _citation_text(facts: dict, cleaned_label: str | None) -> str | None:
 # guaranteed-exhaustive rewrite -- new prose using different wording could
 # still slip through un-cleaned.
 _EXTERNAL_PROSE_SUBSTITUTIONS = (
+    (r"\s*Specific schools/hospitals within a fixed radius were not independently verified (this pass|this review)\s*(\(see Gaps\))?\.?", ""),
+    (r"\s*Not every document was individually read(\s*\([^)]*\))?;\s*the quarterly certificates/sale deeds not opened are lower-diligence-priority than the title/Form-B/encumbrance/IOA documents that were\.?", ""),
+    (r"Allotment mechanics: Standard MahaRERA-governed sale under the Act -- no allotment mechanism beyond the statutory framework was separately disclosed in the documents reviewed\.?", ""),
     (r"confirmed on re-extraction after fixing this session's OCR pipeline", "independently re-verified"),
     (r"re-extraction after fixing this session's OCR pipeline", "independent re-verification"),
     (r"this session's OCR extraction pipeline \(Tesseract\)", "the OCR process used for this review"),
@@ -3246,9 +3742,13 @@ def _externalize_prose(facts: dict, text: str) -> str:
     def _replace_preserving_case(pattern: str, replacement: str, s: str) -> str:
         def _repl(m: re.Match) -> str:
             matched = m.group(0)
-            return replacement[0].upper() + replacement[1:] if matched[:1].isupper() else replacement
+            if not replacement or not matched[:1].isupper():
+                return replacement
+            return replacement[0].upper() + replacement[1:]
         return re.sub(pattern, _repl, s, flags=re.IGNORECASE)
 
+    for original, rewritten in _EXTERNAL_DASH_REWRITES.items():
+        text = text.replace(original, rewritten)
     for pattern, replacement in _EXTERNAL_PROSE_SUBSTITUTIONS:
         text = _replace_preserving_case(pattern, replacement, text)
     text = _INTERNAL_FIELD_ANNOTATION_RE.sub("", text)
@@ -4414,7 +4914,7 @@ def _append_executive_summary_kpis(doc, facts: dict, flags: dict) -> None:
     value_cells = kpi_table.rows[1].cells
     for i, (label, value, fill) in enumerate(cards):
         header_cells[i].text = label
-        value_cells[i].text = value
+        value_cells[i].text = _externalize_prose(facts, value)
         _shade_cell(header_cells[i], fill)
         for para in header_cells[i].paragraphs:
             for run in para.runs:
@@ -4569,24 +5069,41 @@ def _append_developer_score_section(doc, facts: dict) -> None:
     doc.add_page_break()
     heading_para = doc.add_paragraph(_external_heading(facts, "Developer Score (Code-Computed)"))
     heading_para.style = heading_style
-    doc.add_paragraph(
-        f"Composite: {developer_score['composite']}/100 -- Grade {developer_score['grade']}. Scored "
-        "against a fixed 3-bucket rubric -- Operational Strength (50%: Team Strength, Influence in "
-        "Micromarket, Past Experience - Area, Track Record, 12.5% each), Financial Strength (20%: debt "
-        "structure), Governance Strength (30%: RERA Compliance, GST/TDS Compliance, Cases/Past Defaults, "
-        "Entity Rating, 7.5% each) -- each sub-metric independently banded AAA/AA/A/B/C/D. Every sub-"
-        "metric's weight below is fixed and always shown, even when it couldn't be scored this pass: "
-        "unscored weight is never redistributed to the others or excluded from the composite's "
-        "denominator, so incomplete public disclosure structurally lowers the composite rather than "
-        "being scored purely on the strength of whatever little is known. An imminent-tier flag (see "
-        "Overview & Flags) caps the grade at A regardless of the composite, unless the composite alone "
-        "already bands lower than that."
-    )
+    if facts.get("_doc_variant") == "external":
+        doc.add_paragraph(
+            f"Composite: {developer_score['composite']}/100 (Grade {developer_score['grade']}), scored "
+            "across Operational Strength (50%), Financial Strength (20%), and Governance Strength (30%). "
+            "A grade below A signals either weak fundamentals or gaps in public disclosure that could not "
+            "be scored."
+        )
+    else:
+        doc.add_paragraph(
+            f"Composite: {developer_score['composite']}/100 -- Grade {developer_score['grade']}. Scored "
+            "against a fixed 3-bucket rubric -- Operational Strength (50%: Team Strength, Influence in "
+            "Micromarket, Past Experience - Area, Track Record, 12.5% each), Financial Strength (20%: debt "
+            "structure), Governance Strength (30%: RERA Compliance, GST/TDS Compliance, Cases/Past Defaults, "
+            "Entity Rating, 7.5% each) -- each sub-metric independently banded AAA/AA/A/B/C/D. Every sub-"
+            "metric's weight below is fixed and always shown, even when it couldn't be scored this pass: "
+            "unscored weight is never redistributed to the others or excluded from the composite's "
+            "denominator, so incomplete public disclosure structurally lowers the composite rather than "
+            "being scored purely on the strength of whatever little is known. An imminent-tier flag (see "
+            "Overview & Flags) caps the grade at A regardless of the composite, unless the composite alone "
+            "already bands lower than that."
+        )
 
-    table = doc.add_table(rows=1, cols=6)
+    # External drops the Weight column -- the bucket/composite explanation
+    # above already covers how scoring works, and a numeric weight per row
+    # reads as internal-methodology detail rather than a finding. Internal
+    # keeps all 6 columns.
+    show_weight = facts.get("_doc_variant") != "external"
+    columns = ("Bucket", "Sub-metric", "Tier", "Score", "Weight", "Note / Reason") if show_weight \
+        else ("Bucket", "Sub-metric", "Tier", "Score", "Note / Reason")
+    note_col = 5 if show_weight else 4
+
+    table = doc.add_table(rows=1, cols=len(columns))
     _set_table_borders(table)
     header_cells = table.rows[0].cells
-    for i, label in enumerate(("Bucket", "Sub-metric", "Tier", "Score", "Weight", "Note / Reason")):
+    for i, label in enumerate(columns):
         header_cells[i].text = label
         _shade_cell(header_cells[i], "D9E2F3")
         for para in header_cells[i].paragraphs:
@@ -4598,15 +5115,16 @@ def _append_developer_score_section(doc, facts: dict) -> None:
             row = table.add_row()
             row.cells[0].text = bucket_name
             row.cells[1].text = criterion.get("display_name", key.replace("_", " ").title())
-            row.cells[4].text = f"{criterion.get('weight', '')}%"
+            if show_weight:
+                row.cells[4].text = f"{criterion.get('weight', '')}%"
             if criterion.get("score") is None:
                 row.cells[2].text = "N/A"
                 row.cells[3].text = "N/A"
-                row.cells[5].text = _externalize_prose(facts, criterion.get("reason", ""))
+                row.cells[note_col].text = _externalize_prose(facts, criterion.get("reason", ""))
             else:
                 row.cells[2].text = criterion["tier"]
                 row.cells[3].text = str(criterion["score"])
-                row.cells[5].text = _externalize_prose(facts, criterion.get("note", ""))
+                row.cells[note_col].text = _externalize_prose(facts, criterion.get("note", ""))
 
 
 def _append_counterparty_summary(doc, facts: dict) -> None:
@@ -4628,13 +5146,20 @@ def _append_counterparty_summary(doc, facts: dict) -> None:
             heading_para.style = heading_style
             heading_added = True
 
+    # A plain colon reads better than " -- " in these short one-liners, but
+    # each has a dynamic value (agency list, status text, grade...) sitting
+    # right where a literal dash would be, so a fixed dict/regex substitution
+    # can't reach it -- this separator is built once and spliced in instead.
+    # Internal keeps " -- " exactly as before; External gets ":".
+    _sep = ":" if facts.get("_doc_variant") == "external" else " --"
+
     credit_check = facts.get("credit_rating_check")
     if credit_check:
         _ensure_heading()
         promoter_result = credit_check.get("promoter") or {}
         if promoter_result.get("found"):
             agencies = ", ".join(r["agency"] for r in promoter_result.get("ratings", []))
-            doc.add_paragraph(f"Credit rating: found ({agencies or 'agency unspecified'}) -- see Diligence Appendix for the full instrument/rating detail.")
+            doc.add_paragraph(f"Credit rating: found ({agencies or 'agency unspecified'}){_sep} see Diligence Appendix for the full instrument/rating detail.")
         else:
             doc.add_paragraph(f"Credit rating: {promoter_result.get('note', 'not found')} (full detail in Diligence Appendix).")
 
@@ -4642,15 +5167,15 @@ def _append_counterparty_summary(doc, facts: dict) -> None:
     if ibbi_check and ibbi_check.get("found_process") is not None:
         _ensure_heading()
         if ibbi_check["found_process"] is False:
-            doc.add_paragraph(f"IBBI insolvency status: clean -- \"{ibbi_check.get('status_text', '')}\" (full detail in Diligence Appendix).")
+            doc.add_paragraph(f"IBBI insolvency status: clean{_sep} \"{ibbi_check.get('status_text', '')}\" (full detail in Diligence Appendix).")
         else:
-            doc.add_paragraph("IBBI insolvency status: a record was found against this CIN -- see Diligence Appendix for the raw detail (not auto-classified).")
+            doc.add_paragraph(f"IBBI insolvency status: a record was found against this CIN{_sep} see Diligence Appendix for the raw detail (not auto-classified).")
 
     profile_check = facts.get("company_profile_check")
     if profile_check and profile_check.get("found"):
         _ensure_heading()
         doc.add_paragraph(
-            f"Company registration: confirmed via ZaubaCorp -- {profile_check.get('status', 'status unknown')}, "
+            f"Company registration: confirmed via ZaubaCorp{_sep} {profile_check.get('status', 'status unknown')}, "
             f"incorporated {profile_check.get('incorporation_date', 'unknown')} (directors and full detail in Diligence Appendix)."
         )
 
@@ -4666,7 +5191,7 @@ def _append_counterparty_summary(doc, facts: dict) -> None:
     if developer_score:
         _ensure_heading()
         doc.add_paragraph(
-            f"Developer Score: {developer_score['composite']}/100 -- Grade {developer_score['grade']} "
+            f"Developer Score: {developer_score['composite']}/100{_sep} Grade {developer_score['grade']} "
             "(per-pillar breakdown in Diligence Appendix)."
         )
 
@@ -4714,16 +5239,24 @@ def _append_complaint_outcomes_section(doc, facts: dict) -> None:
     heading_style = doc.paragraphs[4].style
 
     doc.add_page_break()
-    heading_para = doc.add_paragraph("Complaint Order Outcomes (Code-Extracted)")
+    heading_text = "Complaint Order Outcomes" if facts.get("_doc_variant") == "external" else "Complaint Order Outcomes (Code-Extracted)"
+    heading_para = doc.add_paragraph(heading_text)
     heading_para.style = heading_style
-    doc.add_paragraph(
-        "Each row below reflects the actual order PDF already on file for that complaint (downloaded "
-        "via the same document-retrieval mechanism used for project documents), classified by a small, "
-        "named set of outcome keywords -- not a self-reported summary. An outcome of \"not determinable\" "
-        "means the extracted text didn't match any of those keywords; it is not a claim that the "
-        "complaint was resolved favourably or unfavourably, only that the automated classification "
-        "could not tell from the text available."
-    )
+    if facts.get("_doc_variant") == "external":
+        doc.add_paragraph(
+            "Each outcome below is classified directly from the complaint's own order PDF, not "
+            "self-reported. \"Not determinable\" means the classifier couldn't tell from the text; "
+            "it is not a claim the complaint was resolved either way."
+        )
+    else:
+        doc.add_paragraph(
+            "Each row below reflects the actual order PDF already on file for that complaint (downloaded "
+            "via the same document-retrieval mechanism used for project documents), classified by a small, "
+            "named set of outcome keywords -- not a self-reported summary. An outcome of \"not determinable\" "
+            "means the extracted text didn't match any of those keywords; it is not a claim that the "
+            "complaint was resolved favourably or unfavourably, only that the automated classification "
+            "could not tell from the text available."
+        )
 
     table = doc.add_table(rows=1, cols=2)
     _set_table_borders(table)
@@ -4799,16 +5332,19 @@ def _append_credit_rating_section(doc, facts: dict) -> None:
     doc.add_page_break()
     heading_para = doc.add_paragraph(_external_heading(facts, "Credit Rating Check (Code-Computed)"))
     heading_para.style = heading_style
-    doc.add_paragraph(
-        "Checked directly against every rating agency's public database (currently ICRA and Infomerics) "
-        "for an exact match on the promoter's own legal name -- not a fuzzy or \"probably the same "
-        "company\" guess, since attributing a rating to the wrong legal entity would itself be a serious "
-        "error. Every agency is checked regardless of whether an earlier one already found something, so "
-        "that if two agencies rate the same entity, both ratings are shown here for comparison rather "
-        "than silently reporting only one. A promoter having no public rating anywhere is the ordinary "
-        "case, not a red flag: these agencies only rate developers that sought a public rating (typically "
-        "larger, listed, or NCD-issuing entities)."
-    )
+    if facts.get("_doc_variant") == "external":
+        doc.add_paragraph("Checked against ICRA and Infomerics for a rating under the promoter's exact legal name.")
+    else:
+        doc.add_paragraph(
+            "Checked directly against every rating agency's public database (currently ICRA and Infomerics) "
+            "for an exact match on the promoter's own legal name -- not a fuzzy or \"probably the same "
+            "company\" guess, since attributing a rating to the wrong legal entity would itself be a serious "
+            "error. Every agency is checked regardless of whether an earlier one already found something, so "
+            "that if two agencies rate the same entity, both ratings are shown here for comparison rather "
+            "than silently reporting only one. A promoter having no public rating anywhere is the ordinary "
+            "case, not a red flag: these agencies only rate developers that sought a public rating (typically "
+            "larger, listed, or NCD-issuing entities)."
+        )
 
     promoter_result = check.get("promoter", {})
     if promoter_result.get("found"):
@@ -4844,15 +5380,19 @@ def _append_ibbi_check_section(doc, facts: dict) -> None:
     doc.add_page_break()
     heading_para = doc.add_paragraph(_external_heading(facts, "Insolvency Check -- IBBI Corporate Debtor Master Data (Code-Computed)"))
     heading_para.style = heading_style
-    doc.add_paragraph(
-        "Checked directly against the Insolvency and Bankruptcy Board of India's public Corporate "
-        "Debtor Master Data, by the promoter's own CIN -- an exact-identifier lookup, not a name-based "
-        "guess."
-    )
+    if facts.get("_doc_variant") == "external":
+        doc.add_paragraph("Checked against IBBI's public Corporate Debtor Master Data by the promoter's own CIN.")
+    else:
+        doc.add_paragraph(
+            "Checked directly against the Insolvency and Bankruptcy Board of India's public Corporate "
+            "Debtor Master Data, by the promoter's own CIN -- an exact-identifier lookup, not a name-based "
+            "guess."
+        )
     if check["found_process"] is False:
         ibbi_citation = _citation_text(facts, _clean_source_label(check.get("url", "")) or check.get("url", ""))
+        _sep = ":" if facts.get("_doc_variant") == "external" else " --"
         doc.add_paragraph(
-            f"Result: \"{check['status_text']}\" -- no insolvency process is recorded against this CIN "
+            f"Result: \"{check['status_text']}\"{_sep} no insolvency process is recorded against this CIN "
             f"in IBBI's public database. {ibbi_citation}"
         )
     else:
@@ -4866,6 +5406,21 @@ def _append_ibbi_check_section(doc, facts: dict) -> None:
         doc.add_paragraph(f"Source: {_citation_text(facts, _clean_source_label(check.get('url', '')) or check.get('url', ''))}")
 
 
+def _clean_scraped_address(address: str) -> str:
+    """Registry-scraped addresses (ZaubaCorp/Tofler/InstaFinancials) come
+    from concatenating separate HTML fields with no space normalization --
+    real example seen in this Charter's own data: 'Flat 2207,Floor 22, Wing
+    B,Ashok Tower-B ... Parel East,   , Mumbai'. Fixes both variants
+    (a data-quality bug, not a content/scope difference): collapses a
+    stray empty ", ," segment first, then inserts the missing space after
+    every remaining comma."""
+    if not address:
+        return address
+    address = re.sub(r"\s*,\s*,", ",", address)
+    address = re.sub(r",(?=\S)", ", ", address)
+    return re.sub(r"\s+", " ", address).strip()
+
+
 def _append_company_profile_section(doc, facts: dict) -> None:
     """Appends a section reporting the code-computed company registration
     profile merged from the MCA-mirror chain (ZaubaCorp -> Tofler ->
@@ -4877,26 +5432,39 @@ def _append_company_profile_section(doc, facts: dict) -> None:
 
     heading_style = doc.paragraphs[4].style
     sources_used = check.get("sources_used") or ["ZaubaCorp"]
-    sources_label = ", ".join(s.replace(".com", "").replace(".in", "").title() for s in sources_used)
+    # .title() was clobbering the intentional internal capitals in these
+    # brand names ("zaubacorp" -> "Zaubacorp" instead of "ZaubaCorp") --
+    # _MCA_SOURCE_DISPLAY_NAMES already has the correct display form.
+    sources_label = ", ".join(_MCA_SOURCE_DISPLAY_NAMES.get(s, s.replace(".com", "").replace(".in", "").title()) for s in sources_used)
 
     doc.add_page_break()
-    heading_para = doc.add_paragraph(_external_heading(facts, f"Company Registration Profile ({sources_label}, Code-Computed)"))
+    if facts.get("_doc_variant") == "external":
+        # Which registries were cross-checked is methodology detail, not
+        # something a CEO needs in a section heading.
+        heading_text = "Company Registration Profile"
+    else:
+        heading_text = _external_heading(facts, f"Company Registration Profile ({sources_label}, Code-Computed)")
+    heading_para = doc.add_paragraph(heading_text)
     heading_para.style = heading_style
-    doc.add_paragraph(
-        f"Pulled directly from {len(sources_used)} independent public company-registry mirror(s) by "
-        "CIN -- an exact-identifier lookup, not a name-based guess -- and cross-checked against each "
-        "other; any disagreement between them on the current director roster is called out under "
-        "Gaps & Limitations rather than silently resolved."
-    )
+    if facts.get("_doc_variant") == "external":
+        doc.add_paragraph(f"Cross-checked across {len(sources_used)} independent company registries by CIN.")
+    else:
+        doc.add_paragraph(
+            f"Pulled directly from {len(sources_used)} independent public company-registry mirror(s) by "
+            "CIN -- an exact-identifier lookup, not a name-based guess -- and cross-checked against each "
+            "other; any disagreement between them on the current director roster is called out under "
+            "Gaps & Limitations rather than silently resolved."
+        )
     profile_citation = _citation_text(facts, _clean_source_label(check.get("url", "")))
+    _sep = ":" if facts.get("_doc_variant") == "external" else " --"
     doc.add_paragraph(
-        f"{check['name']} ({check['cin']}) -- Status: {check.get('status', 'unknown')}; "
+        f"{check['name']} ({check['cin']}){_sep} Status: {check.get('status', 'unknown')}; "
         f"Class: {check.get('class_of_company', 'unknown')}; "
         f"Category: {check.get('company_category', 'unknown')}; ROC: {check.get('roc', 'unknown')}"
         + (f" {profile_citation}" if profile_citation else "")
     )
     doc.add_paragraph(f"Incorporated: {check.get('incorporation_date', 'unknown')}")
-    doc.add_paragraph(f"Registered address: {check.get('registered_address', 'unknown')}")
+    doc.add_paragraph(f"Registered address: {_clean_scraped_address(check.get('registered_address', 'unknown'))}")
     doc.add_paragraph(
         f"Authorised capital: {check.get('authorised_capital') or 'not publicly available'}; "
         f"Paid-up capital: {check.get('paid_up_capital') or 'not publicly available'}"
@@ -5038,24 +5606,36 @@ def _append_group_companies_section(doc, facts: dict) -> None:
     doc.add_page_break()
     heading_para = doc.add_paragraph(_external_heading(facts, "Group / Affiliated Companies (Code-Computed Director & Address Crosswalk)"))
     heading_para.style = heading_style
-    doc.add_paragraph(
-        "Every entity below shares at least one concrete, named link with the promoter above -- a "
-        "specific director in common, a shared registered office, or a filed subsidiary/associate/JV "
-        "relationship -- rather than being inferred from a name or industry match. The strength of each "
-        "link should be judged from the basis given, not assumed uniform across the list."
-    )
+    if facts.get("_doc_variant") == "external":
+        doc.add_paragraph(
+            "Each entity below shares a concrete link with the promoter above: a shared director, "
+            "registered office, or a filed subsidiary/associate/JV relationship."
+        )
+    else:
+        doc.add_paragraph(
+            "Every entity below shares at least one concrete, named link with the promoter above -- a "
+            "specific director in common, a shared registered office, or a filed subsidiary/associate/JV "
+            "relationship -- rather than being inferred from a name or industry match. The strength of each "
+            "link should be judged from the basis given, not assumed uniform across the list."
+        )
 
     director_rows = _build_director_company_links(facts)
     if any(r["link_count"] for r in director_rows):
         sub_heading = doc.add_paragraph("Director Relationship Map")
         for run in sub_heading.runs:
             run.bold = True
-        doc.add_paragraph(
-            "Each of this promoter's directors, current or past, cross-referenced against how many of "
-            "the group companies below name them as a shared director -- collapses the 299-entity list "
-            "to the thing that actually matters here: how concentrated the group's leadership is around "
-            "a small number of individuals, not a name-by-name read of every affiliated entity."
-        )
+        if facts.get("_doc_variant") == "external":
+            doc.add_paragraph(
+                "Shows how concentrated the group's leadership is around a small number of individuals, "
+                "based on shared directorships across the 299 linked entities."
+            )
+        else:
+            doc.add_paragraph(
+                "Each of this promoter's directors, current or past, cross-referenced against how many of "
+                "the group companies below name them as a shared director -- collapses the 299-entity list "
+                "to the thing that actually matters here: how concentrated the group's leadership is around "
+                "a small number of individuals, not a name-by-name read of every affiliated entity."
+            )
         dir_table = doc.add_table(rows=1, cols=3)
         _set_table_borders(dir_table)
         header_cells = dir_table.rows[0].cells
@@ -5293,31 +5873,42 @@ def _append_authenticity_page(doc, facts: dict) -> None:
     doc.add_page_break()
     heading_para = doc.add_paragraph("Documentation Authenticity & Confidence Summary")
     heading_para.style = heading_style
-    doc.add_paragraph(
-        "This page is generated directly from the same sources and gaps already listed earlier in "
-        "this document -- it is a count, not a self-assessment. A report author claiming its own "
-        "work is \"reliable\" would just be another unverified claim; this page instead classifies "
-        "every cited source by tier so a reader can judge confidence from the same underlying data."
-    )
+    if facts.get("_doc_variant") == "external":
+        doc.add_paragraph("Reflects how well this Charter's own claims are sourced and cross-verified.")
+    else:
+        doc.add_paragraph(
+            "This page is generated directly from the same sources and gaps already listed earlier in "
+            "this document -- it is a count, not a self-assessment. A report author claiming its own "
+            "work is \"reliable\" would just be another unverified claim; this page instead classifies "
+            "every cited source by tier so a reader can judge confidence from the same underlying data."
+        )
 
     from docx.shared import Pt
 
+    _sep = ":" if facts.get("_doc_variant") == "external" else " --"
     score_para = doc.add_paragraph()
-    score_run = score_para.add_run(f"Documentation Confidence Score: {confidence['overall']}/100 -- {confidence['band']}")
+    score_run = score_para.add_run(f"Documentation Confidence Score: {confidence['overall']}/100{_sep} {confidence['band']}")
     score_run.bold = True
     score_run.font.size = Pt(14)
-    doc.add_paragraph(
-        "This score rates how well-sourced and verified THIS DOCUMENT's own claims are -- source "
-        "quality, completeness, cross-corroboration, recency, and re-check success -- it is NOT a "
-        "rating of the underlying project's quality, safety, or investment merit. A project with a "
-        "genuinely poor track record whose problems are thoroughly documented can score HIGH here; a "
-        "genuinely sound project with little public paper trail to verify against can score LOW. It "
-        "is a weighted average of six criteria computed below from this document's own sources and "
-        "gaps -- informed by the structure of CRISIL's real-estate methodology (a small number of "
-        "named factors rather than one flat checklist) but NOT a replica of any CRISIL formula: CRISIL "
-        "does not publish a numeric weighting scheme for any of its three real-estate products, and "
-        "the weights used here are this project's own calibration."
-    )
+    if facts.get("_doc_variant") == "external":
+        doc.add_paragraph(
+            "This score measures how well this report's own claims are documented and verified; it "
+            "does not rate the project itself. A well-documented project with real problems can score "
+            "HIGH here; a genuinely sound project with a thin public paper trail can score LOW."
+        )
+    else:
+        doc.add_paragraph(
+            "This score rates how well-sourced and verified THIS DOCUMENT's own claims are -- source "
+            "quality, completeness, cross-corroboration, recency, and re-check success -- it is NOT a "
+            "rating of the underlying project's quality, safety, or investment merit. A project with a "
+            "genuinely poor track record whose problems are thoroughly documented can score HIGH here; a "
+            "genuinely sound project with little public paper trail to verify against can score LOW. It "
+            "is a weighted average of six criteria computed below from this document's own sources and "
+            "gaps -- informed by the structure of CRISIL's real-estate methodology (a small number of "
+            "named factors rather than one flat checklist) but NOT a replica of any CRISIL formula: CRISIL "
+            "does not publish a numeric weighting scheme for any of its three real-estate products, and "
+            "the weights used here are this project's own calibration."
+        )
 
     score_table = doc.add_table(rows=1, cols=4)
     _set_table_borders(score_table)
@@ -5379,22 +5970,33 @@ def _append_authenticity_page(doc, facts: dict) -> None:
     pct_primary = round(100 * primary / total) if total else 0
 
     doc.add_paragraph()
-    doc.add_paragraph(
-        f"Of {total} cited source(s) in this report, {primary} ({pct_primary}%) come from a primary "
-        f"regulatory record, a document opened directly from it, or a live Google Maps route checked "
-        f"in this session -- the highest-confidence tier. The remainder are corporate-registry "
-        f"mirrors, real-estate aggregator listings, press, or social-media corroboration, all "
-        f"explicitly labelled by tier above rather than presented as equivalent to a primary source. "
-        f"Separately, {gaps} item(s) in this report are recorded as explicit, unresolved gaps -- facts "
-        f"that were sought but could not be confirmed, listed in full under \"Gaps & Limitations\" "
-        f"earlier in this document -- rather than filled in with an estimate."
-    )
-    doc.add_paragraph(
-        "Recommended reading of this summary: treat primary-regulatory-tier and live-Maps findings as "
-        "confirmed; treat aggregator/press/social-tier findings as directional and worth an independent "
-        "check before any financial or legal decision; treat every listed gap as genuinely open, not as "
-        "an implicit \"probably fine.\""
-    )
+    if facts.get("_doc_variant") == "external":
+        doc.add_paragraph(
+            f"{primary} of {total} cited sources ({pct_primary}%) are primary-regulatory or "
+            "live-verified; the rest are registry mirrors, aggregators, or press. "
+            f"{gaps} item(s) remain open gaps (see Gaps & Sources)."
+        )
+        doc.add_paragraph(
+            "Treat primary/regulatory findings as confirmed, aggregator/press findings as directional, "
+            "and every listed gap as genuinely open."
+        )
+    else:
+        doc.add_paragraph(
+            f"Of {total} cited source(s) in this report, {primary} ({pct_primary}%) come from a primary "
+            f"regulatory record, a document opened directly from it, or a live Google Maps route checked "
+            f"in this session -- the highest-confidence tier. The remainder are corporate-registry "
+            f"mirrors, real-estate aggregator listings, press, or social-media corroboration, all "
+            f"explicitly labelled by tier above rather than presented as equivalent to a primary source. "
+            f"Separately, {gaps} item(s) in this report are recorded as explicit, unresolved gaps -- facts "
+            f"that were sought but could not be confirmed, listed in full under \"Gaps & Limitations\" "
+            f"earlier in this document -- rather than filled in with an estimate."
+        )
+        doc.add_paragraph(
+            "Recommended reading of this summary: treat primary-regulatory-tier and live-Maps findings as "
+            "confirmed; treat aggregator/press/social-tier findings as directional and worth an independent "
+            "check before any financial or legal decision; treat every listed gap as genuinely open, not as "
+            "an implicit \"probably fine.\""
+        )
 
 
 def _diff_mortgage_lender(facts: dict, prior_facts: dict | None) -> str | None:
