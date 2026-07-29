@@ -4759,15 +4759,67 @@ def _score_entity_rating(facts: dict) -> dict:
 
 
 def _score_rera_compliance(facts: dict) -> dict:
-    """Governance sub-metric: RERA compliance history (registration
-    timeliness, extension/penalty record). Not yet computed as a scored
-    metric by this pipeline -- unlike Team Strength (no public source
-    exists at all), this is a pending build: a real data source (e.g. a
-    structured read of MahaRERA's own extension/penalty filings across the
-    promoter's portfolio) would need to be wired in before this can score
-    anything, so it's an honest "not yet built" gap, not a permanent
-    public-data limitation."""
-    return {"score": None, "tier": None, "reason": "RERA compliance history (registration timeliness, extension/penalty record) is not yet computed as a scored metric -- no data source has been wired in for this criterion yet; a pending build, not a permanent public-data gap."}
+    """Governance sub-metric: RERA compliance history for THIS project --
+    whether its RERA-registered completion commitment has ever been
+    extended, plus how many complaints/appeals are on record against it.
+    Combines both into a single 0(best)-100(worst) "compliance friction"
+    point score, banded onto the AAA-D scale (LOWER points = stronger,
+    same convention as _score_financial_strength_debt). Reuses
+    _FLAG_THRESHOLDS' own complaint/appeal breakpoints so a project that's
+    already flagged in Overview & Flags for complaint/appeal volume can't
+    silently score AAA here -- the two systems read the same underlying
+    numbers.
+
+    Deliberately does NOT read complaint-order OUTCOME text (dismissed /
+    allowed / etc.) into this score: summarize_complaint_outcomes' own
+    docstring is explicit that its keyword classification is a heuristic
+    for a quick tally, "not a substitute for a human reading the actual
+    order for anything that matters to a real decision" -- a complaint
+    dismissed purely on jurisdictional grounds, with the underlying
+    allegation never actually ruled on, would be indistinguishable from
+    one dismissed on the merits. Raw complaint/appeal COUNT and extension
+    status are the only signals reliable enough to score automatically;
+    the substance of any complaint still belongs in Litigation Status and
+    the flag list, read by a human, not folded into this number.
+
+    Requires complaint_count and appeal_count to both be confidently
+    parseable -- _parse_completion_slippage's own "never extended" default
+    is always well-defined by construction (see its docstring), so
+    extension status alone never blocks scoring."""
+    complaint_count, appeal_count = _parse_complaint_appeal_counts(facts)
+    if complaint_count is None or appeal_count is None:
+        return {"score": None, "tier": None, "reason": "This project's complaint/appeal counts are not confidently parseable from rera_core_fields -- both are needed to score RERA compliance friction."}
+
+    _, was_extended = _parse_completion_slippage(facts)
+    points = 25 if was_extended else 0
+    if complaint_count > _FLAG_THRESHOLDS["complaint_imminent"]:
+        points += 45
+    elif complaint_count > _FLAG_THRESHOLDS["complaint_monitor"]:
+        points += 30
+    elif complaint_count >= 1:
+        points += 15
+    if appeal_count > _FLAG_THRESHOLDS["appeal_imminent"]:
+        points += 45
+    elif appeal_count > _FLAG_THRESHOLDS["appeal_monitor"]:
+        points += 30
+    elif appeal_count >= 1:
+        points += 15
+
+    if points == 0:
+        tier = "AAA"
+    elif points <= 20:
+        tier = "AA"
+    elif points <= 40:
+        tier = "A"
+    elif points <= 60:
+        tier = "B"
+    elif points <= 80:
+        tier = "C"
+    else:
+        tier = "D"
+    extension_note = "completion date extended" if was_extended else "no completion extension"
+    note = f"{points} compliance-friction points (lower is stronger): {extension_note}, {complaint_count} complaint(s), {appeal_count} appeal(s) on record for this project."
+    return {"score": _DEVELOPER_SCORE_TIER_SCORES[tier], "tier": tier, "note": note}
 
 
 def _score_gst_tds_compliance(facts: dict) -> dict:

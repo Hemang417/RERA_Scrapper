@@ -18,9 +18,13 @@ with less publicly-verifiable data structurally scores lower, even when
 everything that IS available is top-tier -- this is a deliberate design
 choice (confirmed explicitly), not an oversight.
 
-Three sub-metrics (team_strength; financial_strength_debt; rera_compliance
-and gst_tds_compliance) have no data source wired in at all today -- they
-always resolve to None/N/A, not a temporary gap.
+Two sub-metrics (team_strength; financial_strength_debt) have no data
+source wired in at all today -- they always resolve to None/N/A, not a
+temporary gap. gst_tds_compliance is the same shape (pending build, not
+permanent). rera_compliance now scores from completion-extension status
+and this project's own complaint/appeal counts -- see
+_score_rera_compliance and test_rera_compliance_scores_when_data_
+available_else_unscored.
 
 Run directly: python test_developer_score.py
 """
@@ -95,17 +99,52 @@ def test_team_strength_and_financial_debt_are_permanent_gaps():
     print("test_team_strength_and_financial_debt_are_permanent_gaps: PASS")
 
 
-def test_rera_and_gst_tds_are_pending_build_gaps():
-    """RERA Compliance and GST/TDS Compliance have no wired-in data source
-    yet -- always None/N/A regardless of input, same shape as
-    team_strength but with a "pending build" reason rather than "no public
-    source exists at all", since these COULD be built later."""
+def test_gst_tds_is_pending_build_gap():
+    """GST/TDS Compliance still has no wired-in data source -- always
+    None/N/A regardless of input, same shape as team_strength but with a
+    "pending build" reason rather than "no public source exists at all",
+    since it COULD be built later."""
     result = cc._compute_developer_score({}, {"imminent": [], "structural": [], "monitor": []})
-    for key in ("rera_compliance", "gst_tds_compliance"):
-        criterion = result["criteria"][key]
-        assert criterion["score"] is None, criterion
-        assert "not yet" in criterion["reason"].lower() or "pending" in criterion["reason"].lower(), criterion
-    print("test_rera_and_gst_tds_are_pending_build_gaps: PASS")
+    criterion = result["criteria"]["gst_tds_compliance"]
+    assert criterion["score"] is None, criterion
+    assert "not yet" in criterion["reason"].lower() or "pending" in criterion["reason"].lower(), criterion
+    print("test_gst_tds_is_pending_build_gap: PASS")
+
+
+def test_rera_compliance_scores_when_data_available_else_unscored():
+    """RERA Compliance is no longer an unconditional gap: it scores a
+    "compliance friction" band from completion-extension status plus this
+    project's own complaint/appeal counts, but stays honestly unscored
+    when those counts aren't confidently parseable (an empty facts dict,
+    or one missing rera_core_fields entirely)."""
+    unscored = cc._score_rera_compliance({})
+    assert unscored["score"] is None, unscored
+    assert "not confidently parseable" in unscored["reason"].lower(), unscored
+
+    clean = cc._score_rera_compliance({
+        "rera_core_fields": {
+            "total_complaints_count": 0, "total_appeals_count": 0,
+            "completion_date_current": "2027-01-01", "completion_date_original": "2027-01-01",
+        },
+    })
+    assert clean["tier"] == "AAA", clean
+
+    one_complaint = cc._score_rera_compliance({
+        "rera_core_fields": {
+            "total_complaints_count": 3, "total_appeals_count": 0,
+            "completion_date_current": "2027-01-01", "completion_date_original": "2027-01-01",
+        },
+    })
+    assert one_complaint["tier"] == "AA", one_complaint  # 15 friction points -- within the 1-15 complaint band, no extension
+
+    extended_and_heavy = cc._score_rera_compliance({
+        "rera_core_fields": {
+            "total_complaints_count": 50, "total_appeals_count": 20,
+            "completion_date_current": "2029-01-01", "completion_date_original": "2027-01-01",
+        },
+    })
+    assert extended_and_heavy["tier"] == "D", extended_and_heavy  # 25 (extended) + 45 (>40 complaints) + 45 (>15 appeals) = 115 points
+    print("test_rera_compliance_scores_when_data_available_else_unscored: PASS")
 
 
 def test_entity_rating_bands():
@@ -176,7 +215,16 @@ def test_godrej_park_greens_real_fixture():
     cap is not what's restraining the grade here; the composite itself
     does. If promoter_portfolio.json is refreshed again, update these
     specific numbers to match -- that's tracking real, live data, not a
-    regression."""
+    regression.
+
+    NOTE: this fixture's facts.json was deleted in an output-folder wipe
+    and hasn't been rebuilt (this test currently fails on FileNotFoundError,
+    a known, pre-existing, unrelated gap). When it IS rebuilt, rera_compliance
+    will also resolve now (see _score_rera_compliance) -- GPG's own 67
+    complaints/18 appeals almost certainly cross the imminent threshold, so
+    expect a D there and re-verify every assertion below (including scored_names
+    and composite) against the real rebuilt data rather than assuming these
+    numbers still hold."""
     facts = _load_gpg_facts()
     flags = cc._classify_flags(facts)
     assert flags["imminent"], "fixture must have imminent flags for this test's premise to hold"
@@ -202,17 +250,15 @@ def test_godrej_park_greens_real_fixture():
 
 
 def test_pranami_bliss_real_fixture():
-    """Pranami Bliss: three sub-metrics resolve -- Entity Rating (AAA,
-    7.5%), Cases/Past Defaults (AAA, 7.5%), and Track Record (AAA, 24
-    years -- sourced to Pranami Group's own "founded 2002" claim for this
-    SPV's parent group, 12.5%). Composite = 7.5+7.5+12.5 = 27.5 (the fixed-
-    weight sum of exactly these three, each at its own tier score of
-    100 -- coincidentally the same total as GPG's fixture above, since
-    GPG's two B-tier area sub-metrics at 12.5% each happen to sum to the
-    same contribution as this fixture's one AAA-tier 12.5% sub-metric).
-    Pranami Bliss also carries its own imminent flag (the FSI/BUA gap),
-    but 27.5 already bands well below A on the composite alone, so the
-    hard cap isn't what's active here either."""
+    """Pranami Bliss: four sub-metrics resolve -- Entity Rating (AAA,
+    7.5%), Cases/Past Defaults (AAA, 7.5%), Track Record (AAA, 24 years --
+    sourced to Pranami Group's own "founded 2002" claim for this SPV's
+    parent group, 12.5%), and RERA Compliance (AAA, 7.5% -- 0 compliance-
+    friction points: never extended, 0 complaints, 0 appeals on record for
+    this project). Composite = 7.5+7.5+12.5+7.5 = 35.0. Pranami Bliss also
+    carries its own imminent flag (the FSI/BUA gap), but 35.0 already
+    bands well below A on the composite alone, so the hard cap isn't what's
+    active here either."""
     with open(_PRANAMI_FACTS_PATH, encoding="utf-8") as f:
         facts = json.load(f)
     flags = cc._classify_flags(facts)
@@ -221,34 +267,40 @@ def test_pranami_bliss_real_fixture():
     result = cc._compute_developer_score(facts, flags)
     criteria = result["criteria"]
     scored_names = {name for name, c in criteria.items() if c["score"] is not None}
-    assert scored_names == {"entity_rating", "past_default_count", "track_record_years"}, scored_names
-    assert result["composite"] == 27.5, result["composite"]
+    assert scored_names == {"entity_rating", "past_default_count", "track_record_years", "rera_compliance"}, scored_names
+    assert criteria["rera_compliance"]["tier"] == "AAA", criteria["rera_compliance"]
+    assert result["composite"] == 35.0, result["composite"]
 
     print("test_pranami_bliss_real_fixture: PASS")
     print(f"  composite={result['composite']} grade={result['grade']}")
 
 
-def test_max_achievable_grade_today_is_a_not_capped():
-    """team_strength (12.5%), rera_compliance (7.5%), and
-    gst_tds_compliance (7.5%) are unconditional gaps under the CURRENT
-    rubric (no data source wired in for any of them yet) -- so even a
-    facts dict maxed out on every OTHER sub-metric can only reach a 72.5
-    composite (100 - 12.5 - 7.5 - 7.5), which bands to "A" on the
-    composite alone (A >= 58.35, AA >= 75.0) -- AAA/AA is structurally
-    unreachable with today's built criteria, regardless of imminent flags.
-    This documents that ceiling honestly rather than silently assuming the
-    hard cap is what's restraining every real project's grade."""
+def test_max_achievable_grade_today_is_aa_not_capped():
+    """team_strength (12.5%) and gst_tds_compliance (7.5%) are the only
+    remaining unconditional gaps under the CURRENT rubric (no data source
+    wired in for either yet) -- so a facts dict maxed out on every OTHER
+    sub-metric, including rera_compliance (now scoreable -- see
+    _score_rera_compliance), reaches an 80.0 composite (100 - 12.5 - 7.5),
+    which bands to "AA" (AA >= 75.0, AAA >= 91.65) -- AAA remains
+    structurally unreachable with today's built criteria, but AA is now
+    reachable where it wasn't before RERA Compliance was wired in. This
+    documents that ceiling honestly rather than silently assuming the hard
+    cap is what's restraining every real project's grade."""
     no_flags = {"imminent": [], "structural": [], "monitor": []}
     facts_strong = {
         "corporate_identity": {"organization_type": {"value": "Private Limited Company"}},
         "ibbi_insolvency_check": {"found_process": False},
         "developer_track_record": {"years_in_industry": 25, "financial_strength_points": 5},
         "promoter_portfolio": {"totals": {"total_area_developed_lakh_sqft": 150, "area_within_5km_lakh_sqft": 60}},
+        "rera_core_fields": {
+            "total_complaints_count": 0, "total_appeals_count": 0,
+            "completion_date_current": "2027-01-01", "completion_date_original": "2027-01-01",
+        },
     }
     result = cc._compute_developer_score(facts_strong, no_flags)
-    assert result["composite"] == 72.5, result["composite"]
-    assert result["grade"] == "A", result["grade"]
-    print("test_max_achievable_grade_today_is_a_not_capped: PASS")
+    assert result["composite"] == 80.0, result["composite"]
+    assert result["grade"] == "AA", result["grade"]
+    print("test_max_achievable_grade_today_is_aa_not_capped: PASS")
 
 
 def test_hard_cap_restrains_but_never_worsens():
@@ -256,11 +308,11 @@ def test_hard_cap_restrains_but_never_worsens():
     when imminent flags exist -- but a composite already at A or below
     must be left alone, never pushed down further by the same cap.
 
-    Since 3 sub-metrics (team_strength; rera_compliance;
-    gst_tds_compliance) are permanent/pending gaps with NO data source
-    today, a real facts dict can never naturally drive the composite above
-    72.5 (see test_max_achievable_grade_today_is_a_not_capped) -- so this
-    test temporarily monkeypatches _DEVELOPER_SCORE_STRUCTURE to stub every
+    Since 2 sub-metrics (team_strength; gst_tds_compliance) are
+    permanent/pending gaps with NO data source today, a real facts dict
+    can never naturally drive the composite above 80.0 (see
+    test_max_achievable_grade_today_is_aa_not_capped) -- so this test
+    temporarily monkeypatches _DEVELOPER_SCORE_STRUCTURE to stub every
     sub-metric as a guaranteed AAA, to prove the cap mechanism itself still
     fires correctly for the day those gaps get built and a real AAA/AA
     composite becomes reachable."""
@@ -298,12 +350,13 @@ if __name__ == "__main__":
     test_all_nine_submetrics_always_named_with_fixed_weight()
     test_bucket_weights_sum_correctly()
     test_team_strength_and_financial_debt_are_permanent_gaps()
-    test_rera_and_gst_tds_are_pending_build_gaps()
+    test_gst_tds_is_pending_build_gap()
+    test_rera_compliance_scores_when_data_available_else_unscored()
     test_entity_rating_bands()
     test_area_band_thresholds()
     test_past_default_count_from_clean_ibbi()
     test_godrej_park_greens_real_fixture()
     test_pranami_bliss_real_fixture()
-    test_max_achievable_grade_today_is_a_not_capped()
+    test_max_achievable_grade_today_is_aa_not_capped()
     test_hard_cap_restrains_but_never_worsens()
     print("\nAll tests passed.")
