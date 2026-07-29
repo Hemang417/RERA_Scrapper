@@ -2529,6 +2529,102 @@ def _fix_bullet_hanging_indent(doc) -> None:
             lvl0.append(p_pr)
 
 
+# Mirrors _TEXT_RED/_TEXT_AMBER (defined later in this file, alongside the
+# other document-styling constants) -- duplicated here as literals rather
+# than referenced, since this set is built at module-import time, before
+# those later assignments have run. "1F3864" is the template's own Heading
+# style color (navy), applied to every section heading in both variants --
+# a deliberate design choice, not the grey-placeholder bug this gate exists
+# to catch.
+_EXTERNAL_ALLOWED_RUN_COLORS = {None, "000000", "C00000", "BF8F00", "1F3864"}
+
+
+def _iter_all_paragraphs(doc):
+    """Yields every paragraph in the document body plus every table cell
+    (recursively, in case a cell itself contains a nested table) -- the
+    verification gate below needs to see ALL rendered text, not just
+    doc.paragraphs (which skips table contents entirely)."""
+    def _from_tables(tables):
+        for table in tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    yield from cell.paragraphs
+                    yield from _from_tables(cell.tables)
+
+    yield from doc.paragraphs
+    yield from _from_tables(doc.tables)
+
+
+def _verify_external_document_quality(docx_path: str) -> list[str]:
+    """Re-opens a just-saved External Charter and checks for the exact
+    regressions this session found and fixed by hand (grey/italic body
+    text, hyphen-pair "dashes", the Weight column, the Document Library
+    section, missing bullet numbering, and dangling-paren citations) --
+    not a general style linter, just a guard against these specific bugs
+    coming back the next time someone edits _fill_template. Returns a
+    list of violation strings; empty means clean. Raises nothing itself --
+    the caller decides how loudly to fail."""
+    import re
+    import docx as _docx
+
+    doc = _docx.Document(docx_path)
+    violations = []
+
+    for para in _iter_all_paragraphs(doc):
+        text = para.text
+        if " -- " in text:
+            violations.append(f"hyphen-pair dash found in paragraph: {text[:80]!r}")
+        if "—" in text:  # em dash
+            violations.append(f"em dash found in paragraph: {text[:80]!r}")
+        if "Document Library" in text:
+            violations.append(f"'Document Library' section text survived in External: {text[:80]!r}")
+
+        for run in para.runs:
+            color = run.font.color
+            rgb = str(color.rgb) if color is not None and color.rgb is not None else None
+            if run.italic and rgb != "C00000":
+                # The one deliberate exception: the Standing Gap paragraph
+                # in the Gaps & Sources section is colored red AND italic on
+                # purpose -- red pairs only with that intentional styling,
+                # never with the grey-placeholder bug this check exists to
+                # catch.
+                violations.append(f"italic run (leftover template placeholder styling) in: {text[:80]!r}")
+            if rgb not in _EXTERNAL_ALLOWED_RUN_COLORS:
+                violations.append(f"unexpected run color {rgb} (expected black/red/amber/heading-navy only) in: {text[:80]!r}")
+
+    # Citation-entry checks (dangling parens, missing bullet) apply only to
+    # the real Sources list in the document body -- NOT to every table cell
+    # that happens to hold a bare "[N]" marker (e.g. a "Source" column),
+    # which was never a bulleted list item to begin with.
+    for para in doc.paragraphs:
+        stripped = para.text.strip()
+        m = re.match(r"^\[(\d+)\]\s+\S", stripped)
+        if m:
+            if stripped.count("(") != stripped.count(")"):
+                violations.append(f"unbalanced parentheses in citation entry: {stripped[:80]!r}")
+            p_pr = para._p.pPr
+            if p_pr is None or p_pr.numPr is None:
+                violations.append(f"citation entry lost its bullet numbering: {stripped[:80]!r}")
+
+    for table in doc.tables:
+        if not table.rows:
+            continue
+        header_texts = [c.text.strip() for c in table.rows[0].cells]
+        if header_texts[:2] == ["Bucket", "Sub-metric"] and "Weight" in header_texts:
+            violations.append("Developer Score table still has a Weight column in External")
+
+    from docx.oxml.ns import qn
+    numbering_root = doc.part.numbering_part.element
+    for abstract_num in numbering_root.findall(qn("w:abstractNum")):
+        if abstract_num.get(qn("w:abstractNumId")) != "2":
+            continue
+        lvl0 = abstract_num.find(qn("w:lvl"))
+        if lvl0 is None or lvl0.find(qn("w:pPr")) is None:
+            violations.append("bullet numbering (abstractNum id=2) is missing its hanging-indent fix")
+
+    return violations
+
+
 def _set_cell(table, row: int, col: int, text: str) -> None:
     _set_paragraph_text(table.rows[row].cells[col].paragraphs[0], str(text))
 
@@ -3099,6 +3195,20 @@ def _fill_template(reg_no: str, facts: dict, out_path: str, doc_variant: str = "
 
     doc.save(out_path)
     _ACTIVE_EXTERNAL_FACTS = None
+
+    if doc_variant == "external":
+        # Re-opens the file we just saved (not the in-memory `doc`) so this
+        # checks exactly what a reader will actually open -- catches a
+        # future code change silently reintroducing any of the specific
+        # bugs this session found and fixed by hand (see the function's own
+        # docstring). Fails loudly rather than silently shipping a
+        # regressed document.
+        violations = _verify_external_document_quality(out_path)
+        if violations:
+            raise RuntimeError(
+                f"External Charter quality gate failed for {out_path} "
+                f"({len(violations)} violation(s)):\n" + "\n".join(f"  - {v}" for v in violations)
+            )
 
     # For doc_variant="internal", `facts` above is the caller's own object
     # (only "external" works on a deep copy), so these two rendering-only
