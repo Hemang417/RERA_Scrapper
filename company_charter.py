@@ -2061,6 +2061,69 @@ def run_cts_land_lookup(facts: dict, reg_no: str, output_dir: str = config.OUTPU
     return facts
 
 
+# ---------------------------------------------------------------------------
+# GST filing-compliance intake -- same opt-in convention as
+# run_cts_land_lookup/reviews.json just above: does nothing unless a human
+# has dropped output/<reg_no>/gst_filing_input.json, since there is no
+# automated GST portal scrape here at all (see gst_compliance.py's own
+# module docstring: the portal's "Search Taxpayer" filing table sits behind
+# a CAPTCHA solved fresh per lookup, the same hard constraint already
+# documented for MahaRERA/Maha Bhulekh). The GSTIN is requested directly
+# from the developer; the filing dates in that JSON come from either the
+# developer's own reply or a human manually reading the portal's filing
+# table themselves.
+# ---------------------------------------------------------------------------
+
+def run_gst_compliance_check(facts: dict, reg_no: str, output_dir: str = config.OUTPUT_ROOT) -> dict:
+    """Runs the GST filing-pattern analysis only if output/<reg_no>/
+    gst_filing_input.json exists, containing:
+      {"gstin": "27AANCM5273D1ZA", "records": [{"form": "GSTR-3B"|"GSTR-1",
+       "period_start": "YYYY-MM-DD", "period_end": "YYYY-MM-DD",
+       "filing_date": "YYYY-MM-DD"|null}, ...]}
+    Silently returns facts unchanged if that file is absent -- the ordinary
+    case for every automated run. Sets facts["gst_compliance_check"] to
+    {"found": False, "note": ...} (never raises) on a malformed GSTIN or
+    record, so a typo'd input file surfaces as an honest gap rather than
+    crashing the whole Charter pass."""
+    input_path = os.path.join(output_dir, reg_no, "gst_filing_input.json")
+    if not os.path.exists(input_path):
+        return facts
+
+    import gst_compliance
+
+    with open(input_path, "r", encoding="utf-8") as f:
+        gst_input = json.load(f)
+
+    gstin = (gst_input.get("gstin") or "").strip()
+    if not gst_compliance.validate_gstin(gstin):
+        facts["gst_compliance_check"] = {"found": False, "note": f"{input_path}'s gstin ({gstin!r}) is not a validly-formatted GSTIN."}
+        return facts
+
+    records = []
+    for i, rec in enumerate(gst_input.get("records", [])):
+        try:
+            records.append({
+                "form": rec["form"],
+                "period_start": datetime.strptime(rec["period_start"], "%Y-%m-%d").date(),
+                "period_end": datetime.strptime(rec["period_end"], "%Y-%m-%d").date(),
+                "filing_date": datetime.strptime(rec["filing_date"], "%Y-%m-%d").date() if rec.get("filing_date") else None,
+            })
+        except (KeyError, ValueError) as e:
+            facts["gst_compliance_check"] = {"found": False, "note": f"{input_path} record[{i}] is malformed: {e}"}
+            return facts
+
+    summary = gst_compliance.summarize_filing_pattern(gstin, records, as_of=datetime.now().date())
+    facts["gst_compliance_check"] = {"found": True, "gstin": gstin, "summary": summary}
+    facts.setdefault("sources", []).append({
+        "label": "GST filing history (developer-supplied)",
+        "ref": f"GSTIN {gstin}, {len(records)} filing period(s) on record",
+        "topic": "gst_compliance",
+        "published_date": "unknown",
+        "accessed_date": datetime.now().strftime("%Y-%m-%d"),
+    })
+    return facts
+
+
 def _slugify_for_pending_key(*parts: str) -> str:
     """Joins the given parts with underscores into a filesystem-safe
     directory name -- strips characters Windows/NTFS rejects in a path
@@ -4318,6 +4381,12 @@ _FLAG_THRESHOLDS = {
     "complaint_monitor": 15, "complaint_imminent": 40,
     "appeal_monitor": 5, "appeal_imminent": 15,
     "credit_rating_min_units": 500,  # below this, "no rating found" isn't flagged
+    # GST filing-pattern breakpoints -- shared between _score_gst_compliance
+    # and _classify_flags (same reasoning as the complaint/appeal pair
+    # above: a project already flagged for a bad GST pattern can't silently
+    # score AAA, and vice versa).
+    "gst_late_pct_monitor": 15, "gst_late_pct_imminent": 40,
+    "gst_recent_delays_monitor": 1, "gst_recent_delays_imminent": 3,
 }
 # The Developer Score's 3-bucket / 9-sub-metric AAA-D framework (see
 # _DEVELOPER_SCORE_STRUCTURE below): each sub-metric is scored independently
@@ -4798,6 +4867,29 @@ def _classify_flags(facts: dict) -> dict:
         elif appeal_count >= 1:
             structural.append({"text": f"Appeal volume: {appeal_count} appeal(s) on record -- a visible floor worth noting, not blended into zero.", "field": "rera_core_fields.litigations_per_record"})
 
+    # 6b. GST filing pattern -- only present when a human has supplied
+    # gst_filing_input.json (see run_gst_compliance_check); reuses the same
+    # thresholds _score_gst_compliance scores against, so a project flagged
+    # here can't silently score AAA there. A bad RECENT pattern is exactly
+    # what should prompt raising this directly with the developer, which is
+    # why delays_last_12_months (not lifetime late_pct alone) drives the
+    # imminent/structural split.
+    gst_check = facts.get("gst_compliance_check")
+    if gst_check and gst_check.get("found"):
+        gst_summary = gst_check["summary"]
+        gst_late_pct = gst_summary.get("late_pct", 0)
+        gst_delays_recent = gst_summary.get("delays_last_12_months", 0)
+        gst_text = (
+            f"GST filing pattern for GSTIN {gst_check.get('gstin', '')}: {gst_late_pct}% of rated periods filed "
+            f"late, {gst_delays_recent} delayed/unfiled period(s) due in the trailing 12 months."
+        )
+        if gst_delays_recent > _FLAG_THRESHOLDS["gst_recent_delays_imminent"] or gst_late_pct > _FLAG_THRESHOLDS["gst_late_pct_imminent"]:
+            imminent.append({"text": gst_text + " Above the threshold for raising directly with the developer.", "field": "gst_compliance_check.summary"})
+        elif gst_delays_recent > _FLAG_THRESHOLDS["gst_recent_delays_monitor"] or gst_late_pct > _FLAG_THRESHOLDS["gst_late_pct_monitor"]:
+            structural.append({"text": gst_text, "field": "gst_compliance_check.summary"})
+        elif gst_delays_recent > 0 or gst_late_pct > 0:
+            monitor.append({"text": gst_text, "field": "gst_compliance_check.summary"})
+
     # 7. Promoter portfolio total -- always structural, never colour-scored
     portfolio = facts.get("promoter_portfolio")
     if portfolio:
@@ -5087,11 +5179,76 @@ def _score_rera_compliance(facts: dict) -> dict:
     return {"score": _DEVELOPER_SCORE_TIER_SCORES[tier], "tier": tier, "note": note}
 
 
-def _score_gst_tds_compliance(facts: dict) -> dict:
-    """Governance sub-metric: GST/TDS statutory compliance. Same "pending
-    build" status as _score_rera_compliance -- no data source (e.g. a GST
-    portal lookup or filed-return record) is wired in yet."""
-    return {"score": None, "tier": None, "reason": "GST/TDS compliance is not yet computed as a scored metric -- no data source has been wired in for this criterion yet; a pending build, not a permanent public-data gap."}
+def _score_gst_compliance(facts: dict) -> dict:
+    """Governance sub-metric: GST return-filing compliance (GSTR-1/GSTR-3B
+    due-date and delay pattern -- see gst_compliance.py). TDS is explicitly
+    out of scope (deferred per an earlier scoping decision), hence "GST
+    Compliance" not "GST/TDS Compliance" in _DEVELOPER_SCORE_STRUCTURE.
+
+    Requires facts["gst_compliance_check"] to have been populated by
+    run_gst_compliance_check -- itself gated on a human-supplied
+    output/<reg_no>/gst_filing_input.json, since there is no automated GST
+    portal scrape here at all: the portal's own "Search Taxpayer" filing
+    table sits behind a CAPTCHA solved fresh per lookup (see
+    gst_compliance.py's own module docstring), the same hard constraint
+    already documented for MahaRERA/Maha Bhulekh elsewhere in this file.
+    Unscored (not a permanent gap, just nothing supplied this pass) when
+    that file was never dropped in.
+
+    Banded on the same "friction points, lower is stronger" convention as
+    _score_rera_compliance, and reuses _FLAG_THRESHOLDS' own GST breakpoints
+    so a project already flagged in Overview & Flags for a bad filing
+    pattern can't silently score AAA here -- the two systems read the same
+    underlying numbers. Weights three signals: overall late-filing rate,
+    the single worst delay on record, and -- weighted highest, since it's
+    what should actually drive an "ask the developer" conversation today --
+    how many periods were late or still unfiled within the trailing 12
+    months."""
+    check = facts.get("gst_compliance_check")
+    if not check or not check.get("found"):
+        return {
+            "score": None, "tier": None,
+            "reason": "No GST filing data available this pass. Requires a human-supplied output/<reg_no>/"
+            "gst_filing_input.json (GSTIN + filing dates), since the GST portal's own CAPTCHA makes live "
+            "scraping unautomatable here; this is a pending-input gap, not a permanent one.",
+        }
+
+    summary = check["summary"]
+    if summary["on_time"] + summary["late"] == 0:
+        return {"score": None, "tier": None, "reason": "GST filing input contained no period with both a resolvable due date and a recorded filing outcome to score against."}
+
+    late_pct = summary["late_pct"]
+    points = 45 if late_pct > _FLAG_THRESHOLDS["gst_late_pct_imminent"] \
+        else 30 if late_pct > _FLAG_THRESHOLDS["gst_late_pct_monitor"] \
+        else 15 if late_pct > 0 else 0
+
+    worst_delay = summary.get("worst_delay_days")
+    if worst_delay is not None:
+        points += 30 if worst_delay > 60 else 15 if worst_delay > 20 else 0
+
+    delays_recent = summary.get("delays_last_12_months", 0)
+    points += 45 if delays_recent > _FLAG_THRESHOLDS["gst_recent_delays_imminent"] \
+        else 25 if delays_recent > _FLAG_THRESHOLDS["gst_recent_delays_monitor"] else 0
+
+    if points == 0:
+        tier = "AAA"
+    elif points <= 20:
+        tier = "AA"
+    elif points <= 40:
+        tier = "A"
+    elif points <= 60:
+        tier = "B"
+    elif points <= 80:
+        tier = "C"
+    else:
+        tier = "D"
+
+    note = (
+        f"{points} compliance-friction points (lower is stronger): {late_pct}% of rated periods filed late, "
+        f"worst delay {worst_delay if worst_delay is not None else 0} day(s), {delays_recent} delayed/unfiled "
+        f"period(s) due in the trailing 12 months."
+    )
+    return {"score": _DEVELOPER_SCORE_TIER_SCORES[tier], "tier": tier, "note": note}
 
 
 # Three fixed-weight buckets, each holding a fixed number of sub-metrics
@@ -5118,7 +5275,7 @@ _DEVELOPER_SCORE_STRUCTURE = (
     )),
     ("Governance Strength", 30.0, (
         ("rera_compliance", "RERA Compliance", _score_rera_compliance),
-        ("gst_tds_compliance", "GST/TDS Compliance", _score_gst_tds_compliance),
+        ("gst_compliance", "GST Compliance", _score_gst_compliance),
         ("past_default_count", "Cases (Past Defaults)", _score_past_default_count),
         ("entity_rating", "Entity Rating", _score_entity_rating),
     )),
@@ -6819,6 +6976,7 @@ def run_company_charter(
         })
 
     facts = run_cts_land_lookup(facts, reg_no, output_dir)
+    facts = run_gst_compliance_check(facts, reg_no, output_dir)
 
     land = facts.get("land_identification", {})
     origin_locality = (land.get("village_locality") or {}).get("value", "")

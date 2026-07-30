@@ -22,6 +22,23 @@ clean period records.
 from __future__ import annotations
 
 import datetime
+import re
+
+# 15 characters: 2-digit state code, 10-char PAN (5 letters + 4 digits + 1
+# letter), 1-char entity/registration count for that PAN in that state
+# (digit or letter), literal "Z", 1-char alphanumeric checksum. Anchored
+# and case-sensitive (validate_gstin uppercases first) -- matches this
+# file's own worked example, 27AANCM5273D1ZA.
+_GSTIN_RE = re.compile(r"^\d{2}[A-Z]{5}\d{4}[A-Z][1-9A-Z]Z[0-9A-Z]$")
+
+
+def validate_gstin(gstin: str) -> bool:
+    """Format validation only -- confirms the string HAS the shape of a
+    real GSTIN (state code, embedded PAN, entity code, checksum slot), not
+    that it's actually registered or active (that would need a live portal
+    lookup, out of scope here -- see this module's own docstring). Never
+    raises on bad input; a non-string or empty value is simply invalid."""
+    return bool(_GSTIN_RE.match((gstin or "").strip().upper()))
 
 
 # ---------------------------------------------------------------------------

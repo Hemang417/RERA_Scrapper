@@ -16,6 +16,20 @@ _MAHARASHTRA_GSTIN = "27AANCM5273D1ZA"  # state code 27 -- the worked example fr
 _DELHI_GSTIN = "07AANCM5273D1ZB"  # state code 07 -- a Category Y state, for contrast
 
 
+def test_validate_gstin_accepts_real_examples_and_rejects_garbage():
+    """Format validation only (see validate_gstin's own docstring) -- both
+    of this module's own worked examples must pass, case-insensitively,
+    and obviously-wrong input must not."""
+    assert gst.validate_gstin(_MAHARASHTRA_GSTIN) is True
+    assert gst.validate_gstin(_DELHI_GSTIN) is True
+    assert gst.validate_gstin(_MAHARASHTRA_GSTIN.lower()) is True
+    assert gst.validate_gstin("not-a-gstin") is False
+    assert gst.validate_gstin("") is False
+    assert gst.validate_gstin(None) is False
+    assert gst.validate_gstin("27AANCM5273D1Z") is False  # one character short
+    print("test_validate_gstin_accepts_real_examples_and_rejects_garbage: PASS")
+
+
 def test_qrmp_category_by_state_code():
     """Maharashtra (27) is Category X (22nd); Delhi (07) is Category Y
     (24th) -- confirms the lookup isn't accidentally inverted or
@@ -169,6 +183,7 @@ def test_summarize_filing_pattern_excludes_unresolvable_frequency():
 
 
 if __name__ == "__main__":
+    test_validate_gstin_accepts_real_examples_and_rejects_garbage()
     test_qrmp_category_by_state_code()
     test_detect_period_frequency()
     test_due_date_monthly()
