@@ -1,22 +1,26 @@
 """
 GST return-filing compliance analysis -- pure, offline logic only (no
-scraping, no network calls, no CAPTCHA-solving in this file).
+scraping, no network calls, no CAPTCHA-solving in this file). GSTIN
+format validation and PAN extraction live here too, since they're pure
+string operations every caller (intake, scoring, the live portal lookup)
+needs.
 
-The live GST portal lookup (Search Taxpayer by PAN -> enumerate every
-GSTIN registered under it -> Search Taxpayer by GSTIN -> SHOW FILING
-TABLE) is a SEPARATE, not-yet-built step that requires a human to solve
-the portal's own CAPTCHA each time -- that can't be automated (a hard
-constraint, not a preference), so it isn't attempted here. This module
-only covers what's fully testable without it: given already-extracted
-filing records (however they eventually get scraped), determine each
-period's filing frequency from its own date span, compute the correct
-statutory due date, measure delay, and aggregate into a pattern a human
-can act on.
+The live GST portal lookup itself (Search Taxpayer by PAN -> enumerate
+every GSTIN registered under it -> Search Taxpayer by GSTIN -> SHOW
+FILING TABLE) is a SEPARATE module, gst_portal.py, since it needs
+Playwright and a human to solve the portal's own CAPTCHA each time --
+that can't be automated (a hard constraint, not a preference), same
+policy as mahabhumi.py/session_auth.py elsewhere in this pipeline. This
+module only covers what's fully testable without a browser: given
+already-extracted filing records (from gst_portal.py, or supplied by
+hand), determine each period's filing frequency from its own date span,
+compute the correct statutory due date, measure delay, and aggregate
+into a pattern a human can act on.
 
 Everything here operates on plain dicts/tuples, not facts.json directly
--- company_charter.py's _score_gst_compliance (once wired in) is
-responsible for reading facts["gst_compliance"] and handing this module
-clean period records.
+-- company_charter.py's run_gst_compliance_check/_score_gst_compliance are
+responsible for reading facts["gst_compliance_check"] and handing this
+module clean period records.
 """
 
 from __future__ import annotations
@@ -39,6 +43,17 @@ def validate_gstin(gstin: str) -> bool:
     lookup, out of scope here -- see this module's own docstring). Never
     raises on bad input; a non-string or empty value is simply invalid."""
     return bool(_GSTIN_RE.match((gstin or "").strip().upper()))
+
+
+def extract_pan_from_gstin(gstin: str) -> str | None:
+    """Returns the 10-character PAN embedded in a GSTIN (characters 3-12 --
+    e.g. "AANCM5273D" out of "27AANCM5273D1ZA"), or None if gstin doesn't
+    validate as a real GSTIN first (see validate_gstin) -- never slices a
+    malformed string and calls the result a PAN."""
+    gstin = (gstin or "").strip().upper()
+    if not validate_gstin(gstin):
+        return None
+    return gstin[2:12]
 
 
 # ---------------------------------------------------------------------------

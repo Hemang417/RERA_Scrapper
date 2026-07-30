@@ -30,6 +30,18 @@ def test_validate_gstin_accepts_real_examples_and_rejects_garbage():
     print("test_validate_gstin_accepts_real_examples_and_rejects_garbage: PASS")
 
 
+def test_extract_pan_from_gstin():
+    """Characters 3-12 of a valid GSTIN are its embedded PAN -- this
+    file's own worked example's PAN, AANCM5273D, is publicly confirmable
+    against the real GSTIN it was extracted from. An invalid GSTIN must
+    never be sliced and called a PAN."""
+    assert gst.extract_pan_from_gstin(_MAHARASHTRA_GSTIN) == "AANCM5273D"
+    assert gst.extract_pan_from_gstin(_DELHI_GSTIN) == "AANCM5273D"
+    assert gst.extract_pan_from_gstin("not-a-gstin") is None
+    assert gst.extract_pan_from_gstin("") is None
+    print("test_extract_pan_from_gstin: PASS")
+
+
 def test_qrmp_category_by_state_code():
     """Maharashtra (27) is Category X (22nd); Delhi (07) is Category Y
     (24th) -- confirms the lookup isn't accidentally inverted or
@@ -184,6 +196,7 @@ def test_summarize_filing_pattern_excludes_unresolvable_frequency():
 
 if __name__ == "__main__":
     test_validate_gstin_accepts_real_examples_and_rejects_garbage()
+    test_extract_pan_from_gstin()
     test_qrmp_category_by_state_code()
     test_detect_period_frequency()
     test_due_date_monthly()
