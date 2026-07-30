@@ -238,6 +238,24 @@ def build_promoter_portfolio(
     truncated = len(candidates) > project_limit
     kept = candidates[:project_limit]
 
+    # The subject project's own name, resolved from the candidate whose
+    # registration number matches subject_reg_no -- used to spot a
+    # past-experience entry that is really a self-reference to the subject
+    # project (see the entry loop below). Derived here rather than added as
+    # another caller-supplied parameter, since the resolver already carries
+    # it and a caller passing a name that disagreed with subject_reg_no
+    # would be a silent trap.
+    subject_project_name = None
+    if subject_reg_no:
+        subject_project_name = next(
+            (
+                str(c.project_name).strip().upper()
+                for c in kept
+                if c.reg_no and c.reg_no.strip().upper() == subject_reg_no.strip().upper() and c.project_name
+            ),
+            None,
+        )
+
     rows = []
     total_complaints = 0
     total_appeals = 0
@@ -246,6 +264,10 @@ def build_promoter_portfolio(
     lapsed_count = 0
     on_time_count = 0
     delayed_count = 0
+    # Past-experience entries seen across every registration this promoter
+    # holds, so the same historical project is never counted twice -- see the
+    # dedup note in the entry loop below.
+    seen_experience_keys = set()
     total_land_area_sqm = 0.0
     land_area_entries_found = 0
     total_land_area_within_5km_sqm = 0.0
@@ -316,16 +338,61 @@ def build_promoter_portfolio(
                 for entry in entries:
                     if not isinstance(entry, dict):
                         continue
+                    # A promoter's past-experience list is keyed on their
+                    # userProfileId, NOT on the registration it was fetched
+                    # under, so the same historical project comes back once
+                    # per registration this promoter holds. Dedup on the
+                    # API's own primary key for the entry
+                    # (userProfilePastExperienceId), falling back to a
+                    # name/area/completion-date triple if it's ever absent.
+                    entry_key = entry.get("userProfilePastExperienceId")
+                    if entry_key is None:
+                        entry_key = (
+                            str(entry.get("projectName", "")).strip().upper(),
+                            entry.get("landArea"),
+                            entry.get("actualCompletionDate"),
+                        )
+                    if entry_key in seen_experience_keys:
+                        continue
+                    seen_experience_keys.add(entry_key)
+
+                    # Exclude only an entry that IS the subject project
+                    # itself, identified by the ENTRY'S OWN declared identity
+                    # (its MahaRERA registration number, or failing that its
+                    # project name). This used to be keyed on whether the
+                    # entry was FETCHED under the subject project's
+                    # registration (c.reg_no == subject_reg_no), which was
+                    # wrong in a way that silently destroyed real data: for a
+                    # single-project SPV -- the normal structure for a Mumbai
+                    # redevelopment -- the ONLY portfolio project IS the
+                    # subject, so every genuine prior delivery declared under
+                    # it had its area discarded, while the same entry still
+                    # counted toward on_time_count/delayed_count (which never
+                    # had the exclusion). Confirmed live on Pranami Bliss:
+                    # "Mall of Ranchi" (5462.75 sqm, completed on time) gave
+                    # on_time_rate_pct=100.0 but
+                    # total_area_developed_lakh_sqft=None, leaving both the
+                    # Past-Experience-Area and Influence-in-Micromarket
+                    # Developer Score sub-metrics unscored for no real reason.
+                    # Name matching is exact (normalised case/whitespace),
+                    # never fuzzy -- same policy as every other identifier
+                    # match in this pipeline.
+                    entry_reg_no = str(entry.get("mahaRERARegistrationNumber") or "").strip().upper()
+                    entry_name = str(entry.get("projectName") or "").strip().upper()
+                    is_self_reference = bool(
+                        (subject_reg_no and entry_reg_no and entry_reg_no == subject_reg_no.strip().upper())
+                        or (subject_project_name and entry_name and entry_name == subject_project_name)
+                    )
+                    if is_self_reference:
+                        continue
+
                     classification = _classify_completion(entry)
                     if classification == "on_time":
                         on_time_count += 1
                     elif classification == "delayed":
                         delayed_count += 1
                     land_area = entry.get("landArea")
-                    is_subject_project = bool(
-                        subject_reg_no and c.reg_no and c.reg_no.strip().upper() == subject_reg_no.strip().upper()
-                    )
-                    if isinstance(land_area, (int, float)) and land_area > 0 and not is_subject_project:
+                    if isinstance(land_area, (int, float)) and land_area > 0:
                         total_land_area_sqm += land_area
                         land_area_entries_found += 1
 
@@ -366,10 +433,12 @@ def build_promoter_portfolio(
         "treat this as the promoter's own claimed track record, not a confirmed one.",
         "total_area_developed_lakh_sqft and area_within_5km_lakh_sqft are both summed from each "
         "portfolio project's own past_experiences.landArea (self-reported, sqm, converted to "
-        "lakh sq ft), excluding the subject project's own entry -- if the promoter declared the "
-        "SAME historical project's area under more than one of its current registrations, that "
-        "area is counted once per declaration, not deduplicated (the same limitation already "
-        "applies to on_time_count/delayed_count above).",
+        "lakh sq ft). An entry is excluded only when the entry's OWN declared MahaRERA "
+        "registration number is the subject project itself, and entries are deduplicated across "
+        "every registration this promoter holds (on the API's own "
+        "userProfilePastExperienceId), so a historical project declared under several of the "
+        "promoter's registrations is counted exactly once -- the same dedup now applies to "
+        "on_time_count/delayed_count above.",
         "area_within_5km_lakh_sqft additionally requires geocoding: the subject project's own "
         "locality (from its partners category data, if supplied) is resolved via OpenStreetMap's "
         "public Nominatim API -- a free, no-API-key service, rate-limited to ~1 request/second "

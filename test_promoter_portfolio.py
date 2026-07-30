@@ -205,7 +205,15 @@ def test_area_within_5km_excludes_far_ungeocodable_and_self():
     from itself and trivially inflate both area totals with a
     self-reference). total_area_developed_lakh_sqft must still count the
     far/ungeocodable entries (that total doesn't require geocoding), but
-    must still exclude the subject project's own entry."""
+    must still exclude the subject project's own entry.
+
+    A self-reference is identified by the ENTRY'S OWN declared identity (its
+    projectName, or its MahaRERA registration number), never by which
+    registration it was fetched under. That distinction matters: the
+    fetched-under rule silently discarded every genuine prior delivery for a
+    single-project SPV, since there the only portfolio project IS the subject
+    -- confirmed live on Pranami Bliss, whose real "Mall of Ranchi" delivery
+    was being thrown away while still counting toward on_time_rate_pct."""
     subject_reg_no = "P52100019639"
     candidates = [
         _fake_candidate(subject_reg_no, "2000", "Godrej Park Greens (subject, self)"),
@@ -214,10 +222,16 @@ def test_area_within_5km_excludes_far_ungeocodable_and_self():
         _fake_candidate("P52100000022", "2003", "Ungeocodable Project"),
     ]
     past_experiences_by_project = {
-        "2000": [{"originalProposedCompletionDate": None, "actualCompletionDate": None, "landArea": 32917.0, "address": "Mamurdi"}],
-        "2001": [{"originalProposedCompletionDate": None, "actualCompletionDate": None, "landArea": 5000.0, "address": "Near Mamurdi"}],
-        "2002": [{"originalProposedCompletionDate": None, "actualCompletionDate": None, "landArea": 8000.0, "address": "Nagpur"}],
-        "2003": [{"originalProposedCompletionDate": None, "actualCompletionDate": None, "landArea": 3000.0, "address": ""}],
+        # A genuine self-reference: the promoter declared the subject project
+        # itself as one of its own past experiences, named as such. Real
+        # MahaRERA past_experiences entries always carry projectName
+        # (confirmed live), which is what makes a self-reference identifiable
+        # by the entry's OWN identity rather than by which registration it
+        # was fetched under -- see the note in this test's docstring.
+        "2000": [{"projectName": "Godrej Park Greens (subject, self)", "originalProposedCompletionDate": None, "actualCompletionDate": None, "landArea": 32917.0, "address": "Mamurdi"}],
+        "2001": [{"projectName": "Prior Delivery Near Subject", "originalProposedCompletionDate": None, "actualCompletionDate": None, "landArea": 5000.0, "address": "Near Mamurdi"}],
+        "2002": [{"projectName": "Prior Delivery Far Away", "originalProposedCompletionDate": None, "actualCompletionDate": None, "landArea": 8000.0, "address": "Nagpur"}],
+        "2003": [{"projectName": "Prior Delivery Ungeocodable", "originalProposedCompletionDate": None, "actualCompletionDate": None, "landArea": 3000.0, "address": ""}],
     }
     subject_coords = (18.65, 73.75)
     geocode_by_query = {
@@ -292,6 +306,100 @@ def test_no_token_skips_past_experiences_honestly():
     print("test_no_token_skips_past_experiences_honestly: PASS")
 
 
+def test_single_project_spv_keeps_its_genuine_prior_delivery():
+    """The exact regression this fix exists for, taken from real Pranami
+    Bliss data. A single-project SPV's portfolio contains ONLY the subject
+    registration, and that registration's past_experiences list carries a
+    genuine, differently-named prior delivery ("Mall of Ranchi", 5462.75
+    sqm, completed on time, not MahaRERA-registered since it's in
+    Jharkhand). Its area MUST count: the old rule excluded any entry
+    fetched under the subject's own registration, which for an SPV meant
+    every entry, so on_time_rate_pct read 100.0 while
+    total_area_developed_lakh_sqft read None -- two Developer Score
+    sub-metrics unscored for no real reason."""
+    subject_reg_no = "P51800077150"
+    candidates = [_fake_candidate(subject_reg_no, "46590", "PRANAMI BLISS")]
+
+    def fake_fetch_category(category, project_id, session, token, body=None):
+        if category == "projects":
+            return {"projectCurrentStatus": "Certificate Signed", "isProjectLapsed": 0, "userProfileId": 105868}
+        if category == "complaints":
+            return {"complaintDetails": []}
+        if category == "appeals":
+            return []
+        if category == "past_experiences":
+            return [{
+                "userProfilePastExperienceId": 13710,
+                "projectName": "Mall of Ranchi",
+                "mahaRERARegistrationNumber": None,
+                "landArea": 5462.75,
+                "originalProposedCompletionDate": "2022-07-31",
+                "actualCompletionDate": "2022-07-31",
+                "address": "Ratu Road Ranchi Jharkhand 835222",
+            }]
+        raise AssertionError(f"unexpected category fetched: {category}")
+
+    with patch.object(resolver, "search_promoters", return_value=candidates), \
+         patch.object(promoter_portfolio.api_client, "fetch_category", side_effect=fake_fetch_category):
+        with requests.Session() as session:
+            portfolio = promoter_portfolio.build_promoter_portfolio(
+                "Pranami Neev Realty Limited", session, token="fake-token", headless=True,
+                subject_reg_no=subject_reg_no,
+            )
+
+    totals = portfolio["totals"]
+    assert totals["on_time_count"] == 1, totals
+    assert totals["on_time_rate_pct"] == 100.0, totals
+    expected_area = round(5462.75 * 10.7639 / 100_000, 2)  # 0.59 lakh sq ft
+    assert totals["total_area_developed_lakh_sqft"] == expected_area, totals
+    print("test_single_project_spv_keeps_its_genuine_prior_delivery: PASS", totals["total_area_developed_lakh_sqft"])
+
+
+def test_same_prior_delivery_across_two_registrations_counted_once():
+    """A promoter's past-experience list is keyed on their userProfileId, not
+    on the registration it was fetched under, so the same historical project
+    comes back once per registration they hold. It must be counted exactly
+    once -- both for area and for the on-time/delayed split, which the older
+    code never deduplicated at all."""
+    candidates = [
+        _fake_candidate("P52100000030", "3000", "Project One"),
+        _fake_candidate("P52100000031", "3001", "Project Two"),
+    ]
+    shared_entry = {
+        "userProfilePastExperienceId": 999,
+        "projectName": "The Only Prior Delivery",
+        "mahaRERARegistrationNumber": None,
+        "landArea": 4000.0,
+        "originalProposedCompletionDate": "2021-01-01",
+        "actualCompletionDate": "2021-01-01",
+        "address": "Somewhere",
+    }
+
+    def fake_fetch_category(category, project_id, session, token, body=None):
+        if category == "projects":
+            return {"projectCurrentStatus": "Registered", "isProjectLapsed": 0, "userProfileId": 7}
+        if category == "complaints":
+            return {"complaintDetails": []}
+        if category == "appeals":
+            return []
+        if category == "past_experiences":
+            return [dict(shared_entry)]  # same entry returned under BOTH registrations
+        raise AssertionError(f"unexpected category fetched: {category}")
+
+    with patch.object(resolver, "search_promoters", return_value=candidates), \
+         patch.object(promoter_portfolio.api_client, "fetch_category", side_effect=fake_fetch_category):
+        with requests.Session() as session:
+            portfolio = promoter_portfolio.build_promoter_portfolio(
+                "Test Promoter Pvt Ltd", session, token="fake-token", headless=True
+            )
+
+    totals = portfolio["totals"]
+    assert totals["total_experience_entries_found"] == 1, totals
+    assert totals["on_time_count"] == 1, totals
+    assert totals["total_area_developed_lakh_sqft"] == round(4000.0 * 10.7639 / 100_000, 2), totals
+    print("test_same_prior_delivery_across_two_registrations_counted_once: PASS")
+
+
 if __name__ == "__main__":
     test_on_time_rate_math()
     test_zero_entries_gives_none_not_zero()
@@ -300,4 +408,6 @@ if __name__ == "__main__":
     test_extract_subject_project_location()
     test_area_within_5km_excludes_far_ungeocodable_and_self()
     test_no_token_skips_past_experiences_honestly()
+    test_single_project_spv_keeps_its_genuine_prior_delivery()
+    test_same_prior_delivery_across_two_registrations_counted_once()
     print("\nAll tests passed.")

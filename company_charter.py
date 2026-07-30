@@ -181,6 +181,115 @@ def summarize_complaint_outcomes(complaint_orders_manifest: list, documents_dir:
     return {"outcome_counts": outcome_counts, "per_complaint": per_complaint}
 
 
+# ---------------------------------------------------------------------------
+# Entity-name normalisation. Scraped/filed names arrive in inconsistent
+# shapes -- confirmed live in a single project's own data: "SUNDEEP  PODDAR"
+# (double space, ALL CAPS) alongside "Vimanam Realty LLP" (title case) and
+# "SAHEJTA REALITY LLP" (ALL CAPS) in the same list. Rendering those
+# side by side in one table reads as sloppy, so every name that reaches a
+# table goes through here first.
+#
+# Deliberately conservative: an input that is NOT effectively all-caps is
+# left alone apart from whitespace collapsing, so a deliberately-mixed name
+# ("A plus Architects plus Planners") is never re-cased into something its
+# owner doesn't use. Only genuinely ALL-CAPS input gets title-cased, then a
+# small token map restores the forms that title-casing gets wrong.
+# ---------------------------------------------------------------------------
+
+_NAME_TOKEN_FIXES = {
+    "LLP": "LLP", "LLC": "LLC", "PLC": "PLC", "HUF": "HUF", "OPC": "OPC",
+    "JV": "JV", "AOP": "AOP", "PVT": "Pvt", "PVT.": "Pvt.", "LTD": "Ltd",
+    "LTD.": "Ltd.", "CO": "Co", "CO.": "Co.", "AND": "and", "OF": "of",
+    "THE": "the",
+}
+
+
+def _normalise_entity_name(name: str) -> str:
+    """Collapses whitespace in a person/company name, and title-cases it if
+    (and only if) it arrived effectively ALL CAPS. Returns "" for a missing
+    name rather than "None"."""
+    cleaned = re.sub(r"\s+", " ", str(name or "").strip())
+    if not cleaned:
+        return ""
+
+    letters = [ch for ch in cleaned if ch.isalpha()]
+    if letters and not all(ch.isupper() for ch in letters):
+        return cleaned  # already mixed case -- the owner's own styling, leave it
+
+    words = []
+    for i, word in enumerate(cleaned.split(" ")):
+        fixed = _NAME_TOKEN_FIXES.get(word.upper())
+        if fixed is not None:
+            # A lowercase connector ("and"/"of"/"the") never leads a name.
+            words.append(fixed.capitalize() if i == 0 and fixed.islower() else fixed)
+        else:
+            words.append(word.capitalize())
+    return " ".join(words)
+
+
+# ---------------------------------------------------------------------------
+# Professional team of record -- code-computed from MahaRERA's own structured
+# `professionals` category, NOT model-authored.
+#
+# Why this exists: the model was writing local_planning.professionals_of_record
+# from the DOCUMENTS it was handed and reporting, verbatim on a real project,
+# "Engineer and CA firms of record were listed in MahaRERA's professionals
+# category but not individually named in the documents reviewed this pass" --
+# while that very category, already fetched and passed to it, named all five
+# (architect, engineer, chartered accountant, and two "Other" firms) with
+# their registration numbers. Same class of thing as document_library and
+# promoter_portfolio: a deterministic list should never be re-derived or
+# paraphrased by a model when it can be read directly.
+#
+# Registration numbers are reported EXACTLY as filed, never cleaned up or
+# dropped for looking wrong -- one real project's architect CoA number is
+# literally "a", and that filing-quality signal belongs in front of a reader
+# rather than being quietly sanitised away.
+# ---------------------------------------------------------------------------
+
+# professionalTypeName -> the field that carries that role's registration id.
+_PROFESSIONAL_REGISTRATION_FIELDS = {
+    "Architect": ("architectCoARegistrationNo", "CoA registration"),
+    "Engineer": ("engineerLicenseNo", "Engineer licence"),
+    "Chartered Accountant": ("caIcaiMembershipNo", "ICAI membership"),
+    "Real Estate Agent": ("realEstateAgentReraRegNo", "RERA registration"),
+}
+
+
+def summarize_professionals(category_data: dict) -> list:
+    """Returns [{role, name, is_individual, registration_label,
+    registration_number}] -- one entry per professional on MahaRERA's record
+    for this project, in the order the portal lists them. Returns [] when the
+    category is absent or empty (never a fabricated entry), so a caller can
+    render an honest "none on record" line instead."""
+    professionals = category_data.get("professionals")
+    if not isinstance(professionals, list):
+        return []
+
+    team = []
+    for entry in professionals:
+        if not isinstance(entry, dict):
+            continue
+        role = str(entry.get("professionalTypeName") or "").strip() or "Not stated"
+        name = _normalise_entity_name(
+            entry.get("entityCompanyName") or entry.get("profileName") or entry.get("firstName") or ""
+        )
+        if not name:
+            continue
+
+        reg_field, reg_label = _PROFESSIONAL_REGISTRATION_FIELDS.get(role, (None, None))
+        reg_number = str(entry.get(reg_field) or "").strip() if reg_field else ""
+
+        team.append({
+            "role": role,
+            "name": name,
+            "is_individual": str(entry.get("professionalPersonalTypeName") or "").strip().lower().startswith("person"),
+            "registration_label": reg_label or "",
+            "registration_number": reg_number,
+        })
+    return team
+
+
 def _select_documents_for_extraction(documents_manifest: list, documents_dir: str) -> tuple[dict, list]:
     """Returns (extracted_text_by_label, all_labels_with_status) -- the
     former feeds the Claude prompt (capped total size), the latter fills the
@@ -1284,11 +1393,41 @@ def _zaubacorp_director_table(table) -> list:
 
 _ZAUBACORP_GATED_NOTE = "This information is part of the paid company report.Purchase Report"
 
+# Free-tier mirrors gate some cells behind a paid report and put their upsell
+# copy in the cell where the VALUE should be, so a naive scrape reports the
+# advert as the data. Confirmed live on a real company: the "Percentage of
+# Shares Held" column rendered into the Charter as "subsidiary/associate/JV
+# (This information is part of the paid company report.Purchase Report shares
+# held)", and on that same table the company NAME cell was gated too --
+# _ZAUBACORP_GATED_NOTE's exact-match check above never caught either,
+# because the placeholder arrives concatenated with surrounding text.
+# Matched case-insensitively on substrings, since the exact wording varies by
+# site and by page.
+_PAYWALL_MARKERS = (
+    "paid company report", "purchase report", "part of the paid",
+    "subscribe", "upgrade to", "login to view", "sign up to view",
+    "buy full report", "available in the paid",
+)
+
+
+def _looks_paywalled(value: str) -> bool:
+    """True when a scraped cell holds a site's paywall upsell copy rather
+    than a real value -- such a cell must be treated as "not disclosed",
+    never rendered as if it were data."""
+    lowered = str(value or "").lower()
+    return any(marker in lowered for marker in _PAYWALL_MARKERS)
+
 
 def _zaubacorp_clean(value: str | None) -> str | None:
     """None instead of ZaubaCorp's free-tier paywall placeholder, so
-    callers don't mistake "gated" for a genuine reported value."""
-    if value is None or value.strip() == _ZAUBACORP_GATED_NOTE:
+    callers don't mistake "gated" for a genuine reported value. Delegates to
+    _looks_paywalled rather than exact-matching _ZAUBACORP_GATED_NOTE, so
+    there is exactly ONE definition of "this cell is an advert, not data" in
+    this file -- two competing checks would drift apart, and the exact-match
+    version already missed the group-companies table where the same
+    placeholder appears in the company-NAME cell (see
+    find_group_companies_by_cin)."""
+    if value is None or _looks_paywalled(value):
         return None
     return value
 
@@ -1354,8 +1493,22 @@ def find_group_companies_by_cin(cin: str) -> dict:
     names the concrete signal (a specific shared director, or a shared
     registered office) that ties it to the target, so a reader can judge
     the strength of the link themselves. Returns:
-      {"found": True, "companies": [{"cin", "name", "basis": [...]}, ...], "url": ...}
-    or {"found": False, "note": "..."}."""
+      {"found": True, "companies": [{"cin", "name", "basis": [...]}, ...],
+       "url": ..., "sources_used": [...], "corroboration": {...}}
+    or {"found": False, "note": "..."}.
+
+    Single-sourced to ZaubaCorp by necessity, NOT by preference -- unlike
+    the company profile (see _MCA_PROFILE_CHAIN), which queries three
+    mirrors and merges them. Checked live against both alternatives for a
+    real CIN: InstaFinancials publishes no subsidiary/associate/JV or
+    shared-address structure at all (its only "associate" text is prose
+    about directors), and Tofler's page carries a long company-name list
+    that is a generic industry/directory listing, not verified related
+    parties (it contained companies with no plausible connection to the
+    subject at all) -- scraping it as a related-party set would invent
+    links rather than find them. So the chain here corroborates rather
+    than merges: see _instafinancials_directorship_count, which
+    independently cross-checks the director-overlap COUNT."""
     if not cin or not cin.strip():
         return {"found": False, "note": "no CIN provided to look up"}
     try:
@@ -1367,10 +1520,18 @@ def find_group_companies_by_cin(cin: str) -> dict:
     soup, url = result
 
     by_cin: dict[str, dict] = {}
+    # Rows whose IDENTITY (not merely some detail) is paywalled -- see
+    # _looks_paywalled. Counted, never listed: the relationship's existence
+    # is a real finding, but we do not know who the counterparty is, so
+    # inventing a row for it would be worse than reporting the count.
+    undisclosed_counts: dict[str, int] = {}
 
-    def _add(other_cin: str, name: str, basis: str):
+    def _add(other_cin: str, name: str, basis: str, relationship: str = "related"):
         other_cin = (other_cin or "").strip()
-        name = (name or "").strip()
+        if _looks_paywalled(name) or _looks_paywalled(other_cin):
+            undisclosed_counts[relationship] = undisclosed_counts.get(relationship, 0) + 1
+            return
+        name = _normalise_entity_name(name)
         if not other_cin or not name or other_cin == cin.strip():
             return
         entry = by_cin.setdefault(other_cin, {"cin": other_cin, "name": name, "basis": []})
@@ -1381,7 +1542,7 @@ def find_group_companies_by_cin(cin: str) -> dict:
         heading_text = heading.get_text(strip=True) if heading else ""
 
         if heading_text.startswith("Other Directorships of "):
-            director = heading_text[len("Other Directorships of "):].strip()
+            director = _normalise_entity_name(heading_text[len("Other Directorships of "):])
             for row in _zaubacorp_director_table(table):
                 designation = row.get("Designation", "").strip()
                 basis = f"shared director: {director}" + (f" ({designation})" if designation else "")
@@ -1394,10 +1555,95 @@ def find_group_companies_by_cin(cin: str) -> dict:
         elif heading_text.startswith("Subsidiaries, Associate Companies"):
             for row in _zaubacorp_director_table(table):
                 pct = row.get("Percentage of Shares Held", "").strip()
-                basis = "subsidiary/associate/JV" + (f" ({pct} shares held)" if pct else "")
-                _add(row.get("Company Identifier"), row.get("Name"), basis)
+                if _looks_paywalled(pct):
+                    pct = ""  # the site's upsell copy, not a shareholding figure
+                basis = "subsidiary/associate/JV" + (
+                    f" ({pct} shares held)" if pct else " (shareholding not disclosed on the free tier)"
+                )
+                _add(row.get("Company Identifier"), row.get("Name"), basis, relationship="subsidiary/associate/JV")
 
-    return {"found": True, "companies": list(by_cin.values()), "url": url}
+    companies = list(by_cin.values())
+    return {
+        "found": True,
+        "companies": companies,
+        "url": url,
+        "sources_used": ["zaubacorp.com"],
+        # Confirmed live: ZaubaCorp paywalls the Subsidiaries/Associates table
+        # in full -- the company NAME cell, not just the shareholding
+        # percentage, carries its upsell copy. Those rows are therefore
+        # counted here rather than listed as named entities; reporting "5
+        # subsidiary/associate/JV relationships exist but their identities are
+        # paywalled" is honest, whereas listing 5 rows named after an advert
+        # is not.
+        "undisclosed_relationship_counts": undisclosed_counts,
+        "corroboration": _corroborate_group_companies(cin, companies),
+    }
+
+
+def _instafinancials_directorship_count(cin: str) -> int | None:
+    """InstaFinancials states, in prose on its directors page, how many
+    directorships this company's directors hold elsewhere ("The directors in
+    this company holds a count of 26 directorships in companies, other than
+    X") -- confirmed live. That's an INDEPENDENT count of the same
+    director-overlap ZaubaCorp's "Other Directorships" tables enumerate, so
+    it's usable as a cross-check even though InstaFinancials never names the
+    companies. Returns None if the sentence isn't present or the lookup
+    fails; never raises."""
+    try:
+        result = _instafinancials_fetch(cin)
+    except Exception:
+        return None
+    if result is None:
+        return None
+    _, directors_soup, _, _ = result
+    match = re.search(
+        r"count of\s+(\d+)\s+directorships",
+        directors_soup.get_text(" ", strip=True),
+        re.I,
+    )
+    return int(match.group(1)) if match else None
+
+
+def _corroborate_group_companies(cin: str, companies: list) -> dict:
+    """Cross-checks ZaubaCorp's named director-overlap set against
+    InstaFinancials' own independent directorship count (see
+    _instafinancials_directorship_count). Returns {"independent_directorship
+    _count", "zaubacorp_shared_director_entities", "agrees", "note"} --
+    "agrees" is None (not False) when the second source couldn't be reached,
+    since "no cross-check ran" is a different finding from "the two sources
+    disagree", the same distinction _verify_one_field already draws."""
+    shared_director_entities = sum(
+        1 for c in companies if any(str(b).startswith("shared director") for b in c.get("basis", []))
+    )
+    independent_count = _instafinancials_directorship_count(cin)
+    if independent_count is None:
+        return {
+            "independent_directorship_count": None,
+            "zaubacorp_shared_director_entities": shared_director_entities,
+            "agrees": None,
+            "note": "InstaFinancials' independent directorship count could not be read this pass -- "
+                    "ZaubaCorp's director-overlap set is uncorroborated, not contradicted.",
+        }
+
+    # These count related-but-different things: ZaubaCorp's figure is
+    # distinct ENTITIES sharing at least one director, InstaFinancials' is
+    # total DIRECTORSHIPS held elsewhere (one director on three boards is 3
+    # directorships but up to 3 entities). They should be the same order of
+    # magnitude; a large gap means one source is materially incomplete.
+    larger = max(independent_count, shared_director_entities)
+    agrees = larger == 0 or abs(independent_count - shared_director_entities) <= max(2, round(0.5 * larger))
+    return {
+        "independent_directorship_count": independent_count,
+        "zaubacorp_shared_director_entities": shared_director_entities,
+        "agrees": agrees,
+        "note": (
+            f"InstaFinancials independently reports {independent_count} directorship(s) held elsewhere by this "
+            f"company's directors; ZaubaCorp names {shared_director_entities} distinct entit(y/ies) sharing at "
+            f"least one director. These count related-but-different things (directorships vs entities), so they "
+            f"are expected to be the same order of magnitude rather than identical."
+            + ("" if agrees else " The gap is large enough that one source is likely materially incomplete.")
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1848,7 +2094,15 @@ def _merge_director_rosters(per_source_directors: list[tuple[str, list]]) -> tup
                 continue
             key = d.get("DIN") or _normalize_for_compare(name)
             if key not in by_key:
-                by_key[key] = {"director": dict(d), "confirmed_by": [domain]}
+                stored = dict(d)
+                # Normalise only the DISPLAY name (whitespace + ALL-CAPS), so a
+                # roster table doesn't render "SUNDEEP  PODDAR" beside
+                # title-cased names from another source. `key` above is
+                # deliberately computed from the pre-normalisation name, so this
+                # can never change which directors are treated as the same
+                # person.
+                stored["Director Name"] = _normalise_entity_name(name)
+                by_key[key] = {"director": stored, "confirmed_by": [domain]}
                 order.append(key)
             else:
                 entry = by_key[key]
@@ -6121,6 +6375,18 @@ def _append_group_companies_section(doc, facts: dict) -> None:
         ),
     )
 
+    # A relationship whose counterparty identity is paywalled is still a real,
+    # reportable relationship -- it just can't be named (see
+    # find_group_companies_by_cin's own note). Stated explicitly so it isn't
+    # silently absent from a list a reader would otherwise take as complete.
+    undisclosed = check.get("undisclosed_relationship_counts") or {}
+    for relationship, count in sorted(undisclosed.items()):
+        doc.add_paragraph(
+            f"In addition, {count} {relationship} relationship(s) appear on the registry record but their "
+            f"counterparty identities are withheld behind that source's paid tier, so they cannot be named "
+            f"here. Their existence is confirmed; who they are is not."
+        )
+
     director_rows = _build_director_company_links(facts)
     if any(r["link_count"] for r in director_rows):
         sub_heading = doc.add_paragraph("Director Relationship Map")
@@ -6829,6 +7095,24 @@ def run_company_charter(
     facts = _verify_material_claims(facts)
     facts = _check_document_grounding(facts, extracted_docs, category_data, documents_manifest)
     facts["document_library"] = doc_library_status  # always the full, code-computed list -- not model-generated
+
+    # Also code-computed, never model-authored (see summarize_professionals'
+    # own note for the real mis-reporting this replaces): MahaRERA's
+    # professionals category already names every professional on record with
+    # their registration number, so it is read directly rather than
+    # paraphrased out of the documents.
+    facts["professional_team"] = summarize_professionals(category_data)
+    if facts["professional_team"]:
+        # Overwrite the model's own prose line for the same fact, which was
+        # observed under-reporting it badly ("Engineer and CA firms ... not
+        # individually named") while the structured data named all of them.
+        # Built from the code-computed list so the two can never disagree.
+        facts.setdefault("local_planning", {})["professionals_of_record"] = "; ".join(
+            f"{p['role']}: {p['name']}"
+            + (f" ({p['registration_label']} {p['registration_number']})" if p["registration_number"] else "")
+            for p in facts["professional_team"]
+        )
+
     if promoter_portfolio is not None:
         # Also code-computed, never model-authored -- same reasoning as
         # document_library above: the promoter's cross-project track record

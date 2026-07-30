@@ -280,15 +280,29 @@ def test_godrej_park_greens_real_fixture():
 
 
 def test_pranami_bliss_real_fixture():
-    """Pranami Bliss: four sub-metrics resolve -- Entity Rating (AAA,
+    """Pranami Bliss: five sub-metrics resolve -- Entity Rating (AAA,
     7.5%), Cases/Past Defaults (AAA, 7.5%), Track Record (AAA, 24 years --
     sourced to Pranami Group's own "founded 2002" claim for this SPV's
-    parent group, 12.5%), and RERA Compliance (AAA, 7.5% -- 0 compliance-
+    parent group, 12.5%), RERA Compliance (AAA, 7.5% -- 0 compliance-
     friction points: never extended, 0 complaints, 0 appeals on record for
-    this project). Composite = 7.5+7.5+12.5+7.5 = 35.0. Pranami Bliss also
-    carries its own imminent flag (the FSI/BUA gap), but 35.0 already
-    bands well below A on the composite alone, so the hard cap isn't what's
-    active here either."""
+    this project), and Past Experience - Area (D, 12.5% -- 0.59 lakh sq ft,
+    the promoter's single declared prior delivery, "Mall of Ranchi").
+    Composite = 7.5+7.5+12.5+7.5 + (12.5 x 16.7/100) = 37.1.
+
+    Past Experience - Area only started resolving once the past-experience
+    entry-identity bug was fixed (see test_promoter_portfolio's
+    test_single_project_spv_keeps_its_genuine_prior_delivery): this promoter
+    is a single-project SPV, so the old "exclude anything fetched under the
+    subject's own registration" rule discarded its one genuine prior
+    delivery's area entirely.
+
+    area_within_5km stays unscored, and honestly so: this project's raw
+    partners.json is empty, so the SUBJECT's own locality never geocodes,
+    and without a subject coordinate there is nothing to measure 5km from.
+
+    Pranami Bliss also carries its own imminent flag (the FSI/BUA gap), but
+    37.1 already bands well below A on the composite alone, so the hard cap
+    isn't what's active here either."""
     with open(_PRANAMI_FACTS_PATH, encoding="utf-8") as f:
         facts = json.load(f)
     flags = cc._classify_flags(facts)
@@ -297,9 +311,13 @@ def test_pranami_bliss_real_fixture():
     result = cc._compute_developer_score(facts, flags)
     criteria = result["criteria"]
     scored_names = {name for name, c in criteria.items() if c["score"] is not None}
-    assert scored_names == {"entity_rating", "past_default_count", "track_record_years", "rera_compliance"}, scored_names
+    assert scored_names == {
+        "entity_rating", "past_default_count", "track_record_years", "rera_compliance", "past_area_developed",
+    }, scored_names
     assert criteria["rera_compliance"]["tier"] == "AAA", criteria["rera_compliance"]
-    assert result["composite"] == 35.0, result["composite"]
+    assert criteria["past_area_developed"]["tier"] == "D", criteria["past_area_developed"]
+    assert criteria["area_within_5km"]["score"] is None, criteria["area_within_5km"]
+    assert result["composite"] == 37.1, result["composite"]
 
     print("test_pranami_bliss_real_fixture: PASS")
     print(f"  composite={result['composite']} grade={result['grade']}")
