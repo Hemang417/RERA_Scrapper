@@ -197,10 +197,34 @@ def _wait_for_repopulated(page, selector: str, timeout_ms: int = 10000) -> None:
     )
 
 
+def _value_for_label(page, selector: str, label: str) -> str | None:
+    """Finds the <option> value whose text matches `label` under
+    whitespace-collapsing (confirmed live: some office labels contain a
+    real, verbatim double space, e.g. "...भूमि  अभिलेख, कल्याण")."""
+    return page.eval_on_selector_all(
+        f"{selector} option",
+        "(opts, label) => {"
+        " const norm = s => s.trim().replace(/\\s+/g, ' ');"
+        " const target = norm(label);"
+        " const match = opts.find(o => norm(o.textContent) === target);"
+        " return match ? match.value : null;"
+        " }",
+        label,
+    )
+
+
 def _select_option_exact(page, selector: str, label: str, options: list) -> None:
     if label not in options:
         raise AmbiguousSelectionError(label, options)
-    page.select_option(selector, label=label)
+    # Not page.select_option(selector, label=label): confirmed live that
+    # Playwright's own label= matching collapses internal whitespace before
+    # comparing, so a label with a real double space never matches itself
+    # even passed back byte-identical. Select by value instead, found via
+    # our own whitespace-normalized text match.
+    value = _value_for_label(page, selector, label)
+    if value is None:
+        raise AmbiguousSelectionError(label, options)
+    page.select_option(selector, value=value)
 
 
 # The site's own "nothing matched" message for the CTS-candidates dropdown

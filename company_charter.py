@@ -228,6 +228,60 @@ def _normalise_entity_name(name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# LLP-aware terminology -- an LLP has partners (or "designated partners"), not
+# directors; a company has directors. Confirmed live as a real document bug:
+# Trimity Realty LLP's Charter was reading "director" throughout despite
+# ZaubaCorp's own Designation field correctly saying "Designated Partner" --
+# the underlying facts were right, only the surrounding template prose
+# ignored entity type. Both charter_report.py and charter_research_prep.py
+# call these rather than each keeping their own copy.
+# ---------------------------------------------------------------------------
+
+def _is_llp(facts: dict) -> bool:
+    profile = facts.get("company_profile_check") or {}
+    corp = facts.get("corporate_identity") or {}
+    text = " ".join([
+        str(profile.get("class_of_company") or ""),
+        str((corp.get("organization_type") or {}).get("value") or ""),
+    ]).lower()
+    return "limited liability partnership" in text or re.search(r"\bllp\b", text) is not None
+
+
+def _is_partnership(facts: dict) -> bool:
+    """Broader than _is_llp: also true for a plain (unincorporated)
+    Partnership Firm under the Indian Partnership Act, 1932 -- confirmed
+    live as a real gap for IRA Homes, a promoter with no CIN or LLPIN at
+    all (no MCA registration of any kind), whose partners are still
+    "partners", never "directors", even though it isn't an LLP and
+    "Designated Partner" (an LLP-Act-specific title) doesn't apply to
+    them either. Use this for the plain director/partner noun; keep
+    _is_llp for the "designated partner" label specifically, which is
+    only ever correct for a true LLP."""
+    if _is_llp(facts):
+        return True
+    profile = facts.get("company_profile_check") or {}
+    corp = facts.get("corporate_identity") or {}
+    text = " ".join([
+        str(profile.get("class_of_company") or ""),
+        str((corp.get("organization_type") or {}).get("value") or ""),
+    ]).lower()
+    return "partnership firm" in text or bool(re.search(r"\bpartnership\b", text))
+
+
+def _role_word(facts: dict, count: int = 1, designated: bool = False) -> str:
+    """The correct noun for a person who sits on this entity's board/
+    partnership, singular or plural per `count`. `designated=True` asks for
+    "designated partner" specifically (only meaningful when it's a true
+    LLP; ignored for a plain partnership firm or a company, which just
+    gets "partner" or "director" respectively)."""
+    if _is_partnership(facts):
+        base = "designated partner" if (designated and _is_llp(facts)) else "partner"
+    else:
+        base = "director"
+    return base if count == 1 else base + "s"
+
+
+# ---------------------------------------------------------------------------
 # Professional team of record -- code-computed from MahaRERA's own structured
 # `professionals` category, NOT model-authored.
 #
@@ -950,7 +1004,7 @@ def _check_document_grounding(facts: dict, extracted_docs: dict, category_data: 
             gaps.append(
                 f"{field_name}: none of its distinguishing details ({sample}) were found verbatim in "
                 f"the text of its cited source document, and a second-opinion check could not run "
-                f"({verdict.get('reason', 'verification error')}) -- flagged for a manual re-check "
+                f"({verdict.get('reason', 'verification error')}); flagged for a manual re-check "
                 f"rather than trusted on transcription alone."
             )
             continue
@@ -1537,6 +1591,53 @@ def find_group_companies_by_cin(cin: str) -> dict:
         entry = by_cin.setdefault(other_cin, {"cin": other_cin, "name": name, "basis": []})
         entry["basis"].append(basis)
 
+    # Raw (not-yet-formatted) per-(entity, director) state, so a director who
+    # appears under TWO of ZaubaCorp's own "Other Directorships of X" rows for
+    # the same entity (confirmed live for Mahir Haresh Wadhwani / Suchi
+    # Lifespaces LLP -- listed once as "Designated Partner" ceased 2023-04-01
+    # and again as "Partner" ceased 2023-06-14) merges into ONE basis entry
+    # instead of inflating the "independent links" count or silently dropping
+    # the newer role/date. Keyed by (other_cin, director name).
+    director_state: dict[tuple[str, str], dict] = {}
+
+    def _format_director_status(designation: str, cessation: str) -> str:
+        is_ongoing = not cessation or cessation.strip().lower() == "ongoing"
+        status = "ongoing" if is_ongoing else f"resigned {cessation.strip()}"
+        return f"{designation}, {status}" if designation else status
+
+    def _add_shared_director(other_cin: str, name: str, director: str, designation: str, cessation: str):
+        other_cin = (other_cin or "").strip()
+        if _looks_paywalled(name) or _looks_paywalled(other_cin):
+            undisclosed_counts["related"] = undisclosed_counts.get("related", 0) + 1
+            return
+        name = _normalise_entity_name(name)
+        if not other_cin or not name or other_cin == cin.strip():
+            return
+
+        key = (other_cin, director)
+        is_ongoing = not cessation or cessation.strip().lower() == "ongoing"
+        existing = director_state.get(key)
+        if existing is not None:
+            # Prefer whichever occurrence shows the relationship is STILL
+            # ONGOING (a person can hold two role-labels for the same entity
+            # over time); if both have resigned, keep the LATER cessation
+            # date -- that is when they actually finished leaving.
+            keep_new = is_ongoing or (not existing["is_ongoing"] and cessation > existing["cessation"])
+            if not keep_new:
+                return
+        director_state[key] = {"cessation": cessation, "is_ongoing": is_ongoing}
+
+        status_text = _format_director_status(designation, cessation)
+        basis = f"shared director: {director} ({status_text})"
+        entry = by_cin.setdefault(other_cin, {"cin": other_cin, "name": name, "basis": []})
+        # Replace rather than append when this key already produced a basis
+        # string in a prior call (the merge case above).
+        entry["basis"] = [
+            b for b in entry["basis"]
+            if not (b.startswith("shared director:") and b.split(":", 1)[1].split("(")[0].strip() == director)
+        ]
+        entry["basis"].append(basis)
+
     for table in soup.find_all("table"):
         heading = table.find_previous(["h1", "h2", "h3", "h4", "h5"])
         heading_text = heading.get_text(strip=True) if heading else ""
@@ -1544,9 +1645,15 @@ def find_group_companies_by_cin(cin: str) -> dict:
         if heading_text.startswith("Other Directorships of "):
             director = _normalise_entity_name(heading_text[len("Other Directorships of "):])
             for row in _zaubacorp_director_table(table):
+                company_name = (row.get("Company Name") or "").strip()
+                if not company_name:
+                    # A blank row with no company name or CIN -- confirmed
+                    # live on ZaubaCorp's own page for a director with a
+                    # large directorship count; noise, not a real entity.
+                    continue
                 designation = row.get("Designation", "").strip()
-                basis = f"shared director: {director}" + (f" ({designation})" if designation else "")
-                _add(row.get("CIN"), row.get("Company Name"), basis)
+                cessation = row.get("Cessation", "").strip()
+                _add_shared_director(row.get("CIN"), company_name, director, designation, cessation)
 
         elif heading_text == "Companies with Similar Address":
             for row in _zaubacorp_director_table(table):
@@ -2124,7 +2231,7 @@ def _merge_director_rosters(per_source_directors: list[tuple[str, list]]) -> tup
             conflicts.append(
                 f"Director roster disagreement for \"{entry['director']['Director Name']}\": listed as a "
                 f"current director by {', '.join(confirmed_names)}, but not by "
-                f"{', '.join(missing_names)} -- not reconciled, flagged for manual verification "
+                f"{', '.join(missing_names)}; not reconciled, flagged for manual verification "
                 f"rather than assumed correct or incorrect."
             )
     return merged, conflicts
@@ -2186,19 +2293,168 @@ def _run_mca_profile_chain(cin: str, company_name: str = "") -> dict:
 
 # ---------------------------------------------------------------------------
 # CTS -> land-record lookup (Maha Bhulekh Property Card, see mahabhumi.py).
-# Deliberately NOT wired to run automatically like the CIN checks above:
-# mahabhumi.fetch_property_card() opens a visible browser and blocks waiting
-# for a human to solve a fresh CAPTCHA on every single call (that site
-# grants no reusable session -- see mahabhumi.py's own module note), so
-# running it unconditionally would silently stall every automated Charter
-# pass for up to CAPTCHA_TIMEOUT_SECONDS. Instead this follows the exact
-# same opt-in convention already used for reviews.json just above: it does
-# nothing unless a human has dropped output/<reg_no>/cts_lookup_input.json
-# with the office/village already resolved to the site's exact Marathi
-# labels (via `python mahabhumi.py offices/villages ...`) -- this never
-# guesses one, for the same reason ZaubaCorp's CIN lookup never fuzzy-
-# matches a company name.
+# The FINAL fetch (mahabhumi.fetch_property_card) is deliberately NOT wired
+# to run unconditionally like the CIN checks above: it opens a visible
+# browser and blocks waiting for a human to solve a fresh CAPTCHA on every
+# single call (that site grants no reusable session -- see mahabhumi.py's
+# own module note), so running it unconditionally would silently stall
+# every automated Charter pass for up to CAPTCHA_TIMEOUT_SECONDS.
+#
+# The steps BEFORE that final fetch, however, ARE wired to run
+# automatically -- confirmed live that office/village labels on this site
+# are Marathi-only (e.g. "उप अधीक्षक भूमि अभिलेख, कल्याण") with no reliable
+# way to match them against RERA's own English district/taluka/village
+# text, so a human still has to pick the right office and village from a
+# list; but FETCHING those lists (list_offices/list_villages -- both
+# headless, no CAPTCHA) no longer needs a human to run mahabhumi.py by
+# hand first. discover_cts_office_candidates below runs automatically
+# inside run_cts_land_lookup whenever a district can be resolved and no
+# lookup has been started yet, writing candidates for a human to read and
+# choose from (see cts_resolve.py for the rest of the chain: villages,
+# then CTS-number candidates, then the final cts_lookup_input.json write
+# that this function already knew how to consume).
 # ---------------------------------------------------------------------------
+
+_DISTRICT_HINT_RE_CACHE = None
+
+
+def _extract_district_hint(facts: dict) -> str | None:
+    """Best-effort district name extracted from this Charter's own
+    land_identification.mandal_taluka_district text (e.g. "Taluka Kalyan,
+    District Thane, Maharashtra") -- matched against mahabhumi's own
+    verified 34-district English/Marathi map, NEVER against a fuzzy
+    guess. Prefers the LONGEST matching district name so "Mumbai
+    Suburban" wins over the "Mumbai" substring inside it. Returns None
+    (not a guess) if no known district name appears in the text at all."""
+    import mahabhumi
+
+    text = ((facts.get("land_identification") or {}).get("mandal_taluka_district") or {}).get("value") or ""
+    text_lower = text.lower()
+    matches = [name for name in mahabhumi._DISTRICT_NAME_MAP if name in text_lower]
+    if not matches:
+        return None
+    return max(matches, key=len)
+
+
+def discover_cts_office_candidates(facts: dict, reg_no: str, output_dir: str = config.OUTPUT_ROOT) -> dict:
+    """Automatically fetches the real list of Maha Bhulekh offices
+    (headless, no CAPTCHA) for whichever district this Charter's own land
+    data resolves to, and writes output/<reg_no>/cts_office_candidates
+    .json for a human to read and pick from -- see cts_resolve.py.
+    Never auto-selects an office itself (see module note above: office
+    labels are Marathi-only, a district's offices don't correspond 1:1 to
+    RERA's own taluka names, confirmed live that one real project's
+    office ["...,Andheri"] named a different place than its own village
+    ["Aambivali"]).
+
+    Returns {"found": bool, "district": ..., "offices": [...], "note":
+    ...} -- {"found": False, "note": "..."} when no district could be
+    resolved from the Charter's own data, or the live fetch itself
+    failed; never raises."""
+    district_hint = _extract_district_hint(facts)
+    if not district_hint:
+        return {"found": False, "note": "No known Maharashtra district name could be matched in this Charter's own land_identification.mandal_taluka_district text."}
+
+    import mahabhumi
+
+    result = mahabhumi.list_offices(district_hint)
+    if not result.get("found"):
+        return {"found": False, "district": district_hint, "note": result.get("note", "Office lookup failed")}
+
+    record = {
+        "district": district_hint,
+        "district_label": result.get("district_label"),
+        "offices": result.get("offices"),
+        "generated_at": datetime.now().isoformat(),
+        "note": (
+            "Pick the office covering this Charter's own recorded taluka/village (see "
+            "land_identification in facts.json), then run: python cts_resolve.py villages "
+            f"{reg_no} \"<office label from this list, exact>\""
+        ),
+    }
+    project_dir = os.path.join(output_dir, reg_no)
+    os.makedirs(project_dir, exist_ok=True)
+    with open(os.path.join(project_dir, "cts_office_candidates.json"), "w", encoding="utf-8") as f:
+        json.dump(record, f, indent=2, ensure_ascii=False)
+
+    return {"found": True, "district": district_hint, "offices": result.get("offices"), "note": record["note"]}
+
+
+def discover_cts_village_candidates(reg_no: str, office_label: str, output_dir: str = config.OUTPUT_ROOT) -> dict:
+    """Step 2 of the human-in-the-loop chain: given an office label a
+    human picked from cts_office_candidates.json, fetches the real
+    village list for it (headless, no CAPTCHA) and writes output/<reg_no>
+    /cts_village_candidates.json. Requires discover_cts_office_candidates
+    to have already run for this reg_no (reads its district back out).
+    Returns {"found": bool, "villages": [...], "note": ...}."""
+    office_candidates_path = os.path.join(output_dir, reg_no, "cts_office_candidates.json")
+    if not os.path.exists(office_candidates_path):
+        return {"found": False, "note": f"{office_candidates_path} not found -- run discover_cts_office_candidates (or company_charter.py {reg_no}) first."}
+    with open(office_candidates_path, "r", encoding="utf-8") as f:
+        district = json.load(f)["district"]
+
+    import mahabhumi
+
+    try:
+        result = mahabhumi.list_villages(district, office_label)
+    except mahabhumi.AmbiguousSelectionError as e:
+        return {"found": False, "note": str(e), "options": e.options}
+
+    if not result.get("found"):
+        return {"found": False, "note": result.get("note", "Village lookup failed")}
+
+    record = {
+        "district": district, "office": office_label,
+        "villages": result.get("villages"),
+        "generated_at": datetime.now().isoformat(),
+        "note": (
+            "Pick the village covering this Charter's own recorded plot (see land_identification "
+            f"in facts.json), then run: python cts_resolve.py candidates {reg_no} \"{office_label}\" "
+            "\"<village label from this list, exact>\" <your CTS number>"
+        ),
+    }
+    project_dir = os.path.join(output_dir, reg_no)
+    with open(os.path.join(project_dir, "cts_village_candidates.json"), "w", encoding="utf-8") as f:
+        json.dump(record, f, indent=2, ensure_ascii=False)
+
+    return {"found": True, "villages": result.get("villages"), "note": record["note"]}
+
+
+def discover_cts_number_candidates(reg_no: str, office_label: str, village_label: str, cts_query: str, output_dir: str = config.OUTPUT_ROOT) -> dict:
+    """Step 3: given an office+village a human confirmed from the two
+    candidate files above, resolves the typed CTS number against the
+    site's own valid list for that exact village (headless, no CAPTCHA --
+    a CTS number can have multiple sub-divisions, e.g. "100/1", "100/2").
+    Writes output/<reg_no>/cts_number_candidates.json. Returns {"found":
+    bool, "candidates": [...], "note": ...}."""
+    office_candidates_path = os.path.join(output_dir, reg_no, "cts_office_candidates.json")
+    if not os.path.exists(office_candidates_path):
+        return {"found": False, "note": f"{office_candidates_path} not found -- run discover_cts_office_candidates (or company_charter.py {reg_no}) first."}
+    with open(office_candidates_path, "r", encoding="utf-8") as f:
+        district = json.load(f)["district"]
+
+    import mahabhumi
+
+    result = mahabhumi.search_cts_candidates(district, office_label, village_label, cts_query)
+    if not result.get("found"):
+        return {"found": False, "note": result.get("note", "CTS candidate search failed"), "options": result.get("options")}
+
+    record = {
+        "district": district, "office": office_label, "village": village_label, "cts_query": cts_query,
+        "candidates": result.get("candidates"),
+        "generated_at": datetime.now().isoformat(),
+        "note": (
+            f"Confirm the exact candidate matching your CTS number, then finalize with: python "
+            f"cts_resolve.py finalize {reg_no} \"{office_label}\" \"{village_label}\" <exact CTS number "
+            f"from candidates> <mobile number>"
+        ),
+    }
+    project_dir = os.path.join(output_dir, reg_no)
+    with open(os.path.join(project_dir, "cts_number_candidates.json"), "w", encoding="utf-8") as f:
+        json.dump(record, f, indent=2, ensure_ascii=False)
+
+    return {"found": True, "candidates": result.get("candidates"), "note": record["note"]}
+
 
 def run_cts_land_lookup(facts: dict, reg_no: str, output_dir: str = config.OUTPUT_ROOT) -> dict:
     """Runs the CTS -> Property Card lookup only if output/<reg_no>/
@@ -2246,6 +2502,32 @@ def run_cts_land_lookup(facts: dict, reg_no: str, output_dir: str = config.OUTPU
 
     input_path = os.path.join(output_dir, reg_no, "cts_lookup_input.json")
     if not os.path.exists(input_path):
+        # No manual input yet -- auto-fetch office candidates (headless, no
+        # CAPTCHA) so a human's next step is picking from a real list
+        # rather than first having to run mahabhumi.py by hand. The live
+        # fetch itself only ever runs ONCE per reg_no (checked via the
+        # candidates file already existing, so a normal automated re-run
+        # doesn't keep re-fetching an unchanging office list) -- but the
+        # reminder gap is added on EVERY run until cts_lookup_input.json
+        # exists, so this doesn't go quiet and get forgotten after the
+        # first mention.
+        office_candidates_path = os.path.join(output_dir, reg_no, "cts_office_candidates.json")
+        district_for_gap = None
+        if not os.path.exists(office_candidates_path):
+            discovery = discover_cts_office_candidates(facts, reg_no, output_dir)
+            if discovery.get("found"):
+                district_for_gap = discovery["district"]
+        else:
+            with open(office_candidates_path, "r", encoding="utf-8") as f:
+                district_for_gap = json.load(f).get("district")
+
+        if district_for_gap:
+            facts.setdefault("gaps", []).append(
+                f"CTS land-record lookup: office candidates for {district_for_gap} are in "
+                f"output/{reg_no}/cts_office_candidates.json. Pick the office covering this project's own "
+                f"recorded taluka/village, then run cts_resolve.py to continue (villages, then CTS-number "
+                f"candidates, then the final Property Card fetch)."
+            )
         return facts
 
     import mahabhumi
@@ -2994,14 +3276,17 @@ def _fix_bullet_hanging_indent(doc) -> None:
             lvl0.append(p_pr)
 
 
-# Mirrors _TEXT_RED/_TEXT_AMBER (defined later in this file, alongside the
-# other document-styling constants) -- duplicated here as literals rather
-# than referenced, since this set is built at module-import time, before
-# those later assignments have run. "1F3864" is the template's own Heading
-# style color (navy), applied to every section heading in both variants --
-# a deliberate design choice, not the grey-placeholder bug this gate exists
-# to catch.
-_EXTERNAL_ALLOWED_RUN_COLORS = {None, "000000", "C00000", "BF8F00", "1F3864"}
+# Mirrors _TEXT_RED/_TEXT_AMBER/_TEXT_GREEN (defined later in this file,
+# alongside the other document-styling constants) -- duplicated here as
+# literals rather than referenced, since this set is built at module-import
+# time, before those later assignments have run. "1F3864" is the template's
+# own Heading style color (navy), applied to every section heading in both
+# variants. "375623" (_TEXT_GREEN) completes the same red/amber/green
+# traffic-light convention as a positive-confirmation color in
+# charter_document.py's "What Checks Out" section, which didn't exist when
+# this gate was first written -- none of these are the grey-placeholder bug
+# this gate exists to catch.
+_EXTERNAL_ALLOWED_RUN_COLORS = {None, "000000", "C00000", "BF8F00", "1F3864", "375623"}
 
 
 def _iter_all_paragraphs(doc):
@@ -4545,7 +4830,7 @@ def verify_cross_corroboration(facts: dict) -> dict:
         else:
             gaps.append(
                 f"Cross-corroboration: the '{topic}' topic is backed by only one source "
-                f"({existing_source.get('label', 'unknown')}) -- one independent-second-source "
+                f"({existing_source.get('label', 'unknown')}); one independent-second-source "
                 f"retry attempt did not find a genuinely separate corroborating source "
                 f"({attempt['reason']}). Treat this specific finding with more caution than "
                 f"multi-sourced ones in this Charter."
@@ -5229,7 +5514,7 @@ def _score_track_record_years(facts: dict) -> dict:
     today, not a parsing failure."""
     years = (facts.get("developer_track_record") or {}).get("years_in_industry")
     if not isinstance(years, (int, float)):
-        return {"score": None, "tier": None, "reason": "Years in the industry not confirmed this pass -- needs a sourced start date for the promoter or its parent group from the deep-research profile step."}
+        return {"score": None, "tier": None, "reason": "Years in the industry not confirmed this pass; needs a sourced start date for the promoter or its parent group from the deep-research profile step."}
     if years > 20:
         tier = "AAA"
     elif years >= 17:
@@ -7061,37 +7346,52 @@ def run_company_charter(
     reviews: list | None = None,
     review_source_label: str | None = None,
     promoter_portfolio: dict | None = None,
+    pre_built_facts: dict | None = None,
 ) -> tuple[str, dict]:
     """Returns (out_path, facts) -- facts is the complete, code-and-model
     -assembled Charter data (same content as the .facts.json written
     alongside the docx), so callers can build a separate output (e.g.
     report.py's PDF) from the same source data without re-reading it from
-    disk."""
+    disk.
+
+    `pre_built_facts`: skips the `_run_charter_pass` API call entirely and
+    uses this dict as the model-authored layer instead (still schema-shaped
+    like `_CHARTER_FACTS_SCHEMA`) -- for when that call's own auth isn't
+    available (no ANTHROPIC_API_KEY configured) and an agentic Claude Code
+    session has produced the equivalent JSON directly instead, following
+    the exact same system/user prompt _run_charter_pass would have sent
+    (see _SYSTEM_PROMPT and this function's own user_prompt construction
+    below). Every downstream step (document grounding, professional team,
+    developer score, company profile/IBBI/credit checks) still runs
+    unchanged -- none of those ever called the API to begin with."""
     if not os.path.exists(TEMPLATE_PATH):
         raise FileNotFoundError(f"Template not found at {TEMPLATE_PATH}")
 
     extracted_docs, doc_library_status = _select_documents_for_extraction(documents_manifest, documents_dir)
 
-    research_context = ""
-    if research_data:
-        research_context = (
-            "\n\nAlready-confirmed deep-research findings for this project (reuse these, don't "
-            "re-research from scratch):\n" + json.dumps({k: research_data.get(k) for k in deep_research.RESEARCH_KEYS})
+    if pre_built_facts is not None:
+        facts = pre_built_facts
+    else:
+        research_context = ""
+        if research_data:
+            research_context = (
+                "\n\nAlready-confirmed deep-research findings for this project (reuse these, don't "
+                "re-research from scratch):\n" + json.dumps({k: research_data.get(k) for k in deep_research.RESEARCH_KEYS})
+            )
+
+        user_prompt = (
+            f"MahaRERA registration: {reg_no}\n"
+            f"RERA project data (JSON): {json.dumps(category_data.get('projects') or {})}\n"
+            f"Promoter/partner data (JSON): {json.dumps(category_data.get('partners') or {})}\n"
+            f"Extracted document text (label -> text, high-priority documents only):\n"
+            f"{json.dumps(extracted_docs)[:_MAX_TOTAL_DOC_CHARS]}\n"
+            f"Full document library ({len(doc_library_status)} entries, for reference/completeness):\n"
+            f"{json.dumps([d['document_name'] for d in doc_library_status])}"
+            f"{research_context}\n\n"
+            f"Produce the complete Company Charter facts as the raw JSON object described above."
         )
 
-    user_prompt = (
-        f"MahaRERA registration: {reg_no}\n"
-        f"RERA project data (JSON): {json.dumps(category_data.get('projects') or {})}\n"
-        f"Promoter/partner data (JSON): {json.dumps(category_data.get('partners') or {})}\n"
-        f"Extracted document text (label -> text, high-priority documents only):\n"
-        f"{json.dumps(extracted_docs)[:_MAX_TOTAL_DOC_CHARS]}\n"
-        f"Full document library ({len(doc_library_status)} entries, for reference/completeness):\n"
-        f"{json.dumps([d['document_name'] for d in doc_library_status])}"
-        f"{research_context}\n\n"
-        f"Produce the complete Company Charter facts as the raw JSON object described above."
-    )
-
-    facts = _run_charter_pass(user_prompt)
+        facts = _run_charter_pass(user_prompt)
     facts = _verify_material_claims(facts)
     facts = _check_document_grounding(facts, extracted_docs, category_data, documents_manifest)
     facts["document_library"] = doc_library_status  # always the full, code-computed list -- not model-generated

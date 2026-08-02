@@ -1,20 +1,23 @@
 {
   "domains": {
     "99acres.com": {
-      "hit_count": 2,
+      "hit_count": 4,
       "projects": [
         "P52100019639",
-        "P51800077150"
+        "P51800077150",
+        "P51700048590",
+        "P51700031409"
       ],
       "promoted": false,
       "promoted_on_project": null,
       "review_note": null
     },
     "nobroker.in": {
-      "hit_count": 2,
+      "hit_count": 3,
       "projects": [
         "P52100019639",
-        "P51800077150"
+        "P51800077150",
+        "P51700048590"
       ],
       "promoted": false,
       "promoted_on_project": null,
@@ -42,6 +45,24 @@
       "hit_count": 1,
       "projects": [
         "P51800077150"
+      ],
+      "promoted": false,
+      "promoted_on_project": null,
+      "review_note": null
+    },
+    "squareyards.com": {
+      "hit_count": 1,
+      "projects": [
+        "P51700031409"
+      ],
+      "promoted": false,
+      "promoted_on_project": null,
+      "review_note": null
+    },
+    "indextap.com": {
+      "hit_count": 1,
+      "projects": [
+        "P51700031409"
       ],
       "promoted": false,
       "promoted_on_project": null,
