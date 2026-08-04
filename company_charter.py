@@ -82,6 +82,67 @@ if not shutil.which("tesseract"):
 TEMPLATE_PATH = os.path.join(config.OUTPUT_ROOT, "company_charters", "Company_Charter_TEMPLATE_WebSourced.docx")
 CHARTER_OUTPUT_DIR = os.path.join(config.OUTPUT_ROOT, "company_charters")
 
+# --- CLAUDE.md loaders -----------------------------------------------------
+# CLAUDE.md is auto-loaded by Claude Code for interactive/coding sessions,
+# but this pipeline also calls the Claude API directly and unattended (via
+# _run_charter_pass and the citation-completeness judge below) -- CLAUDE.md
+# is NOT auto-loaded there, so its three sections are read explicitly and
+# routed to exactly the calls each one is scoped for. Section A never leaves
+# this process as API content; Section B goes into every charter
+# content-generating/verifying call; Section C only into external-doc-variant
+# calls. See CLAUDE.md itself for the full rule text this returns.
+_CLAUDE_MD_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "CLAUDE.md")
+_CLAUDE_MD_SECTION_RE = re.compile(
+    r"--- Section {marker}:.*?---\n(.*?)(?=\n--- Section |\Z)", re.DOTALL
+)
+
+
+def _read_claude_md_section(marker: str) -> str:
+    with open(_CLAUDE_MD_PATH, "r", encoding="utf-8") as f:
+        text = f.read()
+    pattern = re.compile(_CLAUDE_MD_SECTION_RE.pattern.format(marker=marker), re.DOTALL)
+    m = pattern.search(text)
+    if not m:
+        raise RuntimeError(f"CLAUDE.md Section {marker} not found -- has the file been restructured?")
+    body = m.group(1).strip()
+    if not body:
+        raise RuntimeError(f"CLAUDE.md Section {marker} is empty")
+    return body
+
+
+def _coding_time_notes() -> str:
+    """Section A -- coding-time rules for Claude Code / human sessions only.
+    Documentation use only; NEVER pass this into any runtime API call."""
+    return _read_claude_md_section("A")
+
+
+def _common_content_rules() -> str:
+    """Section B -- prepended to the system prompt of every charter
+    content-generating/verifying Claude API call, both doc variants."""
+    return _read_claude_md_section("B")
+
+
+def _external_citation_rule() -> str:
+    """Section C -- appended only when the call is building or checking
+    doc_variant == "external" content."""
+    return _read_claude_md_section("C")
+
+
+def _charter_system_blocks(*, external: bool, extra: str = "") -> list:
+    """Assembles the `system` param for a charter-specific Claude API call as
+    a list of text blocks: Section B first (marked as a cacheable prompt
+    prefix -- identical across every call and every project), then Section C
+    only when `external`, then any call-specific instructions. Passing a
+    list (rather than a plain string) to deep_research._run_agentic_pass's
+    `system` param is what the Anthropic API needs to actually cache the
+    Section B prefix."""
+    blocks = [{"type": "text", "text": _common_content_rules(), "cache_control": {"type": "ephemeral"}}]
+    if external:
+        blocks.append({"type": "text", "text": _external_citation_rule()})
+    if extra:
+        blocks.append({"type": "text", "text": extra})
+    return blocks
+
 # Document labels worth extracting full text from (case-insensitive substring
 # match against the manifest's `label`/`saved_filename`) -- everything else
 # is listed in the Document Library table by name only, with an explicit
@@ -640,8 +701,11 @@ code fences, nothing before or after it -- matching exactly this JSON Schema: \
 def _run_charter_pass(user_prompt: str) -> dict:
     # Delegates to deep_research's tool-runner helper (iterates the
     # BetaToolRunner to its final BetaMessage and parses the raw-JSON reply)
-    # rather than duplicating that logic here.
-    return deep_research._run_agentic_pass(user_prompt, _SYSTEM_PROMPT, label="charter_pass")
+    # rather than duplicating that logic here. `facts` produced here is
+    # shared by both Internal and External renders, so only Section B
+    # (doc-variant-agnostic) is injected -- never Section C.
+    system = _charter_system_blocks(external=False, extra=_SYSTEM_PROMPT)
+    return deep_research._run_agentic_pass(user_prompt, system, label="charter_pass")
 
 
 _MAPS_SCRAPE_ENV_VAR = "COMPANY_CHARTER_USE_MAPS_SCRAPE"
@@ -3168,7 +3232,38 @@ def run_review_authenticity_triage(reviews: list, facts: dict) -> dict:
 _ACTIVE_EXTERNAL_FACTS: dict | None = None
 
 
-def _set_paragraph_text(paragraph, text: str) -> None:
+_CIN_VALUE_PATTERN = r"[UL]\d{5}[A-Z]{2}\d{4}[A-Z]{3}\d{6}"
+_CIN_LABELED_RE = re.compile(r"\bCIN\s*[:\-]?\s*" + _CIN_VALUE_PATTERN, re.IGNORECASE)
+_DIN_LABELED_RE = re.compile(r"\bDIN\s*[:\-]?\s*\d{7,8}\b", re.IGNORECASE)
+
+
+def _strip_inline_cin_din(text: str) -> str:
+    """Removes CIN/DIN VALUES (e.g. "CIN U70102MH2010PTC210775", "DIN
+    00448678") from running prose -- CLAUDE.md Section B: CIN/DIN stays
+    only in the stakeholder/director identity tables, never inline in
+    prose anywhere else. Strips just the "CIN <value>"/"DIN <value>"
+    token itself (plus tidying the punctuation left behind), not the
+    whole surrounding parenthetical -- "(DIN 00448678, appointed
+    2022-09-07)" keeps its other, non-CIN/DIN content: "(appointed
+    2022-09-07)"."""
+    if not text:
+        return text
+    text = _CIN_LABELED_RE.sub("", text)
+    text = _DIN_LABELED_RE.sub("", text)
+    text = re.sub(r"\(\s*,\s*", "(", text)   # "(, appointed" -> "(appointed"
+    text = re.sub(r",\s*\)", ")", text)      # "appointed ..., )" -> "appointed ...)"
+    text = re.sub(r"\(\s*\)", "", text)      # a parenthetical left fully empty
+    text = re.sub(r"\s{2,}", " ", text)
+    text = re.sub(r"\s+([,.])", r"\1", text)
+    return text.strip()
+
+
+def _set_paragraph_text_raw(paragraph, text: str) -> None:
+    """The actual paragraph-text setter, with NO CIN/DIN stripping --
+    _set_cell/_set_row_cell call this directly so table cells (including
+    the stakeholder/director identity tables, where CIN/DIN is required,
+    not forbidden) are never touched by _set_paragraph_text's stripping.
+    Every other caller should use _set_paragraph_text instead."""
     if _ACTIVE_EXTERNAL_FACTS is not None:
         text = _externalize_prose(_ACTIVE_EXTERNAL_FACTS, str(text))
     for extra_run in paragraph.runs[1:]:
@@ -3194,6 +3289,61 @@ def _set_paragraph_text(paragraph, text: str) -> None:
         from docx.shared import RGBColor
         run.font.color.rgb = RGBColor.from_string("000000")
         run.italic = False
+
+
+# Proof-of-concept reusable glossary layer for CLAUDE.md Section B's
+# "no jargon, plain language, keep key terms" rule -- deliberately a
+# SEPARATE, small, general-purpose mechanism from _EXTERNAL_DASH_REWRITES
+# (the large hardcoded exact-full-sentence internal->external translation
+# dict a few hundred lines below this one). That dict is a one-off lookup
+# table keyed on exact sentences from one specific promoter/project (it
+# bakes in real DINs/CINs/PANs and falls through as a no-op for any other
+# project's sentences -- see its own comment). Whether it should eventually
+# be migrated onto a mechanism like this one is flagged back to the user,
+# not decided here -- this pass only adds the new jargon-expansion need,
+# it does not touch or refactor that existing dict.
+_JARGON_GLOSSARY = {
+    "CIRP": "insolvency proceedings (CIRP)",
+    "NCLT": "the insolvency tribunal (NCLT)",
+    "NCLAT": "the insolvency appellate tribunal (NCLAT)",
+    "IBC": "the Insolvency and Bankruptcy Code (IBC)",
+    "DSRA": "the debt service reserve account (DSRA)",
+    "ECLGS": "the Emergency Credit Line Guarantee Scheme (ECLGS)",
+    "IGR": "the Inspector General of Registration (IGR)",
+    "e-ASR": "the electronic Annual Statement of Rates (e-ASR)",
+    "KMP": "Key Managerial Personnel (KMP)",
+    "ROC": "the Registrar of Companies (ROC)",
+}
+
+
+def _expand_jargon_first_use(text: str) -> str:
+    """CLAUDE.md Section B: on first use per text, expand a known jargon
+    term once -- keeping the term itself (still searchable/cross-
+    referenceable), just not left unexplained (e.g. "CIRP" -> "insolvency
+    proceedings (CIRP)"). Subsequent occurrences of the SAME term within
+    the same text are left bare, matching ordinary first-use-expands-then-
+    abbreviates writing convention. A plain-language pass, not a
+    dumbing-down pass -- the term is kept, not replaced."""
+    if not text:
+        return text
+    for term, expansion in _JARGON_GLOSSARY.items():
+        pattern = re.compile(rf"\b{re.escape(term)}\b")
+        first = pattern.search(text)
+        if not first:
+            continue
+        start, end = first.span()
+        text = text[:start] + expansion + text[end:]
+    return text
+
+
+def _set_paragraph_text(paragraph, text: str) -> None:
+    """Body-paragraph text setter for narrative slots -- strips inline
+    CIN/DIN values and expands first-use jargon (CLAUDE.md Section B)
+    before delegating to _set_paragraph_text_raw. Table cells go through
+    _set_cell/_set_row_cell instead, which call the raw setter directly
+    and deliberately skip both passes -- see that function's docstring."""
+    text = _expand_jargon_first_use(_strip_inline_cin_din(str(text)))
+    _set_paragraph_text_raw(paragraph, text)
 
 
 def _remove_paragraph(paragraph) -> None:
@@ -3345,6 +3495,51 @@ def _split_into_bullet_clauses(text: str) -> list[str]:
     return [p for p in pieces if p]
 
 
+_MIN_STANDALONE_BULLET_WORDS = 5
+
+
+def _consolidate_bullet_clauses(clauses: list[str]) -> list[str]:
+    """Merges a clause into the previous one when it's too short to read
+    as a standalone point (CLAUDE.md Section B: consolidate split/
+    fragmented bullets into one well-formed bullet rather than a fragment
+    trail) -- _split_into_bullet_clauses correctly splits on every real
+    sentence boundary, but a short trailing sentence (e.g. "Confirmed as
+    of 2026.") reads as an orphaned fragment, not its own point, when left
+    as a separate bullet. The first clause never merges backward (nothing
+    to merge into)."""
+    if len(clauses) <= 1:
+        return clauses
+    merged = [clauses[0]]
+    for clause in clauses[1:]:
+        if len(clause.split()) < _MIN_STANDALONE_BULLET_WORDS:
+            merged[-1] = f"{merged[-1]} {clause}"
+        else:
+            merged.append(clause)
+    return merged
+
+
+def _fix_bullet_capitalization(clause: str) -> str:
+    """Deterministic capitalization/punctuation cleanup (CLAUDE.md Section
+    B) -- capitalizes the clause's first letter if it isn't already, and
+    ensures it ends with terminal punctuation, so a bullet reads as a
+    complete sentence rather than a raw fragment. Deliberately NOT full
+    grammar correction (an LLM/NLP job, with real risk of silently
+    altering a factual claim in a due-diligence document) -- this is the
+    safe, deterministic slice of "grammar and capitalization" code can do
+    without a human or model re-checking every rewrite. Scoped to bullet
+    clauses (narrative prose), never applied to table cells -- a blanket
+    pass there would corrupt structured values (dates, CIN/DIN, currency
+    figures) that should never gain a forced capital or trailing period."""
+    clause = clause.strip()
+    if not clause:
+        return clause
+    if clause[0].islower():
+        clause = clause[0].upper() + clause[1:]
+    if clause[-1] not in ".!?\"')":
+        clause += "."
+    return clause
+
+
 _GAP_PREFIXES = (
     "not confirmed", "not disclosed", "not established", "not applicable",
     "not yet applicable", "not computed", "not stated", "not individually tabulated",
@@ -3369,8 +3564,13 @@ def _looks_like_unresolved_gap(text: str) -> bool:
     single most important finding for an unregistered project) -- which
     always stays. Never used to silently drop a finding; only to skip
     repeating an already-tracked gap (see facts["gaps"]/_classify_flags)
-    as a sentence in the main narrative."""
+    as a sentence in the main narrative. A literally blank value is
+    treated the same as a gap prefix -- an empty table cell is exactly
+    the "bare, un-informative row" this check exists to catch, not a
+    third category of its own."""
     lowered = text.strip().lower()
+    if not lowered:
+        return True
     return any(lowered.startswith(prefix) for prefix in _GAP_PREFIXES)
 
 
@@ -3395,7 +3595,20 @@ def _remove_gap_rows(table, value_col: int, header_rows: int = 1) -> None:
             table._tbl.remove(row._tr)
 
 
-def _set_paragraph_as_bullets(facts: dict, paragraph, text, *, gap_check_text: str | None = None) -> None:
+def _remove_fully_empty_rows(table, header_rows: int = 1) -> None:
+    """Removes a DATA row only if EVERY column in it is empty/an
+    unresolved gap (CLAUDE.md Section B) -- the multi-column counterpart
+    to _remove_gap_rows above, for tables like Group/Affiliated Companies
+    where one gap column (e.g. an unconfirmed CIN) does NOT mean the rest
+    of the row is worthless. A row survives if even one cell holds a
+    real, confirmed value -- e.g. a real company name and a real "shared
+    director" basis survive even if the CIN column reads "unknown"."""
+    for row in list(table.rows[header_rows:]):
+        if all(not cell.text.strip() or _looks_like_unresolved_gap(cell.text) for cell in row.cells):
+            table._tbl.remove(row._tr)
+
+
+def _set_paragraph_as_bullets(facts: dict, paragraph, text, *, gap_check_text: str | None = None, citation: str | None = None) -> None:
     """Renders `text` as brief bullet-point pointers instead of one
     flowing paragraph, when it's actually long enough to benefit (splits
     to 2+ clauses via _split_into_bullet_clauses) -- a short value
@@ -3437,7 +3650,15 @@ def _set_paragraph_as_bullets(facts: dict, paragraph, text, *, gap_check_text: s
     `gap_check_text`, if given, is what gets checked for gap-ness INSTEAD
     of `text` -- needed at a call site that prepends a fixed label
     ("Collection Account of the Project (100%): {value}"), since the
-    label itself never looks like a gap even when the value is one."""
+    label itself never looks like a gap even when the value is one.
+
+    `citation`, if given, is a bare marker string (see _cite_marker) that
+    gets appended to EVERY clause AFTER splitting -- never build the
+    citation into `text` yourself and rely on this function to split it.
+    Doing that used to be the actual bug here: the marker was glued once
+    onto the whole multi-sentence blob before _split_into_bullet_clauses
+    ran, so it landed on whichever clause happened to be last, and every
+    earlier clause rendered with no citation at all."""
     text = str(text)
     check_text = str(gap_check_text) if gap_check_text is not None else text
     if _looks_like_unresolved_gap(check_text):
@@ -3445,8 +3666,12 @@ def _set_paragraph_as_bullets(facts: dict, paragraph, text, *, gap_check_text: s
         return
 
     clauses = _split_into_bullet_clauses(text)
+    clauses = _consolidate_bullet_clauses(clauses)
+    clauses = [_fix_bullet_capitalization(c) for c in clauses]
+    if citation and clauses:
+        clauses = [f"{clause} {citation}" for clause in clauses]
     if len(clauses) <= 1:
-        _set_paragraph_text(paragraph, text)
+        _set_paragraph_text(paragraph, clauses[0] if clauses else text)
         return
     facts.setdefault("_deferred_bullets", []).append((paragraph, clauses))
 
@@ -3660,6 +3885,87 @@ def _iter_all_paragraphs(doc):
     yield from _from_tables(doc.tables)
 
 
+_FACTUAL_CLAIM_MARKER_RE = re.compile(
+    r"\b(19|20)\d{2}\b"                                    # a year
+    r"|\bDIN\s*\d{7,8}\b"                                   # a DIN
+    r"|\b[UL]\d{5}[A-Z]{2}\d{4}[A-Z]{3}\d{6}\b"             # a CIN
+    r"|\bP\d{11}\b"                                         # a MahaRERA registration number
+    r"|\b(?:Rs\.?|INR|₹)\s?[\d,]+"                     # a rupee figure
+    r"|\b[\d,]+\s*(?:crore|lakh|sq\.?\s?ft|units?)\b"       # a scale figure
+    r"|\b(?:High Court|Supreme Court|NCLT|NCLAT|Sessions Court|Tribunal)\b",
+    re.IGNORECASE,
+)
+# Lines that legitimately state a fact with no [N] marker because they're
+# not a sourced claim at all -- a plain absence statement (a genuine
+# finding, not a gap -- see _looks_like_unresolved_gap's own "No X was
+# found" vs "Not confirmed" distinction), a Developer Score/Documentation
+# Confidence line (code-computed from facts already cited elsewhere, not
+# an independent claim needing its own source), or a standing/gap notice.
+# Matched as a lowercase substring.
+_CITATION_EXEMPT_SUBSTRINGS = (
+    "nothing found", "none identified", "no additional material gaps",
+    "no additional gaps identified", "developer score", "documentation confidence",
+    "not independently confirmed", "not disclosed", "not confirmed", "not established",
+    "not applicable", "deep market research", "prepared ",
+)
+_ABSENCE_FINDING_RE = re.compile(r"^\W*no\b", re.IGNORECASE)
+# Short lines (cover-page titles/subtitles, table-adjacent labels) aren't
+# claims a reader parses as prose needing a citation -- only worth
+# checking once there's enough text to actually read as a sentence.
+_MIN_CLAIM_WORDS = 6
+
+
+def _looks_like_uncited_factual_claim(text: str) -> bool:
+    """True when `text` states something specific enough (a year, a CIN/
+    DIN, a registration number, a rupee figure, a scale figure, or a named
+    court/tribunal) to be a factual claim a reader should be able to trace
+    to a source, but carries no "[N]" citation marker anywhere in it.
+    Deliberately pattern-based (fast, deterministic, no API call) --
+    see _llm_verify_citation_completeness for the judgment-based
+    companion pass that catches claims with no fixed pattern to match."""
+    stripped = text.strip()
+    if not stripped or "[" in stripped:
+        return False
+    if len(stripped.split()) < _MIN_CLAIM_WORDS:
+        return False
+    if _ABSENCE_FINDING_RE.match(stripped.lstrip("•").strip()):
+        return False
+    lowered = stripped.lower()
+    if any(s in lowered for s in _CITATION_EXEMPT_SUBSTRINGS):
+        return False
+    return bool(_FACTUAL_CLAIM_MARKER_RE.search(stripped))
+
+
+def _check_citation_completeness(docx_path: str) -> list[str]:
+    """Re-opens a just-saved External Charter and flags any body paragraph
+    that reads as an uncited factual claim (see
+    _looks_like_uncited_factual_claim) -- the CLAUDE.md Section C rule
+    that every inline factual claim must resolve to a numbered "[N]"
+    marker. Deliberately kept SEPARATE from _verify_external_document_
+    quality's hard-fail violations: a missing citation marker can reflect
+    a genuine, pre-existing gap in the underlying facts' source tagging
+    (real project data, not a code bug), and that shouldn't be able to
+    sink an otherwise-good document out of existing entirely the way a
+    deterministic rendering regression (a stray dash, a lost bullet)
+    should. Callers should log this, not raise on it -- same advisory
+    treatment as _llm_verify_citation_completeness, its judgment-based
+    companion check."""
+    import docx as _docx
+
+    doc = _docx.Document(docx_path)
+    flags = []
+    for para in doc.paragraphs:
+        stripped = para.text.strip()
+        if re.match(r"^\[(\d+)\]\s+\S", stripped):
+            continue  # a Sources-list entry itself, not a claim needing one
+        style_name = para.style.name if para.style is not None else ""
+        if style_name in _HEADING_LEVEL_BY_STYLE:
+            continue
+        if _looks_like_uncited_factual_claim(stripped):
+            flags.append(f"factual-looking claim with no citation marker: {stripped[:100]!r}")
+    return flags
+
+
 def _verify_external_document_quality(docx_path: str) -> list[str]:
     """Re-opens a just-saved External Charter and checks for the exact
     regressions this session found and fixed by hand (grey/italic body
@@ -3668,7 +3974,8 @@ def _verify_external_document_quality(docx_path: str) -> list[str]:
     not a general style linter, just a guard against these specific bugs
     coming back the next time someone edits _fill_template. Returns a
     list of violation strings; empty means clean. Raises nothing itself --
-    the caller decides how loudly to fail."""
+    the caller decides how loudly to fail. See _check_citation_completeness
+    for the separate, advisory-only citation-marker check."""
     import re
     import docx as _docx
 
@@ -3732,12 +4039,77 @@ def _verify_external_document_quality(docx_path: str) -> list[str]:
     return violations
 
 
+_CITATION_JUDGE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "uncited_claims": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+    },
+    "required": ["uncited_claims"],
+}
+
+_CITATION_JUDGE_INSTRUCTIONS = f"""You are reviewing the rendered body text of an External \
+Company Charter for citation completeness, per the numbered-citations rule above. You will be \
+given the document's paragraphs/bullets, one per line. For each line that states a specific \
+factual claim (a name, a date, a number, a registry/registration status, or a court/tribunal \
+finding) with NO "[N]"-style citation marker anywhere in it, add its exact verbatim text to \
+`uncited_claims`. Do NOT flag: headings, the Sources list itself (lines already starting with \
+"[N]"), Developer Score / Documentation Confidence Summary lines (these are code-computed from \
+facts already cited elsewhere in the document, not independent claims needing their own \
+source), or a plain "Nothing found" / gap / not-disclosed statement (an absence, not a claim).
+
+Your FINAL reply must be ONLY a single raw JSON object -- no prose, no markdown code fences -- \
+matching exactly this JSON Schema: {json.dumps(_CITATION_JUDGE_SCHEMA)}"""
+
+
+def _llm_verify_citation_completeness(docx_path: str) -> list[str]:
+    """The Task-8 gate-check: a genuine LLM judgment pass over the rendered
+    External Charter's body text, run IN ADDITION to (never instead of)
+    the mechanical regex heuristic in _verify_external_document_quality.
+    The regex only catches claims matching a known fixed pattern (a year,
+    a CIN, a rupee figure...); this catches claims a human editor would
+    recognize as needing a source but that match no fixed pattern (e.g. a
+    named individual's role, a specific allegation, a dated event
+    described in prose without a numeral). Gets the CLAUDE.md Section B +
+    Section C system-prompt blocks (external doc_variant only) via
+    _charter_system_blocks -- this is the one call in this file that
+    exists specifically because doc_variant == "external".
+
+    Degrades to an empty list on ANY failure (missing ANTHROPIC_API_KEY,
+    network error, bad JSON reply) rather than raising -- same philosophy
+    as deep_research._verify_claim's verification_error handling; an LLM
+    judgment pass is advisory, not something a flaky network call should
+    be able to discard an otherwise-good run over. Callers should log
+    (not silently drop) whatever this returns."""
+    import docx as _docx
+
+    doc = _docx.Document(docx_path)
+    body_text = "\n".join(para.text.strip() for para in doc.paragraphs if para.text.strip())
+    if not body_text:
+        return []
+
+    system = _charter_system_blocks(external=True, extra=_CITATION_JUDGE_INSTRUCTIONS)
+    prompt = f"External Charter body text (one paragraph/bullet per line):\n\n{body_text}"
+    try:
+        result = deep_research._run_agentic_pass(prompt, system, label="citation_completeness_judge")
+    except Exception as e:
+        return [f"(citation-completeness judge could not run this pass -- {e})"]
+    claims = result.get("uncited_claims", []) if isinstance(result, dict) else []
+    return [str(c) for c in claims if str(c).strip()]
+
+
 def _set_cell(table, row: int, col: int, text: str) -> None:
-    _set_paragraph_text(table.rows[row].cells[col].paragraphs[0], str(text))
+    # _set_paragraph_text_raw, not _set_paragraph_text -- table cells (the
+    # Corporate/Promoter Identity, Directors, Company Registration Profile
+    # tables among them) are exactly where CIN/DIN is REQUIRED, so cell
+    # writes must never go through the prose CIN/DIN stripper.
+    _set_paragraph_text_raw(table.rows[row].cells[col].paragraphs[0], str(text))
 
 
 def _set_row_cell(row, col: int, text: str) -> None:
-    _set_paragraph_text(row.cells[col].paragraphs[0], str(text))
+    _set_paragraph_text_raw(row.cells[col].paragraphs[0], str(text))
 
 
 def _fill_variable_rows(table, header_rows: int, items: list, fill_row) -> None:
@@ -3788,6 +4160,27 @@ def _fill_variable_paragraphs(doc, start_index: int, slot_count: int, texts: lis
         last = new_para
 
 
+def _convert_docx_to_pdf(docx_path: str) -> str | None:
+    """Converts a just-saved .docx to a same-named .pdf via docx2pdf (Word
+    COM automation on Windows/macOS) -- PDF is the actual final deliverable
+    format (2026-08-04): a due-diligence document should hand off as
+    something any recipient can open faithfully without Word installed,
+    not a .docx whose fonts/template styles can render differently
+    elsewhere. Returns the PDF path, or None on any failure (no Word
+    installed, a COM error, an unsupported platform) -- degrades to
+    leaving the .docx as the only output for that file rather than
+    crashing the whole generation run; the caller logs this, never
+    treats a missing PDF as fatal."""
+    pdf_path = os.path.splitext(docx_path)[0] + ".pdf"
+    try:
+        from docx2pdf import convert
+        convert(docx_path, pdf_path)
+        return pdf_path
+    except Exception as e:
+        print(f"[!] Could not convert {docx_path} to PDF ({e}) -- .docx is the only output for this file.")
+        return None
+
+
 def _fill_template(reg_no: str, facts: dict, out_path: str, doc_variant: str = "internal") -> None:
     """doc_variant is "internal" (default -- today's behavior: inline
     "(label)" citations, "(Code-Computed)" labels, verbatim prose) or
@@ -3825,19 +4218,21 @@ def _fill_template(reg_no: str, facts: dict, out_path: str, doc_variant: str = "
 
     global _ACTIVE_EXTERNAL_FACTS
     _ACTIVE_EXTERNAL_FACTS = facts if doc_variant == "external" else None
-    if doc_variant == "external":
-        # doc.add_paragraph(...) is how every _append_*_section function
-        # writes NEW content (as opposed to _set_paragraph_text filling a
-        # pre-existing template slot, covered by _ACTIVE_EXTERNAL_FACTS
-        # above) -- patching this one fresh, single-use `doc` instance's
-        # bound method reaches all of them uniformly, the same reasoning
-        # as _ACTIVE_EXTERNAL_FACTS, without touching each call site.
-        _real_add_paragraph = doc.add_paragraph
+    # doc.add_paragraph(...) is how every _append_*_section function writes
+    # NEW content (as opposed to _set_paragraph_text filling a pre-existing
+    # template slot) -- patching this one fresh, single-use `doc` instance's
+    # bound method reaches all of them uniformly, without touching each call
+    # site. CIN/DIN stripping (CLAUDE.md Section B) applies to BOTH variants
+    # here, unlike _externalize_prose below (External-only).
+    _real_add_paragraph = doc.add_paragraph
 
-        def _add_paragraph_external(text="", *args, **kwargs):
-            return _real_add_paragraph(_externalize_prose(facts, str(text)), *args, **kwargs)
+    def _add_paragraph_sanitized(text="", *args, **kwargs):
+        text = _expand_jargon_first_use(_strip_inline_cin_din(str(text)))
+        if doc_variant == "external":
+            text = _externalize_prose(facts, text)
+        return _real_add_paragraph(text, *args, **kwargs)
 
-        doc.add_paragraph = _add_paragraph_external
+    doc.add_paragraph = _add_paragraph_sanitized
 
     li = facts["land_identification"]
     ci = facts["corporate_identity"]
@@ -3864,15 +4259,15 @@ def _fill_template(reg_no: str, facts: dict, out_path: str, doc_variant: str = "
     _set_paragraph_as_bullets(facts, p[7], facts["executive_summary"])
     litigation_citation = _citation_text(facts, _clean_source_label(src(facts, "litigation_status")))
     litigation_text = fld(facts, "litigation_status")
-    _set_paragraph_as_bullets(facts, p[15], f"{litigation_text} {litigation_citation}" if litigation_citation else litigation_text)
-    _set_paragraph_as_bullets(facts, p[24], _cite(f"Road: {conn.get('road', '')}", "distance", facts=facts), gap_check_text=conn.get("road", ""))
-    _set_paragraph_as_bullets(facts, p[25], _cite(f"Rail: {conn.get('rail', '')}", "distance", facts=facts), gap_check_text=conn.get("rail", ""))
-    _set_paragraph_as_bullets(facts, p[26], _cite(f"Metro: {conn.get('metro', '')}", "distance", facts=facts), gap_check_text=conn.get("metro", ""))
-    _set_paragraph_as_bullets(facts, p[27], _cite(f"Air: {conn.get('air', '')}", "distance", facts=facts), gap_check_text=conn.get("air", ""))
+    _set_paragraph_as_bullets(facts, p[15], litigation_text, citation=litigation_citation)
+    _set_paragraph_as_bullets(facts, p[24], f"Road: {conn.get('road', '')}", gap_check_text=conn.get("road", ""), citation=_cite_marker("distance", facts=facts))
+    _set_paragraph_as_bullets(facts, p[25], f"Rail: {conn.get('rail', '')}", gap_check_text=conn.get("rail", ""), citation=_cite_marker("distance", facts=facts))
+    _set_paragraph_as_bullets(facts, p[26], f"Metro: {conn.get('metro', '')}", gap_check_text=conn.get("metro", ""), citation=_cite_marker("distance", facts=facts))
+    _set_paragraph_as_bullets(facts, p[27], f"Air: {conn.get('air', '')}", gap_check_text=conn.get("air", ""), citation=_cite_marker("distance", facts=facts))
     _set_paragraph_as_bullets(facts, p[30], facts["social_infrastructure"])
     _set_paragraph_as_bullets(facts, p[32], facts["fsi_governing_framework"])
     _set_paragraph_as_bullets(facts, p[33], facts["fsi_interpretation"])
-    _set_paragraph_as_bullets(facts, p[37], _cite(f"Planning approval sequence: {rs.get('planning_approval_sequence', '')}", "project_registration", facts=facts), gap_check_text=rs.get("planning_approval_sequence", ""))
+    _set_paragraph_as_bullets(facts, p[37], f"Planning approval sequence: {rs.get('planning_approval_sequence', '')}", gap_check_text=rs.get("planning_approval_sequence", ""), citation=_cite_marker("project_registration", facts=facts))
     allotment_text = f"Allotment mechanics: {rs.get('allotment_mechanics', '')}"
     _set_paragraph_as_bullets(facts, p[41], rc.get("registration_summary", ""))
     _set_paragraph_as_bullets(facts, p[42], f"Collection Account of the Project (100%): {rc.get('collection_account', '')}", gap_check_text=rc.get("collection_account", ""))
@@ -3880,12 +4275,12 @@ def _fill_template(reg_no: str, facts: dict, out_path: str, doc_variant: str = "
     _set_paragraph_as_bullets(facts, p[44], f"Litigations/complaints/appeals related to the project: {rc.get('litigations_complaints_appeals', '')}", gap_check_text=rc.get("litigations_complaints_appeals", ""))
     _set_paragraph_as_bullets(facts, p[45], rc.get("statutory_declaration", ""))
     _set_paragraph_as_bullets(facts, p[46], f"Construction progress: {rc.get('construction_progress', '')}", gap_check_text=rc.get("construction_progress", ""))
-    _set_paragraph_as_bullets(facts, p[49], _cite(f"Authority of record: {lp.get('authority_of_record', '')}", "project_registration", facts=facts), gap_check_text=lp.get("authority_of_record", ""))
-    _set_paragraph_as_bullets(facts, p[50], _cite(f"Project type: {lp.get('project_type', '')}", "project_registration", facts=facts), gap_check_text=lp.get("project_type", ""))
-    _set_paragraph_as_bullets(facts, p[51], _cite(f"Professionals of record: {lp.get('professionals_of_record', '')}", "project_registration", facts=facts), gap_check_text=lp.get("professionals_of_record", ""))
-    _set_paragraph_as_bullets(facts, p[54], _cite(facts["micro_market_overview"], "pricing", "market_trend", facts=facts))
-    _set_paragraph_as_bullets(facts, p[56], _cite(facts["area_intelligence_trend"], "market_trend", "pricing", facts=facts))
-    _set_paragraph_as_bullets(facts, p[61], _cite(facts["unit_summary_note"], "project_registration", facts=facts))
+    _set_paragraph_as_bullets(facts, p[49], f"Authority of record: {lp.get('authority_of_record', '')}", gap_check_text=lp.get("authority_of_record", ""), citation=_cite_marker("project_registration", facts=facts))
+    _set_paragraph_as_bullets(facts, p[50], f"Project type: {lp.get('project_type', '')}", gap_check_text=lp.get("project_type", ""), citation=_cite_marker("project_registration", facts=facts))
+    _set_paragraph_as_bullets(facts, p[51], f"Professionals of record: {lp.get('professionals_of_record', '')}", gap_check_text=lp.get("professionals_of_record", ""), citation=_cite_marker("project_registration", facts=facts))
+    _set_paragraph_as_bullets(facts, p[54], facts["micro_market_overview"], citation=_cite_marker("pricing", "market_trend", facts=facts))
+    _set_paragraph_as_bullets(facts, p[56], facts["area_intelligence_trend"], citation=_cite_marker("market_trend", "pricing", facts=facts))
+    _set_paragraph_as_bullets(facts, p[61], facts["unit_summary_note"], citation=_cite_marker("project_registration", facts=facts))
     _set_paragraph_as_bullets(facts, p[64], facts["documents_absent_note"])
 
     # Every entry below is "one template paragraph, either rendered with its
@@ -3901,15 +4296,15 @@ def _fill_template(reg_no: str, facts: dict, out_path: str, doc_variant: str = "
     # mechanism that happens to land in the same slot.
     _always_suppress = lambda _facts: True
     _external_suppressed_paragraphs = (
-        # (index, text_fn(facts) -> str, suppress_for_external_fn(facts) -> bool, gap_check_fn(facts) -> str | None)
-        (12, lambda f: f["address_discrepancy_note"], _always_suppress, None),
-        (13, lambda f: f["corporate_registry_cross_check"], _always_suppress, None),
-        (17, lambda f: _cite(f["location_coordinates_note"], "distance", facts=f), _always_suppress, None),
-        (18, lambda f: "Map screenshot not embedded -- a live map cannot be fetched programmatically, so distances below were sourced from mapping-service queries instead (see Sources).", _always_suppress, None),
-        (36, lambda f: _cite(f"Governing act: {rs.get('governing_act', '')}", "project_registration", facts=f), _always_suppress, lambda f: rs.get("governing_act", "")),
-        (38, lambda f: allotment_text, lambda f: _externalize_prose(f, allotment_text) == "", lambda f: rs.get("allotment_mechanics", "")),
-        (58, lambda f: f.get("rera_scraping_note", f"Extracted directly from the live MahaRERA public project page for registration number {reg_no}."), _always_suppress, None),
-        (63, lambda f: f["documents_reviewed_note"], _always_suppress, None),
+        # (index, text_fn(facts) -> str, suppress_for_external_fn(facts) -> bool, gap_check_fn(facts) -> str | None, citation_fn(facts) -> str | None)
+        (12, lambda f: f["address_discrepancy_note"], _always_suppress, None, None),
+        (13, lambda f: f["corporate_registry_cross_check"], _always_suppress, None, None),
+        (17, lambda f: f["location_coordinates_note"], _always_suppress, None, lambda f: _cite_marker("distance", facts=f)),
+        (18, lambda f: "Map screenshot not embedded -- a live map cannot be fetched programmatically, so distances below were sourced from mapping-service queries instead (see Sources).", _always_suppress, None, None),
+        (36, lambda f: f"Governing act: {rs.get('governing_act', '')}", _always_suppress, lambda f: rs.get("governing_act", ""), lambda f: _cite_marker("project_registration", facts=f)),
+        (38, lambda f: allotment_text, lambda f: _externalize_prose(f, allotment_text) == "", lambda f: rs.get("allotment_mechanics", ""), None),
+        (58, lambda f: f.get("rera_scraping_note", f"Extracted directly from the live MahaRERA public project page for registration number {reg_no}."), _always_suppress, None, None),
+        (63, lambda f: f["documents_reviewed_note"], _always_suppress, None, None),
     )
     # Why each is suppressed for External (kept here, once, rather than
     # repeated as a comment on every removed if/else block above):
@@ -3933,13 +4328,14 @@ def _fill_template(reg_no: str, facts: dict, out_path: str, doc_variant: str = "
     #     is research-scope bookkeeping, not a project fact.
     # Internal keeps every one of these in full -- that process detail IS
     # the point there.
-    for _idx, _text_fn, _suppress_fn, _gap_check_fn in _external_suppressed_paragraphs:
+    for _idx, _text_fn, _suppress_fn, _gap_check_fn, _citation_fn in _external_suppressed_paragraphs:
         if doc_variant == "external" and _suppress_fn(facts):
             _paragraphs_to_remove.append(p[_idx])
         else:
             _set_paragraph_as_bullets(
                 facts, p[_idx], _text_fn(facts),
                 gap_check_text=(_gap_check_fn(facts) if _gap_check_fn else None),
+                citation=(_citation_fn(facts) if _citation_fn else None),
             )
 
     gaps = facts.get("gaps", [])
@@ -4058,6 +4454,15 @@ def _fill_template(reg_no: str, facts: dict, out_path: str, doc_variant: str = "
         "promoter_land_owner_investor", "collection_bank_account", "total_building_units",
     )):
         _set_cell(t[6], row, 1, core.get(key, ""))
+    # Same single-value-column Field/Value shape as Land Identification/
+    # Corporate Identity/Neighbourhood/FSI Metrics above -- this table was
+    # simply never wired into _remove_gap_rows, which is why "RERA Core
+    # Data" used to survive fully intact even when nearly every row read
+    # "Not disclosed"/"Not applicable"/"Not confirmed" (CLAUDE.md Section
+    # B: drop the whole table if every row is a gap -- already-existing
+    # logic in _remove_empty_section_headings handles that once this
+    # table's data rows are actually stripped down to none).
+    _remove_gap_rows(t[6], value_col=1)
 
     def _fill_block_row(row, item):
         _set_row_cell(row, 0, item["block_wing"])
@@ -4369,6 +4774,20 @@ def _fill_template(reg_no: str, facts: dict, out_path: str, doc_variant: str = "
                 f"External Charter quality gate failed for {out_path} "
                 f"({len(violations)} violation(s)):\n" + "\n".join(f"  - {v}" for v in violations)
             )
+
+        # Citation-completeness checks (the mechanical regex heuristic AND
+        # the Task-8 LLM judgment pass) are ADVISORY, not fatal -- see both
+        # functions' own docstrings on why a missing citation marker (which
+        # can reflect a genuine, pre-existing gap in the underlying facts'
+        # source tagging, not a code bug) shouldn't be able to discard an
+        # otherwise-good run the way the hard style-regression gate above
+        # does. Printed for the operator to review, same visibility level
+        # as this pipeline's other console progress output.
+        citation_flags = _check_citation_completeness(out_path) + _llm_verify_citation_completeness(out_path)
+        if citation_flags:
+            print(f"[!] Citation-completeness check flagged {len(citation_flags)} claim(s) for review in {out_path}:")
+            for flag in citation_flags:
+                print(f"    - {flag}")
 
     # For doc_variant="internal", `facts` above is the caller's own object
     # (only "external" works on a deep copy), so these two rendering-only
@@ -5210,18 +5629,36 @@ def _topic_citation(facts: dict, topic: str) -> str | None:
     return None
 
 
+def _cite_marker(*topics: str, facts: dict) -> str | None:
+    """Same topic lookup as _cite, but returns just the bare marker
+    string (e.g. "[1]", or "[1][2]" if the matching source's own label
+    packs several semicolon-joined sources -- see _citation_text) instead
+    of concatenating it onto a piece of text. Lets a caller attach the
+    SAME marker to every bullet clause _split_into_bullet_clauses
+    produces from one field, rather than the old bug: gluing it once onto
+    the whole multi-sentence blob BEFORE splitting, so only the last
+    resulting bullet ever carried a citation and every earlier one carried
+    none (see _set_paragraph_as_bullets's `citation` param, which this
+    feeds)."""
+    for topic in topics:
+        citation = _citation_text(facts, _topic_citation(facts, topic))
+        if citation:
+            return citation
+    return None
+
+
 def _cite(text: str, *topics: str, facts: dict) -> str:
     """Appends the first matching topic citation (tried in the given
     order) to `text`, or returns `text` unchanged if none of the topics
     has a matching source -- never invents a citation just to fill a
-    paragraph."""
+    paragraph. Only safe for a single, un-split paragraph; a field that
+    will be rendered via _set_paragraph_as_bullets must use _cite_marker
+    plus that function's `citation` param instead, so the marker reaches
+    every bullet clause, not just the tail of the pre-split text."""
     if not text:
         return text
-    for topic in topics:
-        citation = _citation_text(facts, _topic_citation(facts, topic))
-        if citation:
-            return f"{text} {citation}"
-    return text
+    marker = _cite_marker(*topics, facts=facts)
+    return f"{text} {marker}" if marker else text
 
 
 def _compute_authenticity_summary(facts: dict) -> dict:
@@ -6580,7 +7017,9 @@ def _append_overview_section(doc, facts: dict, flags: dict) -> None:
             if text_color:
                 _color_run(run, text_color)
         if not items:
-            doc.add_paragraph("None identified this pass.")
+            # CLAUDE.md Section B: a genuinely-empty section collapses to a
+            # single plain "Nothing found" line, not a padded placeholder.
+            doc.add_paragraph("Nothing found.")
             return
         for item in items:
             line = doc.add_paragraph()
@@ -7214,6 +7653,7 @@ def _append_group_companies_section(doc, facts: dict) -> None:
             row.cells[0].text = r["name"]
             row.cells[1].text = f"{r['role']} ({r['tenure']})"
             row.cells[2].text = str(r["link_count"])
+        _remove_fully_empty_rows(dir_table)
 
         promoter_name = ((facts.get("corporate_identity") or {}).get("promoter_name") or {}).get("value") or "This promoter"
         diagram_buf = _render_director_hub_diagram(promoter_name, director_rows)
@@ -7241,6 +7681,7 @@ def _append_group_companies_section(doc, facts: dict) -> None:
         row.cells[0].text = company.get("name", "")
         row.cells[1].text = company.get("cin", "")
         row.cells[2].text = "; ".join(company.get("basis", []))
+    _remove_fully_empty_rows(table)
 
     doc.add_paragraph()
     doc.add_paragraph(f"Source: {_citation_text(facts, _clean_source_label(check.get('url', '')) or check.get('url', ''))}")
@@ -8118,15 +8559,19 @@ def run_company_charter(
     # however many times or in whatever order the two variants render.
     out_path = os.path.join(out_dir, f"Company_Charter_{project_name}_{reg_no}_Internal.docx")
     _fill_template(reg_no, facts, out_path, doc_variant="internal")
+    internal_pdf_path = _convert_docx_to_pdf(out_path)
 
     external_out_path = os.path.join(out_dir, f"Company_Charter_{project_name}_{reg_no}_External.docx")
     _fill_template(reg_no, facts, external_out_path, doc_variant="external")
+    _convert_docx_to_pdf(external_out_path)
 
     facts_path = os.path.join(out_dir, f"Company_Charter_{project_name}_{reg_no}.facts.json")
     with open(facts_path, "w", encoding="utf-8") as f:
         json.dump(facts, f, indent=2, ensure_ascii=False)
 
-    return out_path, facts
+    # PDF is the actual final deliverable format -- fall back to the .docx
+    # path only if conversion itself failed (no Word installed, COM error).
+    return internal_pdf_path or out_path, facts
 
 
 def main() -> int:

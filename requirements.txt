@@ -8,3 +8,4 @@ pymupdf>=1.24
 pytesseract>=0.3
 Pillow>=10.0
 beautifulsoup4>=4.12
+docx2pdf>=0.1.8
