@@ -3205,6 +3205,361 @@ def _remove_paragraph(paragraph) -> None:
     p_element.getparent().remove(p_element)
 
 
+_HEADING_LEVEL_BY_STYLE = {"Heading 1": 1, "Heading 2": 2}
+
+
+def _remove_empty_section_headings(doc) -> None:
+    """Removes a Heading 1/2 paragraph if nothing but blank paragraphs
+    and other headings survive between it and the next heading of the
+    same or shallower level -- called after _apply_deferred_bullets, so
+    gap-only content has already been stripped out by then (e.g. an FSI
+    sub-section whose only two fields both turned out to be unresolved
+    gaps). Checks for a TABLE as well as paragraph text -- some sections'
+    real content lives entirely in a table (Land Identification,
+    Directors, Group Companies, ...), which doc.paragraphs alone would
+    never see, and wrongly deleting a heading that has real tabular
+    content under it would be a serious regression, not a cleanup.
+
+    Runs to a fixed point (repeats until a pass removes nothing): deleting
+    an empty child heading (e.g. "Unit / Building Summary" with nothing
+    left under it) can itself leave a PARENT heading ("RERA Core Data")
+    with nothing left either, only visible on the next pass once the
+    child is actually gone."""
+    from docx.oxml.ns import qn
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+
+    while True:
+        removed_any = False
+        body = doc.element.body
+        children = list(body)
+        heading_positions = []
+        for i, el in enumerate(children):
+            if el.tag != qn("w:p"):
+                continue
+            style = Paragraph(el, doc).style
+            if style is not None and style.name in _HEADING_LEVEL_BY_STYLE:
+                heading_positions.append((i, _HEADING_LEVEL_BY_STYLE[style.name]))
+        for idx, (pos, level) in enumerate(heading_positions):
+            end = len(children)
+            for later_pos, later_level in heading_positions[idx + 1 :]:
+                if later_level <= level:
+                    end = later_pos
+                    break
+            has_content = False
+            empty_tables = []
+            for el in children[pos + 1 : end]:
+                if el.tag == qn("w:tbl"):
+                    # A table with only its header row (no data rows --
+                    # e.g. facts["blocks"] == [], or every data row was
+                    # gap-filtered by _remove_gap_rows) is exactly as
+                    # empty as an unresolved-gap paragraph; a table with
+                    # 2+ rows has at least one real data row and counts
+                    # as content. Deliberately no early `break` here --
+                    # a section can have real paragraph content (a note
+                    # explaining why the table is empty) sitting right
+                    # next to a header-only table shell, and both need
+                    # to be seen in the same pass or the table survives
+                    # as an orphan just because the paragraph came first.
+                    if len(Table(el, doc).rows) > 1:
+                        has_content = True
+                    else:
+                        empty_tables.append(el)
+                    continue
+                if el.tag == qn("w:p") and Paragraph(el, doc).text.strip():
+                    has_content = True
+            if not has_content:
+                # The heading AND any now-orphaned header-only table in
+                # its range both go -- removing just the heading and
+                # leaving a table shell behind (a header row floating
+                # with no heading above it and no data below it) is
+                # exactly the kind of dangling clutter this function
+                # exists to prevent, not a lesser version of it.
+                for empty_table in empty_tables:
+                    body.remove(empty_table)
+                body.remove(children[pos])
+                removed_any = True
+                break  # positions are now stale; restart the scan
+            elif empty_tables:
+                # The heading survives (real content exists elsewhere in
+                # the section), but a header-only table shell alongside
+                # that content is still pure clutter -- strip just the
+                # table(s), leave the heading and real content in place.
+                for empty_table in empty_tables:
+                    body.remove(empty_table)
+                removed_any = True
+                break  # positions are now stale; restart the scan
+        if not removed_any:
+            break
+
+
+def _split_into_bullet_clauses(text: str) -> list[str]:
+    """Splits one long block of prose into short, standalone bullet-point
+    clauses at SENTENCE boundaries only -- a period followed by
+    whitespace and a capital letter/digit/quote next (so a decimal or a
+    domain like "propertyok.com" is never mistaken for a sentence end).
+    Depth-aware like _split_outside_parens, so a period INSIDE a
+    parenthetical aside never triggers a false split.
+
+    Deliberately does NOT split on semicolons (an earlier version did,
+    and it produced messy, fragmented, hard-to-read bullets -- confirmed
+    live: a two-sentence passage like "Bombay HC's search was
+    CAPTCHA-gated; e-Daakhil's search was unreachable; these two checks
+    remain unknowns." became THREE separate bullets, one of them a bare
+    lowercase continuation ("a genuine negative result, not an inability
+    to check.") that reads as a disconnected fragment rather than a
+    standalone point. A semicolon in this codebase's prose usually joins
+    two closely related clauses of the SAME thought (or is a leftover
+    dash-replacement from an earlier sanitization pass -- see
+    charter_citation_system_fixes memory), not two separate findings, so
+    splitting there produces MORE, WORSE bullets, not briefer ones. A
+    period is a real, unambiguous sentence boundary; that's the right and
+    only place to split.
+
+    This is the "informational pointers, not narrated reasoning" rule
+    from the 2026-07-30 Charter-restructure design session -- that
+    session designed it for charter_document.py's restructure, which was
+    never actually wired into production (see charter_two_builders_gotcha
+    memory); this is that same principle finally applied to the real
+    production template (_fill_template) instead."""
+    pieces = []
+    depth = 0
+    start = 0
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        if depth == 0 and ch == ".":
+            m = re.match(r"\s+(?=[A-Z0-9'\"])", text[i + 1 :])
+            if m:
+                pieces.append(text[start : i + 1].strip())
+                start = i + 1 + m.end()
+                i = start
+                continue
+        i += 1
+    pieces.append(text[start:].strip())
+    return [p for p in pieces if p]
+
+
+_GAP_PREFIXES = (
+    "not confirmed", "not disclosed", "not established", "not applicable",
+    "not yet applicable", "not computed", "not stated", "not individually tabulated",
+    "not separately disclosed", "not conclusively confirmed", "not independently confirmed",
+    "gap", "unknown",
+)
+
+
+def _looks_like_unresolved_gap(text: str) -> bool:
+    """True for text reporting an ABSENCE OF INFORMATION (a research
+    limitation -- "we don't know"); false for text reporting a confirmed,
+    POSITIVE absence of something bad ("we checked and there's no
+    litigation/discrepancy/complaint" -- a real, valuable finding, not a
+    gap, and never dropped). The distinguishing signal, confirmed against
+    every real gap-vs-finding sentence already in this pipeline's own
+    facts.json files (2026-08-03 survey of Pranami's and Lavina Estates'):
+    a genuine gap starts with "Not ..." ("Not confirmed", "Not disclosed",
+    "Not established", "Not applicable", ...), "gap", or "unknown"; a
+    positive clean finding is instead phrased "No ..." / "None ..." ("No
+    litigation was found", "No discrepancy found", "No address
+    discrepancy", "NO MahaRERA registration found" -- this pipeline's own
+    single most important finding for an unregistered project) -- which
+    always stays. Never used to silently drop a finding; only to skip
+    repeating an already-tracked gap (see facts["gaps"]/_classify_flags)
+    as a sentence in the main narrative."""
+    lowered = text.strip().lower()
+    return any(lowered.startswith(prefix) for prefix in _GAP_PREFIXES)
+
+
+def _remove_gap_rows(table, value_col: int, header_rows: int = 1) -> None:
+    """Removes any DATA row (below `header_rows`) whose `value_col` cell
+    is an unresolved gap -- same principle as narrative-bullet removal
+    (_looks_like_unresolved_gap), applied to a fixed-template Field/Value
+    -style table (Land Identification, Corporate Identity, Neighbourhood,
+    FSI Metrics) instead of a paragraph. The gap stays tracked once in
+    facts["gaps"]; this only stops it from ALSO being repeated as a bare
+    "Not disclosed" table row a reader has to scan past.
+
+    Deliberately NOT applied to every table in the document -- a
+    Director or Group-Companies table has a DIFFERENT column semantics
+    where one column reading "unknown" (e.g. a CIN not on public record)
+    does not mean the whole row (a real, named company) is worthless;
+    only call this on a table where the checked column genuinely IS the
+    row's entire payload."""
+    for row in list(table.rows[header_rows:]):
+        cell_text = row.cells[value_col].text
+        if _looks_like_unresolved_gap(cell_text):
+            table._tbl.remove(row._tr)
+
+
+def _set_paragraph_as_bullets(facts: dict, paragraph, text, *, gap_check_text: str | None = None) -> None:
+    """Renders `text` as brief bullet-point pointers instead of one
+    flowing paragraph, when it's actually long enough to benefit (splits
+    to 2+ clauses via _split_into_bullet_clauses) -- a short value
+    (splits to just one clause) is left as an ordinary paragraph, pixel-
+    identical to what _set_paragraph_text alone would have produced, and
+    updated immediately (no paragraph is inserted, so nothing shifts).
+
+    A genuinely long value is NOT split immediately, though -- it's
+    QUEUED on facts["_deferred_bullets"] and only actually inserted by
+    _apply_deferred_bullets, called once at the very end of
+    _fill_template. Confirmed live why this matters: several things later
+    in this same function (the Sources-list fill, section-consolidation,
+    the Methodology Note removal) look up doc.paragraphs by a fixed LIVE
+    index, not the stable p[N] object list this function itself uses --
+    inserting new paragraphs immediately, at an early field like
+    Executive Summary, silently shifted every later fixed-index lookup
+    and corrupted the Sources list with stale, unrelated template
+    placeholder text. Deferring every insertion until after all of that
+    has already run avoids the shift entirely.
+
+    Checked WHOLE, before any splitting -- not per-clause. A gap-only
+    field is dropped from the narrative entirely (the paragraph itself is
+    queued for removal, not left empty); the gap is still tracked once in
+    facts["gaps"]/the Monitor flag list, just never repeated as a
+    sentence here too. Confirmed live why per-clause filtering doesn't
+    work: a real field is often phrased "Not confirmed; no X was found in
+    open sources. Y is not established either." -- splitting on the
+    semicolon/period separates the "Not confirmed" lead-in from its own
+    continuation clauses, and per-clause checking then only recognizes
+    the FIRST fragment as a gap, leaving the rest as a dangling,
+    context-free bullet ("no X was found in open sources.") that reads as
+    broken. Checking gap-ness once, on the whole value, avoids this: if
+    the field opens with a gap phrase, the entire thing goes, continuation
+    clauses included; if it doesn't, every clause stays (a real finding's
+    OWN methodology caveats, e.g. "Bombay HC's search was CAPTCHA-gated,"
+    are legitimate supporting context, not something to strip out
+    individually).
+
+    `gap_check_text`, if given, is what gets checked for gap-ness INSTEAD
+    of `text` -- needed at a call site that prepends a fixed label
+    ("Collection Account of the Project (100%): {value}"), since the
+    label itself never looks like a gap even when the value is one."""
+    text = str(text)
+    check_text = str(gap_check_text) if gap_check_text is not None else text
+    if _looks_like_unresolved_gap(check_text):
+        facts.setdefault("_deferred_bullets", []).append((paragraph, []))
+        return
+
+    clauses = _split_into_bullet_clauses(text)
+    if len(clauses) <= 1:
+        _set_paragraph_text(paragraph, text)
+        return
+    facts.setdefault("_deferred_bullets", []).append((paragraph, clauses))
+
+
+def _apply_bullet_hanging_indent(paragraph) -> None:
+    """A "•" text character glued to the front of a paragraph is NOT a
+    bulleted list on its own -- with no hanging indent, a wrapped long
+    sentence flows all the way back to the left margin under the bullet,
+    which reads as an ordinary paragraph that happens to start with a
+    dot, not a genuine short pointer. Confirmed live: this is exactly
+    what the user saw and flagged as "no brief pointers," even though the
+    text itself had already been split into short clauses. left_indent
+    pulls the WHOLE paragraph in; a negative first_line_indent of the
+    same magnitude pulls just the first line (the one starting with •)
+    back out to the margin -- the standard hanging-indent bullet shape,
+    so a wrapped second line aligns under the text, not under the bullet."""
+    from docx.shared import Inches
+    pf = paragraph.paragraph_format
+    pf.left_indent = Inches(0.25)
+    pf.first_line_indent = Inches(-0.25)
+
+
+def _apply_justify(paragraph) -> None:
+    """"Aligned from both sides" -- flush against both margins, wrapped
+    lines stretched to fill the full width (Word's own "Justify" rule
+    only stretches lines that actually wrap; a short one-line heading or
+    label is untouched, so this is safe to apply broadly to narrative
+    body text without disturbing single-line content)."""
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    paragraph.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+
+
+def _justify_body_paragraphs(doc) -> None:
+    """Document-wide pass: every top-level body paragraph (never table
+    cells -- those get centered instead, see _center_all_table_cells)
+    that has NO explicit alignment already set gets justified. Skipping
+    paragraphs with an explicit alignment (e.g. a centered cover title or
+    section badge) avoids the one real regression risk: Word's "last
+    line" of a justified paragraph always renders flush-left, so
+    overwriting an intentionally-centered single-line heading with
+    JUSTIFY would visibly shift it left."""
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    for paragraph in doc.paragraphs:
+        if not paragraph.text.strip():
+            continue
+        if paragraph.paragraph_format.alignment is not None:
+            continue
+        paragraph.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+
+
+def _center_all_table_cells(doc) -> None:
+    """"Center in the table" -- every table in the document (Field/Value
+    tables, Director/Group-Companies tables, scoring tables, all of it)
+    gets its cell content centered. Table-cell writes are scattered across
+    dozens of call sites in this file (_set_cell/_set_row_cell plus many
+    direct `row.cells[i].text = ...` assignments), so this runs as a
+    single blanket pass over the finished tables rather than needing every
+    call site touched individually."""
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for paragraph in cell.paragraphs:
+                    paragraph.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+
+def _apply_deferred_bullets(facts: dict) -> None:
+    """Actually inserts the bulleted paragraphs queued by
+    _set_paragraph_as_bullets, or removes the paragraph entirely if every
+    clause turned out to be an unresolved gap (an empty `clauses` list).
+    Must run as the LAST content change in _fill_template, after every
+    fixed-index doc.paragraphs[...] lookup elsewhere in that function has
+    already happened -- see _set_paragraph_as_bullets' own docstring for
+    why.
+
+    Confirmed live: roughly half of this template's target paragraph
+    slots (e.g. p[41]/p[42]/.../p[51], the RERA Compliance/Local Planning
+    fields) already carry native Word list numbering ("List Paragraph"
+    style with a real numPr) baked in at template-authoring time --
+    unconditionally prepending a manual "• " text character produced a
+    visible DOUBLE bullet ("•  • NO MahaRERA registration found.") on
+    those specific slots. Detected here instead of assumed: a paragraph
+    that already has numPr gets its clauses split with NO added "• "
+    text and NO manual hanging-indent (Word's own list style already
+    supplies both, correctly, via the numbering definition); a plain
+    paragraph with no numPr keeps this session's original text-based
+    "• " + explicit hanging-indent treatment. Same pattern
+    _fill_variable_paragraphs already uses for exactly this reason on its
+    own overflow rows."""
+    for paragraph, clauses in facts.pop("_deferred_bullets", []):
+        if not clauses:
+            _remove_paragraph(paragraph)
+            continue
+        num_pr = None
+        if paragraph._p.pPr is not None and paragraph._p.pPr.numPr is not None:
+            num_pr = paragraph._p.pPr.numPr
+
+        bullets = clauses if num_pr is not None else [f"• {c}" for c in clauses]
+        _set_paragraph_text(paragraph, bullets[0])
+        if num_pr is None:
+            _apply_bullet_hanging_indent(paragraph)
+        last = paragraph
+        for extra in bullets[1:]:
+            new_para = last.insert_paragraph_before("", style=paragraph.style)
+            last._p.addnext(new_para._p)
+            if num_pr is not None:
+                new_para._p.get_or_add_pPr().append(copy.deepcopy(num_pr))
+            else:
+                _apply_bullet_hanging_indent(new_para)
+            _set_paragraph_text(new_para, extra)
+            last = new_para
+
+
 # --- doc_variant consolidation primitives --------------------------------
 # A whole session's worth of "if doc_variant == external: SHORT else: LONG"
 # blocks accumulated across _fill_template and the _append_*_section
@@ -3362,6 +3717,8 @@ def _verify_external_document_quality(docx_path: str) -> list[str]:
         header_texts = [c.text.strip() for c in table.rows[0].cells]
         if header_texts[:2] == ["Bucket", "Sub-metric"] and "Weight" in header_texts:
             violations.append("Developer Score table still has a Weight column in External")
+        if header_texts[:2] == ["Bucket", "Criterion"] and "Weight" in header_texts:
+            violations.append("Documentation Confidence table still has a Weight column in External")
 
     from docx.oxml.ns import qn
     numbering_root = doc.part.numbering_part.element
@@ -3499,33 +3856,37 @@ def _fill_template(reg_no: str, facts: dict, out_path: str, doc_variant: str = "
     _set_paragraph_text(p[2], "Public Web-Sourced Edition -- Adapted for Maharashtra (MahaRERA)")
     _month_year = datetime.now().strftime('%B %Y')
     _set_paragraph_text(p[3], f"Deep Market Research (Prepared {_month_year})" if doc_variant == "external" else f"Deep Market Research -- Prepared {_month_year}")
+    # p[5] (Methodology Note) is deleted entirely further down regardless
+    # of variant ("per request") -- never worth bulleting content that's
+    # about to be thrown away, and _apply_deferred_bullets would crash on
+    # an already-detached paragraph if it tried.
     _set_paragraph_text(p[5], facts["methodology_note"])
-    _set_paragraph_text(p[7], facts["executive_summary"])
+    _set_paragraph_as_bullets(facts, p[7], facts["executive_summary"])
     litigation_citation = _citation_text(facts, _clean_source_label(src(facts, "litigation_status")))
     litigation_text = fld(facts, "litigation_status")
-    _set_paragraph_text(p[15], f"{litigation_text} {litigation_citation}" if litigation_citation else litigation_text)
-    _set_paragraph_text(p[24], _cite(f"Road: {conn.get('road', '')}", "distance", facts=facts))
-    _set_paragraph_text(p[25], _cite(f"Rail: {conn.get('rail', '')}", "distance", facts=facts))
-    _set_paragraph_text(p[26], _cite(f"Metro: {conn.get('metro', '')}", "distance", facts=facts))
-    _set_paragraph_text(p[27], _cite(f"Air: {conn.get('air', '')}", "distance", facts=facts))
-    _set_paragraph_text(p[30], facts["social_infrastructure"])
-    _set_paragraph_text(p[32], facts["fsi_governing_framework"])
-    _set_paragraph_text(p[33], facts["fsi_interpretation"])
-    _set_paragraph_text(p[37], _cite(f"Planning approval sequence: {rs.get('planning_approval_sequence', '')}", "project_registration", facts=facts))
+    _set_paragraph_as_bullets(facts, p[15], f"{litigation_text} {litigation_citation}" if litigation_citation else litigation_text)
+    _set_paragraph_as_bullets(facts, p[24], _cite(f"Road: {conn.get('road', '')}", "distance", facts=facts), gap_check_text=conn.get("road", ""))
+    _set_paragraph_as_bullets(facts, p[25], _cite(f"Rail: {conn.get('rail', '')}", "distance", facts=facts), gap_check_text=conn.get("rail", ""))
+    _set_paragraph_as_bullets(facts, p[26], _cite(f"Metro: {conn.get('metro', '')}", "distance", facts=facts), gap_check_text=conn.get("metro", ""))
+    _set_paragraph_as_bullets(facts, p[27], _cite(f"Air: {conn.get('air', '')}", "distance", facts=facts), gap_check_text=conn.get("air", ""))
+    _set_paragraph_as_bullets(facts, p[30], facts["social_infrastructure"])
+    _set_paragraph_as_bullets(facts, p[32], facts["fsi_governing_framework"])
+    _set_paragraph_as_bullets(facts, p[33], facts["fsi_interpretation"])
+    _set_paragraph_as_bullets(facts, p[37], _cite(f"Planning approval sequence: {rs.get('planning_approval_sequence', '')}", "project_registration", facts=facts), gap_check_text=rs.get("planning_approval_sequence", ""))
     allotment_text = f"Allotment mechanics: {rs.get('allotment_mechanics', '')}"
-    _set_paragraph_text(p[41], rc.get("registration_summary", ""))
-    _set_paragraph_text(p[42], f"Collection Account of the Project (100%): {rc.get('collection_account', '')}")
-    _set_paragraph_text(p[43], f"Separate/Transaction RERA escrow sub-accounts: {rc.get('escrow_subaccounts', '')}")
-    _set_paragraph_text(p[44], f"Litigations/complaints/appeals related to the project: {rc.get('litigations_complaints_appeals', '')}")
-    _set_paragraph_text(p[45], rc.get("statutory_declaration", ""))
-    _set_paragraph_text(p[46], f"Construction progress: {rc.get('construction_progress', '')}")
-    _set_paragraph_text(p[49], _cite(f"Authority of record: {lp.get('authority_of_record', '')}", "project_registration", facts=facts))
-    _set_paragraph_text(p[50], _cite(f"Project type: {lp.get('project_type', '')}", "project_registration", facts=facts))
-    _set_paragraph_text(p[51], _cite(f"Professionals of record: {lp.get('professionals_of_record', '')}", "project_registration", facts=facts))
-    _set_paragraph_text(p[54], _cite(facts["micro_market_overview"], "pricing", "market_trend", facts=facts))
-    _set_paragraph_text(p[56], _cite(facts["area_intelligence_trend"], "market_trend", "pricing", facts=facts))
-    _set_paragraph_text(p[61], _cite(facts["unit_summary_note"], "project_registration", facts=facts))
-    _set_paragraph_text(p[64], facts["documents_absent_note"])
+    _set_paragraph_as_bullets(facts, p[41], rc.get("registration_summary", ""))
+    _set_paragraph_as_bullets(facts, p[42], f"Collection Account of the Project (100%): {rc.get('collection_account', '')}", gap_check_text=rc.get("collection_account", ""))
+    _set_paragraph_as_bullets(facts, p[43], f"Separate/Transaction RERA escrow sub-accounts: {rc.get('escrow_subaccounts', '')}", gap_check_text=rc.get("escrow_subaccounts", ""))
+    _set_paragraph_as_bullets(facts, p[44], f"Litigations/complaints/appeals related to the project: {rc.get('litigations_complaints_appeals', '')}", gap_check_text=rc.get("litigations_complaints_appeals", ""))
+    _set_paragraph_as_bullets(facts, p[45], rc.get("statutory_declaration", ""))
+    _set_paragraph_as_bullets(facts, p[46], f"Construction progress: {rc.get('construction_progress', '')}", gap_check_text=rc.get("construction_progress", ""))
+    _set_paragraph_as_bullets(facts, p[49], _cite(f"Authority of record: {lp.get('authority_of_record', '')}", "project_registration", facts=facts), gap_check_text=lp.get("authority_of_record", ""))
+    _set_paragraph_as_bullets(facts, p[50], _cite(f"Project type: {lp.get('project_type', '')}", "project_registration", facts=facts), gap_check_text=lp.get("project_type", ""))
+    _set_paragraph_as_bullets(facts, p[51], _cite(f"Professionals of record: {lp.get('professionals_of_record', '')}", "project_registration", facts=facts), gap_check_text=lp.get("professionals_of_record", ""))
+    _set_paragraph_as_bullets(facts, p[54], _cite(facts["micro_market_overview"], "pricing", "market_trend", facts=facts))
+    _set_paragraph_as_bullets(facts, p[56], _cite(facts["area_intelligence_trend"], "market_trend", "pricing", facts=facts))
+    _set_paragraph_as_bullets(facts, p[61], _cite(facts["unit_summary_note"], "project_registration", facts=facts))
+    _set_paragraph_as_bullets(facts, p[64], facts["documents_absent_note"])
 
     # Every entry below is "one template paragraph, either rendered with its
     # Internal text or deleted outright for External" -- previously ~7
@@ -3540,15 +3901,15 @@ def _fill_template(reg_no: str, facts: dict, out_path: str, doc_variant: str = "
     # mechanism that happens to land in the same slot.
     _always_suppress = lambda _facts: True
     _external_suppressed_paragraphs = (
-        # (index, text_fn(facts) -> str, suppress_for_external_fn(facts) -> bool, why)
-        (12, lambda f: f["address_discrepancy_note"], _always_suppress),
-        (13, lambda f: f["corporate_registry_cross_check"], _always_suppress),
-        (17, lambda f: _cite(f["location_coordinates_note"], "distance", facts=f), _always_suppress),
-        (18, lambda f: "Map screenshot not embedded -- a live map cannot be fetched programmatically, so distances below were sourced from mapping-service queries instead (see Sources).", _always_suppress),
-        (36, lambda f: _cite(f"Governing act: {rs.get('governing_act', '')}", "project_registration", facts=f), _always_suppress),
-        (38, lambda f: allotment_text, lambda f: _externalize_prose(f, allotment_text) == ""),
-        (58, lambda f: f.get("rera_scraping_note", f"Extracted directly from the live MahaRERA public project page for registration number {reg_no}."), _always_suppress),
-        (63, lambda f: f["documents_reviewed_note"], _always_suppress),
+        # (index, text_fn(facts) -> str, suppress_for_external_fn(facts) -> bool, gap_check_fn(facts) -> str | None)
+        (12, lambda f: f["address_discrepancy_note"], _always_suppress, None),
+        (13, lambda f: f["corporate_registry_cross_check"], _always_suppress, None),
+        (17, lambda f: _cite(f["location_coordinates_note"], "distance", facts=f), _always_suppress, None),
+        (18, lambda f: "Map screenshot not embedded -- a live map cannot be fetched programmatically, so distances below were sourced from mapping-service queries instead (see Sources).", _always_suppress, None),
+        (36, lambda f: _cite(f"Governing act: {rs.get('governing_act', '')}", "project_registration", facts=f), _always_suppress, lambda f: rs.get("governing_act", "")),
+        (38, lambda f: allotment_text, lambda f: _externalize_prose(f, allotment_text) == "", lambda f: rs.get("allotment_mechanics", "")),
+        (58, lambda f: f.get("rera_scraping_note", f"Extracted directly from the live MahaRERA public project page for registration number {reg_no}."), _always_suppress, None),
+        (63, lambda f: f["documents_reviewed_note"], _always_suppress, None),
     )
     # Why each is suppressed for External (kept here, once, rather than
     # repeated as a comment on every removed if/else block above):
@@ -3572,11 +3933,14 @@ def _fill_template(reg_no: str, facts: dict, out_path: str, doc_variant: str = "
     #     is research-scope bookkeeping, not a project fact.
     # Internal keeps every one of these in full -- that process detail IS
     # the point there.
-    for _idx, _text_fn, _suppress_fn in _external_suppressed_paragraphs:
+    for _idx, _text_fn, _suppress_fn, _gap_check_fn in _external_suppressed_paragraphs:
         if doc_variant == "external" and _suppress_fn(facts):
             _paragraphs_to_remove.append(p[_idx])
         else:
-            _set_paragraph_text(p[_idx], _text_fn(facts))
+            _set_paragraph_as_bullets(
+                facts, p[_idx], _text_fn(facts),
+                gap_check_text=(_gap_check_fn(facts) if _gap_check_fn else None),
+            )
 
     gaps = facts.get("gaps", [])
     if facts.get("_doc_variant") == "external":
@@ -3623,6 +3987,7 @@ def _fill_template(reg_no: str, facts: dict, out_path: str, doc_variant: str = "
         # path verbatim -- cleaned to a short label here, same convention as
         # every other citation added below.
         _set_cell(t[0], row, 2, _citation_text(facts, _clean_source_label(src(li, key))) or "")
+    _remove_gap_rows(t[0], value_col=1)
 
     for row, key in zip(range(1, 10), (
         "promoter_name", "organization_type", "cin_llpin", "registered_office_main",
@@ -3644,9 +4009,13 @@ def _fill_template(reg_no: str, facts: dict, out_path: str, doc_variant: str = "
         # explicit touch here. Internal leaves the template's own text
         # completely alone, as always.
         _set_cell(t[1], 3, 0, _externalize_prose(facts, t[1].rows[3].cells[0].text))
+    # Row-index-sensitive fix above must run BEFORE any row removal --
+    # removing a row shifts every later fixed index.
+    _remove_gap_rows(t[1], value_col=1)
 
     for row, key in zip(range(1, 5), ("east", "west", "north", "south")):
         _set_cell(t[2], row, 1, _cite(nb.get(key, ""), "project_registration", "legal_documents", facts=facts))
+    _remove_gap_rows(t[2], value_col=1)
 
     def _fill_distance_row(row, item):
         _set_row_cell(row, 0, item["landmark"])
@@ -3670,6 +4039,7 @@ def _fill_template(reg_no: str, facts: dict, out_path: str, doc_variant: str = "
         history_row = t[4].add_row()
         _set_row_cell(history_row, 0, "Mortgage lender -- change since prior run")
         _set_row_cell(history_row, 1, lender_history_note)
+    _remove_gap_rows(t[4], value_col=1)
 
     def _fill_comparable_row(row, item):
         distance = item.get("distance_km")
@@ -3723,6 +4093,29 @@ def _fill_template(reg_no: str, facts: dict, out_path: str, doc_variant: str = "
         return line
 
     if facts.get("_doc_variant") == "external":
+        # This Sources list is built from the citation registry BEFORE
+        # _append_overview_section (called later, at the end of this
+        # function -- see its own _capture_batch call) ever runs, and that
+        # section is what registers every Overview & Flags citation (see
+        # _annotate_flag_citations). Confirmed live: without this
+        # pre-registration pass, a flag line got a real, working "[N]"
+        # marker in the body, but that citation never made it into the
+        # printed Sources list at all, since the list below was already
+        # written by the time it was registered. _register_citation is
+        # idempotent (same generic label -> same number, however many
+        # times it's called), so re-deriving these same flag texts here
+        # purely to populate the registry, then letting
+        # _append_overview_section do it again later for the real
+        # rendering, can never produce two different numbers for the same
+        # source.
+        _flags_preview = _classify_flags(facts)
+        for _flag_item in (
+            _flags_preview.get("imminent", [])
+            + _flags_preview.get("structural", [])
+            + _flags_preview.get("monitor", [])
+        ):
+            _annotate_flag_citations(facts, _externalize_prose(facts, f"• {_flag_item['text']}"))
+
         # Every "[N]" marker in the body was registered against this exact
         # list, in this exact order (see _register_citation) -- replaces
         # facts["sources"] entirely for External, since that list's
@@ -3744,7 +4137,7 @@ def _fill_template(reg_no: str, facts: dict, out_path: str, doc_variant: str = "
         for run in note_heading.runs:
             run.bold = True
         for note in facts["source_promotion_notes"]:
-            doc.add_paragraph(f"• {note}")
+            _apply_bullet_hanging_indent(doc.add_paragraph(f"• {note}"))
 
     # ---------------------------------------------------------------------
     # Section consolidation -- renames existing template headings to the
@@ -3942,6 +4335,23 @@ def _fill_template(reg_no: str, facts: dict, out_path: str, doc_variant: str = "
     # positions.
     for paragraph in _paragraphs_to_remove:
         _remove_paragraph(paragraph)
+
+    # Genuinely the LAST content change before save -- see
+    # _set_paragraph_as_bullets' own docstring for why this must run only
+    # after every fixed-index doc.paragraphs[...] lookup above (Sources
+    # list, section consolidation, Methodology Note removal) is done.
+    _apply_deferred_bullets(facts)
+
+    # Only safe AFTER _apply_deferred_bullets -- a heading whose only
+    # content was a gap-only field can't be judged empty until that
+    # field's paragraph has actually been removed.
+    _remove_empty_section_headings(doc)
+
+    # Alignment pass: flowing body text justified (both margins), table
+    # content centered. Last thing before save -- runs after every row/
+    # paragraph add-or-remove above so it sees the document's final shape.
+    _justify_body_paragraphs(doc)
+    _center_all_table_cells(doc)
 
     doc.save(out_path)
     _ACTIVE_EXTERNAL_FACTS = None
@@ -4214,9 +4624,45 @@ _DOMAIN_GENERIC = (
     ("zaubacorp.com", "ZaubaCorp (Corporate Registry)"),
     ("tofler.in", "Tofler (Corporate Registry)"),
     ("instafinancials.com", "InstaFinancials (Corporate Registry)"),
+    ("thecompanycheck.com", "TheCompanyCheck (Corporate Registry)"),
     ("ibbi.gov.in", "IBBI (Insolvency and Bankruptcy Board of India)"),
+    ("nclt.gov.in", "NCLT (National Company Law Tribunal)"),
+    ("efiling.nclt.gov.in", "NCLT (National Company Law Tribunal)"),
+    ("indiankanoon.org", "Indian Kanoon (Case Law Record)"),
+    ("insolvencytracker.in", "Insolvency Tracker"),
+    ("linkedin.com", "LinkedIn (Professional Profile)"),
+    ("rocketreach.co", "RocketReach (Organisation Directory)"),
+    ("igrmaharashtra.gov.in", "IGR Maharashtra (Dept. of Registration & Stamps)"),
     ("maharerait.maharashtra.gov.in", "MahaRERA"),
     ("maharera.maharashtra.gov.in", "MahaRERA"),
+)
+
+# Keyword -> canonical domain, for matching an ORGANISATION NAME as it might
+# appear in free-form flag/gap prose (e.g. "TheCompanyCheck lists three
+# charges...") back to the SAME generic label a structured {"value",
+# "source"} citation elsewhere in this same document would produce for that
+# source -- e.g. company_profile_check.url citing thecompanycheck.com. This
+# is what lets a flag item and an Entity Profile table row citing the same
+# real-world source share the exact same "[N]", rather than minting a
+# second, inconsistent citation number for a name-only mention. Checked in
+# order, longest/most-specific phrase first, against the lowercased flag
+# text -- never against a domain (that path already goes through
+# _clean_source_label/_generic_one_label directly).
+_FLAG_TEXT_ORG_ALIASES = (
+    ("thecompanycheck", "thecompanycheck.com"),
+    ("instafinancials", "instafinancials.com"),
+    ("zaubacorp", "zaubacorp.com"),
+    ("tofler.in", "tofler.in"),
+    ("tofler", "tofler.in"),
+    ("ibbi", "ibbi.gov.in"),
+    ("nclt", "nclt.gov.in"),
+    ("indian kanoon", "indiankanoon.org"),
+    ("indiankanoon", "indiankanoon.org"),
+    ("insolvency tracker", "insolvencytracker.in"),
+    ("linkedin", "linkedin.com"),
+    ("rocketreach", "rocketreach.co"),
+    ("igr maharashtra", "igrmaharashtra.gov.in"),
+    ("maharera", "maharera.maharashtra.gov.in"),
 )
 _DOCUMENT_KEYWORD_GENERIC = (
     ("form b", "Form B Declaration"),
@@ -4259,6 +4705,19 @@ def _generic_one_label(label: str) -> str:
             return generic
     if lowered.endswith(".pdf") or lowered.endswith(".json"):
         return "Project record"
+    # A bare organisation NAME (e.g. "TheCompanyCheck", written by hand in a
+    # source field) rather than a domain/URL -- resolve it to the SAME
+    # generic label its domain form would produce (see _DOMAIN_GENERIC),
+    # so "TheCompanyCheck" and "thecompanycheck.com" cited for the same
+    # real source in two different facts.json fields converge on one
+    # citation number instead of minting two. Checked last, after every
+    # more specific table above, so it can never shadow a real match.
+    for keyword, domain in _FLAG_TEXT_ORG_ALIASES:
+        if keyword in lowered:
+            for d, generic in _DOMAIN_GENERIC:
+                if d == domain:
+                    return generic
+            return domain
     return core
 
 
@@ -4273,6 +4732,43 @@ def _register_citation(facts: dict, generic_label: str) -> str:
         registry["index"][generic_label] = len(registry["order"]) + 1
         registry["order"].append(generic_label)
     return f"[{registry['index'][generic_label]}]"
+
+
+def _annotate_flag_citations(facts: dict, text: str) -> str:
+    """External-variant only (returns `text` unchanged for Internal):
+    Overview & Flags' Imminent/Structural/Monitor items come out of
+    _classify_flags as {"text", "field"} -- a facts.json path, never a
+    source -- so unlike every other claim in this Charter, a flag line
+    naming a real source in plain prose (e.g. "Tofler.in's own charges
+    section states...") never resolved to a numbered "[N]", even when
+    that exact same source is cited elsewhere in this same document.
+    Confirmed live: this is why the External Charter's flag lists showed
+    zero citations while the rest of the document did not.
+
+    This scans the already-externalized flag text for a known set of
+    organisation-name mentions (_FLAG_TEXT_ORG_ALIASES) and, for the
+    FIRST mention of each distinct source, inserts the SAME "[N]" that
+    source's own structured citation elsewhere in this document already
+    uses (via the same _generic_one_label/_register_citation this whole
+    Charter runs on) -- never a fabricated citation for a source that
+    isn't actually named in the text. A source mentioned twice in one
+    flag (or under two aliases, e.g. "Tofler.in" then "Tofler") is only
+    cited once, matching how a citation attaches once per claim
+    elsewhere in this Charter rather than once per word."""
+    if facts.get("_doc_variant") != "external":
+        return text
+
+    cited_domains = set()
+    for keyword, domain in _FLAG_TEXT_ORG_ALIASES:
+        if domain in cited_domains:
+            continue
+        match = re.search(re.escape(keyword), text, re.IGNORECASE)
+        if not match:
+            continue
+        marker = _register_citation(facts, _generic_one_label(domain))
+        text = text[: match.end()] + marker + text[match.end() :]
+        cited_domains.add(domain)
+    return text
 
 
 def _citation_text(facts: dict, cleaned_label: str | None) -> str | None:
@@ -4638,6 +5134,18 @@ def _externalize_prose(facts: dict, text: str) -> str:
     for pattern, replacement in _EXTERNAL_PROSE_SUBSTITUTIONS:
         text = _replace_preserving_case(pattern, replacement, text)
     text = _INTERNAL_FIELD_ANNOTATION_RE.sub("", text)
+    # Last-resort fallback, after every curated rewrite above: those are
+    # keyed to specific, hand-checked WHOLE sentences, so any text that
+    # doesn't match one exactly -- new facts.json prose never seen before,
+    # or an old registered sentence now split into a smaller fragment by
+    # _set_paragraph_as_bullets -- would otherwise carry its " -- "/" — "
+    # straight through and fail the External quality gate. A semicolon is
+    # grammatical wherever a dash joins two related clauses or introduces
+    # an explanation, and unlike a comma it can't create a comma splice --
+    # same reasoning charter_document.py's _Builder.prose() already uses
+    # for the same purpose, just never added here until this was actually
+    # confirmed to matter live.
+    text = text.replace(" -- ", "; ").replace(" — ", "; ").replace("—", "; ")
     return text
 
 
@@ -5684,7 +6192,7 @@ def _score_rera_compliance(facts: dict) -> dict:
     extension status alone never blocks scoring."""
     complaint_count, appeal_count = _parse_complaint_appeal_counts(facts)
     if complaint_count is None or appeal_count is None:
-        return {"score": None, "tier": None, "reason": "This project's complaint/appeal counts are not confidently parseable from rera_core_fields -- both are needed to score RERA compliance friction."}
+        return {"score": None, "tier": None, "reason": "This project's complaint/appeal counts are not confidently parseable from rera_core_fields; both are needed to score RERA compliance friction."}
 
     _, was_extended = _parse_completion_slippage(facts)
     points = 25 if was_extended else 0
@@ -6076,12 +6584,14 @@ def _append_overview_section(doc, facts: dict, flags: dict) -> None:
             return
         for item in items:
             line = doc.add_paragraph()
+            _apply_bullet_hanging_indent(line)
             # "(see gaps[0])" / "(see rera_core_fields.litigations_per_record)"
             # are raw internal facts.json paths -- meaningless (and
             # unprofessional-looking) to a client, so External drops the
             # annotation entirely rather than trying to reword it.
             raw_text = _variant(facts, f"• {item['text']} (see {item['field']})", f"• {item['text']}")
-            run = line.add_run(_externalize_prose(facts, raw_text))
+            rendered = _annotate_flag_citations(facts, _externalize_prose(facts, raw_text))
+            run = line.add_run(rendered)
             if text_color:
                 _color_run(run, text_color)
 
