@@ -1604,15 +1604,17 @@ def _section_14_scoring_detail(b: _Builder, developer_score: dict) -> None:
                 criterion = dc_criteria.get(key)
                 if not criterion:
                     continue
-                dc_rows.append([
-                    bucket_name,
-                    _DOC_CONFIDENCE_CRITERION_LABELS.get(key, key),
-                    f"{criterion.get('weight', '')}%",
+                row = [bucket_name, _DOC_CONFIDENCE_CRITERION_LABELS.get(key, key)]
+                if show_weight:
+                    row.append(f"{criterion.get('weight', '')}%")
+                row += [
                     f"{round(criterion['score'])}/100" if criterion.get("score") is not None else "Not rated",
                     criterion.get("note") or "",
-                ])
+                ]
+                dc_rows.append(row)
         if dc_rows:
-            b.table(["Bucket", "Criterion", "Weight", "Score", "Basis"], dc_rows)
+            dc_headers = ["Bucket", "Criterion"] + (["Weight"] if show_weight else []) + ["Score", "Basis"]
+            b.table(dc_headers, dc_rows)
         for skipped in (doc_confidence.get("skipped_criteria") or []):
             b.flag_line(
                 f"Not scored: {_DOC_CONFIDENCE_CRITERION_LABELS.get(skipped, skipped)}. Excluded from this "
