@@ -286,7 +286,7 @@ _FILE_PATH_RE = re.compile(r"(output/[^;]+?\.pdf)", re.IGNORECASE)
 
 
 def _polish_source(source, doc_variant) -> str:
-    source = (source or "").strip()
+    source = _strip_identifier_annotations(source)
     if not source or source.lower().startswith("gap"):
         return ""
     match = _FILE_PATH_RE.search(source)
@@ -305,6 +305,34 @@ def _polish_source(source, doc_variant) -> str:
     return path
 
 
+_PARENTHETICAL_RE = re.compile(r"\s*\(([^)]*)\)")
+
+
+def _strip_identifier_annotations(source: str) -> str:
+    """Removes raw code identifiers that facts.json `source` strings carry as
+    parenthetical annotations, e.g. "MahaRERA project registration data
+    (projectLegalLandAddressDetails.boundariesSouth)".
+
+    CLAUDE.md Section B forbids a JSON key, field name or dotted path in
+    EITHER document. These were reaching the page, and the dotted form also
+    made verify_charter_report_quality report a spurious "bare-domain
+    mention": "...Details.boundariesSouth" pattern-matches a hostname, so the
+    gate was right for the wrong reason. Both forms are stripped, not just the
+    dotted one the gate happens to notice -- otherwise the undotted
+    "(projectLegalLandAddressDetails)" keeps shipping silently.
+
+    Human annotations ("Performa A-1", "First Schedule") contain a space and
+    are kept. Shares cc._is_identifier_annotation so the two builders cannot
+    drift on what counts as code."""
+    def _drop(match):
+        return "" if cc._is_identifier_annotation(match.group(0)) else match.group(0)
+
+    cleaned = _PARENTHETICAL_RE.sub(_drop, source or "")
+    # Tidy separators left behind by a removed trailing annotation.
+    cleaned = re.sub(r"\s+([;,])", r"\1", cleaned)
+    return cleaned.strip(" ;,-")
+
+
 def _inline_citation_label(source: str) -> str:
     """Short, readable inline-citation text for the Internal variant, e.g.
     "(per ZaubaCorp company profile)" or "(per zaubacorp.com)" -- Internal
@@ -313,7 +341,7 @@ def _inline_citation_label(source: str) -> str:
     already present before a URL (e.g. "ZaubaCorp company profile --
     https://...") over the bare domain, same preference order _harvardish
     uses for the References-list line."""
-    source = (source or "").strip()
+    source = _strip_identifier_annotations(source)
     if not source or source.lower().startswith("gap"):
         return ""
     match = _FILE_PATH_RE.search(source)
@@ -993,7 +1021,16 @@ def _cited_field_rows(group: dict) -> list:
             value = str(field.get("value") or "").strip()
             if not value:
                 continue
-            rows.append([cd._field_display_name(key), (value, field.get("source"))])
+            source = field.get("source")
+            if source:
+                # Strip the value's own inline "(per ...)" only when a source
+                # is present, because that source renders as a citation and
+                # the inline mention then repeats what the citation already
+                # says. On a value with no source the inline attribution is
+                # its only attribution and has to stay -- the same distinction
+                # verify_charter_report_quality's own check is drawing.
+                value = _strip_redundant_attribution(value)
+            rows.append([cd._field_display_name(key), (value, source)])
         elif field:
             rows.append([cd._field_display_name(key), str(field)])
     return rows
