@@ -4460,6 +4460,129 @@ def _scrub_clean_checks(facts: dict) -> dict:
     return changed
 
 
+# ---------------------------------------------------------------------------
+# Facts normalization -- three specific misfilings, corrected before render.
+#
+# Unlike the clean-check scrubber above, these are NOT reversed before the
+# facts file is persisted. A scrub removes information from the page and the
+# record must keep it; a relocation moves the same text to the field it always
+# belonged in, so nothing is lost and the corrected record is the better one.
+# All three are idempotent: once moved, the source no longer matches.
+# ---------------------------------------------------------------------------
+
+# "The two 6 March 2024 orders sometimes referenced as a 'merge order' are
+# administrative Deputy Registrar of Co-operative Societies actions
+# (amalgamating ... under the Maharashtra Co-operative Societies Act, 1960),
+# not litigation or a tribunal proceeding."
+_MERGE_ORDER_SENTENCE_RE = re.compile(
+    r"[^.]*\bDeputy Registrar of Co-?operative Societies\b[^.]*\.(?:\s|$)",
+    re.IGNORECASE,
+)
+
+
+def _relocate_merge_orders(facts: dict) -> bool:
+    """Moves society-amalgamation orders out of litigation_status.
+
+    CLAUDE.md Section B, "Ruled-out items survive, in the right section",
+    names this exact case: "Deputy Registrar society-amalgamation orders are
+    land assembly, not litigation - they belong under Land Identification".
+    Sitting in litigation_status, they existed only to be denied ("...not
+    litigation or a tribunal proceeding"); under Land Identification they read
+    as what they are, which is how the two plots became one."""
+    litigation = facts.get("litigation_status")
+    if not isinstance(litigation, dict):
+        return False
+    value = litigation.get("value") or ""
+    match = _MERGE_ORDER_SENTENCE_RE.search(value)
+    if not match:
+        return False
+
+    # Strip a leading closing quote/bracket: the preceding sentence can end
+    # "...on the said Land.'", so the match legitimately begins after that
+    # period but before the quote that closes it.
+    sentence = match.group(0).strip().lstrip("'\"’”) ").strip()
+    litigation["value"] = (value[: match.start()] + value[match.end():]).strip()
+
+    # Reframed on arrival: the trailing "not litigation or a tribunal
+    # proceeding" only made sense as a denial in the section it just left.
+    sentence = re.sub(r",?\s*not litigation or a tribunal proceeding\.?\s*$", ".", sentence).strip()
+    sentence = re.sub(r"^The two", "The two", sentence)
+
+    land = facts.setdefault("land_identification", {})
+    existing = land.get("land_assembly")
+    if isinstance(existing, dict):
+        return False  # already relocated on an earlier pass
+    land["land_assembly"] = {
+        "value": sentence,
+        "source": (litigation.get("source") or ""),
+    }
+    return True
+
+
+def _point_rera_landowner_at_identity_table(facts: dict) -> bool:
+    """Replaces RERA Core Data's promoter_land_owner_investor with a pointer.
+
+    It restates the Corporate/Promoter Identity table's "Landowner / Investor
+    on record" row almost verbatim -- same chain, same conclusion, different
+    wording. CLAUDE.md Section B, "Say it once": a fact appears in exactly one
+    place, and a second mention is a pointer, never a restatement."""
+    core = facts.get("rera_core_fields")
+    corp = facts.get("corporate_identity") or {}
+    if not isinstance(core, dict):
+        return False
+    current = (core.get("promoter_land_owner_investor") or "").strip()
+    other = ((corp.get("landowner_investor") or {}) if isinstance(corp.get("landowner_investor"), dict) else {}).get("value", "")
+    if not current or not other.strip():
+        return False
+    if current.startswith("See the Corporate"):
+        return False  # already a pointer
+    core["promoter_land_owner_investor"] = (
+        "See the Corporate/Promoter Identity table's Landowner / Investor row, "
+        "which sets out the ownership chain in full."
+    )
+    return True
+
+
+def _merged_mortgage_value(facts: dict, fsi_metrics: dict) -> tuple:
+    """Collapses fsi_metrics.mortgage_area and fsi_metrics.mortgage_lender into
+    one "Mortgage / charge on the land" value, returning (text, citation).
+
+    Kept as a render-time merge rather than a facts rewrite because the two
+    fields have genuinely different shapes -- mortgage_area is plain text,
+    mortgage_lender is {value, source} and feeds _diff_mortgage_lender's
+    run-over-run comparison, which needs the field to keep existing.
+
+    Order matters: whatever is left after the clean-check scrubber is a
+    finding, and findings lead. Only the lender field carries a source, so
+    that is the citation for the merged row."""
+    area = (fsi_metrics.get("mortgage_area") or "").strip()
+    lender_field = fsi_metrics.get("mortgage_lender")
+    lender = ((lender_field or {}).get("value") or "").strip() if isinstance(lender_field, dict) else ""
+
+    parts = [p for p in (area, lender) if p]
+    # Both fields habitually open on the same "None disclosed" phrasing; if the
+    # scrubber left them saying substantially the same thing, print it once.
+    if len(parts) == 2 and (parts[0].startswith(parts[1][:40]) or parts[1].startswith(parts[0][:40])):
+        parts = [max(parts, key=len)]
+    text = " ".join(parts).strip() or "None disclosed."
+
+    citation = None
+    if isinstance(lender_field, dict):
+        citation = _citation_text(facts, _clean_source_label(lender_field.get("source") or ""))
+    return text, citation
+
+
+def _normalize_misfiled_facts(facts: dict) -> list:
+    """Runs every facts correction and returns the names of those that fired,
+    for the caller to log. Safe to call repeatedly."""
+    applied = []
+    if _relocate_merge_orders(facts):
+        applied.append("merge_orders_to_land_identification")
+    if _point_rera_landowner_at_identity_table(facts):
+        applied.append("rera_landowner_pointer")
+    return applied
+
+
 def _is_cited_absence(text: str) -> bool:
     """True when a rendered paragraph both reports a nothing AND cites a source
     for it -- the one clean-check failure that hard-fails an External save.
@@ -4519,6 +4642,12 @@ def _fill_template(
     # run_company_charter renders twice and must restore from the FIRST pass;
     # it restores and pops this key before persisting .facts.json, so the
     # record keeps what the page drops.
+    # Corrections first, scrub second: relocating the merge-order sentence out
+    # of litigation_status changes what the scrubber then sees there (what is
+    # left is a bare Form B "no litigation" declaration, which is a clean check
+    # and goes). Running them the other way round would leave that behind.
+    _normalize_misfiled_facts(facts)
+
     _scrubbed = _scrub_clean_checks(facts)
     if _scrubbed and not facts.get("_pre_scrub_narrative"):
         facts["_pre_scrub_narrative"] = _scrubbed
@@ -4711,6 +4840,17 @@ def _fill_template(
         # path verbatim -- cleaned to a short label here, same convention as
         # every other citation added below.
         _set_cell(t[0], row, 2, _citation_text(facts, _clean_source_label(src(li, key))) or "")
+
+    # Grown row: how the plots were assembled (see _relocate_merge_orders).
+    # The template predates this field, which only exists because society
+    # amalgamation orders were being filed under litigation_status.
+    assembly = fld(li, "land_assembly")
+    if assembly:
+        assembly_row = t[0].add_row()
+        _set_row_cell(assembly_row, 0, "Land assembly")
+        _set_row_cell(assembly_row, 1, assembly)
+        _set_row_cell(assembly_row, 2, _citation_text(facts, _clean_source_label(src(li, "land_assembly"))) or "")
+
     _remove_gap_rows(t[0], value_col=1)
 
     for row, key in zip(range(1, 10), (
@@ -4750,14 +4890,17 @@ def _fill_template(
 
     for row, key in zip(range(1, 6), ("net_land_area", "approved_bua", "sanctioned_bua", "mortgage_area", "implied_fsi")):
         _set_cell(t[4], row, 1, fsi_m.get(key, ""))
-    mortgage_lender_value = fld(fsi_m, "mortgage_lender")
-    if mortgage_lender_value:
-        # Grown row, not a fixed template slot -- this field is new (see
-        # _CHARTER_FACTS_SCHEMA note) and the template predates it.
-        lender_row = t[4].add_row()
-        _set_row_cell(lender_row, 0, "Mortgage lender (if disclosed)")
-        lender_citation = _citation_text(facts, _clean_source_label(src(fsi_m, "mortgage_lender")))
-        _set_row_cell(lender_row, 1, f"{mortgage_lender_value} {lender_citation}" if lender_citation else mortgage_lender_value)
+
+    # One row, not two. "Mortgage area" and "Mortgage lender" sat adjacent and
+    # both reported the same absence -- CLAUDE.md Section B: "Two table rows
+    # must not both exist to report the same absence (Mortgage area and
+    # Mortgage lender both reading 'none' is one row's worth of information)."
+    # The row that survives is the one carrying the finding: development
+    # agreements permit the developer to mortgage its free-sale area, and no
+    # mortgage has been taken. A live right is a finding even unexercised.
+    mortgage_value, mortgage_citation = _merged_mortgage_value(facts, fsi_m)
+    _set_cell(t[4], 4, 0, "Mortgage / charge on the land")
+    _set_cell(t[4], 4, 1, f"{mortgage_value} {mortgage_citation}" if mortgage_citation else mortgage_value)
     lender_history_note = facts.get("mortgage_lender_history_note")
     if lender_history_note:
         history_row = t[4].add_row()
@@ -7704,7 +7847,17 @@ def _append_counterparty_summary(doc, facts: dict) -> None:
     if ibbi_check and ibbi_check.get("found_process") is not None:
         _ensure_heading()
         if ibbi_check["found_process"] is False:
-            doc.add_paragraph(f"IBBI insolvency status: clean{_sep} \"{ibbi_check.get('status_text', '')}\" (full detail in Diligence Appendix).")
+            # No pointer to the Appendix on a clean result: that section now
+            # collapses to "Nothing found." (see _append_ibbi_check_section),
+            # so promising "full detail" there would send the reader to an
+            # empty page. This line is the verdict CLAUDE.md's "Say it once"
+            # rule asks for, and on a clean check it is the whole story.
+            # The raw status string is still glossed in place, per "Gloss raw
+            # status strings".
+            doc.add_paragraph(
+                f"IBBI insolvency status: clean{_sep} the register returns "
+                f"\"{ibbi_check.get('status_text', '')}\", meaning no insolvency process is open against this promoter."
+            )
         else:
             doc.add_paragraph(f"IBBI insolvency status: a record was found against this CIN{_sep} see Diligence Appendix for the raw detail (not auto-classified).")
 
