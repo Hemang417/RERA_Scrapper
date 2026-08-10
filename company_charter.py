@@ -3664,6 +3664,41 @@ def _remove_fully_empty_rows(table, header_rows: int = 1) -> None:
             table._tbl.remove(row._tr)
 
 
+# Maps what a clause is ABOUT to the facts["sources"] topic that can support
+# it. Ordered: the first pattern that matches wins, so the more specific
+# subjects come first. Used only when no field-level source exists -- see
+# _set_paragraph_as_bullets. Anything not matched here stays uncited on
+# purpose; Section C would rather have a missing marker than a wrong one.
+_CLAUSE_TOPIC_PATTERNS = (
+    (r"\b(?:CRISIL|ICRA|credit rating|rating rationale|downgrade[ds]?)\b", ("credit_rating",)),
+    (r"\b(?:insolvency|IBBI|NCLT|CIRP)\b", ("insolvency_status",)),
+    (r"\b(?:title|encumbrance|sale deed|conveyance|lis pendens|MHADA|land|plot|CTS)\b", ("land_title", "legal_documents")),
+    (r"\b(?:FSI|floor space|built-up|BUA|sanctioned plan|IOD|DCPR|setback|fungible)\b", ("legal_documents",)),
+    (r"\b(?:sold|unsold|units?|carpet area|booking|inventory|completion|quarterly)\b", ("project_registration",)),
+    (r"\b(?:director|CIN|incorporat|registered office|shareholding|paid-up|authorized capital)\b", ("company_profile",)),
+    (r"\b(?:price|pricing|rate|psf|per sq)\b", ("pricing", "market_trend")),
+    (r"\b(?:school|college|hospital|mall|station|metro|connectivity|locality|neighbourhood|located|situated|complex)\b", ("distance", "market_trend")),
+    (r"\b(?:complaint|appeal|warrant|litigation)\b", ("project_registration",)),
+)
+
+
+def _clause_topic_citation(facts: dict, clause: str) -> str | None:
+    """Resolves ONE clause to the "[N]" of a source that actually supports it,
+    by what the clause is about (see _CLAUSE_TOPIC_PATTERNS).
+
+    Returns None when nothing matches, or when no source carries the matched
+    topic -- never a fabricated or merely adjacent citation. Section C's own
+    worked failure is citing the MahaRERA complaints record for a sentence
+    beginning "independent web research found...": both real sources, wrong
+    pairing. Leaving that clause uncited is the better failure."""
+    if facts.get("_doc_variant") != "external":
+        return None
+    for pattern, topics in _CLAUSE_TOPIC_PATTERNS:
+        if re.search(pattern, clause, re.IGNORECASE):
+            return _cite_marker(*topics, facts=facts)
+    return None
+
+
 def _set_paragraph_as_bullets(facts: dict, paragraph, text, *, gap_check_text: str | None = None, citation: str | None = None) -> None:
     """Renders `text` as brief bullet-point pointers instead of one
     flowing paragraph, when it's actually long enough to benefit (splits
@@ -3726,6 +3761,18 @@ def _set_paragraph_as_bullets(facts: dict, paragraph, text, *, gap_check_text: s
     clauses = [_fix_bullet_capitalization(c) for c in clauses]
     if citation and clauses:
         clauses = [f"{clause} {citation}" for clause in clauses]
+    elif clauses and facts.get("_doc_variant") == "external":
+        # No single source covers this field, so resolve per clause instead of
+        # blanket-citing. CLAUDE.md Section C is explicit that a marker "must
+        # actually support the claim" -- attaching one field-level source to
+        # eight Executive Summary bullets making eight different claims is the
+        # exact mis-citation the rule names, and a wrong marker is worse than
+        # none. _clause_topic_citation returns None when it cannot tell, which
+        # leaves the clause uncited rather than mis-cited.
+        clauses = [
+            f"{clause} {marker}" if (marker := _clause_topic_citation(facts, clause)) else clause
+            for clause in clauses
+        ]
     if len(clauses) <= 1:
         _set_paragraph_text(paragraph, clauses[0] if clauses else text)
         return
@@ -4304,7 +4351,12 @@ _ABSENCE_SHAPES = (
 _ABSENCE_RESCUE_RE = re.compile(
     r"\b(?:except|other than|save for|apart from|aside from|barring|besides|with the exception of)\b"
     r"|\b(?:\d{1,2}\s+)?(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}\b"
-    r"|\b\d{1,2}[/-]\d{1,2}[/-]\d{4}\b",
+    r"|\b\d{1,2}[/-]\d{1,2}[/-]\d{4}\b"
+    # ISO form too. Omitting it made the gate reject two real IRA Insignia
+    # paragraphs that cite dated MahaRERA orders ("Order No. 35 of 2022 (dated
+    # 2022-08-12)") -- a clause naming a specific dated instrument is a
+    # finding, which is the whole principle this rescue encodes.
+    r"|\b\d{4}-\d{2}-\d{2}\b",
     re.IGNORECASE,
 )
 
@@ -5245,6 +5297,21 @@ def _record_source_hits_and_promote(facts: dict, reg_no: str) -> list[str]:
     return promotion_notes
 
 
+def _is_identifier_annotation(annotation: str) -> bool:
+    """True when a "(...)" annotation on a source label is a raw code
+    identifier -- an API/JSON field name, a dotted path, a snake_case key --
+    rather than something written for a reader.
+
+    A human annotation contains a space ("First Schedule", "Performa A-1"); an
+    identifier is a single token, and is additionally either dotted or
+    camelCase. Both conditions are required so an ordinary one-word annotation
+    ("(notarized)") is not mistaken for code."""
+    inner = annotation.strip().strip("()").strip()
+    if not inner or " " in inner:
+        return False
+    return "." in inner or bool(re.search(r"[a-z][A-Z]", inner)) or "_" in inner
+
+
 def _clean_source_label(raw_source: str) -> str | None:
     """Turns a _FIELD_WITH_SOURCE value's raw `source` string -- a
     filesystem path under output/<reg_no>/, a URL, or several of either
@@ -5256,7 +5323,16 @@ def _clean_source_label(raw_source: str) -> str | None:
     already carries (e.g. "(First Schedule)"). Returns None for a source
     that explicitly says it's an unconfirmed gap ("gap -- see Gaps
     section") -- there is nothing to cite there, not a citation to
-    invent."""
+    invent.
+
+    One kind of annotation is dropped rather than preserved: a raw API/JSON
+    key, e.g. "MahaRERA project registration data
+    (projectLegalLandAddressDetails.boundariesSouth)". CLAUDE.md Section B
+    forbids a JSON key in EITHER document, and this one reached the page --
+    it is also what made charter_report.py's own gate report a "bare-domain
+    mention", since "...Details.boundariesSouth" pattern-matches a hostname.
+    Human annotations ("First Schedule", "Performa A-1") contain a space and
+    are kept; an identifier token never does. See _is_identifier_annotation."""
     if not raw_source or not raw_source.strip():
         return None
     if raw_source.strip().lower().startswith("gap"):
@@ -5267,7 +5343,8 @@ def _clean_source_label(raw_source: str) -> str | None:
         annotation = ""
         m = re.search(r"\s*(\([^)]*\))\s*$", piece)
         if m:
-            annotation = " " + m.group(1)
+            if not _is_identifier_annotation(m.group(1)):
+                annotation = " " + m.group(1)
             piece = piece[: m.start()].strip()
         if piece.lower().startswith(("http://", "https://")):
             domain = re.sub(r"^https?://(www\.)?", "", piece).split("/")[0]
@@ -5320,6 +5397,14 @@ _MAHARERA_JSON_GENERIC = (
     ("appeals.json", "MahaRERA appeal record"),
     ("past_experiences.json", "MahaRERA past-experience filing"),
     ("projects.json", "MahaRERA project filing"),
+    # Hand-written source strings, not filenames: a facts.json `source` can say
+    # "MahaRERA complaints/appeals data" directly. Left unmapped, the generic
+    # fallback reduced that to the bare category label "appeals data", which
+    # Section C names as exactly what an External citation must never be.
+    ("complaints/appeals", "MahaRERA complaint and appeal records for this project registration"),
+    ("complaint/appeal", "MahaRERA complaint and appeal records for this project registration"),
+    ("appeals data", "MahaRERA appeal records for this project registration"),
+    ("complaints data", "MahaRERA complaint records for this project registration"),
 )
 _DOMAIN_GENERIC = (
     ("zaubacorp.com", "ZaubaCorp (Corporate Registry)"),
@@ -5405,7 +5490,15 @@ def _generic_one_label(label: str) -> str:
         if keyword in lowered:
             return generic
     if lowered.endswith(".pdf") or lowered.endswith(".json"):
-        return "Project record"
+        # Last resort, for a document with no facts["sources"] entry to describe
+        # it (see _external_source_label, which is tried first). "Project
+        # record" was worse than useless -- a bare category label naming
+        # nothing, which Section C forbids -- and it also collapsed several
+        # genuinely different documents onto one citation number. This at least
+        # tells the reader what kind of thing it is and where it came from.
+        # A source landing here is a facts-quality problem: the document was
+        # cited without ever being catalogued in facts["sources"].
+        return "Document supplied by the promoter for this project"
     # A bare organisation NAME (e.g. "TheCompanyCheck", written by hand in a
     # source field) rather than a domain/URL -- resolve it to the SAME
     # generic label its domain form would produce (see _DOMAIN_GENERIC),
@@ -5420,6 +5513,41 @@ def _generic_one_label(label: str) -> str:
                     return generic
             return domain
     return core
+
+
+def _external_source_label(facts: dict, label: str) -> str:
+    """Resolves one source label to the descriptive citation the External
+    Sources list prints -- issuer, what the document is, and its date.
+
+    CLAUDE.md Section C: an External Sources entry is "never a raw internal
+    filename, never a bare category label like 'Project record' or 'appeals
+    data' that a reader cannot check". _generic_one_label alone produced both:
+    it falls back to the literal string "Project record" for any unrecognised
+    .pdf/.json, and it shipped 'Declaration for one registration 18 March
+    24.pdf' verbatim to a client.
+
+    Every facts["sources"] entry already carries exactly the right text in its
+    `ref` ("Legal Title Report and Title Certificate, Adv. Preet J. Chheda, 18
+    April 2024"), which nothing previously used. This prefers that, and falls
+    back to _generic_one_label only for labels that are not documents at all
+    (a bare domain from _annotate_flag_citations, say).
+
+    Deduplication still works on the returned string, so two fields citing the
+    same document converge on one number -- and, unlike the old generic
+    labels, two DIFFERENT documents no longer collapse into a single
+    "Project record" entry."""
+    core = re.sub(r"\s*\([^)]*\)\s*$", "", label or "").strip()
+    # _topic_citation appends ", accessed YYYY-MM-DD"; strip it before matching.
+    core = re.sub(r",\s*accessed\s+\d{4}-\d{2}-\d{2}$", "", core, flags=re.IGNORECASE).strip()
+    if core:
+        for s in facts.get("sources", []) or []:
+            raw = (s.get("label") or "").strip()
+            if raw and raw.lower() == core.lower():
+                ref = (s.get("ref") or "").strip()
+                if ref:
+                    return ref
+                break
+    return _generic_one_label(label)
 
 
 def _register_citation(facts: dict, generic_label: str) -> str:
@@ -5466,10 +5594,33 @@ def _annotate_flag_citations(facts: dict, text: str) -> str:
         match = re.search(re.escape(keyword), text, re.IGNORECASE)
         if not match:
             continue
-        marker = _register_citation(facts, _generic_one_label(domain))
-        text = text[: match.end()] + marker + text[match.end() :]
+        marker = _register_citation(facts, _external_source_label(facts, domain))
+        text = _insert_marker_at_clause_end(text, match.end(), marker)
         cited_domains.add(domain)
     return text
+
+
+def _insert_marker_at_clause_end(text: str, from_index: int, marker: str) -> str:
+    """Places `marker` at the end of the clause containing `from_index`.
+
+    CLAUDE.md Section C, both halves of the placement rule: a marker "sits at
+    the end of the clause it supports, not at the end of the paragraph", and it
+    "never lands mid-word or mid-token". Inserting immediately after the matched
+    keyword produced literally the example the rule cites against --
+    "MahaRERA[10]-registered" -- because the mention sits inside a compound.
+    Scanning to the clause boundary satisfies both halves at once."""
+    end = len(text)
+    depth = 0
+    for i in range(from_index, len(text)):
+        ch = text[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        elif depth == 0 and ch in ".;":
+            end = i
+            break
+    return text[:end] + marker + text[end:]
 
 
 def _citation_text(facts: dict, cleaned_label: str | None) -> str | None:
@@ -5494,7 +5645,7 @@ def _citation_text(facts: dict, cleaned_label: str | None) -> str | None:
     for piece in (p.strip() for p in _split_outside_parens(cleaned_label, ";")):
         if not piece:
             continue
-        marker = _register_citation(facts, _generic_one_label(piece))
+        marker = _register_citation(facts, _external_source_label(facts, piece))
         if marker not in markers:
             markers.append(marker)
     return "".join(markers) if markers else None
@@ -5876,7 +6027,53 @@ def _externalized_facts_copy(facts: dict) -> dict:
                     _walk(v)
 
     _walk(copied)
+    copied["gaps"] = _external_gaps(copied.get("gaps", []) or [])
     return copied
+
+
+# A gap that records a TOOLING failure rather than a fact about the project:
+# a re-verification that could not run, an authentication error, a pending
+# manual step, or a raw internal path/key. CLAUDE.md Section B: these "stay in
+# full in the Internal document and are cut from the External one", and
+# separately, no file path, JSON key or raw exception string may appear in
+# either document -- least of all External.
+_PROCESS_FAILURE_GAP_RE = re.compile(
+    r"could not resolve authentication|verification could not run|"
+    r"^\s*[a-z_]+(?:\.[a-z_]+)*\s*:|"          # a bare facts.json key used as a label
+    r"\boutput/[\w.-]+/|\.json\b",
+    re.IGNORECASE,
+)
+# The exception: a cross-corroboration gap wraps a REAL finding (this topic
+# rests on a single source) around the same error text. Section B says to
+# "preserve the finding in one consolidated line and drop the error text".
+_SINGLE_SOURCE_GAP_RE = re.compile(r"^Cross-corroboration: the '([\w_]+)' topic is backed by only one source", re.IGNORECASE)
+
+
+def _external_gaps(gaps: list) -> list:
+    """Filters facts["gaps"] down to what belongs in the External document.
+
+    Drops pure process failures outright. Consolidates every single-source
+    cross-corroboration gap into ONE line naming the affected topics, which
+    keeps the finding a reader can act on ("these topics rest on a single
+    source") while dropping the tooling error each one currently carries."""
+    kept, single_source_topics = [], []
+    for gap in gaps:
+        m = _SINGLE_SOURCE_GAP_RE.match(gap.strip())
+        if m:
+            single_source_topics.append(m.group(1).replace("_", " "))
+            continue
+        if _PROCESS_FAILURE_GAP_RE.search(gap):
+            continue
+        kept.append(gap)
+
+    if single_source_topics:
+        topics = ", ".join(single_source_topics[:-1]) + " and " + single_source_topics[-1] \
+            if len(single_source_topics) > 1 else single_source_topics[0]
+        kept.append(
+            f"The following topics rest on a single source each, with no independent second source "
+            f"confirming them: {topics}. Treat these with more caution than multi-sourced findings."
+        )
+    return kept
 
 
 def _external_heading(facts: dict, heading_text: str) -> str:
