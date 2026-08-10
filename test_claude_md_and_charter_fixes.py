@@ -17,6 +17,7 @@ Run directly: python test_claude_md_and_charter_fixes.py
 """
 
 import docx
+import pytest
 
 import company_charter as cc
 import deep_research
@@ -256,7 +257,9 @@ def test_convert_docx_to_pdf_degrades_to_none_on_failure(monkeypatch):
     """No Word installed / a COM error must never crash generation -- the
     .docx stays the only output for that file, and the caller decides how
     to log it."""
-    import docx2pdf
+    # docx2pdf drives Word via COM and only installs on Windows -- skip
+    # rather than fail so the suite still runs on Linux/CI.
+    docx2pdf = pytest.importorskip("docx2pdf")
 
     def fake_convert(*args, **kwargs):
         raise RuntimeError("Word is not installed")
@@ -268,7 +271,7 @@ def test_convert_docx_to_pdf_degrades_to_none_on_failure(monkeypatch):
 
 
 def test_convert_docx_to_pdf_returns_sibling_pdf_path_on_success(monkeypatch):
-    import docx2pdf
+    docx2pdf = pytest.importorskip("docx2pdf")
 
     captured = {}
 

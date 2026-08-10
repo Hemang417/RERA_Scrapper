@@ -33,8 +33,8 @@ from docx.shared import RGBColor
 import company_charter as cc
 
 _FIXTURES = [
-    ("P51800077150", os.path.join("output", "company_charters", "Company_Charter_PranamiBliss_P51800077150.facts.json")),
-    ("P51700031409", os.path.join("output", "company_charters", "Company_Charter_IRAInsignia_P51700031409.facts.json")),
+    ("P51800077150", os.path.join("output", "company_charters", "Company_Charter_Pranami_Bliss_P51800077150.facts.json")),
+    ("P51700031409", os.path.join("output", "company_charters", "Company_Charter_IRA_Insignia_P51700031409.facts.json")),
 ]
 _SCRATCH_DIR = os.path.join("output", "company_charters", "_test_scratch")
 
@@ -126,14 +126,32 @@ def test_quality_gate_detects_reintroduced_grey_italic_run():
     print("test_quality_gate_detects_reintroduced_grey_italic_run: PASS")
 
 
-def test_quality_gate_detects_document_library_regression():
-    def mutate(doc):
+def test_quality_gate_detects_internal_document_status_text():
+    """The gate was deliberately narrowed: External now gets its own
+    opened-documents-only table, so the bare heading "Document Library" is
+    legitimate there and must NOT trip the gate. What must still never
+    survive into External is the INTERNAL table's per-document status
+    column, which narrates what was not opened -- exactly the absence
+    reporting CLAUDE.md Section B deletes. Both halves are asserted here,
+    since a gate that fires on the heading would hard-fail every save."""
+    src = os.path.join(_SCRATCH_DIR, "P51800077150_External.docx")
+
+    def mutate_status_text(doc):
         run = _first_nonempty_run(doc)
-        run.text = "Document Library reappeared by accident."
-    _reopen_mutate_and_check(
-        os.path.join(_SCRATCH_DIR, "P51800077150_External.docx"), mutate, "Document Library"
-    )
-    print("test_quality_gate_detects_document_library_regression: PASS")
+        run.text = "Not opened this pass -- not a high-priority legal document type."
+    _reopen_mutate_and_check(src, mutate_status_text, "leftover Internal Document Library status text")
+
+    # The heading alone is allowed, and must stay allowed.
+    heading_path = src.replace(".docx", "_heading.docx")
+    shutil.copy2(src, heading_path)
+    doc = docx.Document(heading_path)
+    _first_nonempty_run(doc).text = "Document Library"
+    doc.save(heading_path)
+    violations = cc._verify_external_document_quality(heading_path)
+    assert not any("Document Library status text" in v for v in violations), violations
+    os.remove(heading_path)
+
+    print("test_quality_gate_detects_internal_document_status_text: PASS")
 
 
 def test_quality_gate_detects_weight_column_regression():
@@ -219,7 +237,7 @@ if __name__ == "__main__":
     test_standing_gap_red_italic_paragraph_is_not_falsely_flagged()
     test_quality_gate_detects_reintroduced_hyphen_dash()
     test_quality_gate_detects_reintroduced_grey_italic_run()
-    test_quality_gate_detects_document_library_regression()
+    test_quality_gate_detects_internal_document_status_text()
     test_quality_gate_detects_weight_column_regression()
     test_quality_gate_detects_missing_citation_bullet()
     test_quality_gate_detects_dangling_paren_citation()

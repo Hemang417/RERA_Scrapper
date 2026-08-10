@@ -14,7 +14,7 @@ import docx
 import charter_document as cd
 import company_charter as cc
 
-_PRANAMI_FACTS = os.path.join("output", "company_charters", "Company_Charter_PranamiBliss_P51800077150.facts.json")
+_PRANAMI_FACTS = os.path.join("output", "company_charters", "Company_Charter_Pranami_Bliss_P51800077150.facts.json")
 _SCRATCH = os.path.join("output", "company_charters", "_test_scratch_restructure")
 
 

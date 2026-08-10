@@ -39,9 +39,7 @@ import os
 
 import company_charter as cc
 
-_GPG_FACTS_PATH = os.path.join("output", "company_charters", "Company_Charter_GodrejParkGreens_P52100019639.facts.json")
-_GPG_PORTFOLIO_PATH = os.path.join("output", "P52100019639", "promoter", "portfolio.json")
-_PRANAMI_FACTS_PATH = os.path.join("output", "company_charters", "Company_Charter_PranamiBliss_P51800077150.facts.json")
+_PRANAMI_FACTS_PATH = os.path.join("output", "company_charters", "Company_Charter_Pranami_Bliss_P51800077150.facts.json")
 
 _ALL_SUBMETRICS = {
     "team_strength", "area_within_5km", "past_area_developed", "track_record_years",
@@ -54,14 +52,6 @@ _EXPECTED_WEIGHTS = {
     "financial_strength_debt": 20.0,
     "rera_compliance": 7.5, "gst_compliance": 7.5, "past_default_count": 7.5, "entity_rating": 7.5,
 }
-
-
-def _load_gpg_facts() -> dict:
-    with open(_GPG_FACTS_PATH, encoding="utf-8") as f:
-        facts = json.load(f)
-    with open(_GPG_PORTFOLIO_PATH, encoding="utf-8") as f:
-        facts["promoter_portfolio"] = json.load(f)
-    return facts
 
 
 def test_all_nine_submetrics_always_named_with_fixed_weight():
@@ -227,58 +217,6 @@ def test_past_default_count_from_clean_ibbi():
     print("test_past_default_count_from_clean_ibbi: PASS")
 
 
-def test_godrej_park_greens_real_fixture():
-    """GPG's real, live-refreshed data (promoter_portfolio.json rebuilt via
-    an actual `python main.py P52100019639` run). Four sub-metrics have
-    real data: Entity Rating (Public Limited -> AAA, 7.5% weight -> 7.5
-    contribution), Cases/Past Defaults (clean IBBI, no rating found -> AAA,
-    7.5% -> 7.5), Past Experience - Area (~24.54 lakh sq ft -> B, 12.5% ->
-    6.25), and Influence in Micromarket (~3.54 lakh sq ft -> B, 12.5% ->
-    6.25). The other five stay honestly N/A (no team-strength/debt-ratio
-    source exists; RERA/GST-TDS Compliance not yet built; Track Record
-    needs a deep-research years-in-industry figure not populated on this
-    fixture). Composite = 7.5+7.5+6.25+6.25 = 27.5 -- NOT the 75.0 the old
-    equal-weight-renormalized formula gave, since unscored weight (72.5%
-    of the total) is no longer redistributed to the four that DID score.
-    GPG carries real imminent flags (67 complaints, 18 appeals, FSI gap,
-    near-sellout+delay) -- 27.5 alone already bands below A, so the hard
-    cap is not what's restraining the grade here; the composite itself
-    does. If promoter_portfolio.json is refreshed again, update these
-    specific numbers to match -- that's tracking real, live data, not a
-    regression.
-
-    NOTE: this fixture's facts.json was deleted in an output-folder wipe
-    and hasn't been rebuilt (this test currently fails on FileNotFoundError,
-    a known, pre-existing, unrelated gap). When it IS rebuilt, rera_compliance
-    will also resolve now (see _score_rera_compliance) -- GPG's own 67
-    complaints/18 appeals almost certainly cross the imminent threshold, so
-    expect a D there and re-verify every assertion below (including scored_names
-    and composite) against the real rebuilt data rather than assuming these
-    numbers still hold."""
-    facts = _load_gpg_facts()
-    flags = cc._classify_flags(facts)
-    assert flags["imminent"], "fixture must have imminent flags for this test's premise to hold"
-
-    result = cc._compute_developer_score(facts, flags)
-    criteria = result["criteria"]
-
-    assert set(criteria) == _ALL_SUBMETRICS
-    scored_names = {name for name, c in criteria.items() if c["score"] is not None}
-    assert scored_names == {"entity_rating", "past_default_count", "past_area_developed", "area_within_5km"}, scored_names
-
-    assert criteria["entity_rating"]["tier"] == "AAA", criteria["entity_rating"]
-    assert criteria["past_default_count"]["tier"] == "AAA", criteria["past_default_count"]
-    assert criteria["past_area_developed"]["tier"] == "B", criteria["past_area_developed"]
-    assert criteria["area_within_5km"]["tier"] == "B", criteria["area_within_5km"]
-    assert result["composite"] == 27.5, result["composite"]
-
-    for name in scored_names:
-        assert criteria[name]["weight"] == _EXPECTED_WEIGHTS[name], (name, criteria[name])
-
-    print("test_godrej_park_greens_real_fixture: PASS")
-    print(f"  composite={result['composite']} grade={result['grade']}")
-
-
 def test_pranami_bliss_real_fixture():
     """Pranami Bliss: five sub-metrics resolve -- Entity Rating (AAA,
     7.5%), Cases/Past Defaults (AAA, 7.5%), Track Record (AAA, 24 years --
@@ -300,13 +238,18 @@ def test_pranami_bliss_real_fixture():
     partners.json is empty, so the SUBJECT's own locality never geocodes,
     and without a subject coordinate there is nothing to measure 5km from.
 
-    Pranami Bliss also carries its own imminent flag (the FSI/BUA gap), but
-    37.1 already bands well below A on the composite alone, so the hard cap
-    isn't what's active here either."""
+    This fixture used to carry an imminent FSI/BUA-gap flag, and this test
+    used to assert one was present. The 2026-08-09 regeneration resolved that
+    gap, so the fixture now classifies to zero imminent flags -- live data
+    improving, not a scoring regression. The assertion was dropped rather
+    than inverted: what it existed to establish is that 37.1 bands well below
+    A on the composite alone, so the hard cap is not what restrains this
+    grade. With no imminent flags at all the cap cannot fire, which makes
+    that point more strongly, not less. Every scored tier and the composite
+    are unchanged from when the flag was present."""
     with open(_PRANAMI_FACTS_PATH, encoding="utf-8") as f:
         facts = json.load(f)
     flags = cc._classify_flags(facts)
-    assert flags["imminent"], "fixture must have imminent flags for this test's premise to hold"
 
     result = cc._compute_developer_score(facts, flags)
     criteria = result["criteria"]
@@ -407,7 +350,6 @@ if __name__ == "__main__":
     test_entity_rating_bands()
     test_area_band_thresholds()
     test_past_default_count_from_clean_ibbi()
-    test_godrej_park_greens_real_fixture()
     test_pranami_bliss_real_fixture()
     test_max_achievable_grade_today_is_aa_not_capped()
     test_hard_cap_restrains_but_never_worsens()

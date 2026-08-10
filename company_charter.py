@@ -7543,7 +7543,10 @@ def _append_company_profile_section(doc, facts: dict) -> None:
         for director in directors:
             row = table.add_row()
             for i, col in enumerate(cols):
-                row.cells[i].text = director.get(col, "")
+                # `or ""` rather than a .get default: a director record can
+                # carry an explicit None (e.g. a DIN the registry never
+                # returned), and python-docx raises TypeError on None.
+                row.cells[i].text = director.get(col) or ""
 
     _add_director_table("Current Directors & Key Managerial Personnel", check.get("current_directors", []))
     _add_director_table("Past Directors & Key Managerial Personnel", check.get("past_directors", []))
