@@ -4046,6 +4046,13 @@ def _verify_external_document_quality(docx_path: str) -> list[str]:
             violations.append(f"em dash found in paragraph: {text[:80]!r}")
         if "Document Library" in text:
             violations.append(f"'Document Library' section text survived in External: {text[:80]!r}")
+        if _is_cited_absence(text):
+            # CLAUDE.md Section B: "Never attach a citation marker to an
+            # absence." A citation spent establishing that there is nothing to
+            # report is the exact defect the clean-check rule exists to
+            # prevent, and unlike the rule's softer cases it is unambiguous --
+            # so it hard-fails the save rather than merely being scrubbed.
+            violations.append(f"citation marker attached to an absence: {text[:80]!r}")
 
         for run in para.runs:
             color = run.font.color
@@ -4237,6 +4244,198 @@ def _convert_docx_to_pdf(docx_path: str) -> str | None:
         return None
 
 
+# ---------------------------------------------------------------------------
+# Clean-check scrubber -- CLAUDE.md Section B, "A clean check produces no
+# sentence": when a check ran and came back clear, the document says nothing
+# at all about it. The prompt asks for this on every generating call, but
+# model compliance is probabilistic, so this is the deterministic layer.
+#
+# Two independent guards, because shape alone provably cannot do the job.
+# These two sentences are grammatically identical:
+#     "No litigation is disclosed against the promoter."       -> delete
+#     "Not found among the documents reviewed: an FSI certificate." -> KEEP
+# The first reports that a RISK is absent (reassuring, and the rule's whole
+# target). The second reports that EVIDENCE is absent -- a gap, which the same
+# section says to keep in full and "never compress or delete under the
+# clean-check rule". So a clause is only scrubbed when BOTH hold: it sits in a
+# field on the reviewed list below, AND the thing it reports missing is a risk.
+# A field not on the list is still covered by the prompt layer and by
+# _verify_external_document_quality's own absence-with-a-citation check.
+# ---------------------------------------------------------------------------
+
+# Narrative fields audited against the real Pranami Bliss / IRA Insignia facts
+# and confirmed to carry clean-check prose. Dotted path into `facts`.
+_CLEAN_CHECK_FIELDS = (
+    "executive_summary",
+    "address_discrepancy_note",
+    "litigation_status.value",
+    "rera_core_fields.litigations_per_record",
+    "rera_compliance.litigations_complaints_appeals",
+    "fsi_metrics.mortgage_area",
+    "fsi_metrics.mortgage_lender.value",
+)
+
+# Things whose ABSENCE is a reassuring finding rather than an open unknown.
+# The distinction that makes this list necessary is in the block comment above:
+# a missing encumbrance is a clean check, a missing certificate is a gap.
+_RISK_NOUNS = (
+    "litigation", "litigations", "complaint", "complaints", "appeal", "appeals",
+    "warrant", "warrants", "encumbrance", "encumbrances", "charge", "charges",
+    "mortgage", "mortgages", "lien", "liens", "default", "defaults", "dispute",
+    "disputes", "discrepancy", "discrepancies", "proceeding", "proceedings",
+    "insolvency", "adverse",
+)
+
+# Structural absence shapes. Deliberately not anchored to any topic -- the
+# topic test is _RISK_NOUNS, applied separately.
+_ABSENCE_SHAPES = (
+    r"\bno\s+[\w\s,'()/-]{0,60}?\b(?:found|disclosed|recorded|reported|identified|registered|filed|raised|pending|on record|against)\b",
+    r"\b(?:found|returned|revealed|showed|turned up)\s+(?:nothing|no\s+\w+)\b",
+    r"\b(?:records?|register|registers|search|searches|filings?|data)\b[\w\s,'()/-]{0,40}\b(?:are|is|was|were)\s+(?:all\s+)?empty\b",
+    r"\bnone\b",
+    r"\bno\s+(?:%s)\b" % "|".join(_RISK_NOUNS),
+    r"\bnot\s+(?:found|disclosed|recorded|reported|identified)\b",
+)
+
+# Any one of these means the clause is doing more than reporting a nothing, so
+# it survives regardless. "except"/"other than" introduce the actual finding
+# ("...found nothing except a Notice of Lis Pendens"); a calendar date means
+# the clause names a specific real event, which a pure absence never does.
+_ABSENCE_RESCUE_RE = re.compile(
+    r"\b(?:except|other than|save for|apart from|aside from|barring|besides|with the exception of)\b"
+    r"|\b(?:\d{1,2}\s+)?(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}\b"
+    r"|\b\d{1,2}[/-]\d{1,2}[/-]\d{4}\b",
+    re.IGNORECASE,
+)
+
+
+def _is_clean_check_clause(text: str, risk_context: bool = False) -> bool:
+    """True when `text` is a bare report that a risk was looked for and not
+    found -- the sentence CLAUDE.md Section B deletes outright.
+
+    `risk_context` lets a caller supply the risk noun from the field name when
+    the clause itself is too terse to carry one: fsi_metrics.mortgage_lender's
+    entire value is "None disclosed.", which is only interpretable as a clean
+    check because of the field it sits in."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    if not any(re.search(p, t, re.IGNORECASE) for p in _ABSENCE_SHAPES):
+        return False
+    if not risk_context and not re.search(r"\b(?:%s)\b" % "|".join(_RISK_NOUNS), t, re.IGNORECASE):
+        return False
+    return not _ABSENCE_RESCUE_RE.search(t)
+
+
+def _strip_absence_tail(clause: str, risk_context: bool = False) -> str:
+    """Drops semicolon-delimited segments that are themselves pure clean checks,
+    from a clause that survives as a whole because it also carries a finding.
+
+    Section B's own worked example of what to delete is exactly this shape:
+    "No litigation found...; MahaRERA's complaint, appeal and warrant records
+    are empty[18]; the Title Report's 30-year search... returned nothing[1]".
+    Bolting that tail onto a real finding is how it survives clause-level
+    scrubbing, e.g. the Executive Summary's "...the Title Report (18 April
+    2024) opines the land title is clear...; no litigation was found... and
+    MahaRERA's records are empty."
+
+    Only semicolons are considered. _split_into_bullet_clauses deliberately
+    refuses to split on them (it fragments real bullets), and that reasoning
+    holds for rendering -- but a semicolon IS a reliable boundary for deciding
+    whether a segment is self-contained enough to test on its own. The leading
+    segment is never dropped: it carries the finding the clause was kept for,
+    and a bullet that opens mid-thought is worse than one that runs long."""
+    if ";" not in clause:
+        return clause
+    segments = [s.strip() for s in clause.split(";")]
+    kept = [segments[0]] + [
+        s for s in segments[1:]
+        if not _is_clean_check_clause(s.rstrip("."), risk_context=risk_context)
+    ]
+    if len(kept) == len(segments):
+        return clause
+    rejoined = "; ".join(s for s in kept if s).rstrip(" ;,")
+    return rejoined if rejoined.endswith(".") else rejoined + "."
+
+
+def _resolve_path(facts: dict, path: str):
+    """Returns (container, key) for a dotted path, or (None, None) if any step
+    is missing or is not a dict. Never creates anything."""
+    node = facts
+    parts = path.split(".")
+    for part in parts[:-1]:
+        if not isinstance(node, dict) or part not in node:
+            return None, None
+        node = node[part]
+    if not isinstance(node, dict) or parts[-1] not in node:
+        return None, None
+    return node, parts[-1]
+
+
+def _scrub_clean_checks(facts: dict) -> dict:
+    """Deletes clean-check clauses from the reviewed narrative fields, in place.
+
+    Returns {path: original_text} for everything it changed, so the caller can
+    put the full text back before persisting. That restoration is not optional:
+    CLAUDE.md Section B is explicit that the scope of what was checked "stay[s]
+    in the facts file; they do not reach the page" -- this removes them from
+    the PAGE only, never from the record.
+
+    Idempotent, so rendering both variants from one dict is safe: a second pass
+    finds nothing left to cut and reports no further changes."""
+    changed = {}
+    for path in _CLEAN_CHECK_FIELDS:
+        container, key = _resolve_path(facts, path)
+        if container is None:
+            continue
+        original = container[key]
+        if not isinstance(original, str) or not original.strip():
+            continue
+
+        risk_context = any(noun in path.lower() for noun in _RISK_NOUNS)
+        kept = []
+        for clause in _split_into_bullet_clauses(original):
+            if _is_clean_check_clause(clause, risk_context=risk_context):
+                continue
+            kept.append(_strip_absence_tail(clause, risk_context))
+        scrubbed = " ".join(c for c in kept if c).strip()
+        if scrubbed != original.strip():
+            changed[path] = original
+            # Emptied entirely: every clause was a clean check. The field's own
+            # empty-value handling (_remove_gap_rows / the empty-section rule)
+            # takes it from here rather than printing a blank bullet.
+            container[key] = scrubbed
+    return changed
+
+
+def _is_cited_absence(text: str) -> bool:
+    """True when a rendered paragraph both reports a nothing AND cites a source
+    for it -- the one clean-check failure that hard-fails an External save.
+
+    Two carve-outs are honoured here rather than by the caller. A Gaps & Sources
+    entry ("Gap 4. ...") is an open unknown, not a clean result, and Section B
+    keeps those in full. A score's stated basis is exempt too, but needs no test
+    of its own: a sub-metric note reads "0 complaints, 0 appeals", which states
+    a figure rather than asserting a non-existence, so no absence shape matches
+    it in the first place."""
+    stripped = re.sub(r"\[\d+\]", "", text or "").strip()
+    if not stripped or stripped.startswith("Gap "):
+        return False
+    if not re.search(r"\[\d+\]", text or ""):
+        return False
+    clauses = _split_into_bullet_clauses(stripped.lstrip("• ").strip())
+    return bool(clauses) and all(_is_clean_check_clause(c) for c in clauses)
+
+
+def _restore_clean_checks(facts: dict, changed: dict) -> None:
+    """Puts the pre-scrub text back, so what gets persisted to .facts.json is
+    the complete record. See _scrub_clean_checks."""
+    for path, original in (changed or {}).items():
+        container, key = _resolve_path(facts, path)
+        if container is not None:
+            container[key] = original
+
+
 def _fill_template(
     reg_no: str, facts: dict, out_path: str, doc_variant: str = "internal",
     elapsed_seconds: float | None = None, cost_usd: float | None = None, api_calls: int | None = None,
@@ -4261,6 +4460,16 @@ def _fill_template(
         facts = _externalized_facts_copy(facts)
     facts["_doc_variant"] = doc_variant
     facts["_citation_registry"] = {"order": [], "index": {}}
+
+    # CLAUDE.md Section B, "A clean check produces no sentence". Runs here so
+    # EVERY caller gets it, including scripts that hit _fill_template directly.
+    # The pre-scrub text is stashed on `facts` rather than returned, because
+    # run_company_charter renders twice and must restore from the FIRST pass;
+    # it restores and pops this key before persisting .facts.json, so the
+    # record keeps what the page drops.
+    _scrubbed = _scrub_clean_checks(facts)
+    if _scrubbed and not facts.get("_pre_scrub_narrative"):
+        facts["_pre_scrub_narrative"] = _scrubbed
 
     shutil.copy2(TEMPLATE_PATH, out_path)
     doc = docx.Document(out_path)
@@ -7512,6 +7721,21 @@ def _append_ibbi_check_section(doc, facts: dict) -> None:
     doc.add_page_break()
     heading_para = doc.add_paragraph(_external_heading(facts, "Insolvency Check -- IBBI Corporate Debtor Master Data (Code-Computed)"))
     heading_para.style = heading_style
+    if check["found_process"] is False:
+        # CLAUDE.md Section B: a check that ran and came back clear produces no
+        # sentence -- no scope-of-search paragraph, no named source, and above
+        # all no citation, since "never attach a citation marker to an absence".
+        # This section used to spend a cited paragraph establishing that there
+        # was nothing to report, which is the exact defect the rule targets.
+        # The score carve-out does not rescue it: the clean IBBI result IS the
+        # stated basis of the Cases/Past Defaults sub-metric, but that basis
+        # belongs to the sub-metric's own note, and Section B is explicit that
+        # "a sentence explaining the figure elsewhere in narrative prose is
+        # not [a finding], and is deleted". So the whole section collapses to
+        # the empty-section form: heading plus one bare line.
+        doc.add_paragraph("Nothing found.")
+        return
+
     _variant_paragraph(
         doc, facts,
         internal_text=(
@@ -7521,22 +7745,16 @@ def _append_ibbi_check_section(doc, facts: dict) -> None:
         ),
         external_text="Checked against IBBI's public Corporate Debtor Master Data by the promoter's own CIN.",
     )
-    if check["found_process"] is False:
-        ibbi_citation = _citation_text(facts, _clean_source_label(check.get("url", "")) or check.get("url", ""))
-        _sep = _variant_sep(facts)
-        doc.add_paragraph(
-            f"Result: \"{check['status_text']}\"{_sep} no insolvency process is recorded against this CIN "
-            f"in IBBI's public database. {ibbi_citation}"
-        )
-    else:
-        doc.add_paragraph(
-            "Result: this CIN returned something other than the standard \"no process\" result. The "
-            "raw extracted page content is reproduced below verbatim for a human to read directly -- "
-            "this checker was not validated against a real active/past insolvency case, so it does not "
-            "attempt to summarize or classify this content itself:"
-        )
-        doc.add_paragraph(check.get("status_text", ""))
-        doc.add_paragraph(f"Source: {_citation_text(facts, _clean_source_label(check.get('url', '')) or check.get('url', ''))}")
+    # Reached only when found_process is True -- a real insolvency signal, which
+    # is a finding and stays in full.
+    doc.add_paragraph(
+        "Result: this CIN returned something other than the standard \"no process\" result. The "
+        "raw extracted page content is reproduced below verbatim for a human to read directly -- "
+        "this checker was not validated against a real active/past insolvency case, so it does not "
+        "attempt to summarize or classify this content itself:"
+    )
+    doc.add_paragraph(check.get("status_text", ""))
+    doc.add_paragraph(f"Source: {_citation_text(facts, _clean_source_label(check.get('url', '')) or check.get('url', ''))}")
 
 
 def _clean_scraped_address(address: str) -> str:
@@ -8732,6 +8950,12 @@ def run_company_charter(
     external_out_path = os.path.join(out_dir, f"Company_Charter_{project_name}_{reg_no}_External.docx")
     _fill_template(reg_no, facts, external_out_path, doc_variant="external")
     _convert_docx_to_pdf(external_out_path)
+
+    # The page drops clean checks; the record keeps them (CLAUDE.md Section B:
+    # the scope of what was checked "stay[s] in the facts file"). Restore
+    # before persisting, so a later pass reading this file still sees what was
+    # actually searched rather than inheriting a hollowed-out record.
+    _restore_clean_checks(facts, facts.pop("_pre_scrub_narrative", None))
 
     facts_path = os.path.join(out_dir, f"Company_Charter_{project_name}_{reg_no}.facts.json")
     with open(facts_path, "w", encoding="utf-8") as f:
