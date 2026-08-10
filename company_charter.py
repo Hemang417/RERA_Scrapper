@@ -4662,6 +4662,70 @@ def run_finding_research(facts: dict, researcher=None) -> dict:
     return summary
 
 
+def _rendered_document_text(docx_path: str, limit: int = 60000) -> str:
+    """Flattens a saved .docx to plain text for review: body paragraphs and
+    table cells, in document order, which is what a reader actually sees."""
+    import docx as _docx
+
+    doc = _docx.Document(docx_path)
+    parts = [p.text for p in _iter_all_paragraphs(doc)]
+    text = "\n".join(p for p in parts if p and p.strip())
+    return text[:limit]
+
+
+def run_claude_md_document_review(paths_by_variant: dict, output_dir: str = ".", reg_no: str = "") -> dict:
+    """Final pipeline stage: re-reads each rendered Charter and audits it
+    against the CLAUDE.md rules it was written under, via the Claude API.
+
+    Section B goes to both variants; Section C is added for External only,
+    exactly as it is at generation time. Section A is never sent: it is
+    coding-time guidance, and _coding_time_notes' own docstring says so.
+
+    ADVISORY BY DESIGN. It reports and records, and does not block the PDF.
+    Two reasons: the deterministic gate (_verify_external_document_quality)
+    already hard-fails a genuinely bad save before this point, and a language
+    model's opinion should not be able to stop a finished document being
+    delivered. Findings are printed and written to a JSON report next to the
+    documents so a human can act on them.
+
+    Never raises. No API key, a rate limit or a malformed reply all come back
+    as reviewed=False with the reason, and the run continues."""
+    section_b = _common_content_rules()
+    section_c = _external_citation_rule()
+
+    results = {}
+    for variant, path in (paths_by_variant or {}).items():
+        if not path or not os.path.exists(path):
+            continue
+        rules = section_b if variant != "external" else f"{section_b}\n\n{section_c}"
+        try:
+            text = _rendered_document_text(path)
+            outcome = deep_research.review_document_against_rules(text, rules, variant)
+        except Exception as e:
+            outcome = {"reviewed": False, "compliant": None, "violations": [],
+                       "summary": f"CLAUDE.md document review could not run: {e}"}
+        outcome["document"] = os.path.basename(path)
+        results[variant] = outcome
+
+        if not outcome["reviewed"]:
+            print(f"[WARN] CLAUDE.md review ({variant}): {outcome['summary']}")
+        elif outcome["compliant"]:
+            print(f"[OK] CLAUDE.md review ({variant}): compliant. {outcome['summary']}")
+        else:
+            print(f"[!] CLAUDE.md review ({variant}): {len(outcome['violations'])} issue(s) to review.")
+            for v in outcome["violations"][:10]:
+                print(f"    - {v.get('rule', 'rule')}: {str(v.get('quote', ''))[:100]!r}")
+
+    if results and reg_no:
+        report_dir = os.path.join(output_dir, "company_charters")
+        os.makedirs(report_dir, exist_ok=True)
+        report_path = os.path.join(report_dir, f"Company_Charter_{reg_no}_claude_md_review.json")
+        with open(report_path, "w", encoding="utf-8") as f:
+            json.dump(results, f, indent=2, ensure_ascii=False)
+        print(f"[INFO] CLAUDE.md review report written to {report_path}")
+    return results
+
+
 def _merged_mortgage_value(facts: dict, fsi_metrics: dict) -> tuple:
     """Collapses fsi_metrics.mortgage_area and fsi_metrics.mortgage_lender into
     one "Mortgage / charge on the land" value, returning (text, citation).
@@ -4700,6 +4764,93 @@ def _normalize_misfiled_facts(facts: dict) -> list:
     if _point_rera_landowner_at_identity_table(facts):
         applied.append("rera_landowner_pointer")
     return applied
+
+
+# A leading "some_field:" or "some.dotted.path:" used as a label. Lowercase and
+# underscores only, so real prose labels ("Cross-corroboration:", "CTS
+# land-record lookup:") are never touched.
+_KEY_LABEL_RE = re.compile(r"^([a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*)\s*:\s*")
+# A raw API exception quoted inside a gap.
+_QUOTED_EXCEPTION_RE = re.compile(r"verification could not run:\s*\"[^\"]*\"", re.IGNORECASE)
+# A path under the run output directory.
+# Must end on a word character, so the full stop closing the sentence is not
+# swallowed along with the filename.
+_OUTPUT_PATH_RE = re.compile(r"\boutput/[\w./-]*\w")
+
+# Field names whose humanized form would otherwise read badly ("Cin llpin").
+_PROCESS_LABEL_OVERRIDES = {
+    "cin_llpin": "CIN / LLPIN",
+    "din": "DIN",
+    "gstin": "GSTIN",
+    "pan": "PAN",
+    "rera_core_fields": "RERA core fields",
+    "cts": "CTS",
+}
+# A module named as a next step.
+_MODULE_NAME_RE = re.compile(r"\b([a-z][a-z0-9_]*)\.py\b")
+
+
+def _sanitize_process_text(text: str) -> str:
+    """Strips internals out of a process-failure item while keeping what it
+    tells the reader.
+
+    CLAUDE.md Section B pulls in two directions here, and both have to be
+    honoured. "Internal keeps process failures, External does not" means these
+    items STAY in the Internal document, so deleting them is wrong. But the
+    same section forbids "a file path, module name, function or parameter name,
+    JSON key, or raw exception string into EITHER document" -- so what stays
+    has to be rewritten, not passed through.
+
+    Four rewrites, each preserving the information:
+      * "promoter_name:" becomes "Promoter name:", and a dotted path is
+        reduced to its last segment ("land_identification.total_gross_area:"
+        becomes "Total gross area:");
+      * a quoted API exception becomes a plain statement that the step could
+        not run, which is the only part a reader can act on anyway;
+      * a run-output path becomes a description of where the data went;
+      * a named module becomes a description of the step it performs.
+    """
+    text = (text or "").strip()
+    if not text:
+        return text
+
+    match = _KEY_LABEL_RE.match(text)
+    if match:
+        # Humanized locally rather than via charter_document._field_display_name:
+        # that module is the dead builder, and the live pipeline should not grow
+        # an import into it just to title-case a word.
+        raw_leaf = match.group(1).split(".")[-1]
+        leaf = _PROCESS_LABEL_OVERRIDES.get(raw_leaf)
+        if not leaf:
+            leaf = raw_leaf.replace("_", " ")
+            leaf = f"{leaf[:1].upper()}{leaf[1:]}"
+        text = f"{leaf}: {text[match.end():]}"
+
+    # No "this pass" here: the sentences carrying this already say it, and
+    # doubling it read as "not re-verified this pass, could not run this pass".
+    text = _QUOTED_EXCEPTION_RE.sub("the verification step could not run", text)
+    text = _OUTPUT_PATH_RE.sub("this project's own run output", text)
+    text = _MODULE_NAME_RE.sub(lambda m: f"the {m.group(1).replace('_', ' ')} step", text)
+    return text.strip()
+
+
+def _sanitize_process_gaps(facts: dict):
+    """Applies _sanitize_process_text across facts["gaps"], in place.
+
+    Returns the ORIGINAL list when anything changed, so the caller can restore
+    it before persisting: the raw exception text and the path are genuine
+    diagnostics and belong in the record, exactly like the clean checks the
+    scrubber removes. They just do not belong on the page. Returns None when
+    nothing changed, which makes this idempotent across two renders."""
+    gaps = facts.get("gaps") or []
+    if not gaps:
+        return None
+    cleaned = [_sanitize_process_text(g) for g in gaps]
+    if cleaned == gaps:
+        return None
+    original = list(gaps)
+    facts["gaps"] = cleaned
+    return original
 
 
 def _is_cited_absence(text: str) -> bool:
@@ -4770,6 +4921,14 @@ def _fill_template(
     _scrubbed = _scrub_clean_checks(facts)
     if _scrubbed and not facts.get("_pre_scrub_narrative"):
         facts["_pre_scrub_narrative"] = _scrubbed
+
+    # Process failures stay in the Internal document (Section B), but the raw
+    # path, JSON key and API exception string inside them may not appear in
+    # EITHER document. Same restore-before-persist contract as the scrub above:
+    # those internals are real diagnostics and belong in the record.
+    _pre_sanitize_gaps = _sanitize_process_gaps(facts)
+    if _pre_sanitize_gaps and not facts.get("_pre_sanitize_gaps"):
+        facts["_pre_sanitize_gaps"] = _pre_sanitize_gaps
 
     shutil.copy2(TEMPLATE_PATH, out_path)
     doc = docx.Document(out_path)
@@ -5033,7 +5192,12 @@ def _fill_template(
         _set_row_cell(row, 0, project_label)
         _set_row_cell(row, 1, item["configuration"])
         _set_row_cell(row, 2, item["pricing"])
-        _set_row_cell(row, 3, item["source"])
+        # CLAUDE.md Section A, "No URLs in narrow table columns": a full listing
+        # URL in this four-column table wraps mid-token and can split across a
+        # page break. The cell carries a short label (Internal) or an "[N]"
+        # marker (External) and the URL itself lives once, in the Sources list,
+        # which is what _citation_text already does everywhere else.
+        _set_row_cell(row, 3, _citation_text(facts, _clean_source_label(item.get("source", ""))) or "")
 
     _fill_variable_rows(t[5], 1, facts.get("comparables", []), _fill_comparable_row)
 
@@ -9437,10 +9601,19 @@ def run_company_charter(
         reg_no, facts, out_path, doc_variant="internal",
         elapsed_seconds=_run_elapsed_seconds, cost_usd=_usage_total["cost_usd"], api_calls=_usage_total["calls"],
     )
-    internal_pdf_path = _convert_docx_to_pdf(out_path)
-
     external_out_path = os.path.join(out_dir, f"Company_Charter_{project_name}_{reg_no}_External.docx")
     _fill_template(reg_no, facts, external_out_path, doc_variant="external")
+
+    # Final stage: both documents are re-read and audited against the CLAUDE.md
+    # rules they were written under, before the PDFs are produced. Advisory --
+    # it reports and writes a review file, and never blocks delivery. See
+    # run_claude_md_document_review for why.
+    facts["claude_md_review"] = run_claude_md_document_review(
+        {"internal": out_path, "external": external_out_path},
+        output_dir=output_dir, reg_no=reg_no,
+    )
+
+    internal_pdf_path = _convert_docx_to_pdf(out_path)
     _convert_docx_to_pdf(external_out_path)
 
     # The page drops clean checks; the record keeps them (CLAUDE.md Section B:
@@ -9448,6 +9621,9 @@ def run_company_charter(
     # before persisting, so a later pass reading this file still sees what was
     # actually searched rather than inheriting a hollowed-out record.
     _restore_clean_checks(facts, facts.pop("_pre_scrub_narrative", None))
+    _pre_sanitize_gaps = facts.pop("_pre_sanitize_gaps", None)
+    if _pre_sanitize_gaps:
+        facts["gaps"] = _pre_sanitize_gaps
 
     facts_path = os.path.join(out_dir, f"Company_Charter_{project_name}_{reg_no}.facts.json")
     with open(facts_path, "w", encoding="utf-8") as f:

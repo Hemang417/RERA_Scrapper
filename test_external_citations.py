@@ -216,7 +216,12 @@ def test_external_drops_process_failures_internal_keeps_them():
     internal = "\n".join(_paragraphs("internal"))
     for leak in ("output/P51800077150", "promoter_name:", "Could not resolve authentication"):
         assert leak not in ext, f"External leaked process text: {leak!r}"
-    assert "Could not resolve authentication" in internal, "Internal must keep process failures in full"
+    # Internal keeps the process-failure ITEM, but not the raw exception string
+    # inside it: Section B forbids that in EITHER document, so it is rewritten
+    # rather than passed through (see _sanitize_process_text). This used to
+    # assert the raw exception survived in Internal, which was the leak.
+    assert "Could not resolve authentication" not in internal, "raw exception text must not survive anywhere"
+    assert "the verification step could not run" in internal, "Internal must still keep the process failure itself"
     print("test_external_drops_process_failures_internal_keeps_them: PASS")
 
 

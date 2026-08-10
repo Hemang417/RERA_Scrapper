@@ -58,8 +58,41 @@ def _rows(variant: str, label_contains: str) -> list:
 
 # --- 1. merge orders are land assembly, not litigation ----------------------
 
+def _unnormalized() -> dict:
+    """A facts dict in the pre-normalization state these transformations expect.
+
+    Built inline rather than read from the fixture on purpose. The pipeline
+    PERSISTS normalized and research-enriched facts back to that same file, so
+    a test asserting "the fixture still holds the un-normalized form" is
+    asserting a transient property of live data, not the behaviour of the code.
+    It passed until the first real re-run and then broke, which is exactly the
+    failure mode worth designing out."""
+    return {
+        "litigation_status": {
+            # Sentence order mirrors the real fixture, because it is load-bearing:
+            # the Form B clean check sits immediately BEFORE the merge-order
+            # sentence, and the period closing "...said Land.'" falls inside a
+            # quote so the splitter fuses the two. That fusion is why Form B
+            # survived scrubbing until the merge orders were moved out.
+            "value": (
+                "No litigation is disclosed against the promoter. The Title Report's search found nothing "
+                "except a Notice of Lis Pendens dated 20 December 2017 naming an adjoining society. "
+                "The promoter's Form B declaration states 'We have no litigation on the said Land.' "
+                "The two 6 March 2024 orders sometimes referenced as a 'merge order' are administrative "
+                "Deputy Registrar of Co-operative Societies actions (amalgamating Azad Nagar Sai Chhaya CHS "
+                "into Azad Nagar Himalaya CHS under the Maharashtra Co-operative Societies Act, 1960), not "
+                "litigation or a tribunal proceeding."
+            ),
+            "source": "Title Report - RERA.pdf",
+        },
+        "land_identification": {},
+        "rera_core_fields": {"promoter_land_owner_investor": "MHADA (original owner) leased the buildings to the societies."},
+        "corporate_identity": {"landowner_investor": {"value": "MHADA (original owner) leased the buildings to the societies.", "source": "x.pdf"}},
+    }
+
+
 def test_merge_orders_move_out_of_litigation_status():
-    facts = _facts()
+    facts = _unnormalized()
     assert "Deputy Registrar" in facts["litigation_status"]["value"], "fixture premise"
     assert cc._relocate_merge_orders(facts) is True
 
@@ -74,7 +107,7 @@ def test_merge_orders_move_out_of_litigation_status():
 
 
 def test_relocation_is_idempotent():
-    facts = _facts()
+    facts = _unnormalized()
     assert cc._relocate_merge_orders(facts) is True
     before = json.dumps(facts, sort_keys=True)
     assert cc._relocate_merge_orders(facts) is False
@@ -88,7 +121,7 @@ def test_relocating_first_lets_the_scrubber_reach_the_form_b_declaration():
     sentence splitter merges it with the merge-order sentence (the preceding
     period sits inside a quote), so it survived scrubbing until the merge
     orders were moved out from under it."""
-    facts = _facts()
+    facts = _unnormalized()
     cc._relocate_merge_orders(facts)
     cc._scrub_clean_checks(facts)
     remaining = facts["litigation_status"]["value"]
@@ -98,9 +131,19 @@ def test_relocating_first_lets_the_scrubber_reach_the_form_b_declaration():
 
 
 def test_merge_orders_appear_exactly_once_in_the_document():
+    """Asserts PLACEMENT rather than a global phrase count.
+
+    A count over the whole document is the wrong test twice over: the
+    per-finding research stage rewrites this passage, and the Sources list
+    legitimately names the Deputy Registrar orders as source documents. What
+    actually matters is that the orders describe land assembly and no longer
+    sit under Litigation Status being denied."""
     for variant in ("internal", "external"):
+        rows = _rows(variant, "Land assembly")
+        assert len(rows) == 1, f"{variant}: expected one Land assembly row, got {len(rows)}"
+        assert "Deputy Registrar of Co-operative Societies" in rows[0][1], rows[0][1]
+
         blob = _all_text(variant)
-        assert blob.count("Deputy Registrar of Co-operative Societies actions") == 1, variant
         assert "not litigation or a tribunal proceeding" not in blob, variant
     print("test_merge_orders_appear_exactly_once_in_the_document: PASS")
 
@@ -148,7 +191,7 @@ def test_mortgage_lender_field_is_not_destroyed():
 # --- 3. the landowner chain is stated once ----------------------------------
 
 def test_rera_core_landowner_becomes_a_pointer():
-    facts = _facts()
+    facts = _unnormalized()
     assert cc._point_rera_landowner_at_identity_table(facts) is True
     pointer = facts["rera_core_fields"]["promoter_land_owner_investor"]
     assert pointer.startswith("See the Corporate/Promoter Identity table")

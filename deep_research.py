@@ -337,6 +337,68 @@ def _run_agentic_pass(user_prompt: str, system: str, label: str = "agentic_pass"
     return _parse_json_response(messages[-1])
 
 
+_DOC_REVIEW_SYSTEM_PROMPT = """You are auditing a finished real estate due-diligence document \
+against the editorial rules it was written under. The rules are given to you above this \
+instruction; treat them as the only standard, and do not invent additional preferences.
+
+You are reviewing the FINAL rendered text, so judge what a reader would actually see. Check \
+in particular:
+  * a check that ran and came back clear should produce no sentence at all,
+  * a citation marker must never be attached to a statement that nothing was found,
+  * no file path, module name, function or parameter name, JSON key, or raw exception string,
+  * a fact, and an absence, should appear in exactly one place,
+  * a flag should be a one sentence headline pointing at its gap, not a restatement of it,
+  * gaps must be kept in full, never compressed or deleted,
+  * plain language, with any abbreviation expanded on first use.
+
+Report only what you can actually see in the text given. Quote the offending text so a human \
+can find it. If the document looks compliant, say so rather than manufacturing findings: a \
+clean result is a valid and useful answer here.
+
+Your FINAL reply must be ONLY a single raw JSON object -- no prose, no markdown code fences -- \
+matching exactly this shape: \
+{"compliant": true | false, "violations": [{"rule": "short rule name", "quote": "the offending \
+text, under 200 characters", "why": "one sentence"}], "summary": "one or two sentences"}"""
+
+
+def review_document_against_rules(document_text: str, rules: str, variant: str,
+                                  label: str = "claude_md_doc_review") -> dict:
+    """Audits one rendered Charter variant against the CLAUDE.md rules it was
+    written under, using the same transport as every other call here.
+
+    `rules` is the caller-assembled rule text (Section B, plus Section C for
+    the External variant). Passing it in rather than reading CLAUDE.md here
+    keeps this module free of the Charter's own section-loading conventions,
+    and keeps Section A -- which must never reach an API call -- impossible to
+    include by accident.
+
+    Degrades like every other call in this module: any failure returns
+    reviewed=False with the reason, never raises. The review is advisory. The
+    deterministic gate (_verify_external_document_quality) is what actually
+    blocks a bad save, and a language model's opinion must not be able to stop
+    a document being delivered."""
+    prompt = (
+        f"Rules this document was written under:\n{rules}\n\n"
+        f"Document variant: {variant}\n\n"
+        f"Rendered document text follows.\n\n{document_text}"
+    )
+    try:
+        result = _run_agentic_pass(prompt, _DOC_REVIEW_SYSTEM_PROMPT, label=label)
+    except Exception as e:
+        return {"reviewed": False, "compliant": None, "violations": [],
+                "summary": f"CLAUDE.md document review could not run: {e}"}
+
+    violations = result.get("violations")
+    if not isinstance(violations, list):
+        violations = []
+    return {
+        "reviewed": True,
+        "compliant": bool(result.get("compliant")) and not violations,
+        "violations": violations,
+        "summary": (result.get("summary") or "").strip(),
+    }
+
+
 def research_finding(finding: str, context: str = "", label: str = "finding_research") -> dict:
     """Researches one confirmed finding in depth (CLAUDE.md Section B, "Deep
     research on every finding"). Returns

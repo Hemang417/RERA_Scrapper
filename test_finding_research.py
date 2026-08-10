@@ -33,6 +33,30 @@ def _facts() -> dict:
     return facts
 
 
+def _synthetic() -> dict:
+    """A deterministic facts dict with exactly one finding per finding-field.
+
+    Not read from the live fixture, and deliberately so. The pipeline persists
+    research-ENRICHED facts back to that file, and an enriched finding is
+    multi-sentence, so it splits into several clauses and the fixture's finding
+    COUNT changes after any real run (3 became 9 on the first one). Tests about
+    counting, capping and per-finding failure need input that cannot drift."""
+    long_a = ("The development agreements permit the developer to create a mortgage over its free sale "
+              "area, and no such mortgage has been taken on this land to date.")
+    long_b = ("Two orders of the Deputy Registrar dated 6 March 2024 amalgamated the two societies into "
+              "one, which is how the separate plots became the single plot this project is built on.")
+    long_c = ("The Title Report's search found nothing against either property except one Notice of Lis "
+              "Pendens dated 20 December 2017 naming an adjoining society on the same survey number.")
+    return {
+        "litigation_status": {"value": long_c, "source": "Title Report - RERA.pdf"},
+        "land_identification": {"land_assembly": {"value": long_b, "source": "Order.pdf"}},
+        "fsi_metrics": {"mortgage_area": long_a},
+        "gaps": ["A gap that must never be researched or altered."],
+        "rera_core_fields": {"project_name": "Test Project", "registration_number": "P51800077150"},
+        "corporate_identity": {"promoter_name": {"value": "Test Promoter", "source": "x"}},
+    }
+
+
 def _ok(prefix="RESOLVED: "):
     return lambda clause, context="": {
         "resolved": True, "text": prefix + clause, "still_live": "no", "note": "",
@@ -69,7 +93,7 @@ def test_clean_checks_are_never_sent_for_research():
 
 def test_gaps_are_left_completely_alone():
     """Section B scopes this stage to findings, "not gaps, not clean checks"."""
-    facts = _facts()
+    facts = _synthetic()
     before = list(facts.get("gaps", []))
     cc.run_finding_research(facts, researcher=_ok())
     assert facts["gaps"] == before
@@ -85,7 +109,7 @@ def test_a_stub_or_label_is_too_short_to_research():
 # --- enrichment --------------------------------------------------------------
 
 def test_resolved_findings_are_written_back_into_their_own_field():
-    facts = _facts()
+    facts = _synthetic()
     summary = cc.run_finding_research(facts, researcher=_ok())
     assert summary["enriched"] == summary["findings_seen"] > 0, summary
     assert "RESOLVED: " in facts["litigation_status"]["value"]
@@ -111,7 +135,7 @@ def test_the_search_gets_project_context_to_disambiguate():
 # --- degradation: the part that actually matters ------------------------------
 
 def test_an_unresolved_finding_keeps_its_original_text_verbatim():
-    facts = _facts()
+    facts = _synthetic()
     original = facts["litigation_status"]["value"]
     summary = cc.run_finding_research(facts, researcher=_unresolved())
     assert facts["litigation_status"]["value"] == original, "a finding was altered despite no research"
@@ -120,7 +144,7 @@ def test_an_unresolved_finding_keeps_its_original_text_verbatim():
 
 
 def test_a_raising_researcher_costs_only_its_own_finding():
-    facts = _facts()
+    facts = _synthetic()
     original = facts["litigation_status"]["value"]
     calls = {"n": 0}
 
@@ -144,7 +168,7 @@ def test_no_finding_is_ever_deleted_whatever_the_researcher_returns():
         lambda c, x="": {"resolved": True, "still_live": "no"},
         lambda c, x="": {},
     ):
-        facts = _facts()
+        facts = _synthetic()
         original = facts["litigation_status"]["value"]
         cc.run_finding_research(facts, researcher=bad)
         assert facts["litigation_status"]["value"] == original, bad
@@ -165,7 +189,7 @@ def test_the_live_transport_degrades_instead_of_raising():
 # --- budget ------------------------------------------------------------------
 
 def test_fan_out_is_capped_and_the_excess_keeps_its_text():
-    facts = _facts()
+    facts = _synthetic()
     findings = cc._collect_findings(facts)
     assert len(findings) >= 2, "fixture premise"
 
