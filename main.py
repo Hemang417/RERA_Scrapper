@@ -28,6 +28,7 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import datetime
 
 import requests
@@ -229,6 +230,11 @@ def _extract_promoter_name(category_data: dict) -> str | None:
 
 
 def main() -> int:
+    # Full pipeline start -- fed into company_charter.run_company_charter so
+    # the Charter's own version-log line reports true end-to-end run time
+    # (scrape + CAPTCHA wait + deep research + charter generation), not just
+    # the charter-build step in isolation.
+    pipeline_start_time = time.time()
     args = parse_args()
     query = args.query.strip()
 
@@ -394,7 +400,7 @@ def main() -> int:
         charter_path, charter_facts = company_charter.run_company_charter(
             reg_no, category_data, documents_manifest, documents_dir, research_data, args.output_dir,
             complaint_orders_manifest=complaint_orders_manifest, complaint_orders_dir=complaint_orders_dir,
-            reviews=reviews, promoter_portfolio=portfolio,
+            reviews=reviews, promoter_portfolio=portfolio, pipeline_start_time=pipeline_start_time,
         )
         external_charter_path = charter_path.replace("_Internal.docx", "_External.docx")
         print(f"[OK] Company Charter (Internal) written to {charter_path}")

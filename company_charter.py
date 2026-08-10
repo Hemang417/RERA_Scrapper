@@ -49,6 +49,7 @@ import os
 import re
 import shutil
 import sys
+import time
 from datetime import datetime
 
 import fitz  # PyMuPDF
@@ -3346,6 +3347,61 @@ def _set_paragraph_text(paragraph, text: str) -> None:
     _set_paragraph_text_raw(paragraph, text)
 
 
+def _format_elapsed(seconds: float) -> str:
+    """Human-readable duration for the version-log line -- "Xh Ym Zs",
+    dropping leading zero units (e.g. "4m 12s", not "0h 4m 12s")."""
+    total = max(int(seconds), 0)
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes}m {secs}s"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+def _insert_version_log(doc, p, elapsed_seconds: float | None, cost_usd: float | None, api_calls: int | None) -> None:
+    """Inserts a small metadata line on the cover page (run time + Anthropic
+    API cost for this specific run), right before the "Overview & Flags"
+    heading. Caller only invokes this for the Internal variant -- cost/
+    timing is operational detail, not something to hand an external
+    counterparty. Inserted as a brand-new paragraph via python-docx rather
+    than a template slot, since the .docx template predates this field --
+    this only touches the in-memory Document built at render time, never
+    output/company_charters/Company_Charter_TEMPLATE_WebSourced.docx itself,
+    so no template backup is needed (see CLAUDE.md's template-safety note,
+    which is about edits to the template FILE).
+
+    Deliberately does NOT anchor on the `p` list captured near the top of
+    _fill_template: "Overview & Flags" is assembled/repositioned to the
+    front of the document by later code in this function, using its own
+    fixed-index lookups against the ORIGINAL template layout (where that
+    position instead holds "Methodology Note", which gets deleted
+    entirely) -- p[4] is stale by the time this runs. Querying doc.paragraphs
+    fresh here reflects the document's true, final, already-reordered shape."""
+    from docx.shared import Pt
+
+    if elapsed_seconds is None and cost_usd is None:
+        return
+    if api_calls:
+        cost_text = f"API cost: ${cost_usd:,.2f} ({api_calls} Anthropic API call{'s' if api_calls != 1 else ''})"
+    else:
+        cost_text = "API cost: no Anthropic API calls recorded this run (content supplied via a pre-built facts file)"
+    time_text = f"Generation time: {_format_elapsed(elapsed_seconds)}" if elapsed_seconds is not None else ""
+    line = "  |  ".join(t for t in (time_text, cost_text) if t)
+
+    anchor = next((para for para in doc.paragraphs if para.text.strip() == "Overview & Flags"), None)
+    if anchor is None:
+        # Heading text not found (template changed?) -- fall back to right
+        # after the title block rather than silently dropping the line.
+        anchor = p[4]
+    version_log_p = anchor.insert_paragraph_before("")
+    run = version_log_p.add_run(line)
+    run.font.size = Pt(9)
+    run.italic = True
+    _color_run(run, "808080")
+
+
 def _remove_paragraph(paragraph) -> None:
     """Deletes `paragraph` from the document entirely (not just its text) --
     a suppressed field that still occupies a bulleted-list template slot
@@ -4181,7 +4237,10 @@ def _convert_docx_to_pdf(docx_path: str) -> str | None:
         return None
 
 
-def _fill_template(reg_no: str, facts: dict, out_path: str, doc_variant: str = "internal") -> None:
+def _fill_template(
+    reg_no: str, facts: dict, out_path: str, doc_variant: str = "internal",
+    elapsed_seconds: float | None = None, cost_usd: float | None = None, api_calls: int | None = None,
+) -> None:
     """doc_variant is "internal" (default -- today's behavior: inline
     "(label)" citations, "(Code-Computed)" labels, verbatim prose) or
     "external" (deduped, sequentially-numbered "[N]" citations resolving
@@ -4751,6 +4810,12 @@ def _fill_template(reg_no: str, facts: dict, out_path: str, doc_variant: str = "
     # content was a gap-only field can't be judged empty until that
     # field's paragraph has actually been removed.
     _remove_empty_section_headings(doc)
+
+    # Version log (run time + Anthropic API cost) -- Internal only, on the
+    # cover page, right above "Overview & Flags". Before the alignment pass
+    # below so it's treated the same as everything else.
+    if doc_variant == "internal":
+        _insert_version_log(doc, p, elapsed_seconds, cost_usd, api_calls)
 
     # Alignment pass: flowing body text justified (both margins), table
     # content centered. Last thing before save -- runs after every row/
@@ -8298,6 +8363,7 @@ def run_company_charter(
     review_source_label: str | None = None,
     promoter_portfolio: dict | None = None,
     pre_built_facts: dict | None = None,
+    pipeline_start_time: float | None = None,
 ) -> tuple[str, dict]:
     """Returns (out_path, facts) -- facts is the complete, code-and-model
     -assembled Charter data (same content as the .facts.json written
@@ -8314,7 +8380,15 @@ def run_company_charter(
     (see _SYSTEM_PROMPT and this function's own user_prompt construction
     below). Every downstream step (document grounding, professional team,
     developer score, company profile/IBBI/credit checks) still runs
-    unchanged -- none of those ever called the API to begin with."""
+    unchanged -- none of those ever called the API to begin with.
+
+    `pipeline_start_time`: a `time.time()` timestamp from the start of the
+    FULL pipeline (main.py's scrape + deep research, not just this
+    function), so the Internal document's version-log line can report the
+    true end-to-end run time. Defaults to this function's own start when
+    omitted (e.g. a standalone `python company_charter.py <REG_NO>` run against
+    already-scraped data), which then reports charter-generation time only."""
+    _charter_start_time = time.time()
     if not os.path.exists(TEMPLATE_PATH):
         raise FileNotFoundError(f"Template not found at {TEMPLATE_PATH}")
 
@@ -8557,8 +8631,19 @@ def run_company_charter(
     # External renders from an internal deep copy (see
     # _externalized_facts_copy) and never touches the real `facts` dict,
     # however many times or in whatever order the two variants render.
+    # Version log inputs -- computed here, right before rendering, so the
+    # cost/call count reflect every API call this run made (charter_pass,
+    # verification passes, document grounding, etc. all log to the same
+    # deep_research._USAGE_LOG). Only passed into the Internal render below
+    # -- External never receives these kwargs, so it stays unaffected.
+    _usage_total = deep_research.usage_summary()["total"]
+    _run_elapsed_seconds = time.time() - (pipeline_start_time or _charter_start_time)
+
     out_path = os.path.join(out_dir, f"Company_Charter_{project_name}_{reg_no}_Internal.docx")
-    _fill_template(reg_no, facts, out_path, doc_variant="internal")
+    _fill_template(
+        reg_no, facts, out_path, doc_variant="internal",
+        elapsed_seconds=_run_elapsed_seconds, cost_usd=_usage_total["cost_usd"], api_calls=_usage_total["calls"],
+    )
     internal_pdf_path = _convert_docx_to_pdf(out_path)
 
     external_out_path = os.path.join(out_dir, f"Company_Charter_{project_name}_{reg_no}_External.docx")

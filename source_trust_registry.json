@@ -51,9 +51,10 @@
       "review_note": null
     },
     "squareyards.com": {
-      "hit_count": 1,
+      "hit_count": 2,
       "projects": [
-        "P51700031409"
+        "P51700031409",
+        "P51800077150"
       ],
       "promoted": false,
       "promoted_on_project": null,
