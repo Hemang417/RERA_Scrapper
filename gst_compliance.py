@@ -35,6 +35,19 @@ import re
 # file's own worked example, 27AANCM5273D1ZA.
 _GSTIN_RE = re.compile(r"^\d{2}[A-Z]{5}\d{4}[A-Z][1-9A-Z]Z[0-9A-Z]$")
 
+# 10 characters: 5 letters, 4 digits, 1 letter -- the same PAN block that
+# sits at characters 3-12 of a GSTIN above, which is why extract_pan_from_gstin
+# can simply slice it out.
+_PAN_RE = re.compile(r"^[A-Z]{5}\d{4}[A-Z]$")
+
+
+def validate_pan(pan: str) -> bool:
+    """Format validation only, exactly as validate_gstin below: confirms the
+    string HAS the shape of a PAN, not that it belongs to anyone. Callers use
+    this to reject a typo before opening a browser and asking a human to solve
+    a CAPTCHA for a lookup that cannot succeed. Never raises."""
+    return bool(_PAN_RE.match((pan or "").strip().upper()))
+
 
 def validate_gstin(gstin: str) -> bool:
     """Format validation only -- confirms the string HAS the shape of a

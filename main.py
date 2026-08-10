@@ -38,6 +38,7 @@ import company_charter
 import config
 import deep_research
 import discover
+import gst_intake
 import promoter_portfolio as promoter_portfolio_mod
 import report
 import resolver
@@ -107,6 +108,28 @@ def parse_args() -> argparse.Namespace:
             "side search-index gap, not a sign the project itself is gone). Only meaningful "
             "when `query` is a registration number, since that's the only case this script "
             "would otherwise need to resolve via search."
+        ),
+    )
+    gst = parser.add_mutually_exclusive_group()
+    gst.add_argument(
+        "--gstin",
+        default=None,
+        help=(
+            "This promoter's GSTIN (e.g. 27AANCP0234D1ZO). Runs the GST filing-history "
+            "intake as part of the pipeline: every GSTIN registered under the same PAN is "
+            "discovered, each one's filing table is fetched, and the result feeds the "
+            "Company Charter's GST Compliance score. Opens a visible browser and needs a "
+            "human to solve a CAPTCHA -- once for the PAN search, then once per GSTIN "
+            "found. Omit to skip GST entirely, exactly as today."
+        ),
+    )
+    gst.add_argument(
+        "--pan",
+        default=None,
+        help=(
+            "This promoter's PAN (e.g. AANCP0234D). Same GST intake as --gstin, starting "
+            "from the PAN instead. MahaRERA's own document set always includes a PAN card "
+            "and never a GSTIN, so this is usually the one you have."
         ),
     )
     return parser.parse_args()
@@ -227,6 +250,35 @@ def _extract_promoter_name(category_data: dict) -> str | None:
     if isinstance(projects_data, dict) and projects_data.get("promoterName"):
         return projects_data["promoterName"].strip()
     return None
+
+
+def _run_gst_intake_step(gst_identifier: str | None, reg_no: str, output_dir: str) -> str:
+    """Runs the opt-in GST filing-history intake and returns a one-line status
+    for the run summary.
+
+    NEVER raises. The intake opens its own browser, depends on a live
+    third-party portal, and needs a human to solve a CAPTCHA -- any of which
+    can fail on a run that is otherwise completely fine. A GST failure costs
+    the Charter one unscored sub-metric (GST Compliance); it must never cost
+    the whole scrape. Same policy as the promoter portfolio and deep research
+    steps either side of it."""
+    if not gst_identifier:
+        print("\n[INFO] No --gstin/--pan supplied -- skipping GST filing-history intake.")
+        return "not requested (pass --gstin or --pan to enable)"
+
+    print(f"\n[INFO] Running GST filing-history intake for {gst_identifier}...")
+    try:
+        result = gst_intake.run_intake(gst_identifier, reg_no, output_dir)
+    except Exception as e:
+        # Broad on purpose -- see this function's own docstring.
+        print(f"[WARN] GST intake failed ({e}) -- continuing without GST filing data.")
+        return f"FAILED this run ({e})"
+
+    print(
+        f"[OK] GST intake: {result['period_count']} scoreable filing period(s) for "
+        f"{result['primary_gstin']}."
+    )
+    return f"{result['period_count']} period(s) for {result['primary_gstin']}"
 
 
 def main() -> int:
@@ -369,6 +421,13 @@ def main() -> int:
     else:
         print("\n[WARN] Could not determine promoter name -- skipping promoter portfolio.")
 
+    # Opt-in, and placed here on purpose: this is the last step that needs a
+    # human at the keyboard (a CAPTCHA solve per portal lookup), so it sits
+    # beside the other browser work rather than after deep research, which
+    # runs unattended for minutes. Writes gst_filing_input.json, which
+    # run_gst_compliance_check picks up during Charter generation below.
+    gst_status = _run_gst_intake_step(args.gstin or args.pan, reg_no, args.output_dir)
+
     print("\n[INFO] Running agentic deep research (market + promoter profile)...")
     try:
         research_data = deep_research.run_deep_research(
@@ -467,6 +526,7 @@ def main() -> int:
 
     print(f"  {'promoter_profile':<20} {'built (' + str(portfolio['totals']['total_projects']) + ' project(s))' if portfolio else 'not available'}")
     print(f"  {'market_research':<20} {'populated' if research_data else 'FAILED this run -- see warning above, or retry with: python deep_research.py ' + reg_no}")
+    print(f"  {'gst_filing_intake':<20} {gst_status}")
     print(f"  {'company_charter':<20} {'written (' + charter_path + ')' if charter_path else 'FAILED this run -- see warning above, or retry with: python company_charter.py ' + reg_no}")
 
     usage = deep_research.write_usage_log(args.output_dir, reg_no)

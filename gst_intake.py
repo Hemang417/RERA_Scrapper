@@ -33,7 +33,15 @@ combining two different states' periods under one GSTIN's state code
 would misclassify some due dates) -- the others' raw filing data is
 still written to gst_portal_raw/ for a human to review, not discarded.
 
-    python gst_intake.py <PAN_or_GSTIN> <reg_no>
+Two entry points, one code path (run_intake):
+    python gst_intake.py <PAN_or_GSTIN> <reg_no>     -- standalone
+    python main.py <reg_no> --pan <PAN>              -- inside the pipeline
+    python main.py <reg_no> --gstin <GSTIN>
+The pipeline step runs between the promoter-portfolio build and deep
+research, so all the human-attended browser work happens together, and it
+is never fatal: a portal outage or an unsolved CAPTCHA costs the Charter
+one unscored sub-metric, not the whole run (see main._run_gst_intake_step).
+Omitting both flags skips GST entirely.
 """
 
 import argparse
@@ -44,26 +52,43 @@ import gst_compliance
 import gst_portal
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Discover every GSTIN under a PAN, fetch each one's full filing history from the live "
-                     "GST portal, parse it, and write gst_filing_input.json for run_gst_compliance_check to "
-                     "pick up automatically on the next Company Charter run."
-    )
-    parser.add_argument("identifier", help="A PAN (e.g. AANCP0234D) or a GSTIN (e.g. 27AANCP0234D1ZO) for this promoter.")
-    parser.add_argument("reg_no", help="MahaRERA registration number this GST data belongs to.")
-    parser.add_argument("--output-dir", default=gst_portal.config.OUTPUT_ROOT)
-    args = parser.parse_args()
+class GstIntakeError(Exception):
+    """Raised when the intake cannot produce any scoreable filing data.
 
-    identifier = args.identifier.strip().upper()
-    if gst_compliance.validate_gstin(identifier):
+    Carries the same human-readable reason the CLI prints, so the pipeline
+    caller in main.py can log it and continue rather than parsing stdout."""
+
+
+def run_intake(identifier: str, reg_no: str, output_dir: str | None = None) -> dict:
+    """Discovers every GSTIN under `identifier`'s PAN, fetches each one's
+    filing history, and writes output/<reg_no>/gst_filing_input.json.
+
+    Shared by this module's own CLI and by main.py's --gstin/--pan pipeline
+    step, so both take exactly the same path. Opens a VISIBLE browser and
+    needs a human to solve a CAPTCHA -- once for the PAN search, then once
+    per discovered GSTIN. Returns a summary dict on success; raises
+    GstIntakeError with a human-readable reason on any outcome that yields
+    no scoreable data. Every raw portal response is written to
+    gst_portal_raw/ either way, so a failed pass is still inspectable."""
+    output_dir = output_dir or gst_portal.config.OUTPUT_ROOT
+    identifier = (identifier or "").strip().upper()
+
+    supplied_gstin = gst_compliance.validate_gstin(identifier)
+    if supplied_gstin:
         pan = gst_compliance.extract_pan_from_gstin(identifier)
         print(f"[INFO] Extracted PAN {pan} from GSTIN {identifier}.")
-    else:
+    elif gst_compliance.validate_pan(identifier):
         pan = identifier
         print(f"[INFO] Treating {pan!r} as a PAN directly.")
+    else:
+        # Checked before opening a browser: the portal lookup costs a human
+        # a fresh CAPTCHA solve, so a typo must never get that far.
+        raise GstIntakeError(
+            f"{identifier!r} is neither a validly-formatted GSTIN (e.g. 27AANCP0234D1ZO) "
+            f"nor a validly-formatted PAN (e.g. AANCP0234D)."
+        )
 
-    project_dir = os.path.join(args.output_dir, args.reg_no)
+    project_dir = os.path.join(output_dir, reg_no)
     raw_dir = os.path.join(project_dir, "gst_portal_raw")
     os.makedirs(raw_dir, exist_ok=True)
 
@@ -73,13 +98,14 @@ def main() -> int:
         json.dump(pan_result, f, indent=2, ensure_ascii=False)
 
     if not pan_result["found"]:
-        if gst_compliance.validate_gstin(identifier):
+        if supplied_gstin:
             print(f"[WARN] No GSTINs found for PAN {pan}: {pan_result.get('note', 'no reason given')}")
             print(f"[INFO] Falling back to just the originally-supplied GSTIN ({identifier}).")
             gstins = [identifier]
         else:
-            print(f"[ERROR] No GSTINs found for PAN {pan}: {pan_result.get('note', 'no reason given')}")
-            return 1
+            raise GstIntakeError(
+                f"No GSTINs found for PAN {pan}: {pan_result.get('note', 'no reason given')}"
+            )
     else:
         gstins = pan_result["gstins"]
         print(f"[OK] Found {len(gstins)} GSTIN(s) under this PAN: {', '.join(gstins)}")
@@ -103,13 +129,26 @@ def main() -> int:
             continue
 
         records = gst_portal.parse_filing_table(by_year)
+        if not records:
+            # Not the same as "no filing table": the registration files, but
+            # only forms with no statutory due-date rule to score against
+            # (annual GSTR9, composition CMP08 -- see parse_filing_table).
+            # Recording it anyway would write a records:[] input file, and
+            # run_gst_compliance_check treats that file existing as "GST data
+            # was supplied", so an empty one is worse than none.
+            print(f"[WARN] {g}: filing table found, but no scoreable monthly GSTR-3B/GSTR-1 period in it. "
+                  f"Raw result written to {result_path}")
+            continue
+
         records_by_gstin[g] = records
         print(f"[OK] {g}: parsed {len(records)} scoreable period(s) across {len(by_year)} financial year(s). "
               f"Raw result written to {result_path}")
 
     if not records_by_gstin:
-        print("\n[ERROR] No GSTIN produced any scoreable filing records this pass -- gst_filing_input.json not written.")
-        return 1
+        raise GstIntakeError(
+            f"No GSTIN produced any scoreable filing records this pass -- gst_filing_input.json not "
+            f"written. Raw portal responses are in {raw_dir}."
+        )
 
     primary_gstin = max(records_by_gstin, key=lambda g: len(records_by_gstin[g]))
     if len(records_by_gstin) > 1:
@@ -122,8 +161,35 @@ def main() -> int:
     with open(gst_filing_input_path, "w", encoding="utf-8") as f:
         json.dump({"gstin": primary_gstin, "records": records_by_gstin[primary_gstin]}, f, indent=2, ensure_ascii=False)
 
-    print(f"\n[OK] Wrote {gst_filing_input_path} -- run_gst_compliance_check will pick this up automatically "
-          f"on the next `python company_charter.py {args.reg_no}` run.")
+    print(f"\n[OK] Wrote {gst_filing_input_path} -- run_gst_compliance_check picks this up automatically "
+          f"on the Company Charter run.")
+    return {
+        "pan": pan,
+        "gstins": list(gstins),
+        "primary_gstin": primary_gstin,
+        "period_count": len(records_by_gstin[primary_gstin]),
+        "scored_gstin_count": len(records_by_gstin),
+        "input_path": gst_filing_input_path,
+        "raw_dir": raw_dir,
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Discover every GSTIN under a PAN, fetch each one's full filing history from the live "
+                     "GST portal, parse it, and write gst_filing_input.json for run_gst_compliance_check to "
+                     "pick up automatically on the next Company Charter run."
+    )
+    parser.add_argument("identifier", help="A PAN (e.g. AANCP0234D) or a GSTIN (e.g. 27AANCP0234D1ZO) for this promoter.")
+    parser.add_argument("reg_no", help="MahaRERA registration number this GST data belongs to.")
+    parser.add_argument("--output-dir", default=gst_portal.config.OUTPUT_ROOT)
+    args = parser.parse_args()
+
+    try:
+        run_intake(args.identifier, args.reg_no, args.output_dir)
+    except GstIntakeError as e:
+        print(f"\n[ERROR] {e}")
+        return 1
     return 0
 
 
