@@ -4423,13 +4423,21 @@ def _fill_template(
         if not material:
             p[66].add_run(_externalize_prose(facts, "No additional material gaps identified beyond the standing gap below."))
         else:
+            # Numbered to match the "(Gap N)" pointers in Overview & Flags.
+            # The number is the gap's stable identity (see _classify_flags),
+            # so External's subset reads "Gap 3.", "Gap 7." rather than
+            # renumbering -- a pointer means the same thing in both variants.
             for idx, (i, g) in enumerate(material):
-                run = p[66].add_run(_externalize_prose(facts, f"• {g}"))
+                run = p[66].add_run(_externalize_prose(facts, f"Gap {i + 1}. {g}"))
                 _color_run(run, _TEXT_RED if gap_severity[i] == "imminent" else _TEXT_AMBER)
                 if idx < len(material) - 1:
                     run.add_break()
     else:
-        _set_paragraph_text(p[66], "\n".join(f"• {g}" for g in gaps) if gaps else "No additional gaps identified beyond the standing gap below.")
+        _set_paragraph_text(
+            p[66],
+            "\n".join(f"Gap {i + 1}. {g}" for i, g in enumerate(gaps)) if gaps
+            else "No additional gaps identified beyond the standing gap below.",
+        )
     # p[67] (the permanent standing gap) is left untouched deliberately.
 
     t = doc.tables
@@ -6467,17 +6475,82 @@ def _classify_flags(facts: dict) -> dict:
 
     for i, gap_text in enumerate(facts.get("gaps", [])):
         lowered = gap_text.lower()
-        field = f"gaps[{i}]"
+        # gap_number is this gap's stable 1-based identity, assigned here so a
+        # flag and its Gaps & Sources entry can be cross-referenced without
+        # either renderer having to re-derive it (CLAUDE.md Section B, "Flags
+        # summarise, Gaps explain"). It indexes facts["gaps"] and does not
+        # renumber per document variant -- see _rendered_gap_numbers.
+        entry = {"text": gap_text, "field": f"gaps[{i}]", "gap_number": i + 1}
         if any(marker in lowered for marker in _ESCROW_GAP_MARKERS):
-            structural.append({"text": gap_text, "field": field})
+            structural.append(entry)
         elif any(marker in lowered for marker in _FSI_AREA_GAP_MARKERS):
-            imminent.append({"text": gap_text, "field": field})
+            imminent.append(entry)
         elif any(phrase in lowered for phrase in _STRUCTURAL_GAP_PHRASES):
-            structural.append({"text": gap_text, "field": field})
+            structural.append(entry)
         else:
-            monitor.append({"text": gap_text, "field": field})
+            monitor.append(entry)
 
     return {"imminent": imminent, "structural": structural, "monitor": monitor}
+
+
+def _rendered_gap_numbers(facts: dict) -> set:
+    """The stable gap numbers (see _classify_flags) that THIS document variant
+    actually prints under Gaps & Sources.
+
+    Internal prints every gap. External prints only those material enough to
+    have also earned an Imminent or Structural flag -- see _fill_template's own
+    note where that list is built. _append_flag_list consults this before
+    emitting a "(Gap N)" pointer, so External can never point at a number it
+    does not print. Numbers stay stable either way: External's list reads
+    "Gap 3.", "Gap 7." rather than renumbering to 1, 2, because the number is
+    the gap's identity, not its position in one variant's list."""
+    gaps = facts.get("gaps", []) or []
+    if facts.get("_doc_variant") != "external":
+        return set(range(1, len(gaps) + 1))
+
+    flags = _classify_flags(facts)
+    return {
+        item["gap_number"]
+        for severity in ("imminent", "structural")
+        for item in flags.get(severity, [])
+        if item.get("gap_number")
+    }
+
+
+def _flag_headline(facts: dict, item: dict) -> tuple:
+    """Returns (text_to_render, points_at_a_gap) for one Overview & Flags item.
+
+    CLAUDE.md Section B, "Flags summarise, Gaps explain": a flag whose full
+    explanation already appears under Gaps & Sources is reduced to a
+    one-sentence headline plus a "(Gap N)" pointer, instead of restating the
+    whole thing. In the Pranami Bliss run that duplication ran to ~1.5 pages.
+
+    A flag with no gap entry to point at -- a CTS mismatch, a missing
+    registration number -- keeps its full text, because nothing else in the
+    document states it. Same when this variant does not print that gap at all
+    (External drops monitor-only gaps): a headline whose detail appears
+    nowhere would just lose information, so the full text stays. The second
+    return value tells the caller which of those two happened, so it does not
+    have to infer it by comparing strings.
+
+    KNOWN LIMITATION, deliberate and deferred: "one sentence" only compresses a
+    gap that HAS more than one. On the 2026-08 Pranami Bliss data 11 of 17 gaps
+    are written as a single dense sentence, so their headline comes back byte-
+    identical to the gap entry and the duplication this function exists to
+    remove survives for those 11. Shortening further (a clause-boundary cut or
+    a character budget) was considered and rejected: both produce grammatical
+    fragments, which CLAUDE.md's "Bullets and grammar" rule specifically warns
+    against, and the real defect is upstream -- a gap should not be one
+    350-character sentence in the first place. The per-finding research stage
+    rewrites gaps into properly structured multi-sentence entries, at which
+    point this compresses naturally with no change here. Do not "fix" this by
+    truncating."""
+    text = item.get("text", "")
+    number = item.get("gap_number")
+    if not number or number not in _rendered_gap_numbers(facts):
+        return text, False
+    clauses = _split_into_bullet_clauses(text)
+    return f"{clauses[0] if clauses else text} (Gap {number})", True
 
 
 # ---------------------------------------------------------------------------
@@ -7089,11 +7162,18 @@ def _append_overview_section(doc, facts: dict, flags: dict) -> None:
         for item in items:
             line = doc.add_paragraph()
             _apply_bullet_hanging_indent(line)
+            headline, points_at_a_gap = _flag_headline(facts, item)
             # "(see gaps[0])" / "(see rera_core_fields.litigations_per_record)"
             # are raw internal facts.json paths -- meaningless (and
             # unprofessional-looking) to a client, so External drops the
-            # annotation entirely rather than trying to reword it.
-            raw_text = _variant(facts, f"• {item['text']} (see {item['field']})", f"• {item['text']}")
+            # annotation entirely rather than trying to reword it. A flag
+            # carrying a "(Gap N)" pointer drops it in BOTH variants: the
+            # pointer already says where the detail lives, in language a
+            # reader can actually follow.
+            if points_at_a_gap:
+                raw_text = f"• {headline}"
+            else:
+                raw_text = _variant(facts, f"• {headline} (see {item['field']})", f"• {headline}")
             rendered = _annotate_flag_citations(facts, _externalize_prose(facts, raw_text))
             run = line.add_run(rendered)
             if text_color:
