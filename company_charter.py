@@ -4543,6 +4543,125 @@ def _point_rera_landowner_at_identity_table(facts: dict) -> bool:
     return True
 
 
+# Narrative fields that carry confirmed findings worth researching in depth.
+# Deliberately NOT every narrative field: CLAUDE.md Section B scopes this to
+# findings ("not gaps, not clean checks"), and a gap sent to a research pass
+# would come back either padded or rewritten into something that reads more
+# certain than the evidence supports.
+_FINDING_FIELDS = (
+    "litigation_status.value",
+    "land_identification.land_assembly.value",
+    "fsi_metrics.mortgage_area",
+)
+
+# Below this, a clause is a label or a stub rather than a finding with anything
+# to research.
+_MIN_FINDING_LENGTH = 80
+
+
+def _collect_findings(facts: dict) -> list:
+    """Returns [{"path", "clause"}] for every confirmed finding worth a
+    research pass.
+
+    Runs over the scrubbed view, so a clean check is never sent for research
+    (there is nothing to research about a nothing) and neither is a gap. What
+    survives the scrubber in these fields IS the finding, which is why this
+    runs after _normalize_misfiled_facts and _scrub_clean_checks."""
+    findings = []
+    for path in _FINDING_FIELDS:
+        container, key = _resolve_path(facts, path)
+        if container is None or not isinstance(container[key], str):
+            continue
+        for clause in _split_into_bullet_clauses(container[key]):
+            if len(clause) >= _MIN_FINDING_LENGTH and not _is_clean_check_clause(clause):
+                findings.append({"path": path, "clause": clause})
+    return findings
+
+
+def _finding_research_context(facts: dict) -> str:
+    """Project identity for disambiguating a search. A Notice of Lis Pendens
+    means nothing without knowing which plot it is being researched against."""
+    core = facts.get("rera_core_fields", {}) or {}
+    corp = facts.get("corporate_identity", {}) or {}
+    land = facts.get("land_identification", {}) or {}
+    fld = lambda d, k: (d.get(k) or {}).get("value", "") if isinstance(d.get(k), dict) else ""
+    bits = [
+        f"Project: {core.get('project_name', '')}",
+        f"MahaRERA registration: {core.get('registration_number', '')}",
+        f"Promoter: {fld(corp, 'promoter_name')}",
+        f"Location: {fld(land, 'village_locality')}, {fld(land, 'mandal_taluka_district')}",
+        f"Plot: {fld(land, 'survey_cts_plot_numbers')}",
+    ]
+    return "\n".join(b for b in bits if b.split(": ", 1)[-1].strip())
+
+
+def run_finding_research(facts: dict, researcher=None) -> dict:
+    """Researches every confirmed finding in depth and writes the resolved text
+    back into the field it came from.
+
+    CLAUDE.md Section B, "Deep research on every finding": a found item is
+    written out with what it is, who it involves, when it arose, whether it is
+    still live, and what it means for this project. This is a per-finding
+    research stage, not a formatting pass, and it is budgeted as one: each call
+    logs under its own "finding_research" label so its cost shows up separately
+    in usage_summary.json, and the fan-out is capped by
+    deep_research.MAX_FINDING_RESEARCH_CALLS.
+
+    Degrades safely and unconditionally. A finding whose research call fails,
+    or that falls beyond the cap, keeps its original text verbatim -- an auth
+    failure or a rate limit must never silently delete a finding, which would
+    be worse than never running the stage. `researcher` is injectable so the
+    whole stage can be exercised without spending anything.
+
+    Returns a summary dict; also records it on facts["finding_research"] for
+    auditability."""
+    researcher = researcher or deep_research.research_finding
+    findings = _collect_findings(facts)
+    cap = deep_research.MAX_FINDING_RESEARCH_CALLS
+    context = _finding_research_context(facts)
+
+    results, enriched, failed = [], 0, 0
+    for i, finding in enumerate(findings):
+        if i >= cap:
+            results.append({**finding, "resolved": False, "note": f"beyond the {cap}-finding cap for one run"})
+            continue
+        try:
+            outcome = researcher(finding["clause"], context)
+        except Exception as e:
+            # Per finding, not per run: deep_research.research_finding already
+            # swallows its own failures, but an injected or future researcher
+            # might not, and one bad finding must not cost the others their
+            # research. This finding keeps its original text.
+            outcome = {"resolved": False, "text": finding["clause"],
+                       "still_live": "unknown", "note": f"deeper research could not run: {e}"}
+        record = {**finding, "resolved": bool(outcome.get("resolved")),
+                  "still_live": outcome.get("still_live", "unknown"),
+                  "note": outcome.get("note", "")}
+        if record["resolved"]:
+            new_text = (outcome.get("text") or "").strip()
+            container, key = _resolve_path(facts, finding["path"])
+            if container is not None and new_text and finding["clause"] in container[key]:
+                container[key] = container[key].replace(finding["clause"], new_text)
+                record["text"] = new_text
+                enriched += 1
+            else:
+                record["resolved"] = False
+                failed += 1
+        else:
+            failed += 1
+        results.append(record)
+
+    summary = {
+        "findings_seen": len(findings),
+        "enriched": enriched,
+        "kept_original": failed + max(0, len(findings) - cap),
+        "cap": cap,
+        "results": results,
+    }
+    facts["finding_research"] = summary
+    return summary
+
+
 def _merged_mortgage_value(facts: dict, fsi_metrics: dict) -> tuple:
     """Collapses fsi_metrics.mortgage_area and fsi_metrics.mortgage_lender into
     one "Mortgage / charge on the land" value, returning (text, citation).
@@ -9270,6 +9389,29 @@ def run_company_charter(
     # own module note) -- always recorded regardless of doc_variant; only
     # rendered in the Internal document below.
     facts["source_promotion_notes"] = _record_source_hits_and_promote(facts, reg_no)
+
+    # Per-finding deep research (CLAUDE.md Section B, "Deep research on every
+    # finding"). Runs here, after every check above has had its say and before
+    # either document renders, so the enriched text reaches both variants and
+    # is persisted to .facts.json.
+    #
+    # Normalization runs first so a relocated finding is researched in the
+    # field it now belongs to. The clean-check scrubber deliberately does NOT
+    # run first: _collect_findings already skips clean-check clauses on its
+    # own, and scrubbing here would mean restoring afterwards, which would
+    # overwrite the very enrichment this stage just wrote into those fields.
+    # Never fatal: a failed call leaves that finding's original text in place.
+    _normalize_misfiled_facts(facts)
+    try:
+        _research_summary = run_finding_research(facts)
+        print(f"[OK] Per-finding research: {_research_summary['enriched']} of "
+              f"{_research_summary['findings_seen']} finding(s) resolved in depth"
+              + (f", {_research_summary['kept_original']} kept as-is"
+                 if _research_summary["kept_original"] else "") + ".")
+    except Exception as e:
+        # Broad on purpose, same policy as every other API-dependent stage:
+        # findings keep their original text and the Charter still builds.
+        print(f"[WARN] Per-finding research failed ({e}) -- findings keep their original text.")
 
     # Two documents from the same underlying facts: Internal (today's
     # existing behavior -- inline "(label)" citations, "(Code-Computed)"

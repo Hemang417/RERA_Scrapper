@@ -45,6 +45,14 @@ import finalize_report
 MODEL = "claude-sonnet-5"
 MAX_GAP_RETRY_ATTEMPTS = 2
 
+# Bounded fan-out for the per-finding research stage, same precedent as
+# MAX_GAP_RETRY_ATTEMPTS above. One agentic web-search call per finding is the
+# whole point of the stage, so the cost scales with how much a project actually
+# has to report -- a cap keeps an unusually messy project from turning one
+# Charter run into dozens of calls without anyone noticing. Findings beyond the
+# cap keep their original text rather than being dropped.
+MAX_FINDING_RESEARCH_CALLS = 8
+
 # $ per 1M tokens. This is Sonnet 5's intro rate, active through 2026-08-31 --
 # update to the standard $3.00/$15.00 after that date (or sooner, if pricing
 # changes again). Only priced models get a real cost figure back from
@@ -238,6 +246,38 @@ Your FINAL reply must be ONLY a single raw JSON object -- no prose, no markdown 
 fences -- matching exactly this shape: \
 {"status": "confirmed" | "unsupported" | "stale", "reason": "one sentence"}"""
 
+_FINDING_RESEARCH_SYSTEM_PROMPT = """Research ONE confirmed finding from a real estate \
+due-diligence report in depth, using web_search, and write it out properly.
+
+The finding has already been established as real. Your job is not to re-confirm that it \
+exists, and not to look for other findings. Resolve these five things about this one:
+  1. what it is, precisely,
+  2. who is involved (name the actual parties, not "an adjoining society"),
+  3. when it arose,
+  4. whether it is still live or has been disposed of, extinguished or closed,
+  5. what it means for this specific project.
+
+Worked example of the difference. "A 2017 Notice of Lis Pendens against an adjoining \
+society" is the input. A proper output resolves WHICH society, under WHAT suit and in \
+which court, whether that suit is still pending, and whether the land it concerns \
+actually touches this project's plot boundary.
+
+Rules for what you write:
+  * Never assert something web_search did not establish. If a sub-question cannot be \
+resolved, say so plainly in one clause and move on; do not guess, and do not pad.
+  * If research adds nothing to what the input already said, return the input's substance \
+unchanged rather than inventing detail.
+  * Report what was found. Do not write a sentence whose only content is that something \
+was searched for and not found.
+  * Plain language. Expand an abbreviation on first use.
+  * No em dashes, and no double hyphen used as a dash. Use commas, colons or a single \
+spaced hyphen.
+
+Your FINAL reply must be ONLY a single raw JSON object -- no prose, no markdown code \
+fences -- matching exactly this shape: \
+{"resolved": true | false, "text": "the rewritten finding, 2 to 5 sentences", \
+"still_live": "yes" | "no" | "unknown", "note": "one sentence on what could not be resolved, or empty"}"""
+
 _GAP_RETRY_SYSTEM_PROMPT = """Try to resolve one specific research gap using web_search, \
 following the given retry strategy (a different angle than what already failed -- do not \
 just repeat the same search).
@@ -295,6 +335,41 @@ def _run_agentic_pass(user_prompt: str, system: str, label: str = "agentic_pass"
         raise RuntimeError("tool_runner produced no messages")
     _record_usage(label, MODEL, messages)
     return _parse_json_response(messages[-1])
+
+
+def research_finding(finding: str, context: str = "", label: str = "finding_research") -> dict:
+    """Researches one confirmed finding in depth (CLAUDE.md Section B, "Deep
+    research on every finding"). Returns
+    {"resolved": bool, "text": str, "still_live": str, "note": str}.
+
+    Degrades the same way _verify_claim does, and for the same reason: any
+    failure -- no API key, a rate limit, malformed JSON -- comes back as
+    resolved=False with the ORIGINAL finding text intact. The caller keeps
+    that original. An auth failure must never silently delete a finding,
+    which is the one outcome that would be worse than not running at all.
+
+    `context` is the surrounding project detail (name, promoter, location) so
+    the search can disambiguate; a Notice of Lis Pendens means nothing without
+    knowing which plot it is being researched against."""
+    prompt = f"Finding to research in depth:\n{finding}"
+    if context.strip():
+        prompt += f"\n\nProject context (for disambiguation only, not itself the finding):\n{context.strip()}"
+    try:
+        result = _run_agentic_pass(prompt, _FINDING_RESEARCH_SYSTEM_PROMPT, label=label)
+    except Exception as e:
+        return {"resolved": False, "text": finding, "still_live": "unknown",
+                "note": f"deeper research could not run: {e}"}
+
+    text = (result.get("text") or "").strip()
+    if not result.get("resolved") or not text:
+        return {"resolved": False, "text": finding, "still_live": result.get("still_live", "unknown"),
+                "note": (result.get("note") or "").strip()}
+    return {
+        "resolved": True,
+        "text": text,
+        "still_live": result.get("still_live", "unknown"),
+        "note": (result.get("note") or "").strip(),
+    }
 
 
 def _verify_claim(claim: str, source_url: str, label: str = "verify_claim") -> dict:
