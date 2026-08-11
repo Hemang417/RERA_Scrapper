@@ -3541,7 +3541,7 @@ def _split_into_bullet_clauses(text: str) -> list[str]:
             depth = max(0, depth - 1)
         if depth == 0 and ch == ".":
             m = re.match(r"\s+(?=[A-Z0-9'\"])", text[i + 1 :])
-            if m:
+            if m and not _period_is_abbreviation(text, i):
                 pieces.append(text[start : i + 1].strip())
                 start = i + 1 + m.end()
                 i = start
@@ -3549,6 +3549,55 @@ def _split_into_bullet_clauses(text: str) -> list[str]:
         i += 1
     pieces.append(text[start:].strip())
     return [p for p in pieces if p]
+
+
+# Tokens that end in a period WITHOUT ending a sentence. Without this guard the
+# splitter fragments real bullets mid-phrase, because the character after the
+# period is a capital or digit and looks exactly like a sentence start:
+#   "Dwarkadas J. Sanghvi College"          -> "Dwarkadas J." + "Sanghvi College"
+#   "...up to 25 minutes via S.V. Road"     -> "...via S.V."  + "Road/Western..."
+#   "Government Regulation No. TPB4315/..." -> "...No."       + "TPB4315/..."
+#   "62.24 sq. m. MHADA tit-bit area"       -> "...sq. m."    + "MHADA tit-bit..."
+# All four shipped in the 2026-08 Pranami Bliss charter as broken bullets.
+_NON_TERMINAL_ABBREVIATIONS = {
+    # reference / numbering
+    "no", "nos", "sr", "jr", "art", "cl", "para", "pp", "vol", "ed", "fig",
+    "sec", "regn", "reg", "ch", "cf", "al", "ors", "anr", "vs", "viz", "etc",
+    # units
+    "sq", "m", "ft", "mtr", "mtrs", "km", "cm", "kg", "hrs", "approx", "wt",
+    # entity / honorific
+    "pvt", "ltd", "co", "inc", "corp", "llp", "mr", "mrs", "ms", "dr", "adv",
+    "prof", "hon", "smt", "shri", "st", "rd", "rs",
+    # organisational
+    "govt", "dept", "dist", "opp",
+}
+
+
+def _period_is_abbreviation(text: str, dot_index: int) -> bool:
+    """True when the period at `dot_index` closes an abbreviation or an
+    initial rather than a sentence.
+
+    Three cases, in order of how often they bite here:
+      * a dotted initialism -- "S.V.", "N.A." -- detected by the captured
+        token still containing a period;
+      * a single-letter initial in a name -- "Dwarkadas J. Sanghvi";
+      * a known abbreviation from _NON_TERMINAL_ABBREVIATIONS.
+
+    Deliberately biased toward NOT splitting. A missed split merges two
+    sentences into one slightly long bullet; a false split severs a name or a
+    regulation number across two bullets and leaves a dangling fragment, which
+    CLAUDE.md's "Bullets and grammar" rule calls out specifically. The cost of
+    the two failures is not symmetric, so ambiguous tokens ("Ltd.", "Co.")
+    stay in the set."""
+    m = re.search(r"([A-Za-z]+(?:\.[A-Za-z]+)*)\.$", text[: dot_index + 1])
+    if not m:
+        return False
+    token = m.group(1)
+    if "." in token:          # S.V, N.A, i.e -- a dotted initialism
+        return True
+    if len(token) == 1:       # a personal initial: "J.", "A."
+        return True
+    return token.lower() in _NON_TERMINAL_ABBREVIATIONS
 
 
 _MIN_STANDALONE_BULLET_WORDS = 5
@@ -3825,20 +3874,56 @@ def _justify_body_paragraphs(doc) -> None:
         paragraph.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
 
 
+# A cell longer than this carries narrative prose rather than a value, and is
+# left-aligned instead of centered -- centered prose is ragged on both edges
+# and unreadable (CLAUDE.md Section A, "Alignment", amended 2026-08-10). Tuned
+# so dates, names, statuses, figures and short phrases still center, while
+# cells like Landowner/Investor, the Board Resolution row and the Mortgage row
+# (all multi-sentence) go left.
+_LONG_CELL_CHARS = 110
+
+
 def _center_all_table_cells(doc) -> None:
     """"Center in the table" -- every table in the document (Field/Value
     tables, Director/Group-Companies tables, scoring tables, all of it)
-    gets its cell content centered. Table-cell writes are scattered across
-    dozens of call sites in this file (_set_cell/_set_row_cell plus many
-    direct `row.cells[i].text = ...` assignments), so this runs as a
-    single blanket pass over the finished tables rather than needing every
-    call site touched individually."""
+    gets its cell content centered, EXCEPT cells carrying a paragraph of
+    narrative prose, which are left-aligned (see _LONG_CELL_CHARS).
+    Table-cell writes are scattered across dozens of call sites in this file
+    (_set_cell/_set_row_cell plus many direct `row.cells[i].text = ...`
+    assignments), so this runs as a single blanket pass over the finished
+    tables rather than needing every call site touched individually.
+
+    Header rows always center regardless of length -- a long header label is
+    still a label, not prose."""
     from docx.enum.text import WD_ALIGN_PARAGRAPH
     for table in doc.tables:
-        for row in table.rows:
+        for row_idx, row in enumerate(table.rows):
             for cell in row.cells:
+                is_prose = (row_idx > 0
+                            and len(cell.text.strip()) > _LONG_CELL_CHARS)
+                target = (WD_ALIGN_PARAGRAPH.LEFT if is_prose
+                          else WD_ALIGN_PARAGRAPH.CENTER)
                 for paragraph in cell.paragraphs:
-                    paragraph.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    paragraph.paragraph_format.alignment = target
+
+
+def _apply_table_pagination(doc) -> None:
+    """Stops tables breaking mid-row across a page boundary, and repeats the
+    header row at the top of each continuation page (CLAUDE.md Section A,
+    "Table pagination"). Runs as a blanket pass alongside
+    _center_all_table_cells, for the same reason: table construction is
+    spread across too many call sites to set this at each one."""
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+    for table in doc.tables:
+        for row_idx, row in enumerate(table.rows):
+            trPr = row._tr.get_or_add_trPr()
+            if not trPr.findall(qn('w:cantSplit')):
+                trPr.append(OxmlElement('w:cantSplit'))
+            if row_idx == 0 and not trPr.findall(qn('w:tblHeader')):
+                hdr = OxmlElement('w:tblHeader')
+                hdr.set(qn('w:val'), 'true')
+                trPr.append(hdr)
 
 
 def _apply_deferred_bullets(facts: dict) -> None:
@@ -4069,6 +4154,20 @@ def _check_citation_completeness(docx_path: str) -> list[str]:
     return flags
 
 
+# The External document is now allowed its own Document Library section -- an
+# opened-and-extracted-only table, agreed 2026-08-10 -- so the old blanket ban
+# on the string "Document Library" would hard-fail every External save. What
+# must still never appear is the INTERNAL table's per-document status column,
+# which narrates what was NOT opened ("Not opened this pass -- not a
+# high-priority legal/regulatory document type") and is exactly the
+# absence-reporting CLAUDE.md Section B deletes. This targets that text, not
+# the heading.
+_EXTERNAL_DOC_LIBRARY_LEFTOVER_RE = re.compile(
+    r"Not opened this pass|another document already opened under this same shared label",
+    re.IGNORECASE,
+)
+
+
 def _verify_external_document_quality(docx_path: str) -> list[str]:
     """Re-opens a just-saved External Charter and checks for the exact
     regressions this session found and fixed by hand (grey/italic body
@@ -4091,8 +4190,8 @@ def _verify_external_document_quality(docx_path: str) -> list[str]:
             violations.append(f"hyphen-pair dash found in paragraph: {text[:80]!r}")
         if "—" in text:  # em dash
             violations.append(f"em dash found in paragraph: {text[:80]!r}")
-        if "Document Library" in text:
-            violations.append(f"'Document Library' section text survived in External: {text[:80]!r}")
+        if _EXTERNAL_DOC_LIBRARY_LEFTOVER_RE.search(text):
+            violations.append(f"leftover Internal Document Library status text survived in External: {text[:80]!r}")
         if _is_cited_absence(text):
             # CLAUDE.md Section B: "Never attach a citation marker to an
             # absence." A citation spent establishing that there is nothing to
@@ -5513,10 +5612,12 @@ def _fill_template(
         _insert_version_log(doc, p, elapsed_seconds, cost_usd, api_calls)
 
     # Alignment pass: flowing body text justified (both margins), table
-    # content centered. Last thing before save -- runs after every row/
-    # paragraph add-or-remove above so it sees the document's final shape.
+    # content centered for short values and left-aligned for prose cells.
+    # Last thing before save -- runs after every row/paragraph add-or-remove
+    # above so it sees the document's final shape.
     _justify_body_paragraphs(doc)
     _center_all_table_cells(doc)
+    _apply_table_pagination(doc)
 
     doc.save(out_path)
     _ACTIVE_EXTERNAL_FACTS = None
@@ -7941,7 +8042,14 @@ def _append_overview_section(doc, facts: dict, flags: dict) -> None:
 
     doc.add_paragraph()
     developer_score = facts.get("developer_score", {}) or {}
-    doc_confidence = facts.get("documentation_confidence_score", {}) or {}
+    # Computed here rather than read blind: _append_authenticity_page (which
+    # normally populates this key) runs LATER in the same _fill_template pass,
+    # in the Diligence Appendix. Reading the key directly at this point showed
+    # "N/A (N/A/100)" on the Internal document, while the External document --
+    # built second, from the same mutated facts dict -- showed the real score.
+    # Same document, two different answers for one figure. This makes the
+    # scorecard self-sufficient and order-independent.
+    doc_confidence = _ensure_documentation_confidence(facts)
     imminent_count = len(flags.get("imminent", []))
     grade = developer_score.get("grade")
     band = doc_confidence.get("band")
@@ -8851,6 +8959,28 @@ def _append_review_authenticity_section(doc, facts: dict) -> None:
             row.cells[2].text = item.get("verdict", "")
 
 
+def _ensure_documentation_confidence(facts: dict) -> dict:
+    """Returns the Documentation Confidence Score, computing and caching it on
+    `facts` the first time it is asked for.
+
+    Exists because two places need this figure -- the Overview & Flags
+    scorecard near the top of the document, and the Documentation Authenticity
+    & Confidence Summary in the Diligence Appendix -- and the appendix one used
+    to be the only writer. Whichever renders first now populates it, so the two
+    can never disagree, and a caller that renders only the scorecard still gets
+    a real number instead of N/A.
+
+    Idempotent: recomputing from the same facts yields the same score, so a
+    cached value is returned as-is rather than recomputed per call site."""
+    cached = facts.get("documentation_confidence_score")
+    if cached:
+        return cached
+    summary = _compute_authenticity_summary(facts)
+    confidence = _compute_documentation_confidence_score(facts, summary)
+    facts["documentation_confidence_score"] = confidence
+    return confidence
+
+
 def _append_authenticity_page(doc, facts: dict) -> None:
     """Appends a new, code-computed section (not model-authored) summarizing
     what tier each cited source falls into and how many claims remain
@@ -8858,11 +8988,12 @@ def _append_authenticity_page(doc, facts: dict) -> None:
     same underlying data already visible in the Sources/Gaps sections,
     rather than trusting a self-assessment."""
     summary = _compute_authenticity_summary(facts)
-    confidence = _compute_documentation_confidence_score(facts, summary)
-    # Stored back onto facts (not just rendered here) so callers building a
-    # separate output from the same facts dict -- e.g. report.py's PDF --
-    # can show the same score without recomputing it.
-    facts["documentation_confidence_score"] = confidence
+    # Routed through the shared helper (which caches onto `facts`) rather than
+    # computing independently, so this page and the Overview & Flags scorecard
+    # can never print two different numbers for the same score. The helper also
+    # keeps it available to callers building a separate output from the same
+    # facts dict -- e.g. report.py's PDF.
+    confidence = _ensure_documentation_confidence(facts)
 
     # This template's heading styles were created via docx-js, not Word --
     # python-docx's add_heading() looks up a style named "Heading 1" and
