@@ -4190,14 +4190,16 @@ _EXTERNAL_DOC_LIBRARY_LEFTOVER_RE = re.compile(
 
 def _verify_external_document_quality(docx_path: str) -> list[str]:
     """Re-opens a just-saved External Charter and checks for the exact
-    regressions this session found and fixed by hand (grey/italic body
+    regressions found and fixed by hand (grey/italic body
     text, hyphen-pair "dashes", the Weight column, the Document Library
     section, missing bullet numbering, and dangling-paren citations) --
     not a general style linter, just a guard against these specific bugs
     coming back the next time someone edits _fill_template. Returns a
     list of violation strings; empty means clean. Raises nothing itself --
     the caller decides how loudly to fail. See _check_citation_completeness
-    for the separate, advisory-only citation-marker check."""
+    for the separate, advisory-only citation-marker check.
+
+    The hard gate that blocks a bad save; see guardrails.md for the full map."""
     import re
     import docx as _docx
 
@@ -4940,6 +4942,8 @@ def run_editorial_passes(facts: dict, judge=None, matcher=None, headline_writer=
 
 def _preflight_rules(doc_variant: str) -> dict:
     """Confirms rules.md is present and intact BEFORE any document is built.
+
+    One of two hard gates; see guardrails.md for the full map.
 
     Most of rules.md is enforced by code rather than by a model: _fill_template
     renders in pure Python, so a missing or malformed rules file would not

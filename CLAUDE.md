@@ -1,8 +1,16 @@
 # RERA Scrapper — pipeline map
 
-**Content rules live in `rules.md`, not here.** Read it before generating,
-editing or reviewing any Charter text. This file is the flow: what runs, in
-what order, what is optional, and what must not be skipped.
+**Two companion files. Read the relevant one before you touch anything.**
+
+- **`rules.md`** — what the documents may and may not say. Read before
+  generating, editing or reviewing any Charter text. Parsed at runtime and
+  injected into API calls, so it is live configuration, not just prose.
+- **`guardrails.md`** — every gate, fallback, bound and never-fatal wrapper,
+  by symbol. Read before changing, removing or adding one. Several look
+  redundant and are not; each records why it exists.
+
+This file is the flow: what runs, in what order, what is optional, and what
+must not be skipped.
 
 ## Entry point
 
@@ -70,8 +78,7 @@ call, C only into External ones), **deterministic passes**, and **gates**
 (`_verify_external_document_quality` blocks a bad save). Section A never reaches
 an API call.
 
-**`guardrails.md` is the full map** — every gate, fallback, bound and
-never-fatal wrapper, by symbol. Read it before changing any of them.
+See `guardrails.md` for the full map of all four.
 
 ## Before calling a run done
 

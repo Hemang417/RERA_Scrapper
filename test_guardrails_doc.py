@@ -60,9 +60,12 @@ def test_every_documented_guardrail_exists():
         if not hasattr(_MODULES[mod], name)
     ]
     assert not missing, (
-        "guardrails.md names symbols that no longer exist:\n  "
+        "guardrails.md names guardrails that no longer exist:\n  "
         + "\n  ".join(missing)
-        + "\nEither restore them or update the doc."
+        + "\n\nIf you renamed one, update guardrails.md to match."
+        + "\nIf you REMOVED one, read its entry in guardrails.md first: each records"
+        + "\nwhy it exists, and several look redundant while preventing a specific"
+        + "\nfailure this pipeline has actually hit."
     )
     print("test_every_documented_guardrail_exists: PASS")
 
