@@ -62,9 +62,9 @@ the run continue. Nothing else may swallow an error.
    from `_externalized_facts_copy()`. Inside each: preflight, normalize, scrub
    clean checks, sanitize process text, then `_verify_external_document_quality()`,
    which blocks the save.
-6. `run_claude_md_document_review()` **[never fatal]** — audits both saved
-   documents against `rules.md` via the API. Advisory: reports and writes a
-   review JSON, never blocks the PDF.
+6. `run_claude_md_document_review()` — audits both saved documents against
+   `rules.md`. **Strict: no PDF unless they can be SHOWN to comply**, and a
+   review that could not run is a failure. `CHARTER_ALLOW_UNCHECKED=1` overrides.
 7. `_convert_docx_to_pdf()` on both. **The PDF is the deliverable.**
 8. Restore scrubbed and sanitized text, then persist `.facts.json`. The record
    keeps what the page drops.

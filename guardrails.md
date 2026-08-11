@@ -18,6 +18,7 @@ this repo have gone stale twice already.
 |---|---|---|
 | `company_charter._preflight_rules` | Generation, before a paragraph is written | `rules.md` missing, a `--- Section X ---` marker broken, a section empty, or Sections B/C carrying an em dash or double-hyphen dash |
 | `company_charter._verify_external_document_quality` | The External `.docx` save | 11 checks, below |
+| `company_charter.run_claude_md_document_review` | **The PDF** | Semantic compliance with `rules.md`, judged by the model. Raises `CharterComplianceError` |
 | `charter_report.verify_charter_report_quality` | The `charter_report.py` save | Its own independent gate, including a bare-domain check |
 | `company_charter._read_rules_section` | Any rules read | Raises on a missing or empty section |
 
@@ -86,13 +87,30 @@ so it re-splits into more clauses each pass and would be researched again. Any
 edit changes the fingerprint, so skipping is only ever an optimisation over
 identical input.
 
-## 6. Advisory — report, never block
+## 6. Compliance gate — the semantic check, and it blocks
 
-`company_charter.run_claude_md_document_review` and
-`company_charter._check_citation_completeness`. Deliberately advisory: the
-deterministic gate already stops a genuinely bad save, and a model's opinion
-should not be able to block a finished document. Making either blocking is a
-product decision, not a bug fix.
+The mechanical gate catches formatting and leaks. It cannot tell whether a
+sentence is a clean check, so `company_charter.run_claude_md_document_review`
+re-reads both saved documents and judges them against `rules.md`. It is
+**strict by default**: no PDF unless the document can be SHOWN to comply.
+
+Two ways to fail: a verified violation, or a review that could not run at all.
+The second matters as much as the first, because unverified is not the same as
+clean, and treating a missing key as a pass would make the whole chain optional
+exactly when it is load-bearing.
+
+Blocking on a model's judgement is only safe because of
+`company_charter._verified_violations`: a violation counts only if the text it
+quotes really appears in the document. That reduces the model's role from
+"decide whether this complies" to "point at the offending text", and the
+pointing is then checked mechanically. An invented or paraphrased quote is
+logged as unverifiable and cannot block. Quotes under 12 characters are not
+trusted, since they match almost anything by coincidence.
+
+`CHARTER_ALLOW_UNCHECKED=1` restores advisory behaviour. It is a decision to
+ship an unchecked document, not a convenience.
+
+`company_charter._check_citation_completeness` remains genuinely advisory.
 
 ## 7. Tests as guardrails
 

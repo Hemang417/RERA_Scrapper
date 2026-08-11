@@ -9,10 +9,12 @@ Two properties matter more than the review's own output:
     engineering sessions, and CLAUDE.md says so explicitly. Section B goes to
     both variants and Section C only to External, matching how they are
     injected at generation time.
-  * The review is ADVISORY. The deterministic gate already hard-fails a
-    genuinely bad save, and a language model's opinion must not be able to
-    stop a finished document being delivered. So a failed, empty or malformed
-    review has to leave the PDFs untouched.
+  * The review BLOCKS. A document that cannot be shown to follow rules.md
+    does not become a PDF, and a review that could not run counts as a
+    failure, because unverified is not the same as clean. Blocking on a
+    model's judgement is only safe because every violation is verified
+    against the document text first: an invented or paraphrased quote is
+    discarded rather than allowed to stop a good document.
 
 Run directly: python test_claude_md_doc_review.py
 """
@@ -48,7 +50,7 @@ def test_section_c_goes_to_external_only():
 
     deep_research.review_document_against_rules = spy
     try:
-        cc.run_claude_md_document_review(_paths())
+        cc.run_claude_md_document_review(_paths(), strict=False)
     finally:
         deep_research.review_document_against_rules = real
 
@@ -65,19 +67,91 @@ def _paths() -> dict:
     }
 
 
-def test_a_failed_review_never_raises():
-    """No API key is the everyday case in a dev environment, and it must not
-    stop a Charter run."""
+def test_a_review_that_could_not_run_blocks_the_pdf():
+    """Unverified is not the same as clean. Treating a missing key or a rate
+    limit as a pass would make the whole check optional exactly when it is
+    load-bearing, which is the failure this stage exists to prevent."""
     real = deep_research.review_document_against_rules
     deep_research.review_document_against_rules = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("rate limit"))
     try:
-        out = cc.run_claude_md_document_review(_paths())
+        try:
+            cc.run_claude_md_document_review(_paths(), strict=True)
+            raise AssertionError("a review that could not run must block")
+        except cc.CharterComplianceError as e:
+            assert "could not run" in str(e), e
+    finally:
+        deep_research.review_document_against_rules = real
+    print("test_a_review_that_could_not_run_blocks_the_pdf: PASS")
+
+
+def test_strict_false_restores_advisory_behaviour():
+    """The deliberate override, for a development run with no key. It has to
+    stay possible, and it has to be explicit."""
+    real = deep_research.review_document_against_rules
+    deep_research.review_document_against_rules = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("rate limit"))
+    try:
+        out = cc.run_claude_md_document_review(_paths(), strict=False)
     finally:
         deep_research.review_document_against_rules = real
     for variant, result in out.items():
         assert result["reviewed"] is False, result
-        assert "could not run" in result["summary"], result
-    print("test_a_failed_review_never_raises: PASS")
+    print("test_strict_false_restores_advisory_behaviour: PASS")
+
+
+def _stub_review(violations):
+    return lambda text, rules, variant, label="x": {
+        "reviewed": True, "compliant": True, "violations": violations, "summary": "stub"}
+
+
+def test_an_invented_quote_is_discarded_not_allowed_to_block():
+    """The guard that makes blocking on a model's judgement safe at all. A
+    reviewer that hallucinates or paraphrases a quote must not be able to stop
+    a good document; it gets logged as unverifiable instead."""
+    real = deep_research.review_document_against_rules
+    deep_research.review_document_against_rules = _stub_review(
+        [{"rule": "clean check", "quote": "This sentence appears nowhere in the document", "why": "x"}])
+    try:
+        out = cc.run_claude_md_document_review({"external": _paths()["external"]}, strict=True)
+    finally:
+        deep_research.review_document_against_rules = real
+    assert out["external"]["violations"] == [], "an invented quote blocked a good document"
+    assert len(out["external"]["unverifiable_violations"]) == 1, "it must still be logged for a human"
+    print("test_an_invented_quote_is_discarded_not_allowed_to_block: PASS")
+
+
+def test_a_real_quote_blocks_the_pdf():
+    text = cc._rendered_document_text(_paths()["external"])
+    quote = next(l for l in text.split("\n") if len(l) > 60)[:70]
+    real = deep_research.review_document_against_rules
+    deep_research.review_document_against_rules = _stub_review(
+        [{"rule": "clean check", "quote": quote, "why": "x"}])
+    try:
+        try:
+            cc.run_claude_md_document_review({"external": _paths()["external"]}, strict=True)
+            raise AssertionError("a verified violation must block")
+        except cc.CharterComplianceError as e:
+            assert "verified violation" in str(e), e
+            assert e.results["external"]["violations"], "the error must carry the violations"
+    finally:
+        deep_research.review_document_against_rules = real
+    print("test_a_real_quote_blocks_the_pdf: PASS")
+
+
+def test_a_very_short_quote_is_not_trusted():
+    """A three-word quote matches almost any document by coincidence, so it
+    cannot be treated as evidence of a real violation."""
+    verified, unverifiable = cc._verified_violations([{"quote": "the"}], "the document text")
+    assert verified == [] and len(unverifiable) == 1
+    print("test_a_very_short_quote_is_not_trusted: PASS")
+
+
+def test_quote_matching_survives_reflowed_whitespace():
+    """The reviewer reads text pulled out of a .docx and may not reproduce line
+    breaks, so matching normalises whitespace before comparing."""
+    verified, _ = cc._verified_violations(
+        [{"quote": "no litigation   was\n found here"}], "Text: No litigation was found here, per the report.")
+    assert len(verified) == 1, "whitespace differences must not defeat verification"
+    print("test_quote_matching_survives_reflowed_whitespace: PASS")
 
 
 def test_the_live_transport_degrades_instead_of_raising():
@@ -116,7 +190,7 @@ def test_violations_make_the_result_non_compliant():
 
 
 def test_missing_documents_are_skipped_not_fatal():
-    out = cc.run_claude_md_document_review({"internal": "does/not/exist.docx"})
+    out = cc.run_claude_md_document_review({"internal": "does/not/exist.docx"}, strict=False)
     assert out == {}, out
     print("test_missing_documents_are_skipped_not_fatal: PASS")
 
@@ -142,7 +216,12 @@ def test_rendered_text_includes_table_cells():
 if __name__ == "__main__":
     test_section_a_is_never_sent_to_the_api()
     test_section_c_goes_to_external_only()
-    test_a_failed_review_never_raises()
+    test_a_review_that_could_not_run_blocks_the_pdf()
+    test_strict_false_restores_advisory_behaviour()
+    test_an_invented_quote_is_discarded_not_allowed_to_block()
+    test_a_real_quote_blocks_the_pdf()
+    test_a_very_short_quote_is_not_trusted()
+    test_quote_matching_survives_reflowed_whitespace()
     test_the_live_transport_degrades_instead_of_raising()
     test_a_malformed_reply_is_not_treated_as_compliant()
     test_violations_make_the_result_non_compliant()

@@ -4997,7 +4997,47 @@ def _rendered_document_text(docx_path: str, limit: int = 60000) -> str:
     return text[:limit]
 
 
-def run_claude_md_document_review(paths_by_variant: dict, output_dir: str = ".", reg_no: str = "") -> dict:
+def _verified_violations(violations: list, document_text: str) -> tuple:
+    """Splits reported violations into (verified, unverifiable).
+
+    A violation is verified only when the text it quotes actually appears in
+    the document. This is what makes it safe to BLOCK on a model's judgement:
+    a reviewer that invents a quote, or paraphrases one, gets discarded rather
+    than stopping a good document from shipping. It reduces the model's role
+    from "decide whether this is compliant" to "point at the offending text",
+    and the pointing is then checked mechanically.
+
+    Whitespace is normalised before comparison, since the reviewer reads text
+    reflowed out of the .docx and may not reproduce line breaks exactly."""
+    def _norm(s):
+        return " ".join((s or "").split()).lower()
+
+    haystack = _norm(document_text)
+    verified, unverifiable = [], []
+    for v in violations or []:
+        quote = _norm(str(v.get("quote", "")))
+        # Very short quotes match almost anything; treat them as unverifiable
+        # rather than accept a coincidental substring hit.
+        if len(quote) >= 12 and quote in haystack:
+            verified.append(v)
+        else:
+            unverifiable.append(v)
+    return verified, unverifiable
+
+
+class CharterComplianceError(RuntimeError):
+    """Raised when a rendered Charter could not be shown to follow rules.md.
+
+    Carries the verified violations so a caller can print or persist them
+    rather than re-deriving them from a message string."""
+
+    def __init__(self, message: str, results: dict):
+        super().__init__(message)
+        self.results = results
+
+
+def run_claude_md_document_review(paths_by_variant: dict, output_dir: str = ".", reg_no: str = "",
+                                  strict: bool = True) -> dict:
     """Final pipeline stage: re-reads each rendered Charter and audits it
     against the CLAUDE.md rules it was written under, via the Claude API.
 
@@ -5012,12 +5052,28 @@ def run_claude_md_document_review(paths_by_variant: dict, output_dir: str = ".",
     delivered. Findings are printed and written to a JSON report next to the
     documents so a human can act on them.
 
-    Never raises. No API key, a rate limit or a malformed reply all come back
-    as reviewed=False with the reason, and the run continues."""
+    STRICT BY DEFAULT. A document that cannot be SHOWN to follow rules.md does
+    not become a PDF. Two ways to fail:
+
+      * a verified violation, meaning the reviewer quoted text that really is
+        in the document (see _verified_violations);
+      * the review could not run at all. Unverified is not the same as clean,
+        and treating a missing API key as a pass would make the whole check
+        optional exactly when it is load-bearing.
+
+    Blocking on a model's judgement is only safe because of that verification
+    step: a reviewer that invents or paraphrases a quote is discarded rather
+    than allowed to stop a good document. Unverifiable reports are still
+    written to the report file, since a real issue described imprecisely is
+    worth a human's attention even when it cannot be trusted to block.
+
+    strict=False restores advisory behaviour, for a deliberate override or a
+    development run with no key. It is a decision to ship an unchecked
+    document; make it explicitly."""
     section_b = _common_content_rules()
     section_c = _external_citation_rule()
 
-    results = {}
+    results, blocking = {}, []
     for variant, path in (paths_by_variant or {}).items():
         if not path or not os.path.exists(path):
             continue
@@ -5026,19 +5082,30 @@ def run_claude_md_document_review(paths_by_variant: dict, output_dir: str = ".",
             text = _rendered_document_text(path)
             outcome = deep_research.review_document_against_rules(text, rules, variant)
         except Exception as e:
+            text = ""
             outcome = {"reviewed": False, "compliant": None, "violations": [],
                        "summary": f"CLAUDE.md document review could not run: {e}"}
-        outcome["document"] = os.path.basename(path)
+
+        verified, unverifiable = _verified_violations(outcome.get("violations"), text)
+        outcome.update({
+            "document": os.path.basename(path),
+            "violations": verified,
+            "unverifiable_violations": unverifiable,
+            "compliant": bool(outcome.get("reviewed")) and not verified,
+        })
         results[variant] = outcome
 
         if not outcome["reviewed"]:
-            print(f"[WARN] CLAUDE.md review ({variant}): {outcome['summary']}")
+            print(f"[!!] CLAUDE.md review ({variant}) DID NOT RUN: {outcome['summary']}")
+            blocking.append(f"{variant}: review could not run ({outcome['summary']})")
         elif outcome["compliant"]:
-            print(f"[OK] CLAUDE.md review ({variant}): compliant. {outcome['summary']}")
+            note = f" ({len(unverifiable)} unverifiable report(s) logged)" if unverifiable else ""
+            print(f"[OK] CLAUDE.md review ({variant}): compliant{note}. {outcome['summary']}")
         else:
-            print(f"[!] CLAUDE.md review ({variant}): {len(outcome['violations'])} issue(s) to review.")
-            for v in outcome["violations"][:10]:
+            print(f"[!!] CLAUDE.md review ({variant}): {len(verified)} verified violation(s).")
+            for v in verified[:10]:
                 print(f"    - {v.get('rule', 'rule')}: {str(v.get('quote', ''))[:100]!r}")
+            blocking.append(f"{variant}: {len(verified)} verified violation(s)")
 
     if results and reg_no:
         report_dir = os.path.join(output_dir, "company_charters")
@@ -5047,6 +5114,15 @@ def run_claude_md_document_review(paths_by_variant: dict, output_dir: str = ".",
         with open(report_path, "w", encoding="utf-8") as f:
             json.dump(results, f, indent=2, ensure_ascii=False)
         print(f"[INFO] CLAUDE.md review report written to {report_path}")
+
+    if strict and blocking:
+        raise CharterComplianceError(
+            "Charter compliance check failed, so no PDF was produced:\n  "
+            + "\n  ".join(blocking)
+            + "\nSee the review report for the quoted text. To ship anyway, this stage "
+              "must be run with strict=False, which is a decision to ship an unchecked document.",
+            results,
+        )
     return results
 
 
@@ -9990,9 +10066,15 @@ def run_company_charter(
     # rules they were written under, before the PDFs are produced. Advisory --
     # it reports and writes a review file, and never blocks delivery. See
     # run_claude_md_document_review for why.
+    # Strict unless explicitly overridden. A document that cannot be shown to
+    # follow rules.md does not become a PDF: the deliverable is the PDF, so
+    # gating it here is what makes the whole enforcement chain non-optional.
+    # CHARTER_ALLOW_UNCHECKED=1 restores advisory behaviour for a development
+    # run with no API key; it is a decision to ship an unchecked document.
+    _strict_review = os.environ.get("CHARTER_ALLOW_UNCHECKED", "").strip() not in ("1", "true", "yes")
     facts["claude_md_review"] = run_claude_md_document_review(
         {"internal": out_path, "external": external_out_path},
-        output_dir=output_dir, reg_no=reg_no,
+        output_dir=output_dir, reg_no=reg_no, strict=_strict_review,
     )
 
     internal_pdf_path = _convert_docx_to_pdf(out_path)

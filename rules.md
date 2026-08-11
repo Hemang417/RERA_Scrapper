@@ -95,21 +95,21 @@ markers are parsed at runtime by `_read_rules_section()` in
   conversion input, and as the only output if conversion fails). Any script
   that regenerates a charter directly against `_fill_template` (bypassing
   `run_company_charter`) must call `_convert_docx_to_pdf` itself afterward.
-- **The final stage is a CLAUDE.md review, and it is advisory.** After both
+- **The final stage is a rules review, and it blocks.** After both
   variants render and before the PDFs are produced, `run_company_charter`
   calls `run_claude_md_document_review`, which re-reads each saved `.docx` and
   audits it against these rules via the Claude API. Section B goes to both
   variants and Section C only to External, exactly as at generation time.
   **Section A is never sent** — it is coding-time guidance, and
   `test_claude_md_doc_review.py` asserts that. The review REPORTS and writes
-  `Company_Charter_<REG_NO>_claude_md_review.json`; it does not block the PDF,
-  because `_verify_external_document_quality` already hard-fails a genuinely
-  bad save and a model's opinion should not be able to stop a finished
-  document being delivered. It never raises: a missing `ANTHROPIC_API_KEY`, a
-  rate limit or a malformed reply all come back as `reviewed: false` with the
-  reason, and the run continues. Cost is separable under its own
-  `claude_md_doc_review` usage label. If you want it to block on violations
-  instead, that is a deliberate change, not a bug fix.
+  `Company_Charter_<REG_NO>_claude_md_review.json`, and it BLOCKS the PDF:
+  a document that cannot be shown to comply is not delivered. A review that
+  could not run counts as a failure, since unverified is not the same as
+  clean. Blocking on a model's judgement is safe only because each violation
+  is verified against the document text first, so an invented quote cannot
+  stop a good document. Cost is separable under its own
+  `claude_md_doc_review` usage label. `CHARTER_ALLOW_UNCHECKED=1` restores
+  advisory behaviour and ships an unchecked document.
 - **GST intake is opt-in and never fatal.** `main.py` takes mutually-exclusive
   `--gstin` / `--pan`; either runs the full intake (enumerate every GSTIN under
   the PAN, fetch each filing table, write `gst_filing_input.json` for
