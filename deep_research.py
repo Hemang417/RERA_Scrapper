@@ -62,18 +62,26 @@ MAX_FINDING_RESEARCH_CALLS = 8
 # Small verification calls stay cheap on the default; the passes that both
 # search widely AND emit a large structure ask for more.
 DEFAULT_MAX_TOKENS = 8000
-CHARTER_PASS_MAX_TOKENS = 20000
+CHARTER_PASS_MAX_TOKENS = 40000
 RESEARCH_MAX_TOKENS = 16000
 
 # Hard ceiling for a NON-STREAMING request. The SDK refuses one whose expected
 # duration exceeds 10 minutes, computed as 3600 * max_tokens / 128000 seconds
 # (anthropic/_base_client.py::_calculate_nonstreaming_timeout), which puts the
-# limit at 21333. Raising CHARTER_PASS_MAX_TOKENS to 32000 to fix the
-# out-of-budget failure traded it for "Streaming is required for operations
-# that may take longer than 10 minutes" instead. Going above this needs
-# streaming, which tool_runner would have to be reworked for; it is not a
-# number to nudge upward.
+# limit at 21333. This is NOT the model's limit, only the limit of asking for
+# an answer in one blocking response, so _run_agentic_pass switches to
+# tool_runner(stream=True) above it rather than refusing.
+#
+# It took three failed runs to establish that the Charter pass cannot fit under
+# this number. Capping its searches cut its output from 33,493 tokens to
+# 21,295, which proved the cap works and that 21,333 is still not enough room:
+# that pass has to think, search AND emit the largest structure in the pipeline
+# out of one budget. Streaming is what gives it the room; the search cap is
+# what stops it spending the extra room on more searching.
 MAX_NONSTREAMING_TOKENS = 21_333
+
+# The model's own output ceiling, which streaming does expose us to.
+MAX_STREAMING_TOKENS = 64_000
 
 # How many web searches one call may run. Every search result is billed against
 # that call's max_tokens, so an unbounded search budget IS an unbounded spend of
@@ -482,12 +490,17 @@ def _run_agentic_pass(user_prompt: str, system: str, label: str = "agentic_pass"
     with the search budget cut to RETRY_MAX_SEARCHES and told to answer from
     what it already has. That is a bad answer's worth of risk against losing
     an entire run, and everything already paid for in it, to one greedy call."""
-    if max_tokens > MAX_NONSTREAMING_TOKENS:
+    if max_tokens > MAX_STREAMING_TOKENS:
         raise ValueError(
-            f"max_tokens={max_tokens} exceeds the non-streaming ceiling of {MAX_NONSTREAMING_TOKENS}. "
-            f"The SDK refuses a non-streaming request that might run over 10 minutes. Either lower it, "
-            f"or rework this call to stream. See MAX_NONSTREAMING_TOKENS."
+            f"max_tokens={max_tokens} exceeds the model's own output ceiling of "
+            f"{MAX_STREAMING_TOKENS}. No transport choice makes this work; the call has to "
+            f"ask for less, or be split."
         )
+    # Above the non-streaming ceiling the SDK refuses a blocking request
+    # outright, so the transport changes shape rather than the budget being
+    # capped. Only the calls that need the extra room take this path, which
+    # leaves every already-proven call on exactly the transport it was proven on.
+    streaming = max_tokens > MAX_NONSTREAMING_TOKENS
 
     def attempt(prompt: str, searches: int, attempt_label: str) -> dict:
         runner = _get_client().beta.messages.tool_runner(
@@ -496,8 +509,12 @@ def _run_agentic_pass(user_prompt: str, system: str, label: str = "agentic_pass"
             system=system,
             tools=[_web_search_tool(searches)] if search else [],
             messages=[{"role": "user", "content": prompt}],
+            **({"stream": True} if streaming else {}),
         )
-        messages = list(runner)
+        # A streaming runner yields BetaMessageStream, not BetaMessage. Each
+        # must be resolved inside the loop: get_final_message() reads the
+        # stream to completion, and the runner closes it once we move on.
+        messages = [s.get_final_message() for s in runner] if streaming else list(runner)
         if not messages:
             raise RuntimeError("tool_runner produced no messages")
         _record_usage(attempt_label, MODEL, messages)

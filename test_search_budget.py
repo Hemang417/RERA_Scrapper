@@ -45,6 +45,21 @@ class _FakeMessage:
         self.content = [_FakeBlock("text", text)] if text else [_FakeBlock("server_tool_use")]
 
 
+class _FakeStream:
+    """What a streaming tool_runner yields: not a message, but a stream whose
+    get_final_message() resolves to one. Reading it twice would be a bug, so
+    this refuses the second read rather than quietly allowing it."""
+
+    def __init__(self, message):
+        self._message = message
+        self.reads = 0
+
+    def get_final_message(self):
+        self.reads += 1
+        assert self.reads == 1, "the stream was resolved more than once"
+        return self._message
+
+
 class _Recorder:
     """Stands in for the Anthropic client and remembers every tool_runner call.
 
@@ -64,6 +79,8 @@ class _Recorder:
     def tool_runner(self, **kwargs):
         self.calls.append(kwargs)
         reply = self.replies.pop(0) if self.replies else _FakeMessage("{}")
+        if kwargs.get("stream"):
+            return iter([_FakeStream(reply)])
         return iter([reply])
 
     @property
@@ -113,6 +130,63 @@ def test_caller_can_set_its_own_search_budget(recorder):
     rec = recorder()
     deep_research._run_agentic_pass("p", "s", label="t", search=True, max_searches=3)
     assert rec.tools_sent[0][0]["max_uses"] == 3
+
+
+# ---------------------------------------------------------------------------
+# Transport: blocking below the non-streaming ceiling, streaming above it
+# ---------------------------------------------------------------------------
+
+def test_a_small_call_does_not_stream(recorder):
+    """Every call proven live on 2026-08-11 was a blocking one. Switching them
+    all to streaming would discard that evidence for no benefit."""
+    rec = recorder()
+    deep_research._run_agentic_pass("p", "s", label="t",
+                                    max_tokens=deep_research.MAX_NONSTREAMING_TOKENS)
+    assert "stream" not in rec.calls[0]
+
+
+def test_a_call_needing_more_room_streams_instead_of_being_refused(recorder):
+    """It used to raise ValueError here. The SDK's 21,333 limit is a property
+    of asking for one blocking response, not of the model, and the Charter pass
+    demonstrably cannot fit under it."""
+    rec = recorder()
+    result = deep_research._run_agentic_pass(
+        "p", "s", label="t", max_tokens=deep_research.MAX_NONSTREAMING_TOKENS + 1)
+    assert rec.calls[0]["stream"] is True
+    assert result == {"ok": True}, "a streamed reply must parse the same as a blocking one"
+
+
+def test_the_charter_pass_takes_the_streaming_path(recorder):
+    rec = recorder()
+    company_charter._run_charter_pass("some project data")
+    assert rec.calls[0]["stream"] is True
+    assert rec.calls[0]["max_tokens"] == deep_research.CHARTER_PASS_MAX_TOKENS
+
+
+def test_streamed_usage_is_still_recorded(recorder):
+    """_record_usage reads .usage off a message. Handed an unresolved stream it
+    would silently record zero, and the cost of the most expensive call in the
+    pipeline would vanish from the usage log."""
+    recorder()
+    deep_research._run_agentic_pass("p", "s", label="big",
+                                    max_tokens=deep_research.MAX_NONSTREAMING_TOKENS + 1)
+    assert deep_research._USAGE_LOG[0]["output_tokens"] == 50
+
+
+def test_asking_past_the_model_ceiling_is_still_refused(recorder):
+    recorder()
+    with pytest.raises(ValueError, match="output ceiling"):
+        deep_research._run_agentic_pass("p", "s", label="t",
+                                        max_tokens=deep_research.MAX_STREAMING_TOKENS + 1)
+
+
+def test_the_charter_budget_fits_between_the_two_ceilings():
+    assert (deep_research.MAX_NONSTREAMING_TOKENS
+            < deep_research.CHARTER_PASS_MAX_TOKENS
+            <= deep_research.MAX_STREAMING_TOKENS), (
+        "the charter budget must need streaming and be reachable by it; a value "
+        "below the first ceiling silently gives back the room this change bought"
+    )
 
 
 def test_bounding_the_tool_does_not_mutate_the_shared_constant():
