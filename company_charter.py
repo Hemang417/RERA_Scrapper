@@ -6420,9 +6420,8 @@ def _externalize_prose(facts: dict, text: str) -> str:
     # straight through and fail the External quality gate. A semicolon is
     # grammatical wherever a dash joins two related clauses or introduces
     # an explanation, and unlike a comma it can't create a comma splice --
-    # same reasoning charter_document.py's _Builder.prose() already uses
-    # for the same purpose, just never added here until this was actually
-    # confirmed to matter live.
+    # the same reasoning the shared prose builder uses for this, just never
+    # added here until it was actually confirmed to matter live.
     text = text.replace(" -- ", "; ").replace(" — ", "; ").replace("—", "; ")
     return text
 

@@ -13,9 +13,11 @@ without the full appendix. It performs no new interpretation of raw data:
 every sentence traces to a value or a paragraph the Charter's own functions
 already computed.
 
-Deliberately built as its own module rather than an extra mode on
-charter_document.py's _Builder: that class assumes a running prose-and-table
-document inherited from the firm's docx template. A card/quote/chart layout
+Deliberately built as its own module rather than an extra mode on the shared
+prose-and-table builder (charter_report.py's _Builder, and the one
+charter_document.py used to carry before it was retired): that shape assumes a
+running prose-and-table document inherited from the firm's docx template. A
+card/quote/chart layout
 is a different visual grammar (cards need a table used as a layout grid, a
 chart needs a rendered image dropped in) and forcing both shapes through one
 Builder would complicate the class for both callers. This module still reuses
@@ -443,9 +445,9 @@ def build_executive_briefing(reg_no: str, facts: dict, out_path: str, generated_
     full Company Charter. `generated_on` is passed in (e.g. "30 July 2026")
     rather than computed here, so the caller controls the date source.
 
-    Always recomputes developer_score the same way charter_document.py does
-    -- facts["developer_score"] is an output of a prior run, never a valid
-    input (see charter_document.build_charter_document's own note)."""
+    Always recomputes developer_score: facts["developer_score"] is an output
+    of a prior run, never a valid input. charter_report.py's builder makes the
+    same guarantee for the same reason."""
     doc = docx.Document()
     for section in doc.sections:
         section.left_margin = Inches(0.9)

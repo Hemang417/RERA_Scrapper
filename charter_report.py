@@ -1009,9 +1009,9 @@ def _annexure_related_entities(b: _Builder):
 # 4. The Collateral
 # ---------------------------------------------------------------------------
 def _cited_field_rows(group: dict) -> list:
-    """Same idea as charter_document.py's _field_table_rows, but returns
-    rows shaped for THIS module's (label, (value, source)) citation
-    convention instead of a separate "checked against" text column. A
+    """Turns a {value, source}-shaped field group into rows shaped for THIS
+    module's (label, (value, source)) citation convention, rather than a
+    separate "checked against" text column. A
     local function rather than a change to the shared one, so
     charter_document.py's own tables (3 columns, no bracket citations)
     keep rendering exactly as before."""
