@@ -79,7 +79,16 @@ def test_section_a_never_reaches_any_constructed_api_request(monkeypatch):
     cc._llm_verify_citation_completeness(tmp_path)
     os.remove(tmp_path)
 
-    coding_time_marker = "Never edit charter_document.py to change live charter output"
+    # Assert the marker is REALLY in Section A before asserting it is absent
+    # from the requests. Without this the test passes vacuously the moment the
+    # marker's wording changes, which is exactly what happened: it used to look
+    # for "Never edit charter_document.py to change live charter output", and
+    # that sentence was rewritten out of Section A when the dead builder was
+    # retired. The test kept passing while guarding nothing.
+    coding_time_marker = "Template safety"
+    assert coding_time_marker in cc._coding_time_notes(), (
+        f"{coding_time_marker!r} is no longer in Section A, so this test guards nothing"
+    )
     for label, system in captured.items():
         assert coding_time_marker not in _system_texts(system), (
             f"Section A leaked into the '{label}' API request"

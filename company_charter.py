@@ -86,47 +86,53 @@ CHARTER_OUTPUT_DIR = os.path.join(config.OUTPUT_ROOT, "company_charters")
 # --- CLAUDE.md loaders -----------------------------------------------------
 # CLAUDE.md is auto-loaded by Claude Code for interactive/coding sessions,
 # but this pipeline also calls the Claude API directly and unattended (via
-# _run_charter_pass and the citation-completeness judge below) -- CLAUDE.md
-# is NOT auto-loaded there, so its three sections are read explicitly and
-# routed to exactly the calls each one is scoped for. Section A never leaves
-# this process as API content; Section B goes into every charter
-# content-generating/verifying call; Section C only into external-doc-variant
-# calls. See CLAUDE.md itself for the full rule text this returns.
-_CLAUDE_MD_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "CLAUDE.md")
-_CLAUDE_MD_SECTION_RE = re.compile(
+# _run_charter_pass and the citation-completeness judge below) -- no rules file
+# is auto-loaded there, so the three sections are read explicitly and routed to
+# exactly the calls each one is scoped for. Section A never leaves this process
+# as API content; Section B goes into every charter content-generating/verifying
+# call; Section C only into external-doc-variant calls.
+#
+# The rules live in rules.md, not CLAUDE.md. They were split out once CLAUDE.md
+# was rewritten as the pipeline's operational map: the rules are ~250 lines and
+# two thirds of them are injected into API calls, so keeping them in the file
+# every Claude Code session auto-loads made that file too long to be read
+# reliably. CLAUDE.md now describes the flow and points here for the content.
+_RULES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rules.md")
+_RULES_SECTION_RE = re.compile(
     r"--- Section {marker}:.*?---\n(.*?)(?=\n--- Section |\Z)", re.DOTALL
 )
 
 
-def _read_claude_md_section(marker: str) -> str:
-    with open(_CLAUDE_MD_PATH, "r", encoding="utf-8") as f:
+def _read_rules_section(marker: str) -> str:
+    with open(_RULES_PATH, "r", encoding="utf-8") as f:
         text = f.read()
-    pattern = re.compile(_CLAUDE_MD_SECTION_RE.pattern.format(marker=marker), re.DOTALL)
+    pattern = re.compile(_RULES_SECTION_RE.pattern.format(marker=marker), re.DOTALL)
     m = pattern.search(text)
     if not m:
-        raise RuntimeError(f"CLAUDE.md Section {marker} not found -- has the file been restructured?")
+        raise RuntimeError(f"rules.md Section {marker} not found -- has the file been restructured?")
     body = m.group(1).strip()
     if not body:
-        raise RuntimeError(f"CLAUDE.md Section {marker} is empty")
+        raise RuntimeError(f"rules.md Section {marker} is empty")
     return body
 
 
 def _coding_time_notes() -> str:
-    """Section A -- coding-time rules for Claude Code / human sessions only.
-    Documentation use only; NEVER pass this into any runtime API call."""
-    return _read_claude_md_section("A")
+    """rules.md Section A -- coding-time rules for Claude Code / human
+    sessions only. Documentation use only; NEVER pass this into any runtime
+    API call."""
+    return _read_rules_section("A")
 
 
 def _common_content_rules() -> str:
     """Section B -- prepended to the system prompt of every charter
     content-generating/verifying Claude API call, both doc variants."""
-    return _read_claude_md_section("B")
+    return _read_rules_section("B")
 
 
 def _external_citation_rule() -> str:
     """Section C -- appended only when the call is building or checking
     doc_variant == "external" content."""
-    return _read_claude_md_section("C")
+    return _read_rules_section("C")
 
 
 def _charter_system_blocks(*, external: bool, extra: str = "") -> list:
