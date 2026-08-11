@@ -4715,7 +4715,31 @@ _CITED_NARRATIVE_FIELDS = (
 )
 
 
-def _collect_findings(facts: dict) -> list:
+def _field_fingerprint(text: str) -> str:
+    """Content hash of a finding field, used to recognise text this pipeline
+    already researched.
+
+    A fingerprint rather than a flag, and per FIELD rather than per clause,
+    because both alternatives fail. A flag would go stale the moment a new
+    scrape changed the field. A clause-level marker cannot work at all: an
+    enriched finding is multi-sentence, so it re-splits into several clauses on
+    the next pass and none of them equals the text that was recorded."""
+    import hashlib
+    return hashlib.sha256((text or "").strip().encode("utf-8")).hexdigest()[:16]
+
+
+def _already_researched(facts: dict, path: str, current: str) -> bool:
+    """True when `path` still holds exactly the text a previous run produced.
+
+    Any edit, a re-scrape, a human correction, or new content appended, changes
+    the fingerprint and the field is researched again. Skipping is therefore
+    only ever an optimisation over identical input, never a refusal to look at
+    something new."""
+    prior = ((facts.get("finding_research") or {}).get("researched_fields") or {}).get(path)
+    return bool(prior) and prior == _field_fingerprint(current)
+
+
+def _collect_findings(facts: dict, force: bool = False) -> list:
     """Returns [{"path", "clause"}] for every confirmed finding worth a
     research pass.
 
@@ -4727,6 +4751,13 @@ def _collect_findings(facts: dict) -> list:
     for path in _FINDING_FIELDS:
         container, key = _resolve_path(facts, path)
         if container is None or not isinstance(container[key], str):
+            continue
+        if not force and _already_researched(facts, path, container[key]):
+            # Researched on an earlier run and unchanged since. Without this,
+            # re-running compounds: an enriched finding is multi-sentence, so it
+            # splits into more clauses each pass (3 findings became 9 on the
+            # first re-run) and every sub-clause gets researched again, paying
+            # for it and rewriting text that was already resolved.
             continue
         for clause in _split_into_bullet_clauses(container[key]):
             if len(clause) >= _MIN_FINDING_LENGTH and not _is_clean_check_clause(clause):
@@ -4751,7 +4782,7 @@ def _finding_research_context(facts: dict) -> str:
     return "\n".join(b for b in bits if b.split(": ", 1)[-1].strip())
 
 
-def run_finding_research(facts: dict, researcher=None) -> dict:
+def run_finding_research(facts: dict, researcher=None, force: bool = False) -> dict:
     """Researches every confirmed finding in depth and writes the resolved text
     back into the field it came from.
 
@@ -4772,7 +4803,7 @@ def run_finding_research(facts: dict, researcher=None) -> dict:
     Returns a summary dict; also records it on facts["finding_research"] for
     auditability."""
     researcher = researcher or deep_research.research_finding
-    findings = _collect_findings(facts)
+    findings = _collect_findings(facts, force=force)
     cap = deep_research.MAX_FINDING_RESEARCH_CALLS
     context = _finding_research_context(facts)
 
@@ -4807,11 +4838,22 @@ def run_finding_research(facts: dict, researcher=None) -> dict:
             failed += 1
         results.append(record)
 
+    # Carry forward what earlier runs recorded, then fingerprint every field
+    # touched this run. Only fields that actually gained enriched text are
+    # marked: a field whose research all failed must stay eligible next time,
+    # or one bad pass would permanently exclude it.
+    researched_fields = dict(((facts.get("finding_research") or {}).get("researched_fields") or {}))
+    for path in {r["path"] for r in results if r.get("resolved")}:
+        container, key = _resolve_path(facts, path)
+        if container is not None and isinstance(container[key], str):
+            researched_fields[path] = _field_fingerprint(container[key])
+
     summary = {
         "findings_seen": len(findings),
         "enriched": enriched,
         "kept_original": failed + max(0, len(findings) - cap),
         "cap": cap,
+        "researched_fields": researched_fields,
         "results": results,
     }
     facts["finding_research"] = summary

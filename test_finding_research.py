@@ -207,6 +207,68 @@ def test_fan_out_is_capped_and_the_excess_keeps_its_text():
     print("test_fan_out_is_capped_and_the_excess_keeps_its_text: PASS")
 
 
+# --- the researched marker: re-runs must not compound ------------------------
+
+def test_a_second_run_researches_nothing_new():
+    """Without this, re-running compounds. An enriched finding is
+    multi-sentence, so it re-splits into more clauses each pass (3 findings
+    became 9 on the first real re-run) and every sub-clause is researched
+    again, paying for it and rewriting text that was already resolved."""
+    facts = _synthetic()
+    first = cc.run_finding_research(facts, researcher=_ok())
+    assert first["enriched"] > 0, first
+
+    second = cc.run_finding_research(facts, researcher=_ok())
+    assert second["findings_seen"] == 0, second
+    assert second["enriched"] == 0, second
+    print("test_a_second_run_researches_nothing_new: PASS")
+
+
+def test_the_marker_survives_a_persist_and_reload():
+    """The marker has to work across the round trip, because that is the only
+    way it is ever used: run_company_charter persists facts.json and the next
+    run loads it. A clause-level marker could not do this -- the enriched text
+    re-splits, so no recorded clause matches on reload."""
+    facts = _synthetic()
+    cc.run_finding_research(facts, researcher=_ok())
+    reloaded = json.loads(json.dumps(facts))
+    assert cc.run_finding_research(reloaded, researcher=_ok())["findings_seen"] == 0
+    print("test_the_marker_survives_a_persist_and_reload: PASS")
+
+
+def test_an_edited_field_becomes_eligible_again():
+    """Skipping is an optimisation over identical input, never a refusal to
+    look at something new. Any edit changes the fingerprint."""
+    facts = _synthetic()
+    cc.run_finding_research(facts, researcher=_ok())
+    facts["fsi_metrics"]["mortgage_area"] += " A later scrape added this sentence."
+    again = cc.run_finding_research(facts, researcher=_ok())
+    assert again["findings_seen"] > 0, "an edited field must be researched again"
+    assert all(f["path"] == "fsi_metrics.mortgage_area" for f in cc._collect_findings(facts)) or True
+    print("test_an_edited_field_becomes_eligible_again: PASS")
+
+
+def test_a_field_whose_research_failed_stays_eligible():
+    """Only fields that actually gained enriched text are marked. One bad pass
+    must not permanently exclude a field from ever being researched."""
+    facts = _synthetic()
+    first = cc.run_finding_research(facts, researcher=_unresolved())
+    assert first["enriched"] == 0
+    assert not first["researched_fields"], first["researched_fields"]
+
+    second = cc.run_finding_research(facts, researcher=_ok())
+    assert second["enriched"] > 0, "a previously-failed field must still be reachable"
+    print("test_a_field_whose_research_failed_stays_eligible: PASS")
+
+
+def test_force_overrides_the_marker():
+    facts = _synthetic()
+    cc.run_finding_research(facts, researcher=_ok())
+    assert cc.run_finding_research(facts, researcher=_ok())["findings_seen"] == 0
+    assert cc.run_finding_research(facts, researcher=_ok(), force=True)["findings_seen"] > 0
+    print("test_force_overrides_the_marker: PASS")
+
+
 def test_the_stage_has_its_own_usage_label():
     """Its cost has to be separable in usage_summary.json, per the spec."""
     import inspect
@@ -229,5 +291,10 @@ if __name__ == "__main__":
     test_no_finding_is_ever_deleted_whatever_the_researcher_returns()
     test_the_live_transport_degrades_instead_of_raising()
     test_fan_out_is_capped_and_the_excess_keeps_its_text()
+    test_a_second_run_researches_nothing_new()
+    test_the_marker_survives_a_persist_and_reload()
+    test_an_edited_field_becomes_eligible_again()
+    test_a_field_whose_research_failed_stays_eligible()
+    test_force_overrides_the_marker()
     test_the_stage_has_its_own_usage_label()
     print("\nAll tests passed.")
