@@ -73,6 +73,14 @@ markers are parsed at runtime by `_read_rules_section()` in
   External its own opened-documents-only table, so that check must be narrowed
   (to the leftover template placeholder text it was really aimed at) before the
   table ships — otherwise every External save hard-fails.
+- **Section order is locked.** Ten top-level sections, same sequence, always.
+  Reshape content inside the flow; never reorder or rename a section.
+- **Two known data contradictions, left deliberately unreconciled.** Do not
+  "fix" either by picking a number: the Group/Affiliated Companies count (65
+  linked entities vs. "of 299" in the Director Relationship Map), and the
+  Internal document library's 61 rows (10 labelled only `Other – Legal`, 8
+  filenames appearing twice). Both are real disagreements in the source data,
+  and silently choosing one side would present a guess as a fact.
 - **Template safety.** The `.docx` template
   (`output/company_charters/Company_Charter_TEMPLATE_WebSourced.docx`) lives
   under the gitignored `output/` directory. Back it up (timestamped copy)
