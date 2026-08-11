@@ -56,6 +56,14 @@ Each model-backed judgement keeps its deterministic predecessor behind it:
 | citation matching | keyword topic table, in `company_charter._clause_topic_citation` |
 | flag headlines | first sentence, in `company_charter._flag_headline` |
 
+`deep_research._extract_json_object` is the same idea one level lower. Every
+system prompt here demands a bare JSON object and nothing else; a live
+verification call answered with a sentence of commentary, a blank line, and then
+a perfectly correct object, which `json.loads` rejected outright. The right
+answer scored as a failed check, which demotes a confirmed claim to a gap. The
+instruction stays, but it is no longer load-bearing. Truncated JSON is still a
+failure: recovery must not become a way for a cut-off reply to look complete.
+
 `company_charter.run_editorial_passes` precomputes all three once per document
 set and caches them on `facts` keyed by clause text. A lookup miss is
 indistinguishable from "no model ran", so a failed, partial or malformed reply
@@ -80,6 +88,35 @@ and the corrected record is the better one.
 
 `deep_research.MAX_FINDING_RESEARCH_CALLS`, `deep_research.MAX_GAP_RETRY_ATTEMPTS`,
 `company_charter._MIN_FINDING_LENGTH`, and the review's own input cap.
+
+### The search budget, which is also the reply budget
+
+A web-search result is billed against the same `max_tokens` as the reply, so a
+call can spend its whole allowance searching and stop with no text at all. The
+Charter pass did exactly that three times: 27 searches, zero characters written.
+Raising `max_tokens` cannot fix it, because `deep_research.MAX_NONSTREAMING_TOKENS`
+(21,333) is a hard SDK ceiling. Capping the searches is the only side of the
+trade that moves.
+
+Three guards, in order:
+
+1. **Opt in.** `deep_research._run_agentic_pass` takes `search=False`. It used
+   to attach the tool unconditionally, giving this failure mode to six calls
+   that only judge text they were already handed and have nothing to look up.
+2. **Bound it.** `deep_research._web_search_tool` sets `max_uses`, enforced by
+   the API. Budgets: `DEFAULT_MAX_SEARCHES`, `RESEARCH_MAX_SEARCHES`,
+   `CHARTER_PASS_MAX_SEARCHES`, `RETRY_MAX_SEARCHES`. Each prompt states the
+   same number the API enforces, so the model is not budgeting for searches it
+   will not get.
+3. **Retry rather than lose the run.** `deep_research.BudgetExhausted` separates
+   "ran out of room to answer" from "the answer was malformed". A searching call
+   that hits it gets one retry at `RETRY_MAX_SEARCHES`, told to answer from what
+   it has, billed under its own `_retry` label. A non-searching call is not
+   retried: its budget went on the reply itself, so an unchanged retry would
+   only spend the money twice.
+
+`test_search_budget.py` drives every caller through a fake client and asserts on
+the `tools` that actually reached the API, not on the source text.
 
 `company_charter._field_fingerprint` and `company_charter._already_researched`
 stop per-finding research recompounding: an enriched finding is multi-sentence,

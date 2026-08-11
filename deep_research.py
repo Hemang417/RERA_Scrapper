@@ -53,6 +53,51 @@ MAX_GAP_RETRY_ATTEMPTS = 2
 # cap keep their original text rather than being dropped.
 MAX_FINDING_RESEARCH_CALLS = 8
 
+# Output budget per call. Thinking blocks and server-side web-search results are
+# billed against this same budget, so a call that researches heavily can spend
+# the whole allowance before writing a single character of its reply: the model
+# then returns stop_reason="max_tokens" with no text block at all. That is a
+# real failure this pipeline hit -- the Charter assembly pass died on it, and
+# presented only as "model did not return valid JSON" with an empty string.
+# Small verification calls stay cheap on the default; the passes that both
+# search widely AND emit a large structure ask for more.
+DEFAULT_MAX_TOKENS = 8000
+CHARTER_PASS_MAX_TOKENS = 20000
+RESEARCH_MAX_TOKENS = 16000
+
+# Hard ceiling for a NON-STREAMING request. The SDK refuses one whose expected
+# duration exceeds 10 minutes, computed as 3600 * max_tokens / 128000 seconds
+# (anthropic/_base_client.py::_calculate_nonstreaming_timeout), which puts the
+# limit at 21333. Raising CHARTER_PASS_MAX_TOKENS to 32000 to fix the
+# out-of-budget failure traded it for "Streaming is required for operations
+# that may take longer than 10 minutes" instead. Going above this needs
+# streaming, which tool_runner would have to be reworked for; it is not a
+# number to nudge upward.
+MAX_NONSTREAMING_TOKENS = 21_333
+
+# How many web searches one call may run. Every search result is billed against
+# that call's max_tokens, so an unbounded search budget IS an unbounded spend of
+# the reply budget: the Charter assembly pass ran 27 searches and had nothing
+# left to write its answer with. Since max_tokens cannot go above
+# MAX_NONSTREAMING_TOKENS, capping the searches is the only side of that trade
+# that can actually move.
+#
+# The retry cap is deliberately tiny rather than zero -- a call that exhausted
+# its budget searching should be pushed to answer with what it already has,
+# without being stripped of the tool mid-task.
+DEFAULT_MAX_SEARCHES = 6
+RESEARCH_MAX_SEARCHES = 12
+RETRY_MAX_SEARCHES = 2
+
+# The Charter assembly pass is the tightest of these: it both searches (a
+# handful of distances, comparables and the promoter's track record) AND emits
+# the single largest structure in the pipeline, out of one budget. Left
+# unbounded it ran 27 searches and emitted nothing. Eight is the working figure
+# -- enough for the fields whose prompts genuinely ask it to look something up,
+# and small enough to leave room to write the document. Broad market research
+# is not this pass's job; run_deep_research already exists for that.
+CHARTER_PASS_MAX_SEARCHES = 8
+
 # $ per 1M tokens. This is Sonnet 5's intro rate, active through 2026-08-31 --
 # update to the standard $3.00/$15.00 after that date (or sooner, if pricing
 # changes again). Only priced models get a real cost figure back from
@@ -216,6 +261,24 @@ _RESEARCH_BLOCK_SCHEMA = {
 
 _WEB_SEARCH_TOOL = {"type": "web_search_20260209", "name": "web_search"}
 
+
+def _web_search_tool(max_uses: int) -> dict:
+    """The web_search server tool, bounded. `max_uses` is enforced by the API,
+    not by the prompt, which is the point: the model asked to search "as many
+    times as you need" will happily take that literally, and the instruction
+    to stop is itself just more text it can talk itself past."""
+    return dict(_WEB_SEARCH_TOOL, max_uses=max_uses)
+
+
+class BudgetExhausted(RuntimeError):
+    """A call spent its whole output budget before writing its reply.
+
+    Subclasses RuntimeError so the many `except Exception` degradation paths
+    around this module keep working unchanged; it exists so _run_agentic_pass
+    can recognise this ONE failure and retry it usefully, instead of treating
+    "ran out of room to answer" the same as "the answer was malformed"."""
+
+
 _RESEARCH_JSON_SHAPE = json.dumps({key: _RESEARCH_BLOCK_SCHEMA for key in RESEARCH_KEYS})
 
 _SYSTEM_PROMPT = f"""You are producing research for a MahaRERA real-estate project report: \
@@ -233,10 +296,13 @@ guessing or approximating.
 against the promoter's registered legal name and address before accepting it.
 - For any computed/numeric claim (FSI, area, distance), show the inputs and formula \
 in the body text, not just the final number.
-- Use web_search as many times as you need across multiple turns. Once you have \
-everything you need, your FINAL reply must be ONLY a single raw JSON object -- no \
-prose, no markdown code fences, nothing before or after it -- matching exactly this \
-JSON Schema: {_RESEARCH_JSON_SHAPE}"""
+- You have a HARD LIMIT of {RESEARCH_MAX_SEARCHES} web searches for this whole pass, \
+enforced by the API, and every search result is charged against the same budget you \
+have to write your reply with. Leave yourself room to write: an honest entry in `gaps` \
+costs nothing, whereas running out of room before you reply loses the entire pass.
+- Your FINAL reply must be ONLY a single raw JSON object -- no prose, no markdown code \
+fences, nothing before or after it -- matching exactly this JSON Schema: \
+{_RESEARCH_JSON_SHAPE}"""
 
 _VERIFY_SYSTEM_PROMPT = """Re-check one specific claim against its cited source using \
 web_search as needed -- fetch/search to confirm whether the source genuinely supports \
@@ -297,22 +363,102 @@ def _get_client() -> Anthropic:
     return _client
 
 
-def _parse_json_response(message) -> dict:
-    """message is a BetaMessage (one item yielded by iterating a BetaToolRunner --
-    the runner itself is not a message and has no .content)."""
-    text = "".join(getattr(b, "text", "") for b in message.content if getattr(b, "type", None) == "text").strip()
+def _message_text(message) -> str:
+    return "".join(
+        getattr(b, "text", "") for b in message.content if getattr(b, "type", None) == "text"
+    ).strip()
+
+
+def _extract_json_object(text: str):
+    """Returns the largest JSON object embedded anywhere in `text`, or None.
+
+    Every system prompt in this pipeline demands a bare JSON object and nothing
+    else, and the model does not always comply. A live claim-verification call
+    came back as three separate text blocks -- a sentence of commentary, a blank
+    line, then a perfectly correct JSON object -- which json.loads rejects
+    outright. The answer was right there and the pass was scored as a failure.
+
+    Be strict in what you emit and liberal in what you accept. The instruction
+    stays; this stops it being load-bearing.
+
+    Scans left to right and jumps past each object it decodes, so a nested
+    object is never mistaken for the outer one, and prose containing a stray
+    brace costs one failed decode rather than a rescan."""
+    decoder = json.JSONDecoder()
+    best, best_span = None, 0
+    i = 0
+    while True:
+        i = text.find("{", i)
+        if i == -1:
+            return best
+        try:
+            obj, end = decoder.raw_decode(text, i)
+        except ValueError:
+            i += 1
+            continue
+        if isinstance(obj, dict) and end - i > best_span:
+            best, best_span = obj, end - i
+        i = end
+
+
+def _parse_json_response(messages) -> dict:
+    """Extracts the JSON reply from a tool_runner's yielded messages.
+
+    Takes the whole list, not just the last message. Server-side tools mean one
+    message can carry thinking, several searches and the final text, but a run
+    cut short leaves a trailing message with tool blocks and no text at all;
+    scanning backwards finds the answer if any turn produced one.
+
+    A reply that is valid JSON wrapped in commentary is accepted via
+    _extract_json_object rather than rejected; see its docstring.
+
+    The error names stop_reason and the block types, because without them this
+    failure is undiagnosable. It presented as "model did not return valid JSON"
+    with an empty string, and the real cause -- max_tokens exhausted by
+    thinking and searching before any text was emitted -- was on the message
+    object the whole time and never surfaced."""
+    if not isinstance(messages, (list, tuple)):
+        messages = [messages]
+
+    text = ""
+    for message in reversed(messages):
+        text = _message_text(message)
+        if text:
+            break
+
     if text.startswith("```"):
         text = text.strip("`")
         if text.lower().startswith("json"):
             text = text[4:]
         text = text.strip()
+
     try:
         return json.loads(text)
     except json.JSONDecodeError as e:
-        raise RuntimeError(f"model did not return valid JSON: {e}\nRaw text (first 500 chars): {text[:500]}") from e
+        embedded = _extract_json_object(text)
+        if embedded is not None:
+            return embedded
+        last = messages[-1]
+        stop = getattr(last, "stop_reason", None)
+        blocks = [getattr(b, "type", None) for b in getattr(last, "content", [])]
+        detail = (
+            f"model did not return valid JSON: {e}\n"
+            f"stop_reason={stop!r}, messages={len(messages)}, last-message blocks={blocks}\n"
+            f"text recovered: {len(text)} chars\n"
+            f"Raw text (first 500 chars): {text[:500]}"
+        )
+        if stop == "max_tokens":
+            raise BudgetExhausted(
+                f"{detail}\nThe model spent its whole output budget on thinking and searching "
+                f"before writing its reply. max_tokens cannot go above {MAX_NONSTREAMING_TOKENS} "
+                f"without streaming, so cap the searches instead (see DEFAULT_MAX_SEARCHES)."
+            ) from e
+        raise RuntimeError(detail) from e
 
 
-def _run_agentic_pass(user_prompt: str, system: str, label: str = "agentic_pass") -> dict:
+def _run_agentic_pass(user_prompt: str, system: str, label: str = "agentic_pass",
+                      max_tokens: int = DEFAULT_MAX_TOKENS, search: bool = False,
+                      max_searches: int = DEFAULT_MAX_SEARCHES) -> dict:
     """Runs client.beta.messages.tool_runner() to completion. The runner is an
     iterator yielding one BetaMessage per turn -- iterate it fully and read
     .content off the LAST yielded message, not off the runner itself.
@@ -322,19 +468,55 @@ def _run_agentic_pass(user_prompt: str, system: str, label: str = "agentic_pass"
     this whole pipeline funnels through here (including company_charter.py's,
     which delegates to this function), so the label is what lets
     usage_summary() break cost down by purpose instead of one undifferentiated
-    total."""
-    runner = _get_client().beta.messages.tool_runner(
-        model=MODEL,
-        max_tokens=8000,
-        system=system,
-        tools=[_WEB_SEARCH_TOOL],
-        messages=[{"role": "user", "content": user_prompt}],
-    )
-    messages = list(runner)
-    if not messages:
-        raise RuntimeError("tool_runner produced no messages")
-    _record_usage(label, MODEL, messages)
-    return _parse_json_response(messages[-1])
+    total.
+
+    `search` is OFF by default and every caller that wants the web_search tool
+    must ask for it. It used to be attached unconditionally, which meant six
+    calls that only judge text they were already handed -- classify, match,
+    headline, review, citation-completeness, document-grounding -- carried a
+    tool they have no use for, and with it the same budget-exhaustion failure
+    that killed the Charter pass three times. A tool the model cannot see is
+    a tool it cannot spend its reply budget on.
+
+    A call that still exhausts its budget searching gets exactly one retry,
+    with the search budget cut to RETRY_MAX_SEARCHES and told to answer from
+    what it already has. That is a bad answer's worth of risk against losing
+    an entire run, and everything already paid for in it, to one greedy call."""
+    if max_tokens > MAX_NONSTREAMING_TOKENS:
+        raise ValueError(
+            f"max_tokens={max_tokens} exceeds the non-streaming ceiling of {MAX_NONSTREAMING_TOKENS}. "
+            f"The SDK refuses a non-streaming request that might run over 10 minutes. Either lower it, "
+            f"or rework this call to stream. See MAX_NONSTREAMING_TOKENS."
+        )
+
+    def attempt(prompt: str, searches: int, attempt_label: str) -> dict:
+        runner = _get_client().beta.messages.tool_runner(
+            model=MODEL,
+            max_tokens=max_tokens,
+            system=system,
+            tools=[_web_search_tool(searches)] if search else [],
+            messages=[{"role": "user", "content": prompt}],
+        )
+        messages = list(runner)
+        if not messages:
+            raise RuntimeError("tool_runner produced no messages")
+        _record_usage(attempt_label, MODEL, messages)
+        return _parse_json_response(messages)
+
+    try:
+        return attempt(user_prompt, max_searches, label)
+    except BudgetExhausted:
+        if not search or max_searches <= RETRY_MAX_SEARCHES:
+            raise
+        print(f"  [{label}] ran out of output budget while searching; "
+              f"retrying once with at most {RETRY_MAX_SEARCHES} searches", flush=True)
+        return attempt(
+            f"{user_prompt}\n\nYou have a strict budget: at most {RETRY_MAX_SEARCHES} searches, "
+            f"then write your JSON reply immediately from what you have. An incomplete answer "
+            f"in the required shape is useful; running out of room before replying is not.",
+            RETRY_MAX_SEARCHES,
+            f"{label}_retry",
+        )
 
 
 _CLEAN_CHECK_JUDGE_PROMPT = """You are classifying sentences from a real estate due-diligence \
@@ -555,7 +737,8 @@ def review_document_against_rules(document_text: str, rules: str, variant: str,
         f"Rendered document text follows.\n\n{document_text}"
     )
     try:
-        result = _run_agentic_pass(prompt, _DOC_REVIEW_SYSTEM_PROMPT, label=label)
+        result = _run_agentic_pass(prompt, _DOC_REVIEW_SYSTEM_PROMPT, label=label,
+                                   max_tokens=RESEARCH_MAX_TOKENS)
     except Exception as e:
         return {"reviewed": False, "compliant": None, "violations": [],
                 "summary": f"CLAUDE.md document review could not run: {e}"}
@@ -589,7 +772,8 @@ def research_finding(finding: str, context: str = "", label: str = "finding_rese
     if context.strip():
         prompt += f"\n\nProject context (for disambiguation only, not itself the finding):\n{context.strip()}"
     try:
-        result = _run_agentic_pass(prompt, _FINDING_RESEARCH_SYSTEM_PROMPT, label=label)
+        result = _run_agentic_pass(prompt, _FINDING_RESEARCH_SYSTEM_PROMPT, label=label,
+                                   max_tokens=RESEARCH_MAX_TOKENS, search=True)
     except Exception as e:
         return {"resolved": False, "text": finding, "still_live": "unknown",
                 "note": f"deeper research could not run: {e}"}
@@ -621,7 +805,7 @@ def _verify_claim(claim: str, source_url: str, label: str = "verify_claim") -> d
     unsupported verdict."""
     prompt = f"Claim: {claim}\nCited source: {source_url}"
     try:
-        result = _run_agentic_pass(prompt, _VERIFY_SYSTEM_PROMPT, label=label)
+        result = _run_agentic_pass(prompt, _VERIFY_SYSTEM_PROMPT, label=label, search=True)
     except Exception as e:
         return {"status": "verification_error", "reason": f"verification could not run: {e}"}
     if result.get("status") not in ("confirmed", "unsupported", "stale"):
@@ -670,7 +854,8 @@ def _resolve_gaps(block: dict) -> dict:
                 f"Retry using {strategy}."
             )
             try:
-                result = _run_agentic_pass(prompt, _GAP_RETRY_SYSTEM_PROMPT, label="gap_retry")
+                result = _run_agentic_pass(prompt, _GAP_RETRY_SYSTEM_PROMPT, label="gap_retry",
+                                           search=True)
             except Exception:
                 # Broad on purpose, same reasoning as _verify_claim: a missing
                 # ANTHROPIC_API_KEY or any other failure here must count as a
@@ -739,7 +924,9 @@ def run_deep_research(
             f"Produce macro_market, micro_market, and promoter_external research blocks for "
             f"this project."
         )
-        raw = _run_agentic_pass(user_prompt, _SYSTEM_PROMPT, label="research_generate")
+        raw = _run_agentic_pass(user_prompt, _SYSTEM_PROMPT, label="research_generate",
+                                max_tokens=RESEARCH_MAX_TOKENS, search=True,
+                                max_searches=RESEARCH_MAX_SEARCHES)
         for key in RESEARCH_KEYS:
             block = _verify_block(raw.get(key, {}))
             block = _resolve_gaps(block)

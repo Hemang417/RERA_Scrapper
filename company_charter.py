@@ -699,10 +699,15 @@ description on `sources[].topic`) or it will render with no citation at all, eve
 have a source. The `_FIELD_WITH_SOURCE` fields (land_identification, corporate_identity, \
 litigation_status, fsi_metrics.mortgage_lender) work differently: their own `source` value is shown \
 directly, so just make sure it's a real, specific document name/URL, not a vague description.
-- Use web_search as many times as you need across multiple turns. Once you have everything \
-you need, your FINAL reply must be ONLY a single raw JSON object -- no prose, no markdown \
-code fences, nothing before or after it -- matching exactly this JSON Schema: \
-{_CHARTER_JSON_SHAPE}"""
+- You have a HARD LIMIT of {deep_research.CHARTER_PASS_MAX_SEARCHES} web searches for this \
+whole pass, enforced by the API, and every search result is charged against the same budget \
+you have to write your reply with. Spend them only on the fields above that explicitly ask you \
+to look something up (landmark distances, comparables, the promoter's years in industry). Do \
+not research the wider market here; a separate stage already does that. An honest entry in \
+`gaps` costs nothing, whereas running out of room before you reply loses the entire pass.
+- Write your reply while you still have budget to write it in. Your FINAL reply must be ONLY a \
+single raw JSON object -- no prose, no markdown code fences, nothing before or after it -- \
+matching exactly this JSON Schema: {_CHARTER_JSON_SHAPE}"""
 
 
 def _run_charter_pass(user_prompt: str) -> dict:
@@ -712,7 +717,10 @@ def _run_charter_pass(user_prompt: str) -> dict:
     # shared by both Internal and External renders, so only Section B
     # (doc-variant-agnostic) is injected -- never Section C.
     system = _charter_system_blocks(external=False, extra=_SYSTEM_PROMPT)
-    return deep_research._run_agentic_pass(user_prompt, system, label="charter_pass")
+    return deep_research._run_agentic_pass(user_prompt, system, label="charter_pass",
+                                          max_tokens=deep_research.CHARTER_PASS_MAX_TOKENS,
+                                          search=True,
+                                          max_searches=deep_research.CHARTER_PASS_MAX_SEARCHES)
 
 
 _MAPS_SCRAPE_ENV_VAR = "COMPANY_CHARTER_USE_MAPS_SCRAPE"
@@ -7072,7 +7080,8 @@ def _attempt_second_source(topic: str, existing_source: dict) -> dict:
         f"Find one genuinely independent second source that corroborates this."
     )
     try:
-        result = deep_research._run_agentic_pass(prompt, _SECOND_SOURCE_SYSTEM_PROMPT, label="second_source_verify")
+        result = deep_research._run_agentic_pass(prompt, _SECOND_SOURCE_SYSTEM_PROMPT,
+                                                 label="second_source_verify", search=True)
     except Exception as e:
         return {"found": False, "reason": f"verification could not run: {e}"}
     if not isinstance(result, dict) or "found" not in result:

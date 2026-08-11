@@ -60,7 +60,7 @@ def test_section_a_never_reaches_any_constructed_api_request(monkeypatch):
     file makes."""
     captured = {}
 
-    def fake_run_agentic_pass(user_prompt, system, label="agentic_pass"):
+    def fake_run_agentic_pass(user_prompt, system, label="agentic_pass", **kwargs):
         captured[label] = system
         if label == "charter_pass":
             return {"gaps": []}
@@ -103,7 +103,7 @@ def test_section_c_reaches_only_external_variant_requests(monkeypatch):
     External document and must ALWAYS get Section C."""
     captured = {}
 
-    def fake_run_agentic_pass(user_prompt, system, label="agentic_pass"):
+    def fake_run_agentic_pass(user_prompt, system, label="agentic_pass", **kwargs):
         captured[label] = system
         if label == "charter_pass":
             return {"gaps": []}
