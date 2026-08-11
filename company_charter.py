@@ -4997,6 +4997,26 @@ def _rendered_document_text(docx_path: str, limit: int = 60000) -> str:
     return text[:limit]
 
 
+# Passages rules.md explicitly permits. A reviewer that flags one of these is
+# over-flagging: the quote is real, so quote-verification passes, and with a
+# blocking gate that would stop a correct document being delivered. The prompt
+# lists these as carve-outs, but a prompt is a request; this is the backstop.
+_REVIEW_CARVE_OUT_PATTERNS = (
+    r"^\s*nothing found\.?\s*$",                       # the required empty-section form
+    r"^\s*gap \d+\.",                                   # a Gaps & Sources entry
+    r"\b\d+\s+complaints?\s*/\s*\d+\s+appeals?\b",       # a metric card figure
+    r"\b(?:no completion extension|0 complaints, 0 appeals)\b",  # a score sub-metric note
+    r"\b(?:CIN|DIN)\b[^.]{0,40}\b[A-Z]\d{5}[A-Z]{2}\d{4}|(?:\bDIN\s*\d{8}\b)",  # identity-table ids
+    r"^\s*N/?A\b",                                      # an N/A scoring row
+)
+
+
+def _is_carved_out(quote: str) -> bool:
+    """True when a quoted passage is one rules.md explicitly permits."""
+    q = (quote or "").strip()
+    return any(re.search(p, q, re.IGNORECASE | re.MULTILINE) for p in _REVIEW_CARVE_OUT_PATTERNS)
+
+
 def _verified_violations(violations: list, document_text: str) -> tuple:
     """Splits reported violations into (verified, unverifiable).
 
@@ -5015,12 +5035,19 @@ def _verified_violations(violations: list, document_text: str) -> tuple:
     haystack = _norm(document_text)
     verified, unverifiable = [], []
     for v in violations or []:
-        quote = _norm(str(v.get("quote", "")))
-        # Very short quotes match almost anything; treat them as unverifiable
-        # rather than accept a coincidental substring hit.
-        if len(quote) >= 12 and quote in haystack:
+        raw = str(v.get("quote", ""))
+        quote = _norm(raw)
+        if _is_carved_out(raw):
+            # Real text, wrong verdict. Quote-verification cannot catch this
+            # because the passage genuinely is in the document; only knowing
+            # the carve-outs can. Logged, never blocking.
+            v = dict(v, discarded_reason="explicitly permitted by rules.md")
+            unverifiable.append(v)
+        elif len(quote) >= 12 and quote in haystack:
             verified.append(v)
         else:
+            # Very short quotes match almost anything; treat them as
+            # unverifiable rather than accept a coincidental substring hit.
             unverifiable.append(v)
     return verified, unverifiable
 

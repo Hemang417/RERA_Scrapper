@@ -501,9 +501,31 @@ in particular:
   * gaps must be kept in full, never compressed or deleted,
   * plain language, with any abbreviation expanded on first use.
 
+These are NOT violations. Every one is explicitly permitted, and reporting any of them is a \
+false positive that stops a correct document being delivered:
+  * "Nothing found." on its own under a heading. That is the REQUIRED form for a section with
+    no findings, not an absence that should have been deleted.
+  * a bare figure that states the basis of a score: "Litigation Load: 0 complaints / 0
+    appeals", "no completion extension, 0 complaints, 0 appeals". An absence survives where it
+    is the stated basis of a number, in a score table or a metric card.
+  * anything under Gaps & Sources, including entries starting "Gap 4.". A gap is an open
+    unknown, not a clean check, and gaps are kept in full with their citations.
+  * a CIN or DIN inside a stakeholder or director identity table (Corporate/Promoter Identity,
+    Current Directors & KMP, Company Registration Profile). Required there, forbidden only in
+    running prose.
+  * an N/A row in the Developer Score or Documentation Confidence tables. Those are scoring
+    methodology and stay intact however many rows read N/A.
+  * a sentence that reports an absence but also carries a real finding, a named party, a dated
+    event or an exception ("found nothing except a Notice of Lis Pendens dated 20 December
+    2017"). The finding is the point of the sentence.
+
 Report only what you can actually see in the text given. Quote the offending text so a human \
 can find it. If the document looks compliant, say so rather than manufacturing findings: a \
-clean result is a valid and useful answer here.
+clean result is a valid and useful answer here, and is the expected one for a document this \
+pipeline produced.
+
+A false positive is more costly than a missed violation here, because a reported violation \
+blocks delivery. When a passage might fall under one of the carve-outs above, do not report it.
 
 Your FINAL reply must be ONLY a single raw JSON object -- no prose, no markdown code fences -- \
 matching exactly this shape: \

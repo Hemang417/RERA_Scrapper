@@ -137,6 +137,51 @@ def test_a_real_quote_blocks_the_pdf():
     print("test_a_real_quote_blocks_the_pdf: PASS")
 
 
+def test_permitted_passages_cannot_block_delivery():
+    """Over-flagging, which quote-verification cannot catch.
+
+    An over-flagged violation quotes text that genuinely IS in the document,
+    so verification passes; only knowing the carve-outs distinguishes it from
+    a real finding. With a blocking gate that difference decides whether a
+    correct document ships at all. Counted on the real External document, the
+    reviewer prompt without carve-outs had 37 passages available to flag,
+    every one of them permitted by rules.md."""
+    doc = (
+        "Nothing found.\n"
+        "Gap 4. No confirmation of the escrow account could be obtained.\n"
+        "Litigation Load: 0 complaints / 0 appeals\n"
+        "Bijay Kumar Agarwal (DIN 00448678) is a current director.\n"
+        "N/A -- no team-strength source exists.\n"
+        "No litigation is disclosed against the promoter in any source reviewed."
+    )
+    flagged = [{"rule": "clean check", "quote": q} for q in (
+        "Nothing found.",
+        "Gap 4. No confirmation of the escrow account could be obtained.",
+        "Litigation Load: 0 complaints / 0 appeals",
+        "Bijay Kumar Agarwal (DIN 00448678) is a current director.",
+        "N/A -- no team-strength source exists.",
+        "No litigation is disclosed against the promoter in any source reviewed.",
+    )]
+    verified, discarded = cc._verified_violations(flagged, doc)
+    assert len(verified) == 1, [v["quote"] for v in verified]
+    assert verified[0]["quote"].startswith("No litigation is disclosed"), verified
+    assert len(discarded) == 5, discarded
+    assert all(d.get("discarded_reason") for d in discarded), "each discard must say why"
+    print("test_permitted_passages_cannot_block_delivery: PASS")
+
+
+def test_the_reviewer_prompt_names_the_carve_outs():
+    """The backstop is the safety net, not the plan. The prompt should stop the
+    reviewer flagging these in the first place, so it does not spend a call
+    reporting things that will be thrown away."""
+    prompt = deep_research._DOC_REVIEW_SYSTEM_PROMPT
+    for marker in ("Nothing found", "0 complaints", "Gap 4", "identity table", "N/A row"):
+        assert marker in prompt, f"the reviewer prompt does not mention the {marker!r} carve-out"
+    assert "false positive is more costly" in prompt, \
+        "the prompt must tell the reviewer which way to err, since a report now blocks delivery"
+    print("test_the_reviewer_prompt_names_the_carve_outs: PASS")
+
+
 def test_a_very_short_quote_is_not_trusted():
     """A three-word quote matches almost any document by coincidence, so it
     cannot be treated as evidence of a real violation."""
@@ -220,6 +265,8 @@ if __name__ == "__main__":
     test_strict_false_restores_advisory_behaviour()
     test_an_invented_quote_is_discarded_not_allowed_to_block()
     test_a_real_quote_blocks_the_pdf()
+    test_permitted_passages_cannot_block_delivery()
+    test_the_reviewer_prompt_names_the_carve_outs()
     test_a_very_short_quote_is_not_trusted()
     test_quote_matching_survives_reflowed_whitespace()
     test_the_live_transport_degrades_instead_of_raising()
