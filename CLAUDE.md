@@ -23,26 +23,21 @@ the run continue. Nothing else may swallow an error.
 3. **Archive** `run_archive` — loads prior research and manifests, then moves
    the previous run aside so documents can be reused rather than refetched.
 4. **Scrape** `api_client.fetch_all_categories()` — 9 category endpoints into
-   `output/<reg_no>/raw/`. Token-gated failures are retried once with a fresh
-   session.
-5. **Documents** `api_client.download_documents()`, then
-   `download_complaint_orders()` **[never fatal]** into `output/<reg_no>/`.
+   `output/<reg_no>/raw/`; token-gated failures retried once with a fresh session.
+5. **Documents** `download_documents()`, then `download_complaint_orders()`
+   **[never fatal]**.
 6. **Promoter portfolio** `promoter_portfolio.build_promoter_portfolio()`
-   **[never fatal]** — opens its own browser; needs a promoter name from
-   `partners.promoterDetails`.
+   **[never fatal]** — own browser; needs a name from `partners.promoterDetails`.
 7. **GST intake** `_run_gst_intake_step()` **[opt-in] [never fatal]** — needs
    `--gstin` or `--pan`. Enumerates every GSTIN under the PAN, fetches each
    filing table, writes `gst_filing_input.json`. One human CAPTCHA solve per
-   lookup, which is why it sits here beside the other browser work and not
-   after deep research.
+   lookup, which is why it sits beside the other browser work, not after (8).
 8. **Deep research** `deep_research.run_deep_research()` **[never fatal]** —
-   agentic web search, market plus promoter. Unattended, minutes long.
-9. **Charter** `company_charter.run_company_charter()` **[never fatal]** — see
-   below.
-10. **Report** `report.build_pdf()` — the RERA project report. A different
+   agentic web search. Unattended, minutes long.
+9. **Charter** `company_charter.run_company_charter()` **[never fatal]**, below.
+10. **Report** `report.build_pdf()` — the RERA project report, a different
     document from the Charter; do not confuse them.
-11. **Usage log** `deep_research.write_usage_log()` — per-label cost to
-    `usage_summary.json`.
+11. **Usage log** `write_usage_log()` — per-label cost to `usage_summary.json`.
 
 ## Inside `run_company_charter()`
 
@@ -56,15 +51,34 @@ the run continue. Nothing else may swallow an error.
    A failed call keeps the original text; it must never delete a finding.
 5. `_fill_template()` **Internal first, then External.** Internal renders on the
    real facts dict and computes the scores that get persisted; External renders
-   from `_externalized_facts_copy()`. Inside each: normalize, scrub clean
-   checks, sanitize process text, then the hard gate
-   `_verify_external_document_quality()`, which blocks the save.
-6. `run_claude_md_document_review()` **[never fatal]** — re-reads both saved
-   documents and audits them against `rules.md` via the API. Advisory: it
-   reports and writes a review JSON, and never blocks the PDF.
+   from `_externalized_facts_copy()`. Inside each: preflight, normalize, scrub
+   clean checks, sanitize process text, then `_verify_external_document_quality()`,
+   which blocks the save.
+6. `run_claude_md_document_review()` **[never fatal]** — audits both saved
+   documents against `rules.md` via the API. Advisory: reports and writes a
+   review JSON, never blocks the PDF.
 7. `_convert_docx_to_pdf()` on both. **The PDF is the deliverable.**
 8. Restore scrubbed and sanitized text, then persist `.facts.json`. The record
    keeps what the page drops.
+
+## How the rules get enforced
+
+Rendering is pure code, so most of `rules.md` is enforced by passes, not by a
+model reading it. Four mechanisms, in order:
+
+1. **Preflight** `_preflight_rules()`, the first thing `_fill_template` does:
+   fails the build if `rules.md` is missing, a marker is broken, a section is
+   empty, or B/C carry an em dash or double-hyphen dash (injected verbatim into
+   External prompts, and the gate rejects those characters).
+2. **Prompt** — Section B into every content call, C only into External ones.
+   The only stage where a model is asked to follow the rules while writing.
+3. **Deterministic passes** — `_normalize_misfiled_facts`,
+   `_scrub_clean_checks`, `_sanitize_process_gaps`, `_flag_headline`,
+   `_clause_topic_citation`, `_external_source_label`, `_external_gaps`.
+4. **Gates** — `_verify_external_document_quality` blocks a bad save;
+   `run_claude_md_document_review` audits both finished documents and reports.
+
+Section A never reaches an API call, and `_preflight_rules` does not return it.
 
 ## Before calling a run done
 
@@ -80,7 +94,7 @@ the run continue. Nothing else may swallow an error.
 
 ## Other entry points
 
-`company_charter.py <REG_NO>` (charter only) · `deep_research.py <REG_NO>` ·
-`gst_intake.py <PAN|GSTIN> <REG_NO>` · `cts_resolve.py` (human-in-the-loop land
-records) · `charter_report.py` via `run_charter_pipeline.py` or `build_report.py`
-· `executive_briefing.py` · `finalize_report.py` (rebuild PDF, no API calls).
+`company_charter.py <REG_NO>` · `deep_research.py <REG_NO>` · `gst_intake.py
+<PAN|GSTIN> <REG_NO>` · `cts_resolve.py` (human-in-the-loop land records) ·
+`charter_report.py` via `run_charter_pipeline.py` / `build_report.py` ·
+`executive_briefing.py` · `finalize_report.py` (rebuild PDF, no API calls).

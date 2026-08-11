@@ -4767,6 +4767,50 @@ def run_finding_research(facts: dict, researcher=None) -> dict:
     return summary
 
 
+def _preflight_rules(doc_variant: str) -> dict:
+    """Confirms rules.md is present and intact BEFORE any document is built.
+
+    Most of rules.md is enforced by code rather than by a model: _fill_template
+    renders in pure Python, so a missing or malformed rules file would not
+    announce itself, it would just quietly stop constraining output. This is
+    the one place that fails loudly instead.
+
+    Three checks:
+      * all three sections load and are non-empty (a renamed file, a broken
+        `--- Section X: ... ---` marker, or an accidentally emptied section);
+      * Section B, and Section C for External, carry no em dash and no double
+        hyphen used as a dash. They are injected verbatim into External-facing
+        prompts, prompt punctuation bleeds into model output, and
+        _verify_external_document_quality hard-fails the save on either. This
+        check exists because that trap was actually sprung once, by a rewrite
+        of the very sentence forbidding it;
+      * Section A is NOT returned to any caller here, so this function cannot
+        become a route by which coding-time guidance reaches an API call.
+
+    Raises RuntimeError on any failure: generating a document against rules
+    that are missing or self-contradictory is worse than not generating one."""
+    sections = {"A": _coding_time_notes(), "B": _common_content_rules()}
+    if doc_variant == "external":
+        sections["C"] = _external_citation_rule()
+
+    for marker, body in sections.items():
+        if not body.strip():
+            raise RuntimeError(f"rules.md Section {marker} is empty -- refusing to generate against it")
+
+    for marker in ("B", "C"):
+        body = sections.get(marker)
+        if body is None:
+            continue
+        if "—" in body or " -- " in body:
+            raise RuntimeError(
+                f"rules.md Section {marker} contains an em dash or a double-hyphen dash. It is injected "
+                f"verbatim into External prompts and _verify_external_document_quality hard-fails on "
+                f"either, so this would corrupt output. Use commas, colons or a single spaced hyphen."
+            )
+
+    return {"sections_loaded": sorted(sections), "variant": doc_variant}
+
+
 def _rendered_document_text(docx_path: str, limit: int = 60000) -> str:
     """Flattens a saved .docx to plain text for review: body paragraphs and
     table cells, in document order, which is what a reader actually sees."""
@@ -5008,6 +5052,11 @@ def _fill_template(
         # regardless of whether/when an External pass runs against it --
         # see _externalized_facts_copy's own docstring.
         facts = _externalized_facts_copy(facts)
+    # Rules first, before a single paragraph is written. See _preflight_rules:
+    # rendering is pure code, so a missing or self-contradictory rules file
+    # would silently stop constraining output rather than fail.
+    _preflight_rules(doc_variant)
+
     facts["_doc_variant"] = doc_variant
     facts["_citation_registry"] = {"order": [], "index": {}}
 
