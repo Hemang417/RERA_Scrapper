@@ -64,21 +64,14 @@ the run continue. Nothing else may swallow an error.
 ## How the rules get enforced
 
 Rendering is pure code, so most of `rules.md` is enforced by passes, not by a
-model reading it. Four mechanisms, in order:
+model reading it. Four mechanisms, in order: **preflight** (`_preflight_rules`,
+the first thing `_fill_template` does), **prompt** (Section B into every content
+call, C only into External ones), **deterministic passes**, and **gates**
+(`_verify_external_document_quality` blocks a bad save). Section A never reaches
+an API call.
 
-1. **Preflight** `_preflight_rules()`, the first thing `_fill_template` does:
-   fails the build if `rules.md` is missing, a marker is broken, a section is
-   empty, or B/C carry an em dash or double-hyphen dash (injected verbatim into
-   External prompts, and the gate rejects those characters).
-2. **Prompt** — Section B into every content call, C only into External ones.
-   The only stage where a model is asked to follow the rules while writing.
-3. **Deterministic passes** — `_normalize_misfiled_facts`,
-   `_scrub_clean_checks`, `_sanitize_process_gaps`, `_flag_headline`,
-   `_clause_topic_citation`, `_external_source_label`, `_external_gaps`.
-4. **Gates** — `_verify_external_document_quality` blocks a bad save;
-   `run_claude_md_document_review` audits both finished documents and reports.
-
-Section A never reaches an API call, and `_preflight_rules` does not return it.
+**`guardrails.md` is the full map** — every gate, fallback, bound and
+never-fatal wrapper, by symbol. Read it before changing any of them.
 
 ## Before calling a run done
 
