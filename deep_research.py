@@ -337,6 +337,156 @@ def _run_agentic_pass(user_prompt: str, system: str, label: str = "agentic_pass"
     return _parse_json_response(messages[-1])
 
 
+_CLEAN_CHECK_JUDGE_PROMPT = """You are classifying sentences from a real estate due-diligence \
+report. Each one reports that something was NOT found. Decide, for each, which of three kinds \
+it is. This distinction is the whole task:
+
+  "clean_check"  a RISK was looked for and is absent, which is reassuring and adds nothing.
+                 "No litigation is disclosed against the promoter." "No encumbrance is
+                 registered against the land." These are deleted from the report.
+  "gap"          EVIDENCE is absent, so something could not be established. This is an open
+                 unknown the reader must act on. "Not found among the documents reviewed: a
+                 sanctioned-FSI certificate." "No public credit rating could be located."
+                 These are always kept.
+  "finding"      the sentence reports something real despite containing a negation: a dated
+                 event, a named party, an exception ("found nothing except a Notice of Lis
+                 Pendens"), a contractual right, or a statement of what a document IS rather
+                 than what is missing. These are always kept.
+
+The two failure modes are not equally bad. Deleting a gap or a finding loses information a \
+reader needed; leaving a clean check only wastes a line. When genuinely unsure, answer "gap".
+
+Your FINAL reply must be ONLY a single raw JSON object -- no prose, no markdown code fences -- \
+matching exactly this shape, with one entry per input id: \
+{"verdicts": [{"id": 0, "kind": "clean_check" | "gap" | "finding"}]}"""
+
+
+def classify_clean_checks(clauses: list, label: str = "clean_check_judge") -> dict:
+    """Classifies absence-shaped clauses as clean_check / gap / finding.
+
+    Replaces the risk-noun keyword test in company_charter._is_clean_check_clause
+    with a semantic judgement, because shape genuinely cannot separate these:
+        "No litigation is disclosed against the promoter."      clean check
+        "Not found among the documents reviewed: a certificate." gap
+    Same grammar, opposite handling. A keyword list approximates it and needs a
+    code change per new field; this does not.
+
+    One call for the whole document rather than one per clause. Returns
+    {index: kind}; an empty dict means the caller should fall back to its own
+    deterministic test, which is what happens with no API key."""
+    if not clauses:
+        return {}
+    listing = "\n".join(f"{i}. {c}" for i, c in enumerate(clauses))
+    try:
+        result = _run_agentic_pass(f"Classify each sentence:\n{listing}", _CLEAN_CHECK_JUDGE_PROMPT, label=label)
+    except Exception:
+        return {}
+    out = {}
+    for v in (result.get("verdicts") or []):
+        try:
+            idx, kind = int(v["id"]), str(v["kind"]).strip()
+        except (KeyError, TypeError, ValueError):
+            continue
+        if 0 <= idx < len(clauses) and kind in ("clean_check", "gap", "finding"):
+            out[idx] = kind
+    return out
+
+
+_CITATION_MATCH_PROMPT = """You are attaching source citations to claims in a real estate \
+due-diligence report. You are given a numbered list of sources and a numbered list of claims. \
+For each claim, name the ONE source that actually establishes it.
+
+The rule that matters: the citation must support the specific claim. Citing a complaints \
+register for a sentence beginning "independent web research found..." is wrong even though \
+both are real sources. A missing citation is a lesser failure than a wrong one, so if no \
+listed source clearly establishes a claim, return null for it rather than the closest guess.
+
+Your FINAL reply must be ONLY a single raw JSON object -- no prose, no markdown code fences -- \
+matching exactly this shape: \
+{"matches": [{"claim": 0, "source": 3}, {"claim": 1, "source": null}]}"""
+
+
+def match_claims_to_sources(claims: list, sources: list, label: str = "citation_match") -> dict:
+    """Maps each claim to the index of the source that establishes it.
+
+    Replaces a keyword table mapping clause subject to source topic. That table
+    is why External citation coverage sits at 83% rather than near-total: it
+    returns nothing whenever a clause's wording is not anticipated, which is the
+    right failure but a frequent one.
+
+    Returns {claim_index: source_index}; claims with no supporting source are
+    omitted. An empty dict means fall back to the keyword table."""
+    if not claims or not sources:
+        return {}
+    src = "\n".join(f"{i}. {s}" for i, s in enumerate(sources))
+    cl = "\n".join(f"{i}. {c}" for i, c in enumerate(claims))
+    try:
+        result = _run_agentic_pass(f"Sources:\n{src}\n\nClaims:\n{cl}", _CITATION_MATCH_PROMPT, label=label)
+    except Exception:
+        return {}
+    out = {}
+    for m in (result.get("matches") or []):
+        try:
+            ci, si = m.get("claim"), m.get("source")
+        except AttributeError:
+            continue
+        if si is None:
+            continue
+        try:
+            ci, si = int(ci), int(si)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= ci < len(claims) and 0 <= si < len(sources):
+            out[ci] = si
+    return out
+
+
+_HEADLINE_PROMPT = """You are writing one-line headlines for the flag list of a real estate \
+due-diligence report. Each input is the full text of an open gap. The full text is printed \
+elsewhere in the report, so the headline must NOT restate it: it says what the issue is, in \
+one short clause a reader can scan.
+
+Rules:
+  * one sentence, ideally under 15 words, never more than 25,
+  * state the issue itself, not that an issue exists ("Share capital figures disagree across
+    registry sources", not "There is a discrepancy in the figures"),
+  * no citation markers, no trailing full stop, no em dashes and no double hyphen used as a
+    dash,
+  * plain language, and keep any specific name or figure that makes it identifiable.
+
+Your FINAL reply must be ONLY a single raw JSON object -- no prose, no markdown code fences -- \
+matching exactly this shape, one entry per input id: \
+{"headlines": [{"id": 0, "text": "..."}]}"""
+
+
+def write_flag_headlines(gap_texts: list, label: str = "flag_headline") -> dict:
+    """Writes a scannable headline for each gap.
+
+    Replaces "take the first sentence", which compresses nothing when a gap is
+    a single sentence. On the 2026-08 Pranami data that was 11 of 17 gaps, so
+    their flag line was byte-identical to the gap entry it pointed at, which is
+    the duplication the headline rule exists to remove.
+
+    Returns {index: headline}; an empty dict means fall back to first-sentence."""
+    if not gap_texts:
+        return {}
+    listing = "\n\n".join(f"{i}. {t}" for i, t in enumerate(gap_texts))
+    try:
+        result = _run_agentic_pass(f"Write a headline for each gap:\n\n{listing}", _HEADLINE_PROMPT, label=label)
+    except Exception:
+        return {}
+    out = {}
+    for h in (result.get("headlines") or []):
+        try:
+            idx, text = int(h["id"]), str(h["text"]).strip()
+        except (KeyError, TypeError, ValueError):
+            continue
+        text = text.rstrip(". ").replace(" -- ", ", ").replace("—", ", ")
+        if 0 <= idx < len(gap_texts) and text:
+            out[idx] = text
+    return out
+
+
 _DOC_REVIEW_SYSTEM_PROMPT = """You are auditing a finished real estate due-diligence document \
 against the editorial rules it was written under. The rules are given to you above this \
 instruction; treat them as the only standard, and do not invent additional preferences.

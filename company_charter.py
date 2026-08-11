@@ -3748,6 +3748,20 @@ def _clause_topic_citation(facts: dict, clause: str) -> str | None:
     pairing. Leaving that clause uncited is the better failure."""
     if facts.get("_doc_variant") != "external":
         return None
+
+    # A model match, if run_editorial_passes cached one, cites the source that
+    # actually establishes THIS clause rather than the first source carrying a
+    # keyword-guessed topic. A miss falls through to the keyword table, so no
+    # match means today's behaviour exactly.
+    matched = facts.get("_claim_source_matches", {}).get((clause or "").strip())
+    if matched is not None:
+        sources = facts.get("sources") or []
+        if 0 <= matched < len(sources):
+            label = _clean_source_label(sources[matched].get("label") or "") or (sources[matched].get("ref") or "")
+            citation = _citation_text(facts, label)
+            if citation:
+                return citation
+
     for pattern, topics in _CLAUSE_TOPIC_PATTERNS:
         if re.search(pattern, clause, re.IGNORECASE):
             return _cite_marker(*topics, facts=facts)
@@ -4466,7 +4480,19 @@ _ABSENCE_RESCUE_RE = re.compile(
 )
 
 
-def _is_clean_check_clause(text: str, risk_context: bool = False) -> bool:
+def _matches_absence_shape(text: str) -> bool:
+    """Cheap prefilter: does this clause assert that something is absent?
+
+    Deliberately over-inclusive. It answers "is this worth judging at all",
+    not "should this be deleted", so it costs nothing to let a gap through
+    here: the risk-noun test or the model verdict decides that afterwards."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    return any(re.search(p, t, re.IGNORECASE) for p in _ABSENCE_SHAPES)
+
+
+def _is_clean_check_clause(text: str, risk_context: bool = False, facts: dict | None = None) -> bool:
     """True when `text` is a bare report that a risk was looked for and not
     found -- the sentence CLAUDE.md Section B deletes outright.
 
@@ -4479,12 +4505,21 @@ def _is_clean_check_clause(text: str, risk_context: bool = False) -> bool:
         return False
     if not any(re.search(p, t, re.IGNORECASE) for p in _ABSENCE_SHAPES):
         return False
+
+    # A model verdict, if run_editorial_passes cached one for this exact clause,
+    # decides the question the risk-noun list only approximates: is the absent
+    # thing a RISK (delete) or EVIDENCE (a gap, keep)? A miss falls through to
+    # the keyword path below, so no verdict means today's behaviour exactly.
+    verdict = (facts or {}).get("_clean_check_verdicts", {}).get(t)
+    if verdict:
+        return verdict == "clean_check"
+
     if not risk_context and not re.search(r"\b(?:%s)\b" % "|".join(_RISK_NOUNS), t, re.IGNORECASE):
         return False
     return not _ABSENCE_RESCUE_RE.search(t)
 
 
-def _strip_absence_tail(clause: str, risk_context: bool = False) -> str:
+def _strip_absence_tail(clause: str, risk_context: bool = False, facts: dict | None = None) -> str:
     """Drops semicolon-delimited segments that are themselves pure clean checks,
     from a clause that survives as a whole because it also carries a finding.
 
@@ -4507,7 +4542,7 @@ def _strip_absence_tail(clause: str, risk_context: bool = False) -> str:
     segments = [s.strip() for s in clause.split(";")]
     kept = [segments[0]] + [
         s for s in segments[1:]
-        if not _is_clean_check_clause(s.rstrip("."), risk_context=risk_context)
+        if not _is_clean_check_clause(s.rstrip("."), risk_context=risk_context, facts=facts)
     ]
     if len(kept) == len(segments):
         return clause
@@ -4552,9 +4587,9 @@ def _scrub_clean_checks(facts: dict) -> dict:
         risk_context = any(noun in path.lower() for noun in _RISK_NOUNS)
         kept = []
         for clause in _split_into_bullet_clauses(original):
-            if _is_clean_check_clause(clause, risk_context=risk_context):
+            if _is_clean_check_clause(clause, risk_context=risk_context, facts=facts):
                 continue
-            kept.append(_strip_absence_tail(clause, risk_context))
+            kept.append(_strip_absence_tail(clause, risk_context, facts=facts))
         scrubbed = " ".join(c for c in kept if c).strip()
         if scrubbed != original.strip():
             changed[path] = original
@@ -4663,6 +4698,22 @@ _FINDING_FIELDS = (
 # to research.
 _MIN_FINDING_LENGTH = 80
 
+# Narrative fields whose clauses carry factual claims needing a citation in the
+# External document. Used only to assemble the claim list for the editorial
+# citation-matching pass; the renderer still decides per clause.
+_CITED_NARRATIVE_FIELDS = (
+    "executive_summary",
+    "litigation_status.value",
+    "land_identification.land_assembly.value",
+    "fsi_metrics.mortgage_area",
+    "fsi_interpretation",
+    "fsi_governing_framework",
+    "social_infrastructure",
+    "micro_market_overview",
+    "area_intelligence_trend",
+    "unit_summary_note",
+)
+
 
 def _collect_findings(facts: dict) -> list:
     """Returns [{"path", "clause"}] for every confirmed finding worth a
@@ -4764,6 +4815,84 @@ def run_finding_research(facts: dict, researcher=None) -> dict:
         "results": results,
     }
     facts["finding_research"] = summary
+    return summary
+
+
+def run_editorial_passes(facts: dict, judge=None, matcher=None, headline_writer=None) -> dict:
+    """Precomputes the three editorial judgements that a model does better than
+    a keyword table, and caches them on `facts` for the renderer to consult.
+
+    Each one replaces a heuristic that was written deterministically because
+    the reshape spec asked for determinism, and each was visibly limited by it:
+
+      * clean-check classification. Shape cannot separate "no litigation found"
+        (delete) from "no FSI certificate found" (keep, it is a gap), so
+        _is_clean_check_clause needed a risk-noun list AND a field allow-list,
+        and needs a code change per new field.
+      * citation matching. A keyword table mapping clause subject to source
+        topic, which returns nothing on unanticipated wording. That is the
+        right failure but a frequent one, and it is why External coverage sits
+        at 83% rather than near-total.
+      * flag headlines. "First sentence" compresses nothing when a gap IS one
+        sentence, which was 11 of 17 gaps on the Pranami data, leaving the flag
+        line identical to the gap entry it points at.
+
+    Runs ONCE per document set, before either variant renders, so it costs
+    three calls per run rather than three per clause.
+
+    Every consumer falls back to its existing deterministic behaviour when a
+    verdict is missing, so a failed call, a partial reply, or no API key at all
+    leaves output exactly as it is today rather than degraded. That is why the
+    caches are keyed by clause text: a lookup miss is indistinguishable from
+    "no model ran", and both take the old path."""
+    judge = judge or deep_research.classify_clean_checks
+    matcher = matcher or deep_research.match_claims_to_sources
+    headline_writer = headline_writer or deep_research.write_flag_headlines
+
+    summary = {"clean_checks": 0, "citations": 0, "headlines": 0}
+
+    # 1. Clean-check verdicts, over clauses the cheap shape test flags as
+    #    absence-shaped. The shape test stays as a prefilter: it costs nothing
+    #    and keeps the model's input to the genuinely ambiguous cases.
+    candidates = []
+    for path in _CLEAN_CHECK_FIELDS:
+        container, key = _resolve_path(facts, path)
+        if container is None or not isinstance(container[key], str):
+            continue
+        for clause in _split_into_bullet_clauses(container[key]):
+            if _matches_absence_shape(clause) and clause not in candidates:
+                candidates.append(clause)
+    if candidates:
+        verdicts = judge(candidates)
+        if verdicts:
+            facts["_clean_check_verdicts"] = {candidates[i]: k for i, k in verdicts.items()}
+            summary["clean_checks"] = len(verdicts)
+
+    # 2. Claim-to-source matches, for External citation attachment.
+    sources = [(s.get("ref") or s.get("label") or "").strip() for s in (facts.get("sources") or [])]
+    claims = []
+    for path in _CITED_NARRATIVE_FIELDS:
+        container, key = _resolve_path(facts, path)
+        if container is None or not isinstance(container[key], str):
+            continue
+        for clause in _split_into_bullet_clauses(container[key]):
+            if len(clause) >= 40 and clause not in claims:
+                claims.append(clause)
+    if claims and any(sources):
+        matches = matcher(claims, sources)
+        if matches:
+            facts["_claim_source_matches"] = {claims[c]: s for c, s in matches.items()}
+            summary["citations"] = len(matches)
+
+    # 3. Flag headlines, one per gap.
+    gaps = facts.get("gaps") or []
+    if gaps:
+        headlines = headline_writer(list(gaps))
+        if headlines:
+            facts["_flag_headlines"] = {i + 1: h for i, h in headlines.items()}
+            summary["headlines"] = len(headlines)
+
+    facts["_editorial_passes"] = summary
     return summary
 
 
@@ -7536,6 +7665,15 @@ def _flag_headline(facts: dict, item: dict) -> tuple:
     number = item.get("gap_number")
     if not number or number not in _rendered_gap_numbers(facts):
         return text, False
+
+    # A model-written headline, if run_editorial_passes cached one. This is what
+    # closes the duplication the KNOWN LIMITATION above describes: "first
+    # sentence" compresses nothing when the gap IS one sentence. A miss falls
+    # through to first-sentence, so no headline means today's behaviour exactly.
+    written = facts.get("_flag_headlines", {}).get(number)
+    if written:
+        return f"{written} (Gap {number})", True
+
     clauses = _split_into_bullet_clauses(text)
     return f"{clauses[0] if clauses else text} (Gap {number})", True
 
@@ -9751,6 +9889,19 @@ def run_company_charter(
     # overwrite the very enrichment this stage just wrote into those fields.
     # Never fatal: a failed call leaves that finding's original text in place.
     _normalize_misfiled_facts(facts)
+
+    # Editorial judgements a model does better than a keyword table, computed
+    # once here for both variants. Every consumer falls back to its existing
+    # deterministic path on a miss, so a failure leaves output unchanged rather
+    # than degraded.
+    try:
+        _editorial = run_editorial_passes(facts)
+        if any(_editorial.values()):
+            print(f"[OK] Editorial passes: {_editorial['clean_checks']} clause verdict(s), "
+                  f"{_editorial['citations']} citation match(es), {_editorial['headlines']} headline(s).")
+    except Exception as e:
+        print(f"[WARN] Editorial passes failed ({e}) -- falling back to deterministic rules.")
+
     try:
         _research_summary = run_finding_research(facts)
         print(f"[OK] Per-finding research: {_research_summary['enriched']} of "
