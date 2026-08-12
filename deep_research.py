@@ -53,6 +53,22 @@ MAX_GAP_RETRY_ATTEMPTS = 2
 # cap keep their original text rather than being dropped.
 MAX_FINDING_RESEARCH_CALLS = 8
 
+# Same precedent again, for run_deep_research's own verify+gap-retry fan-out.
+# _verify_block calls _verify_claim once per source with no limit on how many
+# sources a block has, and _resolve_gaps retries every gap it's handed (each
+# retry itself a call, up to MAX_GAP_RETRY_ATTEMPTS tries) with no limit on how
+# many gaps a block has. Neither loop is bounded by the other's cap: a project
+# whose research legitimately turns up many claims -- exactly what a real
+# promoter and market profile does -- can spawn dozens of independent 6-search
+# agentic calls in this one pipeline step. That is what actually happened on
+# 2026-08-12: P51800077150's first-ever research pass (no prior_research to
+# reuse, so the full generate+verify+resolve path) ran past $10 before being
+# killed by hand. One shared budget across all three research blocks in a
+# single run_deep_research() call bounds it, the same way MAX_FINDING_RESEARCH_
+# CALLS bounds the per-finding stage. A source or gap beyond the cap is kept,
+# never dropped -- annotated the same way a verification_error already is.
+MAX_RESEARCH_VERIFICATION_CALLS = 15
+
 # Output budget per call. Thinking blocks and server-side web-search results are
 # billed against this same budget, so a call that researches heavily can spend
 # the whole allowance before writing a single character of its reply: the model
@@ -830,16 +846,50 @@ def _verify_claim(claim: str, source_url: str, label: str = "verify_claim") -> d
     return result
 
 
-def _verify_block(block: dict, label: str = "verify_claim") -> dict:
+class _VerificationBudget:
+    """Shared call counter for one run_deep_research() call. _verify_block and
+    _resolve_gaps both draw from it -- across all three research blocks, and
+    across _resolve_gaps's own use of _verify_block on its retry results -- so
+    the total number of verify/gap-retry API calls one project's research can
+    spend is bounded regardless of how many sources or gaps it produces. See
+    MAX_RESEARCH_VERIFICATION_CALLS."""
+
+    def __init__(self, limit: int | None = None):
+        # Reads the module-level constant by name at call time, not as a bound
+        # default, so a test (or a future caller) can patch
+        # MAX_RESEARCH_VERIFICATION_CALLS and have it actually take effect.
+        self.remaining = MAX_RESEARCH_VERIFICATION_CALLS if limit is None else limit
+
+    def take(self) -> bool:
+        if self.remaining <= 0:
+            return False
+        self.remaining -= 1
+        return True
+
+
+def _verify_block(block: dict, label: str = "verify_claim",
+                  budget: "_VerificationBudget | None" = None) -> dict:
     """Re-checks every cited source independently. A source that failed a
     real check is demoted into `gaps` (never dropped silently) so
     _resolve_gaps gets a chance to retry it. A source whose check could not
     even run ("verification_error") is kept as-is rather than discarded --
     see _verify_claim's docstring -- but still gets an explicit, honest gap
-    noting it was never actually independently re-checked this pass."""
+    noting it was never actually independently re-checked this pass.
+
+    `budget`, if given, caps how many sources this call will actually spend
+    an API call verifying; anything beyond it is kept unverified with the
+    same honest-gap treatment as a verification_error, rather than spending
+    another call or dropping the source."""
     kept_sources = []
     demoted_gaps = list(block.get("gaps", []))
     for src in block.get("sources", []):
+        if budget is not None and not budget.take():
+            kept_sources.append(src)
+            demoted_gaps.append(
+                f"{src.get('claim', '')} (NOT independently re-verified this pass -- "
+                f"research verification budget exhausted)"
+            )
+            continue
         verdict = _verify_claim(src.get("claim", ""), src.get("url", ""), label=label)
         status = verdict.get("status")
         if status == "confirmed":
@@ -856,15 +906,25 @@ def _verify_block(block: dict, label: str = "verify_claim") -> dict:
     return block
 
 
-def _resolve_gaps(block: dict) -> dict:
+def _resolve_gaps(block: dict, budget: "_VerificationBudget | None" = None) -> dict:
     """Bounded retry per gap, each attempt using a different strategy than the last.
     A gap that survives every attempt stays in `gaps`, annotated with what was tried --
-    it is never fabricated away just to make the list shorter."""
+    it is never fabricated away just to make the list shorter.
+
+    `budget`, if given, is shared with _verify_block (see its docstring) and
+    caps the total number of retry/verify calls this function will make; a
+    gap reached after the budget is spent is left open, annotated rather than
+    silently skipped."""
     still_open = []
     for gap in block.get("gaps", []):
+        if budget is not None and budget.remaining <= 0:
+            still_open.append(f"{gap} (not retried -- research verification budget exhausted)")
+            continue
         attempts_log = []
         resolved = False
         for strategy in GAP_RETRY_STRATEGIES[:MAX_GAP_RETRY_ATTEMPTS]:
+            if budget is not None and not budget.take():
+                break
             prompt = (
                 f"Earlier research could not confirm this: {gap}\n"
                 f"Already tried: {attempts_log or ['the direct/default search approach']}\n"
@@ -880,7 +940,8 @@ def _resolve_gaps(block: dict) -> dict:
                 result = {}
             attempts_log.append(strategy)
             if result.get("sources"):
-                verified = _verify_block({"sources": result["sources"], "gaps": []}, label="gap_retry_verify")
+                verified = _verify_block({"sources": result["sources"], "gaps": []},
+                                         label="gap_retry_verify", budget=budget)
                 if verified["sources"]:
                     block.setdefault("sections", []).extend(result.get("sections", []))
                     block.setdefault("sources", []).extend(verified["sources"])
@@ -919,6 +980,7 @@ def run_deep_research(
     reusable = age_hours is not None and age_hours <= RESEARCH_REUSE_WINDOW_HOURS
 
     research = {}
+    budget = _VerificationBudget()
     if reusable:
         for key in RESEARCH_KEYS:
             prior_block = prior_research.get(key) or {}
@@ -929,7 +991,7 @@ def run_deep_research(
                 "gaps": list(prior_block.get("gaps", [])),
             }
             if block["gaps"]:
-                block = _resolve_gaps(block)
+                block = _resolve_gaps(block, budget=budget)
             research[key] = block
     else:
         projects = category_data.get("projects") or {}
@@ -945,8 +1007,8 @@ def run_deep_research(
                                 max_tokens=RESEARCH_MAX_TOKENS, search=True,
                                 max_searches=RESEARCH_MAX_SEARCHES)
         for key in RESEARCH_KEYS:
-            block = _verify_block(raw.get(key, {}))
-            block = _resolve_gaps(block)
+            block = _verify_block(raw.get(key, {}), budget=budget)
+            block = _resolve_gaps(block, budget=budget)
             research[key] = block
 
     research["_generated_at"] = datetime.now().isoformat()

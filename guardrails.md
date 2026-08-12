@@ -87,7 +87,21 @@ and the corrected record is the better one.
 ## 5. Bounds
 
 `deep_research.MAX_FINDING_RESEARCH_CALLS`, `deep_research.MAX_GAP_RETRY_ATTEMPTS`,
-`company_charter._MIN_FINDING_LENGTH`, and the review's own input cap.
+`deep_research.MAX_RESEARCH_VERIFICATION_CALLS`, `company_charter._MIN_FINDING_LENGTH`,
+and the review's own input cap.
+
+`deep_research.MAX_RESEARCH_VERIFICATION_CALLS` bounds a fan-out the other two
+don't: `_verify_block` calls `_verify_claim` once per source with no limit on
+how many sources a block has, and `_resolve_gaps` retries every gap it's
+handed with no limit on how many gaps a block has. `MAX_GAP_RETRY_ATTEMPTS`
+only bounds attempts *per* gap, not the number of gaps. A `_VerificationBudget`
+shared across all three research blocks (and across `_resolve_gaps`'s own use
+of `_verify_block` on retry results) in one `run_deep_research()` call caps
+the total regardless. This is not hypothetical: P51800077150's first-ever
+research pass (2026-08-12, no `prior_research` to reuse) ran past $10 before
+being killed by hand. A source or gap reached after the budget is spent is
+kept, never dropped -- annotated the same way a `verification_error` already
+is.
 
 ### The search budget, which is also the reply budget
 

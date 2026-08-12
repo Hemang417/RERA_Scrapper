@@ -435,5 +435,99 @@ def test_no_search_budget_exceeds_what_the_token_budget_can_pay_for():
         assert 0 < value <= 15, f"{name}={value} is outside the range this design assumes"
 
 
+# ---------------------------------------------------------------------------
+# The verify/gap-retry fan-out has its own shared budget
+#
+# _verify_block calls _verify_claim once per source, and _resolve_gaps retries
+# every gap it's handed -- neither loop has a limit of its own on how many
+# sources or gaps a research block produces. A _VerificationBudget shared
+# across both is what actually bounds it; see MAX_RESEARCH_VERIFICATION_CALLS.
+# ---------------------------------------------------------------------------
+
+def test_verify_block_stops_spending_once_the_shared_budget_is_gone(recorder):
+    rec = recorder([_FakeMessage(json.dumps({"status": "confirmed", "reason": "ok"}))
+                    for _ in range(2)])
+    budget = deep_research._VerificationBudget(limit=2)
+    block = {"sources": [{"claim": f"claim {i}", "url": "http://x"} for i in range(5)],
+             "gaps": []}
+
+    result = deep_research._verify_block(block, budget=budget)
+
+    assert len(rec.calls) == 2, "must not spend more calls than the budget allows"
+    assert len(result["sources"]) == 5, (
+        "a source past the budget is kept, same as a verification_error -- never dropped"
+    )
+    assert len(result["gaps"]) == 3, "everything past the budget gets an honest gap note too"
+    assert all("budget exhausted" in g for g in result["gaps"])
+
+
+def test_resolve_gaps_stops_retrying_once_the_shared_budget_is_gone(recorder):
+    rec = recorder([_FakeMessage(json.dumps({"sections": [], "sources": []}))])
+    budget = deep_research._VerificationBudget(limit=1)
+    block = {"gaps": [f"gap {i}" for i in range(4)]}
+
+    result = deep_research._resolve_gaps(block, budget=budget)
+
+    assert len(rec.calls) == 1, "must not spend more calls than the budget allows"
+    assert len(result["gaps"]) == 4, "nothing is dropped, only annotated"
+    assert "not retried" in result["gaps"][1]
+
+
+def test_verify_and_resolve_gaps_draw_from_the_same_budget(recorder):
+    """_resolve_gaps calls _verify_block internally on its own retry results
+    (label gap_retry_verify) -- that must count against the same budget, or a
+    project whose gaps all happen to resolve successfully could still spend
+    unboundedly."""
+    rec = recorder([
+        _FakeMessage(json.dumps({
+            "sections": [{"heading": "h", "body": "b"}],
+            "sources": [{"claim": "c", "url": "http://x"}],
+        })),
+        _FakeMessage(json.dumps({"status": "confirmed", "reason": "ok"})),
+    ])
+    budget = deep_research._VerificationBudget(limit=2)
+    block = {"gaps": ["one gap"]}
+
+    deep_research._resolve_gaps(block, budget=budget)
+
+    assert len(rec.calls) == 2, "one gap_retry call plus one verify call on its result"
+    assert budget.remaining == 0
+
+
+def test_a_fresh_budget_defaults_to_the_module_constant():
+    assert deep_research._VerificationBudget().remaining == deep_research.MAX_RESEARCH_VERIFICATION_CALLS
+
+
+def test_run_deep_research_shares_one_budget_across_all_three_blocks(recorder, monkeypatch):
+    """A project whose research legitimately turns up many claims across all
+    three blocks (macro market, micro market, promoter profile) must still be
+    bounded by ONE total, not one allowance per block -- otherwise the total
+    spend still scales with project size, just with a bigger constant."""
+    monkeypatch.setattr(deep_research, "MAX_RESEARCH_VERIFICATION_CALLS", 5)
+
+    def block(n):
+        return {
+            "summary": "s", "sections": [],
+            "sources": [{"claim": f"c{i}", "url": "http://x"} for i in range(n)],
+            "gaps": [],
+        }
+
+    generate_reply = _FakeMessage(json.dumps({
+        "macro_market": block(3), "micro_market": block(3), "promoter_external": block(3),
+    }))
+    rec = recorder([generate_reply] + [
+        _FakeMessage(json.dumps({"status": "confirmed", "reason": "ok"})) for _ in range(20)
+    ])
+
+    with tempfile.TemporaryDirectory() as tmp:
+        deep_research.run_deep_research("P00000000000", {}, output_dir=tmp)
+
+    # 1 generation call, then at most 5 verify calls total across all three
+    # blocks combined -- not 5 per block, which would be 15.
+    assert len(rec.calls) == 1 + 5, (
+        f"expected 6 total calls (1 generate + 5 shared verify budget), got {len(rec.calls)}"
+    )
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
