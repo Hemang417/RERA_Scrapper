@@ -214,6 +214,65 @@ def test_budget_exhausted_is_still_caught_by_existing_degradation_paths():
     assert issubclass(deep_research.BudgetExhausted, RuntimeError)
 
 
+# ---------------------------------------------------------------------------
+# A hard ceiling on the WHOLE run's spend, not just one stage
+# ---------------------------------------------------------------------------
+
+def _spend(amount):
+    deep_research._USAGE_LOG.append({
+        "label": "prior", "model": deep_research.MODEL, "turns": 1,
+        "input_tokens": 0, "cache_write_tokens": 0, "cache_read_tokens": 0,
+        "output_tokens": 0, "cost_usd": amount,
+    })
+
+
+def test_a_call_is_refused_once_the_pipeline_cost_cap_is_reached(recorder):
+    rec = recorder()
+    _spend(deep_research.PIPELINE_COST_CAP_USD)
+
+    with pytest.raises(deep_research.CostCapExceeded):
+        deep_research._run_agentic_pass("p", "s", label="t")
+    assert not rec.calls, "a refused call must never reach the transport at all"
+
+
+def test_a_call_under_the_cap_still_proceeds(recorder):
+    rec = recorder()
+    _spend(deep_research.PIPELINE_COST_CAP_USD - 1)
+
+    deep_research._run_agentic_pass("p", "s", label="t")
+    assert rec.calls, "spend below the cap must not block a call"
+
+
+def test_cost_cap_exceeded_is_not_retried(recorder):
+    """Unlike BudgetExhausted, an overspent run doesn't get cheaper with a
+    smaller search budget -- the cap must not trigger the retry path."""
+    rec = recorder()
+    _spend(deep_research.PIPELINE_COST_CAP_USD)
+
+    with pytest.raises(deep_research.CostCapExceeded):
+        deep_research._run_agentic_pass("p", "s", label="t", search=True, max_searches=8)
+    assert not rec.calls, "no attempt, and therefore no retry, may reach the transport"
+
+
+def test_cost_cap_exceeded_is_still_caught_by_existing_degradation_paths():
+    """deep research and Charter generation are both [never fatal] stages in
+    main.py; if this didn't inherit from RuntimeError, hitting the cap would
+    start crashing the whole pipeline run instead of just that one stage."""
+    assert issubclass(deep_research.CostCapExceeded, RuntimeError)
+
+
+def test_the_cap_check_reads_real_usage_not_a_stale_snapshot(recorder):
+    """The check must call usage_summary() fresh each time, not cache a total
+    computed once -- otherwise spend from calls made after the cap object
+    was created would go uncounted."""
+    rec = recorder()
+    deep_research._run_agentic_pass("p", "s", label="t")  # cheap, doesn't trip the cap
+    assert rec.calls, "a call made before any spend must still succeed"
+    _spend(deep_research.PIPELINE_COST_CAP_USD)
+    with pytest.raises(deep_research.CostCapExceeded):
+        deep_research._run_agentic_pass("p", "s", label="t2")
+
+
 def test_a_searching_call_that_runs_out_of_room_retries_with_fewer_searches(recorder):
     rec = recorder([
         _FakeMessage("", stop_reason="max_tokens"),
@@ -436,62 +495,112 @@ def test_no_search_budget_exceeds_what_the_token_budget_can_pay_for():
 
 
 # ---------------------------------------------------------------------------
-# The verify/gap-retry fan-out has its own shared budget
+# The verify/gap-retry fan-out is batched, and shares a budget
 #
-# _verify_block calls _verify_claim once per source, and _resolve_gaps retries
-# every gap it's handed -- neither loop has a limit of its own on how many
-# sources or gaps a research block produces. A _VerificationBudget shared
-# across both is what actually bounds it; see MAX_RESEARCH_VERIFICATION_CALLS.
+# _verify_block used to call _verify_claim once per source, and _resolve_gaps
+# once per gap per attempt -- neither loop had a limit of its own on how many
+# sources or gaps a research block produces. _verify_claims_batch and
+# _retry_gaps_batch check/retry many at once in a single call sharing one
+# search budget, and a _VerificationBudget shared across both bounds the
+# total number of those batched calls; see MAX_RESEARCH_VERIFICATION_CALLS.
 # ---------------------------------------------------------------------------
 
-def test_verify_block_stops_spending_once_the_shared_budget_is_gone(recorder):
-    rec = recorder([_FakeMessage(json.dumps({"status": "confirmed", "reason": "ok"}))
-                    for _ in range(2)])
-    budget = deep_research._VerificationBudget(limit=2)
-    block = {"sources": [{"claim": f"claim {i}", "url": "http://x"} for i in range(5)],
-             "gaps": []}
+def test_verify_block_batches_sources_under_the_chunk_size_into_one_call(recorder):
+    rec = recorder([_FakeMessage(json.dumps({"verdicts": [
+        {"id": i, "status": "confirmed", "reason": "ok"} for i in range(5)
+    ]}))])
+    block = {"sources": [{"claim": f"claim {i}", "url": "http://x"} for i in range(5)], "gaps": []}
+
+    result = deep_research._verify_block(block)
+
+    assert len(rec.calls) == 1, "5 sources under the chunk size must fit in one call, not five"
+    assert len(result["sources"]) == 5
+    assert result["gaps"] == []
+
+
+def test_verify_block_chunks_a_block_larger_than_the_chunk_size(recorder, monkeypatch):
+    monkeypatch.setattr(deep_research, "BATCH_VERIFY_CHUNK_SIZE", 2)
+    rec = recorder([
+        _FakeMessage(json.dumps({"verdicts": [{"id": 0, "status": "confirmed", "reason": "ok"},
+                                              {"id": 1, "status": "confirmed", "reason": "ok"}]})),
+        _FakeMessage(json.dumps({"verdicts": [{"id": 0, "status": "confirmed", "reason": "ok"}]})),
+    ])
+    block = {"sources": [{"claim": f"claim {i}", "url": "http://x"} for i in range(3)], "gaps": []}
+
+    result = deep_research._verify_block(block)
+
+    assert len(rec.calls) == 2, "3 sources over a chunk size of 2 must take two calls, not three"
+    assert len(result["sources"]) == 3
+    assert result["gaps"] == []
+
+
+def test_verify_block_stops_spending_once_the_shared_budget_is_gone(recorder, monkeypatch):
+    monkeypatch.setattr(deep_research, "BATCH_VERIFY_CHUNK_SIZE", 2)
+    rec = recorder([_FakeMessage(json.dumps({"verdicts": [
+        {"id": 0, "status": "confirmed", "reason": "ok"},
+        {"id": 1, "status": "confirmed", "reason": "ok"},
+    ]}))])
+    budget = deep_research._VerificationBudget(limit=1)
+    block = {"sources": [{"claim": f"claim {i}", "url": "http://x"} for i in range(5)], "gaps": []}
 
     result = deep_research._verify_block(block, budget=budget)
 
-    assert len(rec.calls) == 2, "must not spend more calls than the budget allows"
-    assert len(result["sources"]) == 5, (
-        "a source past the budget is kept, same as a verification_error -- never dropped"
+    assert len(rec.calls) == 1, "only the first chunk's call may spend the one-call budget"
+    assert len(result["sources"]) == 5, "a source past the budget is kept, never dropped"
+    assert len(result["gaps"]) == 3, (
+        "the two chunks the budget couldn't cover are annotated, not silently skipped"
     )
-    assert len(result["gaps"]) == 3, "everything past the budget gets an honest gap note too"
     assert all("budget exhausted" in g for g in result["gaps"])
 
 
+def test_resolve_gaps_batches_every_pending_gap_into_one_call_per_round(recorder):
+    rec = recorder([_FakeMessage(json.dumps({"results": []}))
+                    for _ in range(deep_research.MAX_GAP_RETRY_ATTEMPTS)])
+    block = {"gaps": [f"gap {i}" for i in range(4)]}
+
+    result = deep_research._resolve_gaps(block)
+
+    assert len(rec.calls) == deep_research.MAX_GAP_RETRY_ATTEMPTS, (
+        "one batched call per retry round, covering all 4 gaps together -- not one call per gap"
+    )
+    assert len(result["gaps"]) == 4, "nothing is dropped, only annotated"
+    assert all(f"retried {deep_research.MAX_GAP_RETRY_ATTEMPTS} alternate approach" in g
+              for g in result["gaps"])
+
+
 def test_resolve_gaps_stops_retrying_once_the_shared_budget_is_gone(recorder):
-    rec = recorder([_FakeMessage(json.dumps({"sections": [], "sources": []}))])
+    rec = recorder([_FakeMessage(json.dumps({"results": []}))])
     budget = deep_research._VerificationBudget(limit=1)
     block = {"gaps": [f"gap {i}" for i in range(4)]}
 
     result = deep_research._resolve_gaps(block, budget=budget)
 
-    assert len(rec.calls) == 1, "must not spend more calls than the budget allows"
-    assert len(result["gaps"]) == 4, "nothing is dropped, only annotated"
-    assert "not retried" in result["gaps"][1]
+    assert len(rec.calls) == 1, "only the first round's batched call may spend the one-call budget"
+    assert len(result["gaps"]) == 4, "nothing is dropped"
+    assert all("retried 1 alternate approach" in g for g in result["gaps"])
 
 
-def test_verify_and_resolve_gaps_draw_from_the_same_budget(recorder):
-    """_resolve_gaps calls _verify_block internally on its own retry results
-    (label gap_retry_verify) -- that must count against the same budget, or a
-    project whose gaps all happen to resolve successfully could still spend
+def test_gap_retry_and_its_verify_draw_from_the_same_shared_budget(recorder):
+    """A round that finds sources spends a second batched call verifying
+    them -- that must count against the same budget as the retry call
+    itself, or a project whose gaps all happen to resolve could still spend
     unboundedly."""
     rec = recorder([
-        _FakeMessage(json.dumps({
-            "sections": [{"heading": "h", "body": "b"}],
-            "sources": [{"claim": "c", "url": "http://x"}],
-        })),
-        _FakeMessage(json.dumps({"status": "confirmed", "reason": "ok"})),
+        _FakeMessage(json.dumps({"results": [
+            {"id": 0, "sections": [{"heading": "h", "body": "b"}],
+             "sources": [{"claim": "c", "url": "http://x"}]},
+        ]})),
+        _FakeMessage(json.dumps({"verdicts": [{"id": 0, "status": "confirmed", "reason": "ok"}]})),
     ])
     budget = deep_research._VerificationBudget(limit=2)
     block = {"gaps": ["one gap"]}
 
-    deep_research._resolve_gaps(block, budget=budget)
+    result = deep_research._resolve_gaps(block, budget=budget)
 
-    assert len(rec.calls) == 2, "one gap_retry call plus one verify call on its result"
+    assert len(rec.calls) == 2, "one batched gap-retry call plus one batched verify call on its result"
     assert budget.remaining == 0
+    assert result["gaps"] == [], "the gap resolved once its source verified as confirmed"
+    assert len(result["sources"]) == 1
 
 
 def test_a_fresh_budget_defaults_to_the_module_constant():
@@ -503,7 +612,8 @@ def test_run_deep_research_shares_one_budget_across_all_three_blocks(recorder, m
     three blocks (macro market, micro market, promoter profile) must still be
     bounded by ONE total, not one allowance per block -- otherwise the total
     spend still scales with project size, just with a bigger constant."""
-    monkeypatch.setattr(deep_research, "MAX_RESEARCH_VERIFICATION_CALLS", 5)
+    monkeypatch.setattr(deep_research, "MAX_RESEARCH_VERIFICATION_CALLS", 4)
+    monkeypatch.setattr(deep_research, "BATCH_VERIFY_CHUNK_SIZE", 2)
 
     def block(n):
         return {
@@ -516,16 +626,56 @@ def test_run_deep_research_shares_one_budget_across_all_three_blocks(recorder, m
         "macro_market": block(3), "micro_market": block(3), "promoter_external": block(3),
     }))
     rec = recorder([generate_reply] + [
-        _FakeMessage(json.dumps({"status": "confirmed", "reason": "ok"})) for _ in range(20)
+        _FakeMessage(json.dumps({"verdicts": [{"id": 0, "status": "confirmed", "reason": "ok"}]}))
+        for _ in range(20)
     ])
 
     with tempfile.TemporaryDirectory() as tmp:
         deep_research.run_deep_research("P00000000000", {}, output_dir=tmp)
 
-    # 1 generation call, then at most 5 verify calls total across all three
-    # blocks combined -- not 5 per block, which would be 15.
-    assert len(rec.calls) == 1 + 5, (
-        f"expected 6 total calls (1 generate + 5 shared verify budget), got {len(rec.calls)}"
+    # Each block's 3 sources need 2 chunk-calls at chunk size 2 (2 then 1) --
+    # 6 verify calls total if unbounded. The shared budget caps it at 4,
+    # regardless of which block they'd otherwise fall in.
+    assert len(rec.calls) == 1 + 4, (
+        f"expected 5 total calls (1 generate + 4 shared verify budget), got {len(rec.calls)}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Prompt caching: every call marks the request cacheable
+# ---------------------------------------------------------------------------
+
+def test_every_call_asks_for_cache_control(recorder):
+    rec = recorder()
+    deep_research._run_agentic_pass("p", "s", label="t")
+    assert rec.calls[0]["cache_control"] == {"type": "ephemeral"}, (
+        "a call with no cache_control never benefits from a repeated system "
+        "prompt, however many times the same label gets called"
+    )
+
+
+def test_cache_tokens_are_priced_separately_from_plain_input(recorder):
+    """cache_creation_input_tokens/cache_read_input_tokens are NOT part of
+    input_tokens on the usage object -- pricing them at the plain input rate
+    (or ignoring them) would silently under- or over-report every cached
+    call's real cost."""
+    class _CachedUsage(_FakeUsage):
+        def __init__(self):
+            super().__init__()
+            self.input_tokens = 0
+            self.output_tokens = 0
+            self.cache_read_input_tokens = 100
+
+    msg = _FakeMessage(json.dumps({"ok": True}))
+    msg.usage = _CachedUsage()
+    recorder([msg])
+
+    deep_research._run_agentic_pass("p", "s", label="cached")
+    record = deep_research._USAGE_LOG[0]
+    expected = round(100 * 2.00 * deep_research._CACHE_READ_MULTIPLIER / 1_000_000, 6)
+    assert record["cost_usd"] == expected, (
+        "a 100-token cache read must cost 10% of the base input rate, not the full rate "
+        "and not zero"
     )
 
 

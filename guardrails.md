@@ -87,21 +87,46 @@ and the corrected record is the better one.
 ## 5. Bounds
 
 `deep_research.MAX_FINDING_RESEARCH_CALLS`, `deep_research.MAX_GAP_RETRY_ATTEMPTS`,
-`deep_research.MAX_RESEARCH_VERIFICATION_CALLS`, `company_charter._MIN_FINDING_LENGTH`,
-and the review's own input cap.
+`deep_research.MAX_RESEARCH_VERIFICATION_CALLS`, `deep_research.PIPELINE_COST_CAP_USD`,
+`company_charter._MIN_FINDING_LENGTH`, and the review's own input cap.
+
+### The total, not just each piece
+
+Every bound above caps its own stage. None of them stops the pieces from
+adding up past what a run should ever cost -- deep research staying under its
+own ceiling and Charter generation staying under its own ceiling can still sum
+to more than either alone. `deep_research.PIPELINE_COST_CAP_USD` (2026-08-13,
+$6.00) is a hard ceiling on the WHOLE run, checked in `_run_agentic_pass`
+itself -- the one function every Claude API call in this pipeline funnels
+through, deep research's own calls and `company_charter.py`'s alike -- so it
+is the one place a check actually covers the total. A call already in flight
+when spend crosses the line is allowed to finish; only a call that would
+START after the cap is reached is refused (`deep_research.CostCapExceeded`,
+not retried), so the real ceiling is the cap plus at most one more call's
+worst case, not a precise stop at exactly $6.00. Hitting it fails whichever
+stage was mid-call exactly the way a missing `ANTHROPIC_API_KEY` already
+does -- gracefully, since both stages are `[never fatal]` in `main.py`.
 
 `deep_research.MAX_RESEARCH_VERIFICATION_CALLS` bounds a fan-out the other two
-don't: `_verify_block` calls `_verify_claim` once per source with no limit on
-how many sources a block has, and `_resolve_gaps` retries every gap it's
-handed with no limit on how many gaps a block has. `MAX_GAP_RETRY_ATTEMPTS`
-only bounds attempts *per* gap, not the number of gaps. A `_VerificationBudget`
-shared across all three research blocks (and across `_resolve_gaps`'s own use
-of `_verify_block` on retry results) in one `run_deep_research()` call caps
-the total regardless. This is not hypothetical: P51800077150's first-ever
-research pass (2026-08-12, no `prior_research` to reuse) ran past $10 before
-being killed by hand. A source or gap reached after the budget is spent is
-kept, never dropped -- annotated the same way a `verification_error` already
-is.
+don't: `_verify_block` used to call `_verify_claim` once per source with no
+limit on how many sources a block has, and `_resolve_gaps` retried every gap
+it was handed with no limit on how many gaps a block has (`MAX_GAP_RETRY_
+ATTEMPTS` only bounds attempts *per* gap, not the number of gaps). This is not
+hypothetical: P51800077150's first-ever research pass (2026-08-12, no
+`prior_research` to reuse) ran past $10 before being killed by hand.
+
+`deep_research._verify_claims_batch` and `deep_research._retry_gaps_batch`
+(2026-08-13) fixed the root cause rather than just capping it: many sources,
+or every gap still open in a retry round, are checked in ONE call sharing one
+search budget, instead of one independent call each. `BATCH_VERIFY_CHUNK_SIZE`
+keeps any single call's load bounded regardless of block size. A
+`_VerificationBudget` shared across all three research blocks (and across
+`_resolve_gaps`'s own use of `_verify_claims_batch` on retry results) in one
+`run_deep_research()` call still caps the total batched-call count -- now a
+backstop for an unusually large block or gap count, since batching already
+cut the call volume that caused the $10 run. A source or gap reached after
+the budget is spent is kept, never dropped -- annotated the same way a
+`verification_error` already is.
 
 ### The search budget, which is also the reply budget
 

@@ -43,6 +43,25 @@ import config
 import finalize_report
 
 MODEL = "claude-sonnet-5"
+
+# Hard ceiling on this pipeline's TOTAL spend across one project run --
+# deep research and Charter generation together, not just one stage. Every
+# per-stage cap below (MAX_FINDING_RESEARCH_CALLS, MAX_RESEARCH_VERIFICATION_
+# CALLS, the search/token budgets) bounds its own piece, but nothing used to
+# stop the pieces from adding up past what a run should ever cost. Enforced
+# in _run_agentic_pass, the one function every Claude API call in this whole
+# pipeline funnels through (deep_research's own calls and company_charter.py's,
+# which delegate here) -- so this is the one place a check actually covers
+# the total, not just one caller's slice of it.
+#
+# A call already in flight when spend crosses the line is allowed to finish
+# (its cost can't be known before it completes); only a call that would
+# START after the cap is already reached is refused. The real ceiling is
+# therefore PIPELINE_COST_CAP_USD plus at most one more call's worst case --
+# typically well under $1 for any single call in this pipeline -- not a
+# precise stop at exactly $6.00.
+PIPELINE_COST_CAP_USD = 6.0
+
 MAX_GAP_RETRY_ATTEMPTS = 2
 
 # Bounded fan-out for the per-finding research stage, same precedent as
@@ -53,20 +72,20 @@ MAX_GAP_RETRY_ATTEMPTS = 2
 # cap keep their original text rather than being dropped.
 MAX_FINDING_RESEARCH_CALLS = 8
 
-# Same precedent again, for run_deep_research's own verify+gap-retry fan-out.
-# _verify_block calls _verify_claim once per source with no limit on how many
-# sources a block has, and _resolve_gaps retries every gap it's handed (each
-# retry itself a call, up to MAX_GAP_RETRY_ATTEMPTS tries) with no limit on how
-# many gaps a block has. Neither loop is bounded by the other's cap: a project
-# whose research legitimately turns up many claims -- exactly what a real
-# promoter and market profile does -- can spawn dozens of independent 6-search
-# agentic calls in this one pipeline step. That is what actually happened on
-# 2026-08-12: P51800077150's first-ever research pass (no prior_research to
-# reuse, so the full generate+verify+resolve path) ran past $10 before being
-# killed by hand. One shared budget across all three research blocks in a
-# single run_deep_research() call bounds it, the same way MAX_FINDING_RESEARCH_
-# CALLS bounds the per-finding stage. A source or gap beyond the cap is kept,
-# never dropped -- annotated the same way a verification_error already is.
+# Same precedent again, for run_deep_research's own verify+gap-retry fan-out,
+# which used to call _verify_claim once per source and retry once per gap with
+# no limit on how many sources/gaps a block has. That is what actually happened
+# on 2026-08-12: P51800077150's first-ever research pass (no prior_research to
+# reuse) ran past $10 before being killed by hand.
+#
+# _verify_claims_batch and _retry_gaps_batch (below) fixed the root cause by
+# checking many sources, or retrying many gaps, in ONE call with a shared
+# search budget instead of one call each -- so this cap now bounds batched
+# calls, not individual sources/gaps, and should rarely bind in practice. It
+# stays as the backstop for a block large enough to need several chunks (see
+# BATCH_VERIFY_CHUNK_SIZE) or a project with unusually many open gaps. A source
+# or gap beyond the cap is kept, never dropped -- annotated the same way a
+# verification_error already is.
 MAX_RESEARCH_VERIFICATION_CALLS = 15
 
 # Output budget per call. Thinking blocks and server-side web-search results are
@@ -122,6 +141,22 @@ RETRY_MAX_SEARCHES = 2
 # is not this pass's job; run_deep_research already exists for that.
 CHARTER_PASS_MAX_SEARCHES = 8
 
+# Batched verification: many sources checked in one call sharing one search
+# budget, instead of one independent 6-search call per source. Chunking keeps
+# any single call's prompt and search load bounded regardless of how large a
+# research block's source list is -- a block with 25 sources takes 3 calls,
+# not 25.
+BATCH_VERIFY_CHUNK_SIZE = 10
+BATCH_VERIFY_MAX_SEARCHES = 10
+BATCH_VERIFY_MAX_TOKENS = RESEARCH_MAX_TOKENS
+
+# Batched gap retry: every gap still open in a round is retried in ONE call
+# using that round's strategy, instead of one call per gap per attempt. Any
+# sources the round turns up, across every gap in it, are then checked in one
+# _verify_claims_batch call rather than one verify call per gap.
+BATCH_GAP_RETRY_MAX_SEARCHES = 10
+BATCH_GAP_RETRY_MAX_TOKENS = RESEARCH_MAX_TOKENS
+
 # $ per 1M tokens. This is Sonnet 5's intro rate, active through 2026-08-31 --
 # update to the standard $3.00/$15.00 after that date (or sooner, if pricing
 # changes again). Only priced models get a real cost figure back from
@@ -130,6 +165,17 @@ CHARTER_PASS_MAX_SEARCHES = 8
 _PRICING_PER_1M_TOKENS = {
     "claude-sonnet-5": {"input": 2.00, "output": 10.00},
 }
+
+# Multipliers on the base input rate above, for prompt-cache reads/writes --
+# see _run_agentic_pass's cache_control. Anthropic's standard rates for the
+# default 5-minute ephemeral TTL (this module never asks for the 1-hour TTL,
+# whose multiplier differs). A cache write costs MORE than a plain input
+# token; a cache read costs a tenth as much. Both are reported separately
+# from plain input_tokens on the usage object, never included in it, so
+# _record_usage must price them on their own or every cached call's cost
+# would be undercounted (for the write) or overcounted (for the read).
+_CACHE_WRITE_MULTIPLIER = 1.25
+_CACHE_READ_MULTIPLIER = 0.10
 
 # Every Claude API call this whole pipeline makes (both this module's own
 # research/verification passes and company_charter.py's Charter-assembly and
@@ -163,11 +209,14 @@ def usage_summary() -> dict:
     by_label = {}
     for record in _USAGE_LOG:
         bucket = by_label.setdefault(record["label"], {
-            "calls": 0, "turns": 0, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0,
+            "calls": 0, "turns": 0, "input_tokens": 0, "cache_write_tokens": 0,
+            "cache_read_tokens": 0, "output_tokens": 0, "cost_usd": 0.0,
         })
         bucket["calls"] += 1
         bucket["turns"] += record["turns"]
         bucket["input_tokens"] += record["input_tokens"]
+        bucket["cache_write_tokens"] += record.get("cache_write_tokens", 0)
+        bucket["cache_read_tokens"] += record.get("cache_read_tokens", 0)
         bucket["output_tokens"] += record["output_tokens"]
         bucket["cost_usd"] = round(bucket["cost_usd"] + record["cost_usd"], 6)
 
@@ -175,6 +224,8 @@ def usage_summary() -> dict:
         "calls": len(_USAGE_LOG),
         "turns": sum(r["turns"] for r in _USAGE_LOG),
         "input_tokens": sum(r["input_tokens"] for r in _USAGE_LOG),
+        "cache_write_tokens": sum(r.get("cache_write_tokens", 0) for r in _USAGE_LOG),
+        "cache_read_tokens": sum(r.get("cache_read_tokens", 0) for r in _USAGE_LOG),
         "output_tokens": sum(r["output_tokens"] for r in _USAGE_LOG),
         "cost_usd": round(sum(r["cost_usd"] for r in _USAGE_LOG), 6),
     }
@@ -211,24 +262,42 @@ def _record_usage(label: str, model: str, messages: list) -> dict:
     """Sums usage across every BetaMessage a tool_runner pass yielded, not
     just the final one -- each turn (including every web_search round-trip)
     is its own billed API call, so counting only the last message would
-    silently undercount every multi-turn pass."""
+    silently undercount every multi-turn pass.
+
+    cache_creation_input_tokens and cache_read_input_tokens are reported
+    separately from input_tokens, never included in it -- _run_agentic_pass's
+    cache_control means every call now reports one or the other whenever its
+    system prompt has been seen before within the cache TTL. Pricing them at
+    the plain input rate would under-price a cache write and over-price a
+    cache read; see _CACHE_WRITE_MULTIPLIER/_CACHE_READ_MULTIPLIER."""
     input_tokens = 0
     output_tokens = 0
+    cache_write_tokens = 0
+    cache_read_tokens = 0
     for message in messages:
         usage = getattr(message, "usage", None)
         if usage is None:
             continue
         input_tokens += getattr(usage, "input_tokens", 0) or 0
         output_tokens += getattr(usage, "output_tokens", 0) or 0
+        cache_write_tokens += getattr(usage, "cache_creation_input_tokens", 0) or 0
+        cache_read_tokens += getattr(usage, "cache_read_input_tokens", 0) or 0
 
     price = _PRICING_PER_1M_TOKENS.get(model, {"input": 0.0, "output": 0.0})
-    cost_usd = (input_tokens * price["input"] + output_tokens * price["output"]) / 1_000_000
+    cost_usd = (
+        input_tokens * price["input"]
+        + cache_write_tokens * price["input"] * _CACHE_WRITE_MULTIPLIER
+        + cache_read_tokens * price["input"] * _CACHE_READ_MULTIPLIER
+        + output_tokens * price["output"]
+    ) / 1_000_000
 
     record = {
         "label": label,
         "model": model,
         "turns": len(messages),
         "input_tokens": input_tokens,
+        "cache_write_tokens": cache_write_tokens,
+        "cache_read_tokens": cache_read_tokens,
         "output_tokens": output_tokens,
         "cost_usd": round(cost_usd, 6),
     }
@@ -303,6 +372,19 @@ class BudgetExhausted(RuntimeError):
     "ran out of room to answer" the same as "the answer was malformed"."""
 
 
+class CostCapExceeded(RuntimeError):
+    """Refused instead of making a call, because this run has already spent
+    at or over PIPELINE_COST_CAP_USD.
+
+    Subclasses RuntimeError for the same reason as BudgetExhausted: every
+    caller in this pipeline already degrades through `except Exception`
+    (deep research and Charter generation are both [never fatal] stages in
+    main.py), so hitting the cap makes whichever stage was mid-call fail
+    exactly the way a missing ANTHROPIC_API_KEY already does -- gracefully,
+    logged, never crashing the run. It is not retried, unlike BudgetExhausted:
+    a smaller search budget doesn't make an already-overspent run cheaper."""
+
+
 _RESEARCH_JSON_SHAPE = json.dumps({key: _RESEARCH_BLOCK_SCHEMA for key in RESEARCH_KEYS})
 
 _SYSTEM_PROMPT = f"""You are producing research for a MahaRERA real-estate project report: \
@@ -368,14 +450,34 @@ fences -- matching exactly this shape: \
 {"resolved": true | false, "text": "the rewritten finding, 2 to 5 sentences", \
 "still_live": "yes" | "no" | "unknown", "note": "one sentence on what could not be resolved, or empty"}"""
 
-_GAP_RETRY_SYSTEM_PROMPT = """Try to resolve one specific research gap using web_search, \
-following the given retry strategy (a different angle than what already failed -- do not \
-just repeat the same search).
+_VERIFY_BATCH_SYSTEM_PROMPT = f"""Re-check MULTIPLE claims, each against its own cited \
+source, using web_search as needed -- for EACH one, fetch/search to confirm whether the \
+source genuinely supports the claim as stated, not just that the source exists. Judge \
+every claim independently; do not let one claim's outcome bias another's.
+
+You have a shared budget of at most {BATCH_VERIFY_MAX_SEARCHES} web searches for every \
+claim in this call combined, enforced by the API. Spend it where it matters: an honest \
+"unsupported" or "stale" verdict on a claim you didn't get to costs nothing, whereas \
+running out of room before you reply loses every verdict in this batch, checked or not.
 
 Your FINAL reply must be ONLY a single raw JSON object -- no prose, no markdown code \
-fences -- matching exactly this shape: {"sections": [{"heading": "...", "body": "..."}], \
-"sources": [{"claim": "...", "url": "...", "publisher": "...", "accessed_date": "..."}]} \
--- use empty arrays for both if you still can't confirm anything."""
+fences -- matching exactly this shape, with one entry per input id: \
+{{"verdicts": [{{"id": 0, "status": "confirmed" | "unsupported" | "stale", \
+"reason": "one sentence"}}]}}"""
+
+_GAP_RETRY_BATCH_SYSTEM_PROMPT = f"""Try to resolve MULTIPLE specific research gaps using \
+web_search, one attempt per gap, all following the SAME given retry strategy (a different \
+angle than whatever was already tried for each -- do not just repeat the same search). \
+Resolve each gap independently; finding one has no bearing on another.
+
+You have a shared budget of at most {BATCH_GAP_RETRY_MAX_SEARCHES} web searches for every \
+gap in this call combined, enforced by the API.
+
+Your FINAL reply must be ONLY a single raw JSON object -- no prose, no markdown code \
+fences -- matching exactly this shape, with one entry per input id, using empty arrays \
+for sections/sources on any gap you still can't confirm: \
+{{"results": [{{"id": 0, "sections": [{{"heading": "...", "body": "..."}}], \
+"sources": [{{"claim": "...", "url": "...", "publisher": "...", "accessed_date": "..."}}]}}]}}"""
 
 _client = None
 
@@ -505,7 +607,16 @@ def _run_agentic_pass(user_prompt: str, system: str, label: str = "agentic_pass"
     A call that still exhausts its budget searching gets exactly one retry,
     with the search budget cut to RETRY_MAX_SEARCHES and told to answer from
     what it already has. That is a bad answer's worth of risk against losing
-    an entire run, and everything already paid for in it, to one greedy call."""
+    an entire run, and everything already paid for in it, to one greedy call.
+
+    Every call passes cache_control unconditionally. Per the SDK, it marks
+    the last cacheable block in the request -- system plus tools, which
+    precede the (varying) user message -- so a system prompt reused across
+    calls with the same label (every batched verify/gap-retry/finding-research
+    call shares one) is billed at the cache-read rate on its second and later
+    uses instead of full price. A one-off call still writes the cache once at
+    a small premium (_CACHE_WRITE_MULTIPLIER); there is no case where this
+    loses money, only ones where it saves it."""
     if max_tokens > MAX_STREAMING_TOKENS:
         raise ValueError(
             f"max_tokens={max_tokens} exceeds the model's own output ceiling of "
@@ -519,12 +630,19 @@ def _run_agentic_pass(user_prompt: str, system: str, label: str = "agentic_pass"
     streaming = max_tokens > MAX_NONSTREAMING_TOKENS
 
     def attempt(prompt: str, searches: int, attempt_label: str) -> dict:
+        spent = usage_summary()["total"]["cost_usd"]
+        if spent >= PIPELINE_COST_CAP_USD:
+            raise CostCapExceeded(
+                f"[{attempt_label}] refused: this run has already spent ${spent:.4f}, "
+                f"at or over the ${PIPELINE_COST_CAP_USD:.2f} pipeline cost cap"
+            )
         runner = _get_client().beta.messages.tool_runner(
             model=MODEL,
             max_tokens=max_tokens,
             system=system,
             tools=[_web_search_tool(searches)] if search else [],
             messages=[{"role": "user", "content": prompt}],
+            cache_control={"type": "ephemeral"},
             **({"stream": True} if streaming else {}),
         )
         # A streaming runner yields BetaMessageStream, not BetaMessage. Each
@@ -867,31 +985,78 @@ class _VerificationBudget:
         return True
 
 
-def _verify_block(block: dict, label: str = "verify_claim",
-                  budget: "_VerificationBudget | None" = None) -> dict:
-    """Re-checks every cited source independently. A source that failed a
-    real check is demoted into `gaps` (never dropped silently) so
-    _resolve_gaps gets a chance to retry it. A source whose check could not
-    even run ("verification_error") is kept as-is rather than discarded --
-    see _verify_claim's docstring -- but still gets an explicit, honest gap
-    noting it was never actually independently re-checked this pass.
+def _verify_claims_batch(sources: list, label: str = "verify_claim_batch",
+                         budget: "_VerificationBudget | None" = None) -> dict:
+    """Verifies many sources in as few calls as possible, sharing one search
+    budget across every claim in a call, instead of _verify_claim's one
+    independent call per source. Chunks internally at BATCH_VERIFY_CHUNK_SIZE
+    so a single call's prompt and search load stay bounded regardless of how
+    long the caller's list is.
 
-    `budget`, if given, caps how many sources this call will actually spend
-    an API call verifying; anything beyond it is kept unverified with the
-    same honest-gap treatment as a verification_error, rather than spending
-    another call or dropping the source."""
-    kept_sources = []
-    demoted_gaps = list(block.get("gaps", []))
-    for src in block.get("sources", []):
+    Returns {index: {"status": ..., "reason": ...}}. An index missing from
+    the result -- a chunk skipped because `budget` ran out, or a claim the
+    model didn't return a verdict for -- is the caller's signal to treat it
+    as unverified, the same as this pipeline already treats a
+    verification_error: kept, never dropped, annotated as not independently
+    re-checked this pass."""
+    if not sources:
+        return {}
+    out = {}
+    for start in range(0, len(sources), BATCH_VERIFY_CHUNK_SIZE):
+        chunk = sources[start:start + BATCH_VERIFY_CHUNK_SIZE]
         if budget is not None and not budget.take():
+            continue
+        listing = "\n".join(
+            f"{i}. Claim: {s.get('claim', '')}\n   Cited source: {s.get('url', '')}"
+            for i, s in enumerate(chunk)
+        )
+        try:
+            result = _run_agentic_pass(
+                f"Claims to verify:\n{listing}", _VERIFY_BATCH_SYSTEM_PROMPT, label=label,
+                max_tokens=BATCH_VERIFY_MAX_TOKENS, search=True, max_searches=BATCH_VERIFY_MAX_SEARCHES,
+            )
+        except Exception as e:
+            for i in range(len(chunk)):
+                out[start + i] = {"status": "verification_error",
+                                  "reason": f"verification could not run: {e}"}
+            continue
+        for v in (result.get("verdicts") or []):
+            try:
+                idx = int(v["id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            status = v.get("status")
+            if status not in ("confirmed", "unsupported", "stale"):
+                status = "unsupported"
+            if 0 <= idx < len(chunk):
+                out[start + idx] = {"status": status, "reason": (v.get("reason") or "").strip()}
+    return out
+
+
+def _verify_block(block: dict, label: str = "verify_claim_batch",
+                  budget: "_VerificationBudget | None" = None) -> dict:
+    """Re-checks every cited source, batched (see _verify_claims_batch). A
+    source that failed a real check is demoted into `gaps` (never dropped
+    silently) so _resolve_gaps gets a chance to retry it. A source whose
+    check could not even run ("verification_error", including one skipped
+    because `budget` ran out) is kept as-is rather than discarded, with an
+    explicit, honest gap noting it was never actually independently
+    re-checked this pass."""
+    sources = block.get("sources", [])
+    demoted_gaps = list(block.get("gaps", []))
+    verdicts = _verify_claims_batch(sources, label=label, budget=budget)
+
+    kept_sources = []
+    for i, src in enumerate(sources):
+        verdict = verdicts.get(i)
+        if verdict is None:
             kept_sources.append(src)
             demoted_gaps.append(
                 f"{src.get('claim', '')} (NOT independently re-verified this pass -- "
                 f"research verification budget exhausted)"
             )
             continue
-        verdict = _verify_claim(src.get("claim", ""), src.get("url", ""), label=label)
-        status = verdict.get("status")
+        status = verdict["status"]
         if status == "confirmed":
             kept_sources.append(src)
         elif status == "verification_error":
@@ -906,49 +1071,98 @@ def _verify_block(block: dict, label: str = "verify_claim",
     return block
 
 
-def _resolve_gaps(block: dict, budget: "_VerificationBudget | None" = None) -> dict:
-    """Bounded retry per gap, each attempt using a different strategy than the last.
-    A gap that survives every attempt stays in `gaps`, annotated with what was tried --
-    it is never fabricated away just to make the list shorter.
-
-    `budget`, if given, is shared with _verify_block (see its docstring) and
-    caps the total number of retry/verify calls this function will make; a
-    gap reached after the budget is spent is left open, annotated rather than
-    silently skipped."""
-    still_open = []
-    for gap in block.get("gaps", []):
-        if budget is not None and budget.remaining <= 0:
-            still_open.append(f"{gap} (not retried -- research verification budget exhausted)")
+def _retry_gaps_batch(gaps: list, strategy: str, label: str = "gap_retry_batch") -> dict:
+    """Retries many gaps in one call, all using the same strategy for this
+    round, sharing one search budget across every gap instead of one
+    independent call each. Returns {index: {"sections": [...], "sources": [...]}}
+    for whichever gaps the model found something for; a missing index means
+    nothing was found for that gap this round."""
+    if not gaps:
+        return {}
+    listing = "\n".join(f"{i}. {g}" for i, g in enumerate(gaps))
+    prompt = f"Earlier research could not confirm these:\n{listing}\nRetry EACH using {strategy}."
+    try:
+        result = _run_agentic_pass(prompt, _GAP_RETRY_BATCH_SYSTEM_PROMPT, label=label,
+                                   max_tokens=BATCH_GAP_RETRY_MAX_TOKENS, search=True,
+                                   max_searches=BATCH_GAP_RETRY_MAX_SEARCHES)
+    except Exception:
+        # Broad on purpose, same reasoning as _verify_claim: a missing
+        # ANTHROPIC_API_KEY or any other failure here must count as a failed
+        # retry round for every gap in it, not crash the whole research pass.
+        return {}
+    out = {}
+    for r in (result.get("results") or []):
+        try:
+            idx = int(r["id"])
+        except (KeyError, TypeError, ValueError):
             continue
-        attempts_log = []
-        resolved = False
-        for strategy in GAP_RETRY_STRATEGIES[:MAX_GAP_RETRY_ATTEMPTS]:
-            if budget is not None and not budget.take():
-                break
-            prompt = (
-                f"Earlier research could not confirm this: {gap}\n"
-                f"Already tried: {attempts_log or ['the direct/default search approach']}\n"
-                f"Retry using {strategy}."
-            )
-            try:
-                result = _run_agentic_pass(prompt, _GAP_RETRY_SYSTEM_PROMPT, label="gap_retry",
-                                           search=True)
-            except Exception:
-                # Broad on purpose, same reasoning as _verify_claim: a missing
-                # ANTHROPIC_API_KEY or any other failure here must count as a
-                # failed retry attempt, not crash the whole research pass.
-                result = {}
-            attempts_log.append(strategy)
-            if result.get("sources"):
-                verified = _verify_block({"sources": result["sources"], "gaps": []},
-                                         label="gap_retry_verify", budget=budget)
-                if verified["sources"]:
-                    block.setdefault("sections", []).extend(result.get("sections", []))
-                    block.setdefault("sources", []).extend(verified["sources"])
-                    resolved = True
-                    break
-        if not resolved:
-            still_open.append(f"{gap} (retried {len(attempts_log)} alternate approach(es), not confirmed)")
+        if 0 <= idx < len(gaps):
+            out[idx] = {"sections": r.get("sections") or [], "sources": r.get("sources") or []}
+    return out
+
+
+def _resolve_gaps(block: dict, budget: "_VerificationBudget | None" = None) -> dict:
+    """Bounded retry, batched across every gap still open in a round (see
+    _retry_gaps_batch) instead of one call per gap per attempt. Each round
+    uses a different strategy than the last, same as before; a gap that
+    survives every round stays in `gaps`, annotated with what was tried -- it
+    is never fabricated away just to make the list shorter.
+
+    `budget`, if given, is shared with _verify_block and caps the total
+    number of retry/verify calls this function will make; a round not
+    reached because the budget ran out leaves its gaps open, annotated
+    rather than silently skipped."""
+    gaps = list(block.get("gaps", []))
+    if not gaps:
+        return block
+
+    pending = list(range(len(gaps)))  # indices into `gaps` still unresolved
+    attempts_used = {i: 0 for i in pending}
+    found_sections, found_sources = [], []
+
+    for strategy in GAP_RETRY_STRATEGIES[:MAX_GAP_RETRY_ATTEMPTS]:
+        if not pending:
+            break
+        if budget is not None and not budget.take():
+            break
+
+        batch = [gaps[i] for i in pending]
+        results = _retry_gaps_batch(batch, strategy, label="gap_retry_batch")
+        for i in pending:
+            attempts_used[i] += 1
+
+        # Flatten this round's finds across every pending gap, remembering
+        # which gap each source belongs to, so one verify call (not one per
+        # gap) covers the whole round.
+        owners, flat_sources, sections_by_owner = [], [], {}
+        for local_i, global_i in enumerate(pending):
+            found = results.get(local_i)
+            if found and found.get("sources"):
+                sections_by_owner[global_i] = found.get("sections") or []
+                for src in found["sources"]:
+                    owners.append(global_i)
+                    flat_sources.append(src)
+
+        if not flat_sources:
+            continue
+        verdicts = _verify_claims_batch(flat_sources, label="gap_retry_verify_batch", budget=budget)
+
+        resolved_this_round = set()
+        for i, (owner, src) in enumerate(zip(owners, flat_sources)):
+            if verdicts.get(i, {}).get("status") != "confirmed":
+                continue
+            if owner not in resolved_this_round:
+                found_sections.extend(sections_by_owner.get(owner, []))
+            resolved_this_round.add(owner)
+            found_sources.append(src)
+        pending = [i for i in pending if i not in resolved_this_round]
+
+    still_open = [
+        f"{gaps[i]} (retried {attempts_used.get(i, 0)} alternate approach(es), not confirmed)"
+        for i in pending
+    ]
+    block.setdefault("sections", []).extend(found_sections)
+    block.setdefault("sources", []).extend(found_sources)
     block["gaps"] = still_open
     return block
 
