@@ -230,9 +230,25 @@ def classify_claim_evidence(source: str) -> tuple:
     if "ibbi" in lowered:
         return ("IBBI Corporate Debtor Master Data", STATUS_CONFIRMED_INDEPENDENT, True)
 
-    # MahaRERA is official, but what it holds is the promoter's own filing.
-    if "maharera" in lowered:
-        return ("MahaRERA project record (promoter's own filing)", STATUS_PROMOTER_FILED, False)
+    # A state RERA record is official, but what it holds is the promoter's
+    # own filing -- so it is evidence the promoter SAID something, not
+    # independent confirmation.
+    #
+    # This used to test `"maharera" in lowered` only, which silently demoted
+    # every other state's RERA record to STATUS_STATED_ONLY -- the weakest
+    # class, reserved for unverifiable assertions. A Telangana RERA filing is
+    # exactly as official as a MahaRERA one and must classify the same way.
+    _profile = cc._state_profile()
+    if (
+        "rera" in lowered
+        or _profile.rera_acronym.lower() in lowered
+        or any(domain in lowered for domain in _profile.portal_domains)
+    ):
+        return (
+            f"{_profile.rera_acronym} project record (promoter's own filing)",
+            STATUS_PROMOTER_FILED,
+            False,
+        )
 
     return (cc._clean_source_label(src) or src, STATUS_STATED_ONLY, False)
 
@@ -496,7 +512,7 @@ def _headline_claim_rows(facts: dict, totals: dict) -> list:
     if area is not None:
         rows.append([
             f"{area} lakh sq ft delivered across declared prior projects",
-            "Summed from the promoter's own past-experience filings to MahaRERA, excluding the subject project.",
+            f"Summed from the promoter's own past-experience filings to {cc._state_profile().rera_acronym}, excluding the subject project.",
             "Promoter-declared, not independently verified",
         ])
 
@@ -545,9 +561,9 @@ def _green_flags(facts: dict) -> list:
 
     complaint_count, appeal_count = cc._parse_complaint_appeal_counts(facts)
     if complaint_count == 0:
-        green.append("No MahaRERA complaint is on record against this project.")
+        green.append(f"No {cc._state_profile().rera_acronym} complaint is on record against this project.")
     if appeal_count == 0:
-        green.append("No MahaRERA appeal is on record against this project.")
+        green.append(f"No {cc._state_profile().rera_acronym} appeal is on record against this project.")
 
     _original, was_extended = cc._parse_completion_slippage(facts)
     if not was_extended:
@@ -574,7 +590,18 @@ def _recommended_steps(facts: dict, flags: dict) -> list:
     """Concrete next steps derived from what this pass could NOT establish."""
     steps = []
     if not (facts.get("cts_land_record_check") or {}).get("found"):
-        steps.append("Retrieve the Maha Bhulekh Property Card for the project's CTS number to confirm land ownership independently.")
+        # Maha Bhulekh is Maharashtra's land-records portal and holds nothing
+        # for any other state, so recommending it elsewhere would send the
+        # reader to a dead end. Other states have their own systems (Dharani,
+        # Bhoomi, AnyROR...) which this pipeline does not yet query, so the
+        # honest step there is the generic one.
+        if cc._state_profile().can(cc.states.CAP_LAND_RECORDS):
+            steps.append("Retrieve the Maha Bhulekh Property Card for the project's CTS number to confirm land ownership independently.")
+        else:
+            steps.append(
+                "Retrieve the state land-records extract for the project's survey/plot "
+                "number to confirm land ownership independently."
+            )
     if not (facts.get("gst_compliance_check") or {}).get("found"):
         steps.append("Request the developer's GSTIN and pull their GSTR-1 / GSTR-3B filing history to assess statutory filing discipline.")
     if not (facts.get("credit_rating_check") or {}).get("promoter", facts.get("credit_rating_check") or {}).get("ratings"):
@@ -607,7 +634,7 @@ def assess_counterparty(facts: dict, flags: dict, developer_score: dict) -> dict
     single_project = registrations == 1
     if registrations is not None:
         signals.append((
-            "MahaRERA registrations",
+            f"{cc._state_profile().rera_acronym} registrations",
             f"{registrations} held under this promoter's name"
             + (", which is the subject project itself" if single_project else ""),
         ))
@@ -615,7 +642,7 @@ def assess_counterparty(facts: dict, flags: dict, developer_score: dict) -> dict
     prior = totals.get("total_experience_entries_found") or 0
     signals.append((
         "Declared prior deliveries",
-        f"{prior} declared to MahaRERA" if prior else "none declared to MahaRERA",
+        f"{prior} declared to {cc._state_profile().rera_acronym}" if prior else f"none declared to {cc._state_profile().rera_acronym}",
     ))
 
     incorporation = str(profile.get("incorporation_date") or "")
@@ -674,7 +701,7 @@ def assess_counterparty(facts: dict, flags: dict, developer_score: dict) -> dict
         )
     else:
         verdict = (
-            f"This counterparty holds {registrations} MahaRERA registrations and has a track record that can be "
+            f"This counterparty holds {registrations} {cc._state_profile().rera_acronym} registrations and has a track record that can be "
             f"reviewed on its own terms rather than inferred from a parent group."
         )
 

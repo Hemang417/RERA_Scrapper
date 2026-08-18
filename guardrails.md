@@ -196,6 +196,33 @@ the Developer Score; that a refusal leaves no half-written `.docx`; and that
 Section A never reaches an API request, which now asserts its marker is present
 before asserting it is absent, after that test was found passing vacuously.
 
+## State guards — these stop one state's work running for another
+
+Added with the pan-India `StateAdapter` seam. A state declares what its portal
+offers; code checks before doing anything shaped like it. Absence is declared,
+never stubbed — see `states/base.py`.
+
+| Guard | Stops | Why it exists |
+|---|---|---|
+| `states.candidate_profiles` | A registration number resolving to the wrong authority | MahaRERA and TG-RERA both issue `P` + 11 digits, so the number is tried against each in turn and the one that ACTUALLY HAS the project wins. Detection is empirical, not a guess |
+| `states.CAP_LOOKUP_BY_REG_NO` | Probing an authority that cannot answer | TG-RERA's public record does not display a registration number at all; the ladder skips it and tells the operator to supply a project name instead |
+| `states.StateProfile.can` | A capability typo reading as "this state lacks it" | Raises on an unknown capability, so a typo cannot silently skip work |
+| `company_charter._state_profile` | A render defaulting to `None` | Falls back to Maharashtra, so every pre-existing caller renders identically |
+| `company_charter._state_dash_rewrites` | The External gate blocking a save | Generates the Internal/External subtitle pair together, per state, so they cannot drift out of lockstep |
+| `states.get_adapter` | A blank failure for a state with no adapter | Raises naming the `pre_built_facts` route that does work |
+
+Three capability gates fix live bugs rather than prevent future ones: the
+MahaRERA Orders/Judgments scrape used to fire for Telangana projects it could
+never match; `company_charter._extract_district_hint` used to query
+Maharashtra's district map for every state; and
+`charter_document.classify_claim_evidence` used to downgrade any non-MahaRERA
+RERA record to "stated only".
+
+`test_state_leak_guard.py` walks the rendering modules' ASTs and fails on a new
+hardcoded state literal. `test_state_labels.py` renders the same facts under two
+profiles and asserts the difference is exactly the state-bearing paragraphs —
+proving parameterisation is both complete and contained.
+
 ## Adding a guardrail
 
 Put it in code, add its symbol to the right table above, and let

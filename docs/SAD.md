@@ -6,8 +6,8 @@
 | **Document** | Software Architecture Document |
 | **System** | RERA Scrapper (MahaRERA project due-diligence and Company Charter generator) |
 | **Repository root** | `RERA_Scrapper/` |
-| **Version** | 1.0 |
-| **Date** | 11 August 2026 |
+| **Version** | 1.1 |
+| **Date** | 13 August 2026 |
 | **Status** | Baseline — describes the system as implemented |
 | **Owner** | Integrow Asset Management |
 | **Companion documents** | `PRD.md` (product requirements), `CLAUDE.md` (flow), `rules.md` (content rules), `guardrails.md` (guards) |
@@ -634,17 +634,32 @@ There is no `tests/` package, no `conftest.py`, no CI configuration.
    each: {summary, sections[{heading,body}], sources[{claim,url,
           publisher,accessed_date}], gaps[str]}
                                    v
-   _verify_block(): EVERY cited source independently re-checked
+   _verify_block(): EVERY cited source re-checked, BATCHED --
+     _verify_claims_batch() checks up to BATCH_VERIFY_CHUNK_SIZE (10)
+     sources per call, sharing one BATCH_VERIFY_MAX_SEARCHES (10) search
+     budget, instead of one independent call per source
      confirmed          -> keep
      verification_error -> KEEP the source, append an honest gap
                            "(NOT independently re-verified this pass ...)"
      unsupported/stale  -> DROP the source into gaps
                                    v
-   _resolve_gaps(): up to MAX_GAP_RETRY_ATTEMPTS = 2, each with a
-     DIFFERENT strategy (registry/official filing; related-party angle)
-     retry results are themselves re-verified before merging
+   _resolve_gaps(): up to MAX_GAP_RETRY_ATTEMPTS = 2 rounds, each with a
+     DIFFERENT strategy (registry/official filing; related-party angle) --
+     _retry_gaps_batch() retries EVERY gap still open in a round in ONE
+     call sharing one BATCH_GAP_RETRY_MAX_SEARCHES (10) search budget,
+     instead of one call per gap per attempt
+     retry results are themselves re-verified (_verify_claims_batch) before
+     merging; a shared _VerificationBudget (MAX_RESEARCH_VERIFICATION_
+     CALLS = 15) still caps the total batched-call count across all three
+     blocks combined, as a backstop for an unusually large block/gap count
      unresolved -> "(retried N alternate approach(es), not confirmed)"
      *** never fabricated away just to make the list shorter ***
+                                   v
+   EVERY call in this stage funnels through _run_agentic_pass, which
+   refuses to even START a call once this run's total spend (across
+   deep research AND Charter generation) is >= PIPELINE_COST_CAP_USD
+   ($6.00) -- raises CostCapExceeded, never retried, degrades this
+   stage exactly like a missing ANTHROPIC_API_KEY would
                                    v
                  output/<reg>/research/deep_research.json
                  stamped _generated_at + _reused_prior
@@ -1098,7 +1113,7 @@ RERA_Scrapper/
     │   └── <REG_NO>_summary.pdf            <- Stage 10 deliverable
     │
     └── company_charters/                   *** THE PRIMARY DELIVERABLE DIR ***
-        ├── Company_Charter_TEMPLATE_WebSourced.docx   <- the .docx template
+        ├── Company_Charter_TEMPLATE_Integrow_Branded.docx   <- the .docx template
         ├── Company_Charter_<Name>_<REG>_Internal.docx / .pdf
         ├── Company_Charter_<Name>_<REG>_External.docx / .pdf
         ├── Company_Charter_<Name>_<REG>.facts.json    <- THE FULL RECORD
@@ -1466,11 +1481,18 @@ Rendering is pure code, so most of `rules.md` cannot be enforced by a model read
 | Bound | Value | Purpose |
 |---|---|---|
 | `deep_research.MAX_FINDING_RESEARCH_CALLS` | 8 | Findings beyond the cap keep their original text rather than being dropped |
-| `deep_research.MAX_GAP_RETRY_ATTEMPTS` | 2 | One retry per strategy, two strategies |
+| `deep_research.MAX_GAP_RETRY_ATTEMPTS` | 2 | One retry round per strategy, two strategies; every gap still open in a round is retried together, in one batched call |
+| `deep_research.MAX_RESEARCH_VERIFICATION_CALLS` | 15 | Shared `_VerificationBudget` across all three research blocks, bounding the total number of batched verify/gap-retry calls in one `run_deep_research()` call |
+| `deep_research.BATCH_VERIFY_CHUNK_SIZE` | 10 | Sources per `_verify_claims_batch` call; a block with 25 sources takes 3 calls, not 25 |
+| `deep_research.BATCH_VERIFY_MAX_SEARCHES` | 10 | Shared web-search budget for one `_verify_claims_batch` call, across every claim in that chunk |
+| `deep_research.BATCH_GAP_RETRY_MAX_SEARCHES` | 10 | Shared web-search budget for one `_retry_gaps_batch` call, across every gap still open in that round |
+| `deep_research.PIPELINE_COST_CAP_USD` | $6.00 | Hard ceiling on total run spend (deep research + Charter generation combined), enforced in `_run_agentic_pass`; refuses a call that would start after the cap, never retried (`CostCapExceeded`) |
 | `company_charter._MIN_FINDING_LENGTH` | 80 | A fragment is not a finding |
 | review input cap | 60,000 chars | `_rendered_document_text(path, limit=60000)` |
 | `_MAX_DOCUMENT_DOWNLOAD_WORKERS` | 8 | Download pool |
 | `PROMOTER_PROJECT_LIMIT` | 25 | Portfolio fan-out; never silent (`truncated` field) |
+
+`deep_research.MAX_RESEARCH_VERIFICATION_CALLS` used to bound a fan-out that scaled one API call per source and per gap; as of 2026-08-13 `_verify_claims_batch` and `_retry_gaps_batch` fixed the root cause by checking/retrying many at once per call, so this budget is now a backstop for a block or gap count large enough to need several chunks, rather than the primary defence.
 
 `_field_fingerprint` and `_already_researched` stop per-finding research **recompounding**: an enriched finding is multi-sentence, so it re-splits into more clauses each pass and would be researched again. Any edit changes the fingerprint, so skipping is only ever an optimisation over identical input.
 
@@ -1599,12 +1621,19 @@ Three CAPTCHA gates, **three different session models**. This is the single most
         deep_research._run_agentic_pass(user_prompt, system, label)
               |
               v
-        client.beta.messages.tool_runner(
-            model = MODEL = "claude-sonnet-5",
-            max_tokens = 8000,
-            system = <blocks>,
-            tools = [{"type": "web_search_20260209", "name": "web_search"}],
-            messages = [{"role":"user","content": user_prompt}])
+        spent = usage_summary()["total"]["cost_usd"]   (read fresh, never cached)
+        spent >= PIPELINE_COST_CAP_USD ($6.00) ?
+              |                                    \
+              |  NO                                  YES -> raise CostCapExceeded
+              v                                              (never retried -- a
+        client.beta.messages.tool_runner(                    call already in
+            model = MODEL = "claude-sonnet-5",                flight is allowed
+            max_tokens = 8000,                                to finish; only a
+            system = <blocks>,                                call that would
+            tools = [{"type": "web_search_20260209",           START after the
+                      "name": "web_search"}],                  cap is refused)
+            messages = [{"role":"user","content": user_prompt}],
+            cache_control = {"type": "ephemeral"})
               |
               |  the runner is an ITERATOR -> one BetaMessage per turn
               v
@@ -1613,7 +1642,12 @@ Three CAPTCHA gates, **three different session models**. This is the single most
               +--> _record_usage(label, MODEL, messages)
               |      sums input+output tokens across ALL turns, because
               |      each web_search round-trip is separately billed --
-              |      counting only the last message would UNDERCOUNT
+              |      counting only the last message would UNDERCOUNT.
+              |      cache_creation_input_tokens / cache_read_input_tokens
+              |      are read off usage too -- reported separately from
+              |      input_tokens by the API, priced separately here
+              |      (_CACHE_WRITE_MULTIPLIER 1.25x, _CACHE_READ_MULTIPLIER
+              |      0.10x of the base input rate) rather than folded in
               |
               +--> _parse_json_response(messages[-1])
                      strips ``` fences and a leading "json", json.loads
@@ -1623,6 +1657,14 @@ Three CAPTCHA gates, **three different session models**. This is the single most
    Only server tools are given -- raw tool-schema dicts auto-execute
    server-side only for recognised server tools, so no custom handler
    is registered, deliberately.
+
+   cache_control is passed UNCONDITIONALLY on every call (2026-08-13).
+   Per the SDK it marks the last cacheable block in the request -- system
+   plus tools, which precede the varying user message -- so a system
+   prompt reused across calls sharing one label (every batched verify/
+   gap-retry/finding-research call does) is billed at the cache-read rate
+   on its second and later uses. A one-off call still writes the cache
+   once at a small premium; there is no case where this costs more.
 ```
 
 ### 16.2 Call-site inventory
@@ -1641,8 +1683,8 @@ Three CAPTCHA gates, **three different session models**. This is the single most
 | `run_finding_research` | `finding_research` | none |
 | `run_claude_md_document_review` | `claude_md_doc_review` | **B** (internal) / **B + C** (external), passed as an argument |
 | `deep_research.run_deep_research` | `research_generate` | none |
-| `deep_research._verify_block` | `verify_claim` | none |
-| `deep_research._resolve_gaps` | `gap_retry`, `gap_retry_verify` | none |
+| `deep_research._verify_block` → `_verify_claims_batch` | `verify_claim_batch` | none |
+| `deep_research._resolve_gaps` → `_retry_gaps_batch` / `_verify_claims_batch` | `gap_retry_batch`, `gap_retry_verify_batch` | none |
 
 > **Section A never appears in this table.** That is the point.
 
@@ -1651,28 +1693,38 @@ Three CAPTCHA gates, **three different session models**. This is the single most
 ```python
 MODEL = "claude-sonnet-5"
 _PRICING_PER_1M_TOKENS = {"claude-sonnet-5": {"input": 2.00, "output": 10.00}}
-cost_usd = (input_tokens * price["input"] + output_tokens * price["output"]) / 1_000_000
+_CACHE_WRITE_MULTIPLIER = 1.25   # x base input rate, for cache_creation_input_tokens
+_CACHE_READ_MULTIPLIER = 0.10    # x base input rate, for cache_read_input_tokens
+PIPELINE_COST_CAP_USD = 6.0      # hard ceiling, checked in _run_agentic_pass
+
+cost_usd = (
+    input_tokens * price["input"]
+    + cache_write_tokens * price["input"] * _CACHE_WRITE_MULTIPLIER
+    + cache_read_tokens * price["input"] * _CACHE_READ_MULTIPLIER
+    + output_tokens * price["output"]
+) / 1_000_000
 ```
 
 - An **unknown model** yields `{"input": 0.0, "output": 0.0}` so tokens still count but cost reads `0.0` rather than "a silently wrong number".
-- Per-label rollup: `usage_summary()` → `output/<reg>/usage_summary.json`; one rollup line appended to `output/usage_log.jsonl`.
+- Per-label rollup: `usage_summary()` → `output/<reg>/usage_summary.json`; one rollup line appended to `output/usage_log.jsonl`. Each bucket now also carries `cache_write_tokens` and `cache_read_tokens`, summed separately from `input_tokens`/`output_tokens`.
 - The Internal document's **version log** carries elapsed time, total cost and call count for the whole end-to-end run — hence `pipeline_start_time` being threaded from `main.py`.
 - **`reset_usage_log()` is called at the start of every run** because `app.py`'s Streamlit process is long-lived and would otherwise carry token counts across unrelated projects.
+- **`PIPELINE_COST_CAP_USD` (2026-08-13, $6.00)** is a hard ceiling on total run spend — deep research and Charter generation combined, not just one stage — checked at the top of every `_run_agentic_pass` call by reading `usage_summary()["total"]["cost_usd"]` fresh (never a stale snapshot). A call that would **start** at or over the cap raises `CostCapExceeded` and is **not retried** (unlike `BudgetExhausted`: a smaller search budget doesn't make an already-overspent run cheaper); a call already in flight is allowed to finish, so the real ceiling is the cap plus at most one more call's worst case. `CostCapExceeded` subclasses `RuntimeError`, so it degrades exactly like a missing `ANTHROPIC_API_KEY` — the stage it interrupts is `[never fatal]` in `main.py`, never the whole run.
 
-> ⚠️ **Pricing time-bomb.** The comment records this as *"Sonnet 5's intro rate, active through 2026-08-31 — update to the standard $3.00/$15.00 after that date."* As of this document's date (11 Aug 2026) that leaves **20 days**. After expiry, every cost figure in `usage_summary.json`, `usage_log.jsonl`, the run summary and the Internal version log **under-reports by one third** until the constant is updated.
+> ⚠️ **Pricing time-bomb.** The comment records this as *"Sonnet 5's intro rate, active through 2026-08-31 — update to the standard $3.00/$15.00 after that date."* As of this document's date (13 Aug 2026) that leaves **18 days**. After expiry, every cost figure in `usage_summary.json`, `usage_log.jsonl`, the run summary and the Internal version log **under-reports by one third** until the constant is updated. This is unrelated to, and not fixed by, `PIPELINE_COST_CAP_USD` — the cap is denominated in the same (soon-to-be-stale) dollar figures, so it under-*enforces* by the same one third once the rate lapses.
 
 ### 16.4 Verification semantics
 
-`deep_research._verify_claim` returns one of four statuses, and the handling of the fourth is the interesting design decision:
+`deep_research._verify_claim` (still used directly by `company_charter._verify_one_field`, label `material_claim_verify`) and `deep_research._verify_claims_batch` (used by `_verify_block`, one call per chunk of up to `BATCH_VERIFY_CHUNK_SIZE` sources) both resolve every claim to one of four statuses, and the handling of the fourth is the interesting design decision:
 
 | Status | Meaning | Handling |
 |---|---|---|
 | `confirmed` | Source re-checked and stands | keep |
 | `unsupported` | Source does not support the claim | **drop** into gaps with the reason |
 | `stale` | Source is out of date | **drop** into gaps with the reason |
-| `verification_error` | The **check itself** could not run (missing key, network, rate limit, bad JSON) | **keep the source**, and append an honest gap: *"(NOT independently re-verified this pass — reason)"* |
+| `verification_error` | The **check itself** could not run (missing key, network, rate limit, bad JSON, or a chunk skipped because `budget` ran out) | **keep the source**, and append an honest gap: *"(NOT independently re-verified this pass — reason)"* |
 
-An unrecognised status is coerced to `unsupported`. The `verification_error` branch is what prevents an API outage from silently deleting good sourcing.
+An unrecognised status, or a claim id the model's reply omits, is coerced to `unsupported` / treated as unverified. The `verification_error` branch is what prevents an API outage — or a budget-exhausted chunk — from silently deleting good sourcing. Batching (2026-08-13) changed *how many calls* this costs, never *what a status means or how it's handled* — the four-way semantics above are identical to the pre-batch, one-call-per-source implementation.
 
 ---
 
@@ -2180,6 +2232,12 @@ The three measured hot spots, therefore:
 | Earth radius | 6371.0 km | haversine |
 | `MAX_GAP_RETRY_ATTEMPTS` | 2 | `deep_research` |
 | `MAX_FINDING_RESEARCH_CALLS` | 8 | `deep_research` |
+| `MAX_RESEARCH_VERIFICATION_CALLS` | 15 | `deep_research` |
+| `BATCH_VERIFY_CHUNK_SIZE` | 10 | `deep_research` |
+| `BATCH_VERIFY_MAX_SEARCHES` | 10 | `deep_research` |
+| `BATCH_GAP_RETRY_MAX_SEARCHES` | 10 | `deep_research` |
+| `PIPELINE_COST_CAP_USD` | $6.00 | `deep_research` |
+| `_CACHE_WRITE_MULTIPLIER` / `_CACHE_READ_MULTIPLIER` | 1.25x / 0.10x base input rate | `deep_research` |
 | `RESEARCH_REUSE_WINDOW_HOURS` | 24 | `deep_research` |
 | `max_tokens` | 8000 | every agentic pass |
 | review input cap | 60000 chars | `_rendered_document_text` |
@@ -2221,6 +2279,8 @@ There is **no exponential backoff anywhere in the system**. The only retry is `m
 | Tesseract not installed       | "[OCR unavailable]"     | COMPLETES       |
 |                               | marker per document     |                 |
 | Google Maps scrape fails      | falls back to estimate  | COMPLETES       |
+| PIPELINE_COST_CAP_USD reached | whichever deep research | COMPLETES       |
+|                               | / Charter call was next |                 |
 +---------------------------------------------------------------------------+
 | rules.md missing / malformed  | ***  BLOCKS  ***        | RuntimeError    |
 | B or C carries an em dash     | ***  BLOCKS  ***        | RuntimeError    |
@@ -2494,9 +2554,11 @@ Straight from `CLAUDE.md`:
 
 ### Appendix B — Usage labels (the cost ledger's key space)
 
-`research_generate` · `verify_claim` · `gap_retry` · `gap_retry_verify` · `charter_pass` · `material_claim_verify` · `document_grounding_verify` · `citation_completeness_judge` · `second_source_verify` · `clean_check_judge` · `citation_match` · `flag_headline` · `finding_research` · `claude_md_doc_review` · `agentic_pass` *(default)*
+`research_generate` · `verify_claim_batch` · `gap_retry_batch` · `gap_retry_verify_batch` · `charter_pass` · `material_claim_verify` · `document_grounding_verify` · `citation_completeness_judge` · `second_source_verify` · `clean_check_judge` · `citation_match` · `flag_headline` · `finding_research` · `claude_md_doc_review` · `agentic_pass` *(default)*
 
 Each label is a separable cost line in `usage_summary.json` and in the run summary. `claude_md_doc_review` in particular is separable **by design**, so the cost of the compliance gate is visible and arguable.
+
+> As of 2026-08-13, `verify_claim_batch` / `gap_retry_batch` / `gap_retry_verify_batch` replaced the bare `verify_claim` / `gap_retry` / `gap_retry_verify` labels — one call now covers a whole chunk of sources or a whole retry round, not one source or gap. `deep_research._verify_claim` (the single-claim function) still exists and is still called directly, but only with an explicit label override (`material_claim_verify`), so the bare `verify_claim` label itself no longer appears in the ledger.
 
 ### Appendix C — Exception inventory
 
@@ -2508,6 +2570,8 @@ Each label is a separable cost line in `usage_summary.json` and in the run summa
 | `AmbiguousSelectionError` | `mahabhumi` | Carries `hint` and `options` so the caller can re-present the real list |
 | `CategoryFetchError` | `api_client` | Carries `.category` and `.status_code` so callers can distinguish 401/403 |
 | `GstIntakeError` | `gst_intake` | Intake produced no scoreable filing data |
+| `BudgetExhausted` | `deep_research` | A search/token budget ran dry mid-call; the "answer was malformed" and "ran out of room" cases are kept distinguishable |
+| `CostCapExceeded` | `deep_research` | Refused a call because this run's total spend (§16.3) is already at or over `PIPELINE_COST_CAP_USD`; unlike `BudgetExhausted`, **never retried** |
 | `CharterComplianceError` | `company_charter` | **The only class in the module.** Carries `.results`. Blocks the PDF |
 | `RuntimeError` | `company_charter` | Preflight failure, External gate failure |
 | `FileNotFoundError` | `company_charter`, `finalize_report` | Missing template / missing `raw/` |

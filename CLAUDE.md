@@ -14,7 +14,7 @@ must not be skipped.
 
 ## Entry point
 
-`python main.py <REG_NO|project name> [--gstin X | --pan Y] [--headed] [--token T] [--no-auto-auth] [--project-id N] [--output-dir D]`
+`python main.py <REG_NO|project name> [--state MH|TG] [--gstin X | --pan Y] [--headed] [--token T] [--no-auto-auth] [--project-id N] [--output-dir D]`
 
 Everything below runs from `main.py::main()` in this order. Stages marked
 **[opt-in]** do nothing unless asked; **[never fatal]** log a warning and let
@@ -22,20 +22,16 @@ the run continue. Nothing else may swallow an error.
 
 ## Stages
 
-1. **Resolve** `_resolve()` — reg-no or free-text name to internal `project_id`
-   via Playwright search. `--project-id` skips this when MahaRERA's own search
-   cannot find a project that still exists.
-2. **Auth** `ensure_token()` — opens a visible browser for a human CAPTCHA
-   solve. `--token` supplies one manually; `--no-auto-auth` limits the run to
-   the two endpoints needing no token.
-3. **Archive** `run_archive` — loads prior research and manifests, then moves
-   the previous run aside so documents can be reused rather than refetched.
-4. **Scrape** `api_client.fetch_all_categories()` — 9 category endpoints into
-   `output/<reg_no>/raw/`; token-gated failures retried once with a fresh session.
-5. **Documents** `download_documents()`, then `download_complaint_orders()`
-   **[never fatal]**.
-6. **Promoter portfolio** `promoter_portfolio.build_promoter_portfolio()`
-   **[never fatal]** — own browser; needs a name from `partners.promoterDetails`.
+0. **State** `states.candidate_profiles()` — `--state` wins, else every
+   authority whose reg-no format matches. MahaRERA and TG-RERA share
+   `P\d{11}`, so both are **probed in turn and the one that actually has the
+   project wins**; the district-code convention only orders the attempts.
+1-6. **Acquire** `states.get_adapter(code).acquire()` — resolve, auth, scrape,
+   documents, complaint orders, promoter portfolio, behind one call. MahaRERA's
+   is `states/adapter_maharashtra.py`. A state declares what it HAS
+   (`profile.capabilities`); what it lacks returns empty plus an honest
+   `notes` sentence, never a stub. Archiving stays with the caller via
+   `ctx.on_resolved`. `app.py` calls the same method — enforced by a test.
 7. **GST intake** `_run_gst_intake_step()` **[opt-in] [never fatal]** — needs
    `--gstin` or `--pan`. Enumerates every GSTIN under the PAN, fetches each
    filing table, writes `gst_filing_input.json`. One human CAPTCHA solve per
@@ -97,4 +93,6 @@ See `guardrails.md` for the full map of all four.
 `company_charter.py <REG_NO>` · `deep_research.py <REG_NO>` · `gst_intake.py
 <PAN|GSTIN> <REG_NO>` · `cts_resolve.py` (human-in-the-loop land records) ·
 `charter_report.py` via `run_charter_pipeline.py` / `build_report.py` ·
-`executive_briefing.py` · `finalize_report.py` (rebuild PDF, no API calls).
+`executive_briefing.py` · `finalize_report.py` (rebuild PDF, no API calls) ·
+`ts_rera_client.py <name>` (Telangana RERA search+detail, standalone, not
+wired into main.py -- CAPTCHA-gates its own search, human-in-the-loop).

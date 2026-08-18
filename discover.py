@@ -14,13 +14,24 @@ import config
 import api_client
 
 
-def verify_endpoints(project_id: str, out_dir: str, token: str | None = None) -> dict:
+def verify_endpoints(
+    project_id: str,
+    out_dir: str,
+    token: str | None = None,
+    endpoints: dict | None = None,
+    category_order: list | None = None,
+) -> dict:
+    """`endpoints`/`category_order` default to MahaRERA's config tables, so
+    the existing --verify path is unchanged; a second state's adapter passes
+    its own."""
+    endpoints = endpoints if endpoints is not None else config.CATEGORY_ENDPOINTS
+    category_order = category_order if category_order is not None else config.CATEGORY_ORDER
     os.makedirs(out_dir, exist_ok=True)
     report = {}
 
     with requests.Session() as session:
-        for category in config.CATEGORY_ORDER:
-            endpoint = config.CATEGORY_ENDPOINTS[category]
+        for category in category_order:
+            endpoint = endpoints[category]
             try:
                 data = api_client.fetch_category(category, project_id, session, token)
                 is_empty = data in (None, [], {})

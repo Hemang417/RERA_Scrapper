@@ -1,6 +1,6 @@
 """
 Agentic Company Charter generator. Fills output/company_charters/
-Company_Charter_TEMPLATE_WebSourced.docx *in place* (python-docx, preserving
+Company_Charter_TEMPLATE_Integrow_Branded.docx *in place* (python-docx, preserving
 every style/color/table already baked into the template) with real,
 sourced facts about one MahaRERA project -- replacing the manual
 Node/docx-js scripts used for the first (Pranami Bliss) charter.
@@ -61,6 +61,7 @@ import config
 import deep_research
 import finalize_report
 import run_archive
+import states
 
 MODEL = deep_research.MODEL
 
@@ -80,7 +81,7 @@ if not shutil.which("tesseract"):
         if _candidate and os.path.exists(_candidate):
             pytesseract.pytesseract.tesseract_cmd = _candidate
             break
-TEMPLATE_PATH = os.path.join(config.OUTPUT_ROOT, "company_charters", "Company_Charter_TEMPLATE_WebSourced.docx")
+TEMPLATE_PATH = os.path.join(config.OUTPUT_ROOT, "company_charters", "Company_Charter_TEMPLATE_Integrow_Branded.docx")
 CHARTER_OUTPUT_DIR = os.path.join(config.OUTPUT_ROOT, "company_charters")
 
 # --- CLAUDE.md loaders -----------------------------------------------------
@@ -1340,7 +1341,7 @@ def lookup_credit_rating(company_name: str) -> dict:
             f"No public rating found for this exact legal entity name from any agency checked "
             f"({agency_list}). This is NOT itself a red flag -- these agencies only rate developers "
             f"that sought a public rating (typically larger, listed, or NCD-issuing entities); most "
-            f"MahaRERA promoters are too small or private to ever be rated."
+            f"RERA-registered promoters are too small or private to ever be rated."
         ),
     }
 
@@ -1540,6 +1541,10 @@ _PAYWALL_MARKERS = (
     "paid company report", "purchase report", "part of the paid",
     "subscribe", "upgrade to", "login to view", "sign up to view",
     "buy full report", "available in the paid",
+    # Seen live on InstaFinancials for a linked entity during the CONSTELLA
+    # run; it reached the Group/Affiliated Companies table as if it were a
+    # real row, and had to be deleted post-hoc by patch_state_labels.py.
+    "not part of the free profile",
 )
 
 
@@ -2407,6 +2412,13 @@ def _extract_district_hint(facts: dict) -> str | None:
     (not a guess) if no known district name appears in the text at all."""
     import mahabhumi
 
+    # mahabhumi's map holds Maharashtra districts only, so for any other
+    # state every lookup here is guaranteed to miss. Returning early keeps
+    # that honest rather than dressing a structural absence up as "no
+    # district could be matched".
+    if not _state_profile().can(states.CAP_LAND_RECORDS):
+        return None
+
     text = ((facts.get("land_identification") or {}).get("mandal_taluka_district") or {}).get("value") or ""
     text_lower = text.lower()
     matches = [name for name in mahabhumi._DISTRICT_NAME_MAP if name in text_lower]
@@ -3246,6 +3258,64 @@ def run_review_authenticity_triage(reviews: list, facts: dict) -> dict:
 # facts.json) as well as facts.json's own free-text fields.
 _ACTIVE_EXTERNAL_FACTS: dict | None = None
 
+# Which state's RERA this document is about, for the duration of one
+# _fill_template call. Set and reset in exactly the same place, and for
+# exactly the same reason, as _ACTIVE_EXTERNAL_FACTS above: the functions
+# that need it -- _clean_source_label, _generic_one_label, and
+# charter_document.classify_claim_evidence -- are single-argument helpers
+# with ~25 call sites between them, and threading a profile through all of
+# them would be a large, risky diff for a purely additive fact.
+#
+# Read it through _state_profile(), never directly, so a caller that never
+# set it still gets Maharashtra rather than None.
+_ACTIVE_STATE_PROFILE = None
+
+
+def _state_profile():
+    """The state this render is about; Maharashtra when nothing set it.
+
+    Defaulting rather than raising is deliberate -- every existing entry
+    point (finalize_report, the module's own CLI, the ~30 test files that
+    call _fill_template directly) predates the state field and must keep
+    rendering identically."""
+    return _ACTIVE_STATE_PROFILE or states.get_profile(None)
+
+
+def _edition_subtitle(profile, external: bool = False) -> str:
+    """Title-page line 3, authored from the profile.
+
+    The .docx template still carries the placeholder this replaces
+    ("Public Web-Sourced Edition - Adapted for [State] ([State RERA
+    acronym])"), and it is tempting to just leave the template's own text
+    alone. Don't: the template lives under gitignored output/ and is not in
+    version control, so a hand-edit with "Maharashtra" typed into it would
+    silently mis-render every other state. Code owns the sentence; the
+    profile supplies the nouns.
+
+    `external` swaps the " -- " for a colon. Section C forbids the em-dash
+    form in the External document, and the External gate blocks the save if
+    one survives -- which is why this MUST stay in lockstep with
+    _state_dash_rewrites below."""
+    joiner = ":" if external else " --"
+    return f"Public Web-Sourced Edition{joiner} Adapted for {profile.state_name} ({profile.rera_acronym})"
+
+
+def _state_dash_rewrites() -> dict:
+    """Internal-form subtitle -> External-form subtitle, for EVERY
+    registered state.
+
+    Generated rather than hand-listed, and generated for all profiles rather
+    than just the active one, so the two forms cannot drift apart. This
+    replaces a hardcoded literal pair in _EXTERNAL_DASH_REWRITES: that dict
+    is keyed on the exact Internal string, so parameterising the subtitle
+    without regenerating its rewrite key would leave a " -- " in the
+    External document and fail the quality gate at save time -- the worst
+    possible moment to discover it."""
+    return {
+        _edition_subtitle(profile): _edition_subtitle(profile, external=True)
+        for profile in states.PROFILES.values()
+    }
+
 
 _CIN_VALUE_PATTERN = r"[UL]\d{5}[A-Z]{2}\d{4}[A-Z]{3}\d{6}"
 _CIN_LABELED_RE = re.compile(r"\bCIN\s*[:\-]?\s*" + _CIN_VALUE_PATTERN, re.IGNORECASE)
@@ -3382,7 +3452,7 @@ def _insert_version_log(doc, p, elapsed_seconds: float | None, cost_usd: float |
     counterparty. Inserted as a brand-new paragraph via python-docx rather
     than a template slot, since the .docx template predates this field --
     this only touches the in-memory Document built at render time, never
-    output/company_charters/Company_Charter_TEMPLATE_WebSourced.docx itself,
+    output/company_charters/Company_Charter_TEMPLATE_Integrow_Branded.docx itself,
     so no template backup is needed (see CLAUDE.md's template-safety note,
     which is about edits to the template FILE).
 
@@ -4101,11 +4171,26 @@ def _iter_all_paragraphs(doc):
     yield from _from_tables(doc.tables)
 
 
+def _any_state_reg_no_pattern() -> str:
+    """Alternation over EVERY registered state's registration-number format.
+
+    Built from the union rather than the active state's pattern alone,
+    because this feeds a "does this line state a fact?" heuristic where
+    being permissive is safe and being narrow is not: with only MahaRERA's
+    ^P\\d{11}$ hardcoded, a Karnataka number (PRM/KA/RERA/1251/446/PR/...)
+    or a Gujarat one read as NON-factual, so the citation gate stopped
+    asking those lines for a source. A union also avoids threading a
+    profile into a module-level compiled regex."""
+    return "|".join(
+        f"(?:{p.reg_no_pattern.strip('^$')})" for p in states.PROFILES.values()
+    )
+
+
 _FACTUAL_CLAIM_MARKER_RE = re.compile(
     r"\b(19|20)\d{2}\b"                                    # a year
     r"|\bDIN\s*\d{7,8}\b"                                   # a DIN
     r"|\b[UL]\d{5}[A-Z]{2}\d{4}[A-Z]{3}\d{6}\b"             # a CIN
-    r"|\bP\d{11}\b"                                         # a MahaRERA registration number
+    r"|\b(?:" + _any_state_reg_no_pattern() + r")\b"        # any state's RERA registration number
     r"|\b(?:Rs\.?|INR|₹)\s?[\d,]+"                     # a rupee figure
     r"|\b[\d,]+\s*(?:crore|lakh|sq\.?\s?ft|units?)\b"       # a scale figure
     r"|\b(?:High Court|Supreme Court|NCLT|NCLAT|Sessions Court|Tribunal)\b",
@@ -4784,7 +4869,7 @@ def _finding_research_context(facts: dict) -> str:
     fld = lambda d, k: (d.get(k) or {}).get("value", "") if isinstance(d.get(k), dict) else ""
     bits = [
         f"Project: {core.get('project_name', '')}",
-        f"MahaRERA registration: {core.get('registration_number', '')}",
+        f"{_state_profile().rera_acronym} registration: {core.get('registration_number', '')}",
         f"Promoter: {fld(corp, 'promoter_name')}",
         f"Location: {fld(land, 'village_locality')}, {fld(land, 'mandal_taluka_district')}",
         f"Plot: {fld(land, 'survey_cts_plot_numbers')}",
@@ -5316,9 +5401,31 @@ def _restore_clean_checks(facts: dict, changed: dict) -> None:
             container[key] = original
 
 
-def _fill_template(
+def _fill_template(*args, **kwargs) -> None:
+    """Thin wrapper guaranteeing the two module-level render globals are
+    cleared even when the render raises.
+
+    This matters: for doc_variant="external", _verify_external_document_quality
+    raises RuntimeError AFTER doc.save, so the inner function's own inline
+    reset is skipped on exactly the path that fails. A leaked
+    _ACTIVE_STATE_PROFILE would then silently apply to the NEXT render in the
+    same process -- which is every test file, every Streamlit session, and the
+    Internal-then-External pair in run_company_charter.
+
+    Wrapping rather than re-indenting ~650 lines into a try/finally keeps the
+    diff to the two lines below."""
+    global _ACTIVE_EXTERNAL_FACTS, _ACTIVE_STATE_PROFILE
+    try:
+        return _fill_template_inner(*args, **kwargs)
+    finally:
+        _ACTIVE_EXTERNAL_FACTS = None
+        _ACTIVE_STATE_PROFILE = None
+
+
+def _fill_template_inner(
     reg_no: str, facts: dict, out_path: str, doc_variant: str = "internal",
     elapsed_seconds: float | None = None, cost_usd: float | None = None, api_calls: int | None = None,
+    state_profile=None,
 ) -> None:
     """doc_variant is "internal" (default -- today's behavior: inline
     "(label)" citations, "(Code-Computed)" labels, verbatim prose) or
@@ -5383,8 +5490,14 @@ def _fill_template(
     # Paragraph objects from before any deletion, not positions).
     _paragraphs_to_remove = []
 
-    global _ACTIVE_EXTERNAL_FACTS
+    global _ACTIVE_EXTERNAL_FACTS, _ACTIVE_STATE_PROFILE
     _ACTIVE_EXTERNAL_FACTS = facts if doc_variant == "external" else None
+    # Explicit argument first, then whatever run_company_charter already
+    # recorded on the facts dict (so a re-render straight from a saved
+    # .facts.json keeps the right state), then Maharashtra.
+    _ACTIVE_STATE_PROFILE = state_profile or states.get_profile(
+        (facts.get("state") or {}).get("code")
+    )
     # doc.add_paragraph(...) is how every _append_*_section function writes
     # NEW content (as opposed to _set_paragraph_text filling a pre-existing
     # template slot) -- patching this one fresh, single-use `doc` instance's
@@ -5415,7 +5528,7 @@ def _fill_template(
     src = lambda d, k: (d.get(k) or {}).get("source", "") if isinstance(d.get(k), dict) else ""
 
     _set_paragraph_text(p[1], f'Project: {core.get("project_name", "[Unknown]")} | Promoter: {fld(ci, "promoter_name") or "[Unknown]"}')
-    _set_paragraph_text(p[2], "Public Web-Sourced Edition -- Adapted for Maharashtra (MahaRERA)")
+    _set_paragraph_text(p[2], _edition_subtitle(_state_profile()))
     _month_year = datetime.now().strftime('%B %Y')
     _set_paragraph_text(p[3], f"Deep Market Research (Prepared {_month_year})" if doc_variant == "external" else f"Deep Market Research -- Prepared {_month_year}")
     # p[5] (Methodology Note) is deleted entirely further down regardless
@@ -5470,7 +5583,7 @@ def _fill_template(
         (18, lambda f: "Map screenshot not embedded -- a live map cannot be fetched programmatically, so distances below were sourced from mapping-service queries instead (see Sources).", _always_suppress, None, None),
         (36, lambda f: f"Governing act: {rs.get('governing_act', '')}", _always_suppress, lambda f: rs.get("governing_act", ""), lambda f: _cite_marker("project_registration", facts=f)),
         (38, lambda f: allotment_text, lambda f: _externalize_prose(f, allotment_text) == "", lambda f: rs.get("allotment_mechanics", ""), None),
-        (58, lambda f: f.get("rera_scraping_note", f"Extracted directly from the live MahaRERA public project page for registration number {reg_no}."), _always_suppress, None, None),
+        (58, lambda f: f.get("rera_scraping_note", f"Extracted directly from the live {_state_profile().rera_acronym} public project page for registration number {reg_no}."), _always_suppress, None, None),
         (63, lambda f: f["documents_reviewed_note"], _always_suppress, None, None),
     )
     # Why each is suppressed for External (kept here, once, rather than
@@ -6009,7 +6122,7 @@ def _fill_template(
 # ---------------------------------------------------------------------------
 
 _SOURCE_TIERS = [
-    ("Primary regulatory record (MahaRERA/MCA, or a document opened from it)", (
+    ("Primary regulatory record (state RERA/MCA, or a document opened from it)", (
         "maharerait.maharashtra.gov.in", "maharera.maharashtra.gov.in", "mca.gov.in",
         "output" + os.sep, "output/",
     )),
@@ -6084,7 +6197,7 @@ _SOURCE_PROMOTION_HIT_THRESHOLD = 5
 # a developer's own site, Wikipedia) are eligible to graduate into that
 # trusted set via repeated corroboration.
 _ALREADY_TRUSTED_TIERS = frozenset({
-    "Primary regulatory record (MahaRERA/MCA, or a document opened from it)",
+    "Primary regulatory record (state RERA/MCA, or a document opened from it)",
     "Credit rating agency (CRISIL/ICRA/CARE/India Ratings)",
     "Government legal/insolvency record (IBBI, NCLT, NCDRC, MahaREAT judgments)",
     "Corporate-registry mirror",
@@ -6221,7 +6334,7 @@ def _clean_source_label(raw_source: str) -> str | None:
         name = piece.split("/")[-1]
         folder = piece.rsplit("/", 2)[-2] if "/" in piece else ""
         if folder == "raw" and name.endswith(".json"):
-            name = f"MahaRERA {name}"
+            name = f"{_state_profile().rera_acronym} {name}"
         return name + annotation
 
     pieces = [p for p in _split_outside_parens(raw_source, ";") if p.strip()]
@@ -6259,20 +6372,23 @@ def _split_outside_parens(text: str, sep: str) -> list[str]:
 # the External doc. Matched against the lowercased label with any trailing
 # "(annotation)" stripped off entirely (never reattached); see
 # _generic_one_label.
-_MAHARERA_JSON_GENERIC = (
-    ("partners.json", "MahaRERA promoter/partner filing"),
-    ("complaints.json", "MahaRERA complaint record"),
-    ("appeals.json", "MahaRERA appeal record"),
-    ("past_experiences.json", "MahaRERA past-experience filing"),
-    ("projects.json", "MahaRERA project filing"),
+# Values are {acronym} TEMPLATES, formatted against the active state at
+# lookup time (see _generic_one_label) -- a Telangana Charter must not cite
+# its own project filing as a "MahaRERA project filing".
+_RERA_JSON_GENERIC = (
+    ("partners.json", "{acronym} promoter/partner filing"),
+    ("complaints.json", "{acronym} complaint record"),
+    ("appeals.json", "{acronym} appeal record"),
+    ("past_experiences.json", "{acronym} past-experience filing"),
+    ("projects.json", "{acronym} project filing"),
     # Hand-written source strings, not filenames: a facts.json `source` can say
     # "MahaRERA complaints/appeals data" directly. Left unmapped, the generic
     # fallback reduced that to the bare category label "appeals data", which
     # Section C names as exactly what an External citation must never be.
-    ("complaints/appeals", "MahaRERA complaint and appeal records for this project registration"),
-    ("complaint/appeal", "MahaRERA complaint and appeal records for this project registration"),
-    ("appeals data", "MahaRERA appeal records for this project registration"),
-    ("complaints data", "MahaRERA complaint records for this project registration"),
+    ("complaints/appeals", "{acronym} complaint and appeal records for this project registration"),
+    ("complaint/appeal", "{acronym} complaint and appeal records for this project registration"),
+    ("appeals data", "{acronym} appeal records for this project registration"),
+    ("complaints data", "{acronym} complaint records for this project registration"),
 )
 _DOMAIN_GENERIC = (
     ("zaubacorp.com", "ZaubaCorp (Corporate Registry)"),
@@ -6286,6 +6402,14 @@ _DOMAIN_GENERIC = (
     ("insolvencytracker.in", "Insolvency Tracker"),
     ("linkedin.com", "LinkedIn (Professional Profile)"),
     ("rocketreach.co", "RocketReach (Organisation Directory)"),
+    # These stay here even though they name one state, and that is
+    # deliberate: this table answers "what is this DOMAIN called", which is a
+    # fact about the domain and not about whichever state is being rendered.
+    # A Telangana Charter that cites a maharera.maharashtra.gov.in page must
+    # still label it "MahaRERA", not fall through to a bare hostname.
+    # StateProfile.domain_labels is consulted BEFORE this table, and exists
+    # to let a newly added state name its own hosts before they are promoted
+    # here -- it adds rows, it does not replace them.
     ("igrmaharashtra.gov.in", "IGR Maharashtra (Dept. of Registration & Stamps)"),
     ("maharerait.maharashtra.gov.in", "MahaRERA"),
     ("maharera.maharashtra.gov.in", "MahaRERA"),
@@ -6348,8 +6472,14 @@ def _generic_one_label(label: str) -> str:
     core = label[: m.start()].strip() if m else label
     lowered = core.lower()
 
-    for keyword, generic in _MAHARERA_JSON_GENERIC:
+    _profile = _state_profile()
+    for keyword, generic in _RERA_JSON_GENERIC:
         if keyword in lowered:
+            return generic.format(acronym=_profile.rera_acronym)
+    # The active state's own hosts first, so a state that shares a domain
+    # keyword with the national table still gets its own label.
+    for domain, generic in _profile.domain_labels:
+        if domain in lowered:
             return generic
     for domain, generic in _DOMAIN_GENERIC:
         if domain in lowered:
@@ -6376,7 +6506,7 @@ def _generic_one_label(label: str) -> str:
     # more specific table above, so it can never shadow a real match.
     for keyword, domain in _FLAG_TEXT_ORG_ALIASES:
         if keyword in lowered:
-            for d, generic in _DOMAIN_GENERIC:
+            for d, generic in tuple(_profile.domain_labels) + _DOMAIN_GENERIC:
                 if d == domain:
                     return generic
             return domain
@@ -6536,8 +6666,9 @@ def _citation_text(facts: dict, cleaned_label: str | None) -> str | None:
 _EXTERNAL_DASH_REWRITES = {
     # --- static template labels/headings, hardcoded in this file (not
     # facts.json), shared by every Charter this pipeline generates ---
-    "Public Web-Sourced Edition -- Adapted for Maharashtra (MahaRERA)":
-        "Public Web-Sourced Edition: Adapted for Maharashtra (MahaRERA)",
+    # (the title-page subtitle used to be hardcoded here as a literal pair;
+    # it is now generated per state by _state_dash_rewrites and merged in at
+    # the loop below, so the Internal and External forms cannot drift)
     "Every figure above is drawn directly from the underlying facts already researched for this project -- see the flag lists below for detail and the Diligence Appendix for the per-pillar/per-check breakdown behind the Developer Score and Data Authenticity figures.":
         "Every figure above is drawn directly from the underlying facts already researched for this project; see the flag lists below for detail and the Diligence Appendix for the per-pillar/per-check breakdown behind the Developer Score and Data Authenticity figures.",
     "Imminent Red Flags -- act on these before proceeding": "Imminent Red Flags: act on these before proceeding",
@@ -6577,8 +6708,8 @@ _EXTERNAL_DASH_REWRITES = {
     "See Litigation Status -- not a clean read": "See Litigation Status: not a clean read",
     "promoter_portfolio.totals.area_within_5km_lakh_sqft not available -- this pass's promoter_portfolio.json predates the geocoding-based 5km filter (build_promoter_portfolio's subject_project_partners_data/subject_reg_no params), or no subject location could be geocoded. Re-run the pipeline to compute it, rather than treating this as a permanent gap.":
         "Not available. This review's portfolio data predates the geocoding-based 5km filter, or no subject location could be geocoded. This can be computed on a future review rather than treated as a permanent gap.",
-    "promoter_portfolio.totals.total_area_developed_lakh_sqft not available -- requires area figures aggregated across the promoter's other MahaRERA-registered projects, not yet computed this pass.":
-        "Not available. This requires area figures aggregated across the promoter's other MahaRERA-registered projects, not yet computed this review.",
+    "promoter_portfolio.totals.total_area_developed_lakh_sqft not available -- requires area figures aggregated across the promoter's other RERA-registered projects, not yet computed this pass.":
+        "Not available. This requires area figures aggregated across the promoter's other RERA-registered projects, not yet computed this review.",
     "Not applicable this pass -- excluded rather than scored as a failure; remaining weights renormalized to still sum to 100%.":
         "Not applicable this review: excluded rather than scored as a failure; remaining weights renormalized to still sum to 100%.",
     "Complaint volume: 3 total filing(s) on record against this project -- a visible floor worth noting, not blended into zero.":
@@ -6606,8 +6737,8 @@ _EXTERNAL_DASH_REWRITES = {
         "The area-within-5km figure additionally requires geocoding: the subject project's own locality is resolved via OpenStreetMap's public Nominatim API, a free, no-API-key service, rate-limited to roughly 1 request per second. Each portfolio entry's own address is geocoded by preference on any 6-digit Indian pincode found inside it, since MahaRERA's own address field is often a full legal land description (survey numbers, stray commas) that free-form search fails on, while the pincode alone resolves reliably, falling back to the raw address text and then to the project's district if no pincode is present. An entry that still cannot be geocoded is excluded from the 5km sum entirely, and a pincode covers a small area rather than a point, so this figure is a reasonable estimate, not a surveyed one. If no subject location was supplied at all, or it cannot be geocoded, this figure is left blank entirely.",
     "No public source discloses internal team headcounts by function (Liaisoning / Project Development / Sales & CRM) -- a structural limitation of publicly-available data, not something a future pass can close.":
         "No public source discloses internal team headcounts by function (Liaisoning / Project Development / Sales & CRM). This is a structural limitation of publicly available data, not something a future review can close.",
-    "Debt-to-capital ratio, secured-debt ratio, and default occurrence are not disclosed by any source this pipeline checks (MahaRERA/ZaubaCorp don't carry balance-sheet debt structure) -- only resolvable when a credit-rating rationale or MCA financial filing states these figures.":
-        "Debt-to-capital ratio, secured-debt ratio, and default occurrence are not disclosed by any source checked (MahaRERA and ZaubaCorp do not carry balance-sheet debt structure). This is only resolvable when a credit-rating rationale or MCA financial filing states these figures.",
+    "Debt-to-capital ratio, secured-debt ratio, and default occurrence are not disclosed by any source this pipeline checks (neither the RERA record nor the corporate registry carries balance-sheet debt structure) -- only resolvable when a credit-rating rationale or MCA financial filing states these figures.":
+        "Debt-to-capital ratio, secured-debt ratio, and default occurrence are not disclosed by any source checked (neither the RERA record nor the corporate registry carries balance-sheet debt structure). This is only resolvable when a credit-rating rationale or MCA financial filing states these figures.",
     "RERA compliance history (registration timeliness, extension/penalty record) is not yet computed as a scored metric -- no data source has been wired in for this criterion yet; a pending build, not a permanent public-data gap.":
         "RERA compliance history (registration timeliness, extension/penalty record) is not yet computed as a scored metric. No data source has been wired in for this criterion yet; this is a pending build, not a permanent public-data gap.",
     "GST/TDS compliance is not yet computed as a scored metric -- no data source has been wired in for this criterion yet; a pending build, not a permanent public-data gap.":
@@ -6851,6 +6982,12 @@ def _externalize_prose(facts: dict, text: str) -> str:
 
     for original, rewritten in _EXTERNAL_DASH_REWRITES.items():
         text = text.replace(original, rewritten)
+    # Every registered state's subtitle pair, not just the active one --
+    # applying all is harmless (the strings are state-specific and cannot
+    # collide) and makes the Internal/External lockstep structural rather
+    # than something a future edit has to remember.
+    for original, rewritten in _state_dash_rewrites().items():
+        text = text.replace(original, rewritten)
     for pattern, replacement in _EXTERNAL_PROSE_SUBSTITUTIONS:
         text = _replace_preserving_case(pattern, replacement, text)
     text = _INTERNAL_FIELD_ANNOTATION_RE.sub("", text)
@@ -7015,7 +7152,7 @@ def _compute_authenticity_summary(facts: dict) -> dict:
 
     total_sources = sum(tier_counts.values())
     primary_tiers = (
-        "Primary regulatory record (MahaRERA/MCA, or a document opened from it)",
+        "Primary regulatory record (state RERA/MCA, or a document opened from it)",
         "Credit rating agency (CRISIL/ICRA/CARE/India Ratings)",
         "Government legal/insolvency record (IBBI, NCLT, NCDRC, MahaREAT judgments)",
         "Live Google Maps verification",
@@ -7159,7 +7296,7 @@ def verify_cross_corroboration(facts: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 _TIER_WEIGHTS = {
-    "Primary regulatory record (MahaRERA/MCA, or a document opened from it)": 100,
+    "Primary regulatory record (state RERA/MCA, or a document opened from it)": 100,
     "Credit rating agency (CRISIL/ICRA/CARE/India Ratings)": 95,
     "Government legal/insolvency record (IBBI, NCLT, NCDRC, MahaREAT judgments)": 90,
     "Live Google Maps verification": 90,
@@ -7601,7 +7738,7 @@ def _classify_flags(facts: dict) -> dict:
     reg_no = (core.get("registration_number") or "").strip()
     if not reg_no:
         imminent.append({
-            "text": "No MahaRERA registration number could be resolved for this project.",
+            "text": f"No {_state_profile().rera_acronym} registration number could be resolved for this project.",
             "field": "rera_core_fields.registration_number",
         })
 
@@ -7725,7 +7862,7 @@ def _classify_flags(facts: dict) -> dict:
     portfolio = facts.get("promoter_portfolio")
     if portfolio:
         portfolio_total_complaints = (portfolio.get("totals", {}) or {}).get("total_complaints")
-        text = f"Promoter portfolio: {portfolio.get('projects_analyzed', 0)} MahaRERA-registered project(s) tied to this promoter."
+        text = f"Promoter portfolio: {portfolio.get('projects_analyzed', 0)} {_state_profile().rera_acronym}-registered project(s) tied to this promoter."
         if portfolio_total_complaints and complaint_count is not None and portfolio_total_complaints > 0:
             concentration_pct = round(100 * complaint_count / portfolio_total_complaints, 1)
             text += f" This project alone accounts for {complaint_count} of {portfolio_total_complaints} total complaints across that portfolio ({concentration_pct}%)."
@@ -7913,7 +8050,7 @@ def _score_past_area_developed(facts: dict) -> dict:
     other registered projects, not yet computed by every pipeline run."""
     area = ((facts.get("promoter_portfolio") or {}).get("totals") or {}).get("total_area_developed_lakh_sqft")
     if not isinstance(area, (int, float)):
-        return {"score": None, "tier": None, "reason": "promoter_portfolio.totals.total_area_developed_lakh_sqft not available -- requires area figures aggregated across the promoter's other MahaRERA-registered projects, not yet computed this pass."}
+        return {"score": None, "tier": None, "reason": "promoter_portfolio.totals.total_area_developed_lakh_sqft not available -- requires area figures aggregated across the promoter's other RERA-registered projects, not yet computed this pass."}
     if area > 120:
         tier = "AAA"
     elif area >= 81:
@@ -7926,7 +8063,7 @@ def _score_past_area_developed(facts: dict) -> dict:
         tier = "C"
     else:
         tier = "D"
-    return {"score": _DEVELOPER_SCORE_TIER_SCORES[tier], "tier": tier, "note": f"~{area} lakh sq ft developed across the promoter's MahaRERA-registered portfolio"}
+    return {"score": _DEVELOPER_SCORE_TIER_SCORES[tier], "tier": tier, "note": f"~{area} lakh sq ft developed across the promoter's RERA-registered portfolio"}
 
 
 def _score_area_within_5km(facts: dict) -> dict:
@@ -7964,7 +8101,7 @@ def _score_financial_strength_debt(facts: dict) -> dict:
     unrated companies that make up most MahaRERA promoters."""
     points = (facts.get("developer_track_record") or {}).get("financial_strength_points")
     if not isinstance(points, (int, float)):
-        return {"score": None, "tier": None, "reason": "Debt-to-capital ratio, secured-debt ratio, and default occurrence are not disclosed by any source this pipeline checks (MahaRERA/ZaubaCorp don't carry balance-sheet debt structure) -- only resolvable when a credit-rating rationale or MCA financial filing states these figures."}
+        return {"score": None, "tier": None, "reason": "Debt-to-capital ratio, secured-debt ratio, and default occurrence are not disclosed by any source this pipeline checks (neither the RERA record nor the corporate registry carries balance-sheet debt structure) -- only resolvable when a credit-rating rationale or MCA financial filing states these figures."}
     if points <= 8:
         tier = "AAA"
     elif points <= 17:
@@ -8050,7 +8187,13 @@ def _score_rera_compliance(facts: dict) -> dict:
     extension status alone never blocks scoring."""
     complaint_count, appeal_count = _parse_complaint_appeal_counts(facts)
     if complaint_count is None or appeal_count is None:
-        return {"score": None, "tier": None, "reason": "This project's complaint/appeal counts are not confidently parseable from rera_core_fields; both are needed to score RERA compliance friction."}
+        return {
+            "score": None, "tier": None,
+            "reason": "This project's complaint and appeal counts could not be confidently "
+                      "determined from the public record; both are needed to score RERA "
+                      "compliance friction.",
+            "field": "rera_core_fields.total_complaints_count",
+        }
 
     _, was_extended = _parse_completion_slippage(facts)
     points = 25 if was_extended else 0
@@ -8113,9 +8256,10 @@ def _score_gst_compliance(facts: dict) -> dict:
     if not check or not check.get("found"):
         return {
             "score": None, "tier": None,
-            "reason": "No GST filing data available this pass. Requires a human-supplied output/<reg_no>/"
-            "gst_filing_input.json (GSTIN + filing dates), since the GST portal's own CAPTCHA makes live "
-            "scraping unautomatable here; this is a pending-input gap, not a permanent one.",
+            "reason": "No GST filing data available this pass. This requires a human-supplied "
+                      "GSTIN filing-history file, since the GST portal's own CAPTCHA makes live "
+                      "scraping unautomatable here; this is a pending-input gap, not a permanent one.",
+            "field": "gst_compliance_check",
         }
 
     summary = check["summary"]
@@ -8372,7 +8516,7 @@ def _append_overview_section(doc, facts: dict, flags: dict) -> None:
     for label, key in (
         ("Project", "project_name"),
         ("Promoter", None),
-        ("MahaRERA Registration", "registration_number"),
+        (f"{_state_profile().rera_acronym} Registration", "registration_number"),
         ("Project Status", "project_status"),
         ("Proposed Completion Date", "proposed_completion_date"),
         ("Total Units", "total_building_units"),
@@ -8606,8 +8750,10 @@ def _append_counterparty_summary(doc, facts: dict) -> None:
     if profile_check and profile_check.get("found"):
         _ensure_heading()
         doc.add_paragraph(
-            f"Company registration: confirmed via ZaubaCorp{_sep} {profile_check.get('status', 'status unknown')}, "
-            f"incorporated {profile_check.get('incorporation_date', 'unknown')} (directors and full detail in Diligence Appendix)."
+            f"Company registration: confirmed via ZaubaCorp{_sep} "
+            + (f"{profile_check.get('status')}, " if profile_check.get("status") else "")
+            + f"incorporated {profile_check.get('incorporation_date') or 'date not published'} "
+            "(directors and full detail in Diligence Appendix)."
         )
 
     group_check = facts.get("group_companies_check")
@@ -8900,10 +9046,20 @@ def _append_company_profile_section(doc, facts: dict) -> None:
     )
     profile_citation = _citation_text(facts, _clean_source_label(check.get("url", "")))
     _sep = _variant_sep(facts)
+    _identity_clauses = [
+        (label, check.get(key))
+        for label, key in (
+            ("Status", "status"),
+            ("Class", "class_of_company"),
+            ("Category", "company_category"),
+            ("ROC", "roc"),
+        )
+    ]
+    _identity_text = "; ".join(
+        f"{label}: {value}" for label, value in _identity_clauses if value
+    )
     doc.add_paragraph(
-        f"{check['name']} ({check['cin']}){_sep} Status: {check.get('status', 'unknown')}; "
-        f"Class: {check.get('class_of_company', 'unknown')}; "
-        f"Category: {check.get('company_category', 'unknown')}; ROC: {check.get('roc', 'unknown')}"
+        f"{check['name']} ({check['cin']}){_sep} {_identity_text}".rstrip()
         + (f" {profile_citation}" if profile_citation else "")
     )
     doc.add_paragraph(f"Incorporated: {check.get('incorporation_date', 'unknown')}")
@@ -9779,6 +9935,7 @@ def run_company_charter(
     promoter_portfolio: dict | None = None,
     pre_built_facts: dict | None = None,
     pipeline_start_time: float | None = None,
+    state_profile=None,
 ) -> tuple[str, dict]:
     """Returns (out_path, facts) -- facts is the complete, code-and-model
     -assembled Charter data (same content as the .facts.json written
@@ -9809,6 +9966,18 @@ def run_company_charter(
 
     extracted_docs, doc_library_status = _select_documents_for_extraction(documents_manifest, documents_dir)
 
+    # Which state's RERA this run is about. Defaults to Maharashtra so every
+    # existing caller -- main.py, app.py, this module's own CLI, and the
+    # one-off pre_built_facts scripts -- keeps behaving identically without
+    # passing anything.
+    #
+    # Deliberately NOT a field in _CHARTER_FACTS_SCHEMA: that schema is
+    # json.dumps'd into the model's required output shape, and asking the
+    # model to emit a fact the pipeline already knows for certain is exactly
+    # the avoidable hallucination rules.md exists to prevent. It would also
+    # create a second source of truth disagreeing with run_meta.json.
+    _profile_for_run = state_profile or states.get_profile(None)
+
     if pre_built_facts is not None:
         facts = pre_built_facts
     else:
@@ -9820,7 +9989,7 @@ def run_company_charter(
             )
 
         user_prompt = (
-            f"MahaRERA registration: {reg_no}\n"
+            f"{_profile_for_run.rera_acronym} ({_profile_for_run.state_name}) registration: {reg_no}\n"
             f"RERA project data (JSON): {json.dumps(category_data.get('projects') or {})}\n"
             f"Promoter/partner data (JSON): {json.dumps(category_data.get('partners') or {})}\n"
             f"Extracted document text (label -> text, high-priority documents only):\n"
@@ -9900,7 +10069,7 @@ def run_company_charter(
             futures["ibbi"] = executor.submit(_safe_ibbi_check, corp_identifier)
             futures["profile"] = executor.submit(_safe_company_profile, corp_identifier, promoter_name_for_rating)
             futures["group"] = executor.submit(_safe_group_companies, corp_identifier)
-        if project_name_for_judgments:
+        if project_name_for_judgments and _profile_for_run.can(states.CAP_ORDERS_SEARCH):
             futures["judgments"] = executor.submit(_safe_judgments_search, project_name_for_judgments)
 
         results = {key: future.result() for key, future in futures.items()}
@@ -9999,6 +10168,12 @@ def run_company_charter(
             "accessed_date": datetime.now().strftime("%Y-%m-%d"),
         })
 
+    # Recorded BEFORE the remaining stages so every one of them, and both
+    # renders, can read it -- and so it survives into .facts.json, which is
+    # what lets finalize_report and the module CLI re-render a saved run
+    # with the right state months later.
+    facts["state"] = _profile_for_run.as_facts_dict()
+
     facts = run_cts_land_lookup(facts, reg_no, output_dir)
     facts = run_gst_compliance_check(facts, reg_no, output_dir)
 
@@ -10006,7 +10181,8 @@ def run_company_charter(
     origin_locality = (land.get("village_locality") or {}).get("value", "")
     origin_district = (land.get("mandal_taluka_district") or {}).get("value", "")
     if origin_locality:
-        origin = f"{origin_locality}, {origin_district}, Maharashtra" if origin_district else f"{origin_locality}, Maharashtra"
+        _state_name = _profile_for_run.state_name
+        origin = f"{origin_locality}, {origin_district}, {_state_name}" if origin_district else f"{origin_locality}, {_state_name}"
         facts = _refine_distances_with_maps(facts, origin)
 
     # Runs last, after every other step above has had its chance to add a
@@ -10094,9 +10270,10 @@ def run_company_charter(
     _fill_template(
         reg_no, facts, out_path, doc_variant="internal",
         elapsed_seconds=_run_elapsed_seconds, cost_usd=_usage_total["cost_usd"], api_calls=_usage_total["calls"],
+        state_profile=_profile_for_run,
     )
     external_out_path = os.path.join(out_dir, f"Company_Charter_{project_name}_{reg_no}_External.docx")
-    _fill_template(reg_no, facts, external_out_path, doc_variant="external")
+    _fill_template(reg_no, facts, external_out_path, doc_variant="external", state_profile=_profile_for_run)
 
     # Final stage: both documents are re-read and audited against the CLAUDE.md
     # rules they were written under, before the PDFs are produced. Advisory --

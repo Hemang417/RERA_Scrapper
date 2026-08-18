@@ -44,6 +44,7 @@ import report
 import resolver
 import run_archive
 import session_auth
+import states
 import token_cache
 
 
@@ -97,6 +98,17 @@ def parse_args() -> argparse.Namespace:
         help=f"Root output directory (default: {config.OUTPUT_ROOT})",
     )
     parser.add_argument(
+        "--state",
+        default=None,
+        choices=sorted(states.PROFILES),
+        help=(
+            "Which state RERA to query. Inferred from the registration-number format "
+            "when omitted. Maharashtra and Telangana share the same P+11-digit shape, "
+            "so that case is settled by an OBSERVED district-code convention and "
+            "announced -- pass --state explicitly to override it."
+        ),
+    )
+    parser.add_argument(
         "--project-id",
         default=None,
         help=(
@@ -135,121 +147,11 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _describe(c: "resolver.ProjectCandidate") -> str:
-    bits = [c.reg_no or "(unknown reg no)", "--", c.project_name or "(unknown name)"]
-    extra = " ".join(x for x in (c.promoter_name, c.district, c.pincode) if x)
-    if extra:
-        bits.append(f"[{extra}]")
-    return " ".join(bits)
-
-
-def _resolve(query: str, headed: bool, project_id_override: str | None = None) -> tuple[str, str, str]:
-    """Returns (project_id, detail_url, reg_no_for_output_dir)."""
-    is_reg_no = bool(re.match(r"^P\d{11}$", query, re.IGNORECASE))
-
-    if is_reg_no and project_id_override:
-        detail_url = config.DETAIL_VIEW_URL_TEMPLATE.format(project_id_override)
-        print(f"[INFO] Skipping search resolution -- using supplied project ID {project_id_override} directly ({detail_url})")
-        return project_id_override, detail_url, query
-
-    if is_reg_no:
-        print(f"[INFO] Resolving project ID for {query} via public search (no login)...")
-        try:
-            project_id, detail_url = resolver.resolve_project_id(query, headless=not headed)
-        except resolver.ProjectNotFoundError as e:
-            print(f"[ERROR] {e}")
-            sys.exit(1)
-        print(f"[OK] Resolved to internal project ID: {project_id} ({detail_url})")
-        return project_id, detail_url, query
-
-    print(f"[INFO] Searching MahaRERA for project name '{query}' (no login)...")
-    candidates = resolver.search_projects(query, headless=not headed)
-
-    if not candidates:
-        print(f"[ERROR] No projects found matching '{query}'. Double-check the spelling.")
-        sys.exit(1)
-
-    if len(candidates) == 1:
-        chosen = candidates[0]
-    else:
-        print(f"\n[INFO] Found {len(candidates)} projects matching '{query}':\n")
-        for i, c in enumerate(candidates, start=1):
-            print(f"  {i}. {_describe(c)}")
-        print()
-
-        if not sys.stdin.isatty():
-            print(
-                "[ERROR] Multiple matches and no interactive terminal to pick one -- "
-                "re-run with the exact registration number shown above."
-            )
-            sys.exit(2)
-
-        chosen = None
-        while chosen is None:
-            try:
-                choice = input(f"Enter a number (1-{len(candidates)}): ").strip()
-            except EOFError:
-                print(
-                    "\n[ERROR] No input available to pick one -- "
-                    "re-run with the exact registration number shown above."
-                )
-                sys.exit(2)
-            if choice.isdigit() and 1 <= int(choice) <= len(candidates):
-                chosen = candidates[int(choice) - 1]
-            else:
-                print("Not a valid choice, try again.")
-
-    reg_no = chosen.reg_no or chosen.project_id
-    print(f"[OK] Selected: {_describe(chosen)} (internal project ID: {chosen.project_id})")
-    return chosen.project_id, chosen.detail_url, reg_no
-
-
-_AUTH_SOURCE_LABELS = {
-    "explicit": "manually supplied --token",
-    "cached": "reused cached session",
-    "fresh_browser": "freshly solved CAPTCHA session",
-    "none": "no session (only free categories)",
-}
-
-
-def ensure_token(
-    project_id: str, explicit_token: str | None, no_auto_auth: bool, captcha_timeout: int
-) -> tuple[str | None, str]:
-    """Returns (token, auth_source) where auth_source is one of
-    'explicit', 'cached', 'fresh_browser', or 'none'."""
-    if explicit_token:
-        return explicit_token, "explicit"
-
-    if no_auto_auth:
-        return None, "none"
-
-    cached = token_cache.load_valid()
-    if cached:
-        print(f"[OK] Using cached session ({token_cache.minutes_left()} min left) -- no browser needed.")
-        return cached, "cached"
-
-    print("[INFO] No fresh session cached -- opening a browser for you to solve the CAPTCHA...")
-    try:
-        token = session_auth.acquire_token_via_browser(project_id, timeout_seconds=captcha_timeout)
-        return token, "fresh_browser"
-    except (session_auth.CaptchaTimeoutError, session_auth.BrowserClosedError) as e:
-        print(f"[WARN] Couldn't capture a session ({e}). Continuing with only the free categories.")
-        return None, "none"
-
-
-def _extract_promoter_name(category_data: dict) -> str | None:
-    """projects.promoterName is null in practice on every sample seen -- the
-    real promoter name lives on partners.promoterDetails.promoterName
-    (confirmed live), with stray trailing whitespace to strip."""
-    partners = category_data.get("partners")
-    if isinstance(partners, dict):
-        details = partners.get("promoterDetails")
-        if isinstance(details, dict) and details.get("promoterName"):
-            return details["promoterName"].strip()
-    projects_data = category_data.get("projects")  # defensive fallback only
-    if isinstance(projects_data, dict) and projects_data.get("promoterName"):
-        return projects_data["promoterName"].strip()
-    return None
+# _describe / _resolve / ensure_token / _extract_promoter_name moved to
+# states/adapter_maharashtra.py -- they were MahaRERA portal logic, not
+# orchestration. _AUTH_SOURCE_LABELS moved with them and is re-exported
+# here for the run summary below.
+from states.adapter_maharashtra import _AUTH_SOURCE_LABELS  # noqa: E402
 
 
 def _run_gst_intake_step(gst_identifier: str | None, reg_no: str, output_dir: str) -> str:
@@ -281,6 +183,42 @@ def _run_gst_intake_step(gst_identifier: str | None, reg_no: str, output_dir: st
     return f"{result['period_count']} period(s) for {result['primary_gstin']}"
 
 
+class CliReporter:
+    """ProgressReporter for the command line.
+
+    The adapter cannot print directly and cannot call input(): app.py drives
+    the same acquire() through a Streamlit reporter, which re-runs
+    top-to-bottom and cannot block on stdin."""
+
+    def info(self, msg: str) -> None:
+        print(f"[INFO] {msg}")
+
+    def warn(self, msg: str) -> None:
+        print(f"[WARN] {msg}")
+
+    def ok(self, msg: str) -> None:
+        print(f"[OK] {msg}")
+
+    def choose(self, prompt: str, options: list) -> int | None:
+        """Index chosen, or None for "cannot ask".
+
+        None on a non-TTY preserves main()'s previous behaviour exactly: it
+        returned exit code 2 rather than hanging on a blocked read or
+        silently picking the first match."""
+        if not sys.stdin.isatty():
+            return None
+        print(f"\n{prompt}")
+        for i, option in enumerate(options, start=1):
+            print(f"  {i}. {option}")
+        while True:
+            raw = input(f"Enter 1-{len(options)} (or blank to abort): ").strip()
+            if not raw:
+                return None
+            if raw.isdigit() and 1 <= int(raw) <= len(options):
+                return int(raw) - 1
+            print("  Not a valid choice.")
+
+
 def main() -> int:
     # Full pipeline start -- fed into company_charter.run_company_charter so
     # the Charter's own version-log line reports true end-to-end run time
@@ -290,136 +228,166 @@ def main() -> int:
     args = parse_args()
     query = args.query.strip()
 
-    project_id, detail_url, reg_no = _resolve(query, headed=args.headed, project_id_override=args.project_id)
+    # Which state's RERA this is. --state wins; otherwise inferred from the
+    # registration-number format, with the Maharashtra/Telangana collision
+    # settled by an announced, documented tiebreak (states.resolve_state).
+    reporter = CliReporter()
+    candidates, candidates_note = states.candidate_profiles(query, args.state)
+    if candidates_note:
+        reporter.info(candidates_note)
+    profile = candidates[0]
 
-    token, auth_source = ensure_token(project_id, args.token, args.no_auto_auth, args.captcha_timeout)
-    print(f"[INFO] Auth source: {_AUTH_SOURCE_LABELS[auth_source]}")
+    def _archive_previous_run(reg_no: str) -> dict:
+        """Called by the adapter once the project resolves and before it
+        writes anything. Archiving is keyed on reg_no and is entirely
+        state-neutral, so it stays here rather than inside an adapter.
 
-    project_out_dir = os.path.join(args.output_dir, reg_no)
-    raw_dir = os.path.join(project_out_dir, "raw")
-    documents_dir = os.path.join(project_out_dir, "documents")
+        Must read prior_research BEFORE archiving moves
+        research/deep_research.json out from under project_out_dir."""
+        nonlocal prior_research
+        prior_research = run_archive.load_prior_research(reg_no, args.output_dir)
+        archive_dir = run_archive.archive_previous_run(reg_no, args.output_dir)
+        if archive_dir:
+            print(f"[INFO] Archived previous run to {archive_dir}")
+        return {
+            "manifest": run_archive.load_prior_manifest(archive_dir),
+            "documents_dir": run_archive.prior_documents_dir(archive_dir),
+            "complaint_orders_manifest": run_archive.load_prior_complaint_orders_manifest(archive_dir),
+            "complaint_orders_dir": run_archive.prior_complaint_orders_dir(archive_dir),
+        }
+
+    prior_research = None
+    ctx = states.AcquisitionContext(
+        output_dir=args.output_dir,
+        reporter=reporter,
+        headed=args.headed,
+        explicit_token=args.token,
+        no_auto_auth=args.no_auto_auth,
+        captcha_timeout=args.captcha_timeout,
+        project_id_override=args.project_id,
+        on_resolved=_archive_previous_run,
+    )
 
     if args.verify:
-        os.makedirs(project_out_dir, exist_ok=True)
-        print("\n[INFO] Verifying category endpoints...")
-        discover.verify_endpoints(project_id, raw_dir, token)
+        # Developer diagnostic, and category-API-only -- it checks that the
+        # endpoint table still matches what the portal actually serves.
+        if not any(c.can(states.CAP_CATEGORY_API) for c in candidates):
+            print(f"[ERROR] --verify needs per-category endpoints, which {profile.rera_acronym} does not expose.")
+            return 2
+        # Same probe ladder as the main path, but stopping at resolve+auth:
+        # --verify only needs a real project on that authority to check its
+        # endpoint table against, not a full scrape.
+        verify_adapter = None
+        for candidate in candidates:
+            if not candidate.can(states.CAP_CATEGORY_API) or not candidate.can(states.CAP_LOOKUP_BY_REG_NO):
+                continue
+            try:
+                verify_adapter = states.get_adapter(candidate.code)
+            except NotImplementedError:
+                continue
+            try:
+                project_id, _detail_url, reg_no, token, _auth = verify_adapter.resolve_and_auth(query, ctx)
+            except states.StateResolutionError:
+                verify_adapter = None
+                continue
+            profile = candidate
+            break
+        if verify_adapter is None:
+            print(f"[ERROR] '{query}' was not found on any authority with verifiable endpoints.")
+            return 2
+        print(f"[INFO] State: {profile.state_name} ({profile.rera_acronym})")
+        os.makedirs(os.path.join(args.output_dir, reg_no), exist_ok=True)
+        print("[INFO] Verifying category endpoints...")
+        verify_adapter.verify_endpoints(project_id, os.path.join(args.output_dir, reg_no, "raw"), token)
         return 0
 
-    # Snapshot whatever a previous run left behind before this run starts
-    # overwriting it, so two runs of the same project can be diffed instead
-    # of the second silently clobbering the first. Must read prior_research
-    # BEFORE archiving moves research/deep_research.json out from under
-    # project_out_dir.
-    prior_research = run_archive.load_prior_research(reg_no, args.output_dir)
-    archive_dir = run_archive.archive_previous_run(reg_no, args.output_dir)
-    prior_manifest = run_archive.load_prior_manifest(archive_dir)
-    prior_documents_dir = run_archive.prior_documents_dir(archive_dir)
-    prior_complaint_orders_manifest = run_archive.load_prior_complaint_orders_manifest(archive_dir)
-    prior_complaint_orders_dir = run_archive.prior_complaint_orders_dir(archive_dir)
-    if archive_dir:
-        print(f"[INFO] Archived previous run to {archive_dir}")
-
-    os.makedirs(project_out_dir, exist_ok=True)
-
-    # Cleared here, before any Claude API call this run might make -- this
-    # process could otherwise carry over token counts from an unrelated
-    # earlier project (matters for app.py's long-lived Streamlit process
-    # more than this one-shot CLI, but scoping it identically in both keeps
+    # Cleared before any Claude API call this run might make -- this process
+    # could otherwise carry token counts over from an unrelated earlier
+    # project (matters more for app.py's long-lived Streamlit process than
+    # this one-shot CLI, but scoping it identically in both keeps
     # write_usage_log's report accurate to just THIS run).
     deep_research.reset_usage_log()
 
-    print("\n[INFO] Fetching all categories...")
-    errors = {}
-    category_data = api_client.fetch_all_categories(project_id, raw_dir, token, errors_out=errors)
-
-    gated_failed = [
-        cat
-        for cat, err in errors.items()
-        if cat not in config.NO_AUTH_CATEGORIES and err.status_code in (401, 403)
-    ]
-    retried = False
-    if gated_failed and auth_source != "none":
-        print(
-            f"\n[WARN] {len(gated_failed)} categor(ies) came back unauthorized despite having a "
-            f"session -- refreshing it and retrying: {', '.join(gated_failed)}"
-        )
-        token_cache.invalidate()
+    # ASK THE PORTALS instead of guessing which state this is.
+    #
+    # Most registration formats identify their authority outright, so
+    # `candidates` is one entry and this loop runs once -- the ordinary
+    # resolve, unchanged. Where two authorities share a format (MahaRERA and
+    # TG-RERA both issue P + 11 digits), each is tried in turn and the first
+    # one that actually HAS the project wins.
+    #
+    # This costs nothing in the common case: resolving the project on a
+    # portal is work acquire() does anyway, so a successful probe IS the
+    # resolve. Only a miss costs an extra lookup, and a miss is exactly the
+    # case where guessing would have produced a confident wrong answer
+    # against the wrong authority.
+    acquired = None
+    attempted = []
+    for candidate in candidates:
+        if len(candidates) > 1 and not candidate.can(states.CAP_LOOKUP_BY_REG_NO):
+            # Some authorities cannot be searched by registration number at
+            # all -- TG-RERA's public record does not even display one. Skip
+            # rather than pretend, and say so if nothing else matches.
+            attempted.append((candidate, "cannot be searched by registration number"))
+            continue
         try:
-            token = session_auth.acquire_token_via_browser(project_id, timeout_seconds=args.captcha_timeout)
-            auth_source = "fresh_browser"
-            retried = True
-            retry_data = api_client.fetch_all_categories(project_id, raw_dir, token, categories=gated_failed)
-            category_data.update(retry_data)
-        except (session_auth.CaptchaTimeoutError, session_auth.BrowserClosedError) as e:
-            print(f"[WARN] Retry session capture failed ({e}) -- leaving those categories as failed.")
+            adapter = states.get_adapter(candidate.code)
+        except NotImplementedError as e:
+            attempted.append((candidate, "no acquisition adapter yet"))
+            if len(candidates) == 1:
+                print(f"[ERROR] {e}")
+                return 1
+            continue
 
-    print("\n[INFO] Downloading documents...")
-    documents_manifest = api_client.download_documents(
-        category_data.get("documents"),
-        documents_dir,
-        token,
-        project_id,
-        prior_manifest=prior_manifest,
-        prior_documents_dir=prior_documents_dir,
-    )
-    downloaded = sum(1 for d in documents_manifest if d["status"] == "downloaded")
-    reused = sum(1 for d in documents_manifest if d["status"] == "reused")
-    print(
-        f"[OK] {downloaded + reused}/{len(documents_manifest)} document(s) available "
-        f"({downloaded} downloaded, {reused} reused from the previous run)."
-    )
-
-    print("\n[INFO] Downloading complaint order PDFs...")
-    complaint_orders_dir = os.path.join(project_out_dir, "complaint_orders")
-    try:
-        complaint_orders_manifest = api_client.download_complaint_orders(
-            category_data.get("complaints"),
-            complaint_orders_dir,
-            token,
-            project_id,
-            prior_manifest=prior_complaint_orders_manifest,
-            prior_documents_dir=prior_complaint_orders_dir,
-        )
-        co_downloaded = sum(1 for d in complaint_orders_manifest if d["status"] == "downloaded")
-        co_reused = sum(1 for d in complaint_orders_manifest if d["status"] == "reused")
-        print(
-            f"[OK] {co_downloaded + co_reused}/{len(complaint_orders_manifest)} complaint order(s) available "
-            f"({co_downloaded} downloaded, {co_reused} reused from the previous run)."
-        )
-    except Exception as e:
-        # New, still-narrow feature -- a DMS outage or an unexpected
-        # complaints.json shape here must not take down an otherwise-good run.
-        print(f"[WARN] Complaint order download failed ({e}) -- continuing without it.")
-        complaint_orders_manifest = []
-
-    with open(os.path.join(project_out_dir, "complaint_orders_manifest.json"), "w", encoding="utf-8") as f:
-        json.dump(complaint_orders_manifest, f, indent=2, ensure_ascii=False)
-
-    promoter_name = _extract_promoter_name(category_data)
-    portfolio = None
-    if promoter_name:
-        print(f"\n[INFO] Building promoter portfolio for '{promoter_name}'...")
+        if len(candidates) > 1:
+            reporter.info(f"Looking for {query} on {candidate.rera_acronym}...")
         try:
-            with requests.Session() as portfolio_session:
-                portfolio = promoter_portfolio_mod.build_promoter_portfolio(
-                    promoter_name, portfolio_session, token, headless=not args.headed,
-                    subject_project_partners_data=category_data.get("partners"), subject_reg_no=reg_no,
-                )
-            promoter_dir = os.path.join(project_out_dir, "promoter")
-            os.makedirs(promoter_dir, exist_ok=True)
-            with open(os.path.join(promoter_dir, "portfolio.json"), "w", encoding="utf-8") as f:
-                json.dump(portfolio, f, indent=2, ensure_ascii=False)
-            t = portfolio["totals"]
+            acquired = adapter.acquire(query, ctx)
+        except states.StateResolutionError as e:
+            attempted.append((candidate, str(e)))
+            continue
+        profile = candidate
+        if len(candidates) > 1:
+            # A fact now, not a guess -- the authority's own search found it.
+            reporter.ok(f"Confirmed on {profile.rera_acronym}: {query} is a {profile.state_name} project.")
+        break
+
+    if acquired is None:
+        print(f"[ERROR] '{query}' could not be found on any authority whose registration format it matches.")
+        for candidate, why in attempted:
+            print(f"          - {candidate.rera_acronym}: {why}")
+        unsearchable = [c for c, _ in attempted if not c.can(states.CAP_LOOKUP_BY_REG_NO)]
+        if unsearchable:
+            names = ", ".join(c.rera_acronym for c in unsearchable)
             print(
-                f"[OK] Promoter portfolio: {t['total_projects']} project(s), "
-                f"{t['total_complaints']} complaint(s), {t['total_appeals']} appeal(s)."
+                f"        {names} cannot be looked up by registration number -- its public "
+                f"record does not expose one. Re-run with the PROJECT NAME instead, and "
+                f"--state to pick the authority."
             )
-        except Exception as e:
-            # Broad on purpose: this opens its own Playwright browser and
-            # must never be fatal to the main run.
-            print(f"[WARN] Promoter portfolio build failed ({e}) -- continuing without it.")
-    else:
-        print("\n[WARN] Could not determine promoter name -- skipping promoter portfolio.")
+        return 1
+
+    print(f"[INFO] State: {profile.state_name} ({profile.rera_acronym})")
+
+    reg_no = acquired.reg_no
+    project_id = acquired.project_id
+    token = None  # every token-using stage now lives behind the adapter
+    auth_source = acquired.auth_source
+    category_data = acquired.category_data
+    documents_manifest = acquired.documents_manifest
+    complaint_orders_manifest = acquired.complaint_orders_manifest
+    promoter_name = acquired.promoter_name
+    portfolio = acquired.promoter_portfolio
+
+    project_out_dir = os.path.join(args.output_dir, reg_no)
+    raw_dir = os.path.join(project_out_dir, "raw")
+    documents_dir = acquired.documents_dir or os.path.join(project_out_dir, "documents")
+    complaint_orders_dir = acquired.complaint_orders_dir or os.path.join(project_out_dir, "complaint_orders")
+
+    # A state that cannot do something says so, rather than rendering an
+    # empty section that reads like a clean check.
+    for note in acquired.notes:
+        print(f"[INFO] {note}")
+
 
     # Opt-in, and placed here on purpose: this is the last step that needs a
     # human at the keyboard (a CAPTCHA solve per portal lookup), so it sits
@@ -460,6 +428,7 @@ def main() -> int:
             reg_no, category_data, documents_manifest, documents_dir, research_data, args.output_dir,
             complaint_orders_manifest=complaint_orders_manifest, complaint_orders_dir=complaint_orders_dir,
             reviews=reviews, promoter_portfolio=portfolio, pipeline_start_time=pipeline_start_time,
+            state_profile=profile,
         )
         external_charter_path = charter_path.replace("_Internal.docx", "_External.docx")
         print(f"[OK] Company Charter (Internal) written to {charter_path}")
@@ -478,6 +447,12 @@ def main() -> int:
         json.dump(
             {
                 "reg_no": reg_no,
+                # Which state this run was about. finalize_report and the
+                # module CLIs read it back so a re-render months later still
+                # produces the right state's labels. Absent in every tree
+                # written before this field existed -- get_profile(None)
+                # treats that as Maharashtra, which is what those runs were.
+                "state": profile.code,
                 "project_id": project_id,
                 "auth_source": auth_source,
                 "promoter_name": promoter_name,
@@ -501,6 +476,7 @@ def main() -> int:
         promoter_portfolio=portfolio,
         research_data=research_data,
         charter_facts=charter_facts,
+        state_profile=profile,
     )
 
     failed = [cat for cat, data in category_data.items() if data is None]
@@ -509,11 +485,20 @@ def main() -> int:
     print("\n" + "=" * 60)
     print("  Run summary")
     print("=" * 60)
-    print(f"  auth source:         {_AUTH_SOURCE_LABELS[auth_source]}{' (after retry)' if retried else ''}")
+    print(f"  auth source:         {_AUTH_SOURCE_LABELS[auth_source]}")
+    not_published = getattr(acquired, "categories_not_published", set()) or set()
     for cat in config.CATEGORY_ORDER:
         data = category_data.get(cat)
+        if data is None and cat in not_published:
+            # Not a failure -- this authority has no such endpoint. Saying
+            # "FAILED" here would invite a pointless retry and imply the
+            # data exists somewhere.
+            print(f"  {cat:<20} not published by {profile.rera_acronym}")
+            continue
         if cat == "documents":
-            count = f"{downloaded} downloaded, {reused} reused / {len(documents_manifest)} found"
+            _dl = sum(1 for d in documents_manifest if d["status"] == "downloaded")
+            _re = sum(1 for d in documents_manifest if d["status"] == "reused")
+            count = f"{_dl} downloaded, {_re} reused / {len(documents_manifest)} found"
         elif data is None:
             count = "FAILED"
         elif isinstance(data, list):

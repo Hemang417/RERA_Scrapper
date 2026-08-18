@@ -21,6 +21,7 @@ from reportlab.platypus import (
 )
 
 import config
+import states
 
 _STYLES = getSampleStyleSheet()
 _TITLE_STYLE = ParagraphStyle("TitleBig", parent=_STYLES["Title"], fontSize=22, spaceAfter=6)
@@ -63,7 +64,7 @@ _AUTH_SOURCE_LABELS = {
 def _header_footer(canvas, doc):
     canvas.saveState()
     canvas.setFont("Helvetica", 8)
-    canvas.drawString(2 * cm, 1.2 * cm, f"MahaRERA report -- {doc._reg_no}")
+    canvas.drawString(2 * cm, 1.2 * cm, f"{getattr(doc, '_rera_acronym', 'MahaRERA')} report -- {doc._reg_no}")
     canvas.drawRightString(A4[0] - 2 * cm, 1.2 * cm, f"Page {doc.page}")
     canvas.restoreState()
 
@@ -531,7 +532,13 @@ def build_pdf(
     promoter_portfolio: dict | None = None,
     research_data: dict | None = None,
     charter_facts: dict | None = None,
+    state_profile=None,
 ) -> None:
+    # Defaults to Maharashtra, and falls back to whatever the Charter facts
+    # already recorded, so main.py and finalize_report keep working unchanged.
+    _profile = state_profile or states.get_profile(
+        ((charter_facts or {}).get("state") or {}).get("code")
+    )
     doc = SimpleDocTemplate(
         out_path,
         pagesize=A4,
@@ -541,6 +548,9 @@ def build_pdf(
         rightMargin=2 * cm,
     )
     doc._reg_no = reg_no
+    # Stashed the same way as _reg_no above: the page footer is drawn by a
+    # callback that only receives `doc`, so there is nowhere else to put it.
+    doc._rera_acronym = _profile.rera_acronym
 
     failed_categories = {cat for cat, data in category_data.items() if data is None}
     guessed_categories = [
@@ -571,7 +581,7 @@ def build_pdf(
     story = []
 
     story.append(Spacer(1, 4 * cm))
-    story.append(Paragraph("MahaRERA Project Report", _TITLE_STYLE))
+    story.append(Paragraph(f"{_profile.rera_acronym} Project Report", _TITLE_STYLE))
     story.append(Spacer(1, 0.5 * cm))
     story.append(Paragraph(f"<b>Registration No.:</b> {reg_no}", _BODY_STYLE))
     story.append(Paragraph(f"<b>Internal Project ID:</b> {project_id}", _BODY_STYLE))

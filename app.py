@@ -41,16 +41,14 @@ import streamlit as st
 if platform.system() == "Windows" and sys.version_info >= (3, 8):
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
-import api_client
 import company_charter
 import config
 import deep_research
 import finalize_report
-import promoter_portfolio as promoter_portfolio_mod
 import report
 import resolver
 import run_archive
-import session_auth
+import states
 import token_cache
 
 st.set_page_config(page_title="MahaRERA Scraper", page_icon="\U0001F3E2", layout="wide")
@@ -85,25 +83,31 @@ def _pdf_preview(pdf_path: str, height: int = 700) -> None:
     )
 
 
-def _extract_promoter_name(category_data: dict) -> str | None:
-    partners = category_data.get("partners")
-    if isinstance(partners, dict):
-        details = partners.get("promoterDetails")
-        if isinstance(details, dict) and details.get("promoterName"):
-            return details["promoterName"].strip()
-    projects_data = category_data.get("projects")
-    if isinstance(projects_data, dict) and projects_data.get("promoterName"):
-        return projects_data["promoterName"].strip()
-    return None
+# _extract_promoter_name moved to states/adapter_maharashtra.py along with
+# the rest of the acquisition logic this file used to duplicate.
 
 
-# ---------------------------------------------------------------------------
-# Session state
-# ---------------------------------------------------------------------------
-st.session_state.setdefault("candidates", None)
-st.session_state.setdefault("resolved", None)  # {project_id, detail_url, reg_no}
-st.session_state.setdefault("run_result", None)  # everything a completed run produced
-st.session_state.setdefault("log", [])
+class StreamlitReporter:
+    """ProgressReporter for the Streamlit UI.
+
+    choose() always returns None -- "cannot ask". Streamlit re-runs the
+    whole script on every interaction, so a blocking prompt inside
+    acquire() would deadlock. Multi-candidate selection is handled by the
+    st.radio + session_state flow in the resolve phase instead, and
+    acquire() is only ever called once a project is already resolved."""
+
+    def info(self, msg: str) -> None:
+        log(msg)
+
+    def warn(self, msg: str) -> None:
+        log(f"WARN: {msg}")
+        st.warning(msg)
+
+    def ok(self, msg: str) -> None:
+        log(msg)
+
+    def choose(self, prompt: str, options: list) -> int | None:
+        return None
 
 
 def log(msg: str) -> None:
@@ -149,6 +153,13 @@ with tab_run:
         st.session_state.log = []
         st.rerun()
 
+    # Which authority this session is querying. app.py resolves the project
+    # interactively (its own st.radio flow) BEFORE acquire() is called, so
+    # by the time we get there the project is already pinned to one portal
+    # -- there is nothing left to probe. main.py's probe ladder applies to
+    # the CLI, where a bare registration number arrives with no UI step.
+    profile = states.get_profile(states.DEFAULT_STATE_CODE)
+
     if search_clicked:
         q = query.strip()
         st.session_state.candidates = None
@@ -193,21 +204,6 @@ with tab_run:
             project_id, reg_no = r["project_id"], r["reg_no"]
             project_out_dir = _project_out_dir(reg_no)
             raw_dir = os.path.join(project_out_dir, "raw")
-            documents_dir = os.path.join(project_out_dir, "documents")
-
-            # Snapshot whatever a previous run left behind before this run
-            # starts overwriting it -- must read prior_research before
-            # archiving moves it out from under project_out_dir.
-            prior_research = run_archive.load_prior_research(reg_no)
-            archive_dir = run_archive.archive_previous_run(reg_no)
-            prior_manifest = run_archive.load_prior_manifest(archive_dir)
-            prior_documents_dir = run_archive.prior_documents_dir(archive_dir)
-            prior_complaint_orders_manifest = run_archive.load_prior_complaint_orders_manifest(archive_dir)
-            prior_complaint_orders_dir = run_archive.prior_complaint_orders_dir(archive_dir)
-            if archive_dir:
-                st.caption(f"Archived previous run to `{archive_dir}`")
-
-            os.makedirs(project_out_dir, exist_ok=True)
 
             # This process stays alive across multiple runs (unlike main.py's
             # one-shot CLI), so the usage log must be cleared per-run here --
@@ -216,107 +212,62 @@ with tab_run:
             # same Streamlit session.
             deep_research.reset_usage_log()
 
-            # --- auth ---
-            token, auth_source = None, "none"
-            if explicit_token.strip():
-                token, auth_source = explicit_token.strip(), "explicit"
-            elif no_auto_auth:
-                token, auth_source = None, "none"
-            else:
-                cached = token_cache.load_valid()
-                if cached:
-                    token, auth_source = cached, "cached"
-                    st.info(f"Using cached session ({token_cache.minutes_left()} min left) -- no browser needed.")
-                else:
-                    st.warning(
-                        "No fresh session cached -- a **separate Chromium window** is about to open on this "
-                        "machine. Solve the CAPTCHA shown there and click Submit; this page will continue "
-                        "automatically once it's captured."
-                    )
-                    with st.spinner(f"Waiting up to {captcha_timeout}s for the CAPTCHA to be solved..."):
-                        try:
-                            token = session_auth.acquire_token_via_browser(project_id, timeout_seconds=int(captcha_timeout))
-                            auth_source = "fresh_browser"
-                        except (session_auth.CaptchaTimeoutError, session_auth.BrowserClosedError) as e:
-                            st.warning(f"Couldn't capture a session ({e}). Continuing with only the free categories.")
+            prior_research = None
 
-            st.caption(f"Auth source: {_AUTH_SOURCE_LABELS[auth_source]}")
+            def _archive_previous_run(reg_no: str) -> dict:
+                """Same callback contract main.py uses -- see
+                states.AcquisitionContext.on_resolved. Archiving is keyed on
+                reg_no and is state-neutral, so it stays with the caller."""
+                nonlocal prior_research
+                prior_research = run_archive.load_prior_research(reg_no)
+                archive_dir = run_archive.archive_previous_run(reg_no)
+                if archive_dir:
+                    st.caption(f"Archived previous run to `{archive_dir}`")
+                return {
+                    "manifest": run_archive.load_prior_manifest(archive_dir),
+                    "documents_dir": run_archive.prior_documents_dir(archive_dir),
+                    "complaint_orders_manifest": run_archive.load_prior_complaint_orders_manifest(archive_dir),
+                    "complaint_orders_dir": run_archive.prior_complaint_orders_dir(archive_dir),
+                }
 
-            # --- fetch categories ---
-            errors = {}
-            with st.spinner("Fetching all 9 categories..."):
-                category_data = api_client.fetch_all_categories(project_id, raw_dir, token, errors_out=errors)
-
-            gated_failed = [
-                cat for cat, err in errors.items()
-                if cat not in config.NO_AUTH_CATEGORIES and err.status_code in (401, 403)
-            ]
-            retried = False
-            if gated_failed and auth_source != "none":
-                st.warning(f"{len(gated_failed)} categor(ies) came back unauthorized -- refreshing the session and retrying: {', '.join(gated_failed)}")
-                token_cache.invalidate()
+            # ONE call, the same one main.py makes. Everything that used to
+            # be duplicated here -- auth, the 401/403 retry, the 9 category
+            # fetches, document and complaint-order downloads, the promoter
+            # portfolio -- now lives in states/adapter_maharashtra.py, so the
+            # CLI and the UI cannot drift apart again.
+            #
+            # project_id_override carries the project this UI already
+            # resolved interactively across reruns, so acquire() does not
+            # redo a search that has already happened.
+            ctx = states.AcquisitionContext(
+                output_dir=config.OUTPUT_ROOT,
+                reporter=StreamlitReporter(),
+                headed=headed_search,
+                explicit_token=explicit_token.strip() or None,
+                no_auto_auth=no_auto_auth,
+                captcha_timeout=int(captcha_timeout),
+                project_id_override=project_id,
+                on_resolved=_archive_previous_run,
+            )
+            adapter = states.get_adapter(profile.code)
+            with st.spinner("Fetching RERA data (categories, documents, promoter portfolio)..."):
                 try:
-                    with st.spinner("Refreshing session (solve the new CAPTCHA in the browser window)..."):
-                        token = session_auth.acquire_token_via_browser(project_id, timeout_seconds=int(captcha_timeout))
-                    auth_source = "fresh_browser"
-                    retried = True
-                    retry_data = api_client.fetch_all_categories(project_id, raw_dir, token, categories=gated_failed)
-                    category_data.update(retry_data)
-                except (session_auth.CaptchaTimeoutError, session_auth.BrowserClosedError) as e:
-                    st.warning(f"Retry session capture failed ({e}) -- leaving those categories as failed.")
+                    acquired = adapter.acquire(reg_no, ctx)
+                except states.StateResolutionError as e:
+                    st.error(str(e))
+                    st.stop()
 
-            # --- documents ---
-            with st.spinner("Downloading documents..."):
-                documents_manifest = api_client.download_documents(
-                    category_data.get("documents"),
-                    documents_dir,
-                    token,
-                    project_id,
-                    prior_manifest=prior_manifest,
-                    prior_documents_dir=prior_documents_dir,
-                )
-            downloaded = sum(1 for d in documents_manifest if d["status"] == "downloaded")
-            reused = sum(1 for d in documents_manifest if d["status"] == "reused")
-            if reused:
-                st.caption(f"{reused} document(s) reused from the previous run (unchanged, skipped re-download).")
+            category_data = acquired.category_data
+            documents_manifest = acquired.documents_manifest
+            complaint_orders_manifest = acquired.complaint_orders_manifest
+            documents_dir = acquired.documents_dir
+            complaint_orders_dir = acquired.complaint_orders_dir
+            promoter_name = acquired.promoter_name
+            portfolio = acquired.promoter_portfolio
+            auth_source = acquired.auth_source
+            for note in acquired.notes:
+                st.info(note)
 
-            # --- complaint order PDFs ---
-            complaint_orders_dir = os.path.join(project_out_dir, "complaint_orders")
-            with st.spinner("Downloading complaint order PDFs..."):
-                try:
-                    complaint_orders_manifest = api_client.download_complaint_orders(
-                        category_data.get("complaints"),
-                        complaint_orders_dir,
-                        token,
-                        project_id,
-                        prior_manifest=prior_complaint_orders_manifest,
-                        prior_documents_dir=prior_complaint_orders_dir,
-                    )
-                except Exception as e:
-                    st.warning(f"Complaint order download failed ({e}) -- continuing without it.")
-                    complaint_orders_manifest = []
-            with open(os.path.join(project_out_dir, "complaint_orders_manifest.json"), "w", encoding="utf-8") as f:
-                json.dump(complaint_orders_manifest, f, indent=2, ensure_ascii=False)
-
-            # --- promoter portfolio ---
-            promoter_name = _extract_promoter_name(category_data)
-            portfolio = None
-            if promoter_name:
-                with st.spinner(f"Building promoter portfolio for '{promoter_name}'..."):
-                    try:
-                        with requests.Session() as s:
-                            portfolio = promoter_portfolio_mod.build_promoter_portfolio(
-                            promoter_name, s, token, headless=not headed_search,
-                            subject_project_partners_data=category_data.get("partners"), subject_reg_no=reg_no,
-                        )
-                        promoter_dir = os.path.join(project_out_dir, "promoter")
-                        os.makedirs(promoter_dir, exist_ok=True)
-                        with open(os.path.join(promoter_dir, "portfolio.json"), "w", encoding="utf-8") as f:
-                            json.dump(portfolio, f, indent=2, ensure_ascii=False)
-                    except Exception as e:
-                        st.warning(f"Promoter portfolio build failed ({e}) -- continuing without it.")
-            else:
-                st.warning("Could not determine promoter name -- skipping promoter portfolio.")
 
             # --- deep research (market + promoter profile) ---
             research_data = None

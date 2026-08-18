@@ -5,8 +5,8 @@
 |---|---|
 | **Document** | Product Requirements Document |
 | **Product** | RERA Scrapper |
-| **Version** | 1.0 |
-| **Date** | 11 August 2026 |
+| **Version** | 1.1 |
+| **Date** | 13 August 2026 |
 | **Status** | Baseline — documents the product as built, plus forward roadmap |
 | **Owner** | Integrow Asset Management |
 | **Companion documents** | `SAD.md` (architecture), `CLAUDE.md` (flow), `rules.md` (content rules), `guardrails.md` (guards) |
@@ -162,6 +162,8 @@ Producing two documents by hand from one analysis is where inconsistency creeps 
 | 2026-07-31 | GST intake confirmed live end-to-end: PAN → GSTIN → **76 scoreable filing periods** spanning 2022-08 to 2026-06 |
 | **2026-08-10** | **Charter reshape shipped** (all 7 tasks of `CHARTER_RESHAPE_SPEC.md`): flags-vs-gaps split, clean-check deletion, per-clause External citations, facts-schema corrections, per-finding deep research. `charter_document.py`'s builder retired. Rules migrated from `CLAUDE.md` into `rules.md` |
 | 2026-08-11 | Guardrails documentation and the blocking compliance review hardened; this PRD baselined |
+| 2026-08-12 | Deep research's own verify/gap-retry fan-out capped with a shared `_VerificationBudget`, after P51800077150's first-ever research pass (no prior research to reuse) ran past $10 before being killed by hand |
+| **2026-08-13** | **Hard pipeline-wide cost ceiling added** (`PIPELINE_COST_CAP_USD`, $6.00, refuses a call rather than starting it once a run's total spend across deep research **and** Charter generation reaches the cap). The verify and gap-retry fan-out itself was also **batched** — many sources, or every gap open in a retry round, are now checked/retried in one shared-budget call instead of one call each — and every Claude API call now marks its request cacheable (`cache_control`), with cache-write/cache-read tokens priced and reported separately from plain input tokens |
 
 ---
 
@@ -178,7 +180,7 @@ Producing two documents by hand from one analysis is where inconsistency creeps 
 | **PG5** | **A partial failure never costs the run** | Every optional stage degrades to a warning; the run completes |
 | **PG6** | **A non-compliant document does not ship** | The PDF is blocked unless the document can be *shown* to comply |
 | **PG7** | **Two audiences, one analysis** | Internal and External render from the same facts dict, forking only at render time |
-| **PG8** | **Costs are visible and arguable** | Per-label token and USD cost in every run summary and `usage_summary.json` |
+| **PG8** | **Costs are visible and arguable, and bounded** | Per-label token and USD cost in every run summary and `usage_summary.json`; total run spend cannot exceed `PIPELINE_COST_CAP_USD` |
 | **PG9** | **Re-runs are cheap and diffable** | Documents reused, research reused within 24 h, prior runs archived not clobbered |
 | **PG10** | **The record outlives the page** | `.facts.json` retains everything the rendered document drops |
 
@@ -208,7 +210,7 @@ Producing two documents by hand from one analysis is where inconsistency creeps 
 | **Citation coverage, External** | Factual claims carrying a supporting `[N]` marker | 100 % (was ~30 % pre-reshape, ~83 % mid-reshape) |
 | **Gate pass rate** | Runs reaching PDF without a compliance block | > 95 %, with every block genuinely justified |
 | **Category completeness** | Categories fetched / 9 | 9/9 with a session; 2/9 is a valid degraded outcome |
-| **Cost per pack** | `usage_summary.json` total `cost_usd` | Tracked per run; no hard cap, but per-label attribution is mandatory |
+| **Cost per pack** | `usage_summary.json` total `cost_usd` | Tracked per run; per-label attribution is mandatory; total spend across deep research and Charter generation combined is hard-capped at `PIPELINE_COST_CAP_USD` ($6.00) |
 
 ### 5.2 Quality metrics
 
@@ -691,6 +693,7 @@ Requirements are numbered `FR-<area>-<n>`. **MUST / SHOULD / MAY** carry RFC-211
 | FR-RES-10 | A failed per-finding research call **MUST** keep the original finding text. **No finding may ever be deleted** by a research failure | P0 |
 | FR-RES-11 | The system **MUST** maintain a cross-run source-trust registry, tallying open-web domains and auto-promoting at the 5th distinct project, with promotion notes appearing in the **Internal document only** | P2 |
 | FR-RES-12 | Deep research failure **MUST** be never-fatal | P0 |
+| FR-RES-13 | Source re-verification and gap retry **MUST NOT** cost one API call per source or per gap; a block or retry round **MUST** be checked in as few shared-budget calls as the chunking bound allows, so cost stops scaling with how many claims a project's research turns up | P1 |
 
 ### 9.7 Scoring (FR-SCORE)
 
@@ -741,6 +744,8 @@ Requirements are numbered `FR-<area>-<n>`. **MUST / SHOULD / MAY** carry RFC-211
 | FR-OPS-06 | The system **MUST** offer a Streamlit UI wrapping the same functions, with **no duplicated logic** | P3 |
 | FR-OPS-07 | The token cache **MUST** expose a CLI with shell-friendly exit codes (0 success, 1 stale/absent, 2 bad usage) | P2 |
 | FR-OPS-08 | Cost figures for an unknown model **MUST** read `0.0` rather than a silently wrong number | P1 |
+| FR-OPS-09 | The system **MUST** enforce a hard ceiling (`PIPELINE_COST_CAP_USD`) on total spend for one project run, deep research and Charter generation combined. A call that would **start** after the run's spend is at or over the ceiling **MUST** be refused (`CostCapExceeded`, never retried); a call already in flight when the ceiling is crossed **MUST** be allowed to finish | P1 |
+| FR-OPS-10 | Prompt-cache write and read tokens **MUST** be priced and reported separately from plain input tokens, never folded into or ignored against the plain input rate | P2 |
 
 ---
 
@@ -953,6 +958,8 @@ These are product requirements, not style preferences. They are the reason the d
 | NFR-PERF-06 | Section B **MUST** be delivered as a cacheable system-prompt prefix block |
 | NFR-PERF-07 | All human-attended browser work **MUST** be contiguous in the pipeline, so the operator is not called back after a long unattended stage |
 | NFR-PERF-08 | Rendering **MUST** be verifiable with zero API calls from a saved `facts.json` |
+| NFR-PERF-09 | Every Claude API call **MUST** mark its request cacheable (`cache_control`), so a system prompt reused across calls under the same label is billed at the cache-read rate on its second and later uses |
+| NFR-PERF-10 | Verification and gap-retry fan-out **MUST** be batched — many claims or gaps checked per call, sharing one search budget — rather than issuing one independent call per claim or gap |
 
 ### 12.3 Usability (NFR-USE)
 
@@ -1288,7 +1295,7 @@ These are product requirements, not style preferences. They are the reason the d
 
 ## 18. Release history and roadmap
 
-### 18.1 Shipped (as of 2026-08-11)
+### 18.1 Shipped (as of 2026-08-13)
 
 ```
   v0.x  ACQUISITION
@@ -1328,6 +1335,16 @@ These are product requirements, not style preferences. They are the reason the d
         [x] guardrails.md + test_guardrails_doc.py symbol enforcement
         [x] Blocking compliance review with mechanical quote verification
         [x] CHARTER_ALLOW_UNCHECKED documented as a deliberate decision
+
+  v1.1  COST CONTROL  (2026-08-12 -- 2026-08-13)
+        [x] Shared _VerificationBudget caps the verify/gap-retry fan-out,
+            after P51800077150's first-ever research pass ran past $10
+        [x] _verify_claims_batch / _retry_gaps_batch: many sources or every
+            open gap in a round checked/retried in ONE call, not one each
+        [x] PIPELINE_COST_CAP_USD ($6.00) -- hard ceiling on total run
+            spend, deep research and Charter generation combined
+        [x] cache_control on every agentic pass; cache write/read tokens
+            priced and reported separately from plain input tokens
 ```
 
 ### 18.2 Roadmap
@@ -1444,7 +1461,7 @@ These are product requirements, not style preferences. They are the reason the d
 | PG5 Partial failure never costs the run | FR-CORP-10, FR-TRK-10, FR-COMP-12, FR-RES-12, NFR-REL-01/02 | Never-fatal wrappers | `test_gst_intake.py`, `test_promoter_portfolio.py` |
 | PG6 Non-compliant does not ship | FR-GATE-01..10 | Three-tier gate chain | `test_rules_preflight.py`, `test_claude_md_doc_review.py` |
 | PG7 Two audiences, one analysis | FR-DOC-01/02, FR-EXT-* | Render-time fork | `test_charter_report_source_labels.py` |
-| PG8 Costs visible | FR-OPS-02/03/08 | Per-label ledger | `test_usage_tracking.py` |
+| PG8 Costs visible and bounded | FR-OPS-02/03/08/09/10, FR-RES-13 | Per-label ledger + `PIPELINE_COST_CAP_USD` + batched fan-out | `test_usage_tracking.py`, `test_search_budget.py` |
 | PG9 Cheap re-runs | FR-ACQ-15/17/18, FR-RES-08 | Archive + reuse | `test_attach_rera_number.py` |
 | PG10 Record outlives page | FR-REV-01..03, FR-DOC-08 | Scrub/restore | `test_process_text_sanitizer.py` |
 

@@ -64,12 +64,21 @@ def fetch_category(
     session: requests.Session,
     token: str | None = None,
     body: dict | None = None,
+    endpoints: dict | None = None,
+    base_url: str | None = None,
 ):
     """Calls the configured endpoint for one category, returns the unwrapped body.
     Every category takes {"projectId": ...} except where the caller passes an
-    explicit `body` override (see past_experiences in fetch_all_categories)."""
-    endpoint = config.CATEGORY_ENDPOINTS[category]
-    url = config.BASE_URL + endpoint["path"]
+    explicit `body` override (see past_experiences in fetch_all_categories).
+
+    `endpoints`/`base_url` default to MahaRERA's tables in config, so every
+    existing caller is unchanged. They exist so a second state's adapter can
+    supply its own endpoint table without this module having to know that
+    states exist at all."""
+    endpoints = endpoints if endpoints is not None else config.CATEGORY_ENDPOINTS
+    base_url = base_url if base_url is not None else config.BASE_URL
+    endpoint = endpoints[category]
+    url = base_url + endpoint["path"]
     if body is None:
         body = {"projectId": project_id}
 
@@ -134,6 +143,9 @@ def fetch_all_categories(
     token: str | None = None,
     categories: list[str] | None = None,
     errors_out: dict | None = None,
+    endpoints: dict | None = None,
+    category_order: list | None = None,
+    base_url: str | None = None,
 ) -> dict:
     """Fetches the given categories (defaults to every configured category),
     writes raw JSON for each to raw_dir, and returns {category: data_or_None}.

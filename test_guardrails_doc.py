@@ -21,6 +21,7 @@ import re
 
 import charter_report
 import company_charter
+import states
 import deep_research
 import main
 
@@ -30,6 +31,9 @@ _MODULES = {
     "deep_research": deep_research,
     "charter_report": charter_report,
     "main": main,
+    # The state seam documents its guards in guardrails.md too, so the same
+    # rename-protection applies to them.
+    "states": states,
 }
 
 

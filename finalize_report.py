@@ -14,6 +14,7 @@ import os
 import sys
 
 import config
+import states
 import report
 
 
@@ -24,14 +25,14 @@ def _load_json(path: str):
         return json.load(f)
 
 
-def load_category_data(raw_dir: str) -> dict:
+def load_category_data(raw_dir: str, category_order: list | None = None) -> dict:
     """Reads output/<reg_no>/raw/*.json back into the same {category: data}
     shape main.py holds in memory during a live run -- a saved failure
     sentinel ({"_error": ..., "status_code": ...}, written by
     api_client.fetch_all_categories) is converted back to None, matching
     that convention."""
     category_data = {}
-    for category in config.CATEGORY_ORDER:
+    for category in (category_order if category_order is not None else config.CATEGORY_ORDER):
         data = _load_json(os.path.join(raw_dir, f"{category}.json"))
         if isinstance(data, dict) and "_error" in data:
             category_data[category] = None
@@ -68,6 +69,10 @@ def rebuild(reg_no: str, output_dir: str = config.OUTPUT_ROOT) -> str:
     run_meta = _load_json(os.path.join(project_out_dir, "run_meta.json")) or {}
     project_id = run_meta.get("project_id", "")
     auth_source = run_meta.get("auth_source")
+    # Which authority this run was about. Absent in every tree written before
+    # the state field existed -- get_profile(None) reads that as Maharashtra,
+    # which is what those runs were.
+    profile = states.get_profile(run_meta.get("state"))
 
     documents_manifest = _load_json(os.path.join(project_out_dir, "documents_manifest.json")) or []
     promoter_portfolio = _load_json(os.path.join(project_out_dir, "promoter", "portfolio.json"))
@@ -85,6 +90,7 @@ def rebuild(reg_no: str, output_dir: str = config.OUTPUT_ROOT) -> str:
         promoter_portfolio=promoter_portfolio,
         research_data=research_data,
         charter_facts=charter_facts,
+        state_profile=profile,
     )
     return pdf_path
 

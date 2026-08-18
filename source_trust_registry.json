@@ -1,16 +1,17 @@
 {
   "domains": {
     "99acres.com": {
-      "hit_count": 4,
+      "hit_count": 5,
       "projects": [
         "P52100019639",
         "P51800077150",
         "P51700048590",
-        "P51700031409"
+        "P51700031409",
+        "CONSTELLA_TS"
       ],
-      "promoted": false,
-      "promoted_on_project": null,
-      "review_note": null
+      "promoted": true,
+      "promoted_on_project": "CONSTELLA_TS",
+      "review_note": "Source \"99acres.com\" auto-promoted to trusted status after 5 corroborating uses across separate projects (most recently CONSTELLA_TS) -- this was an automatic, frequency-based promotion, not a manual accuracy review; recommend a one-time spot-check of this source's reliability."
     },
     "nobroker.in": {
       "hit_count": 3,
@@ -42,19 +43,21 @@
       "review_note": null
     },
     "wikipedia.org": {
-      "hit_count": 1,
+      "hit_count": 2,
       "projects": [
-        "P51800077150"
+        "P51800077150",
+        "CONSTELLA_TS"
       ],
       "promoted": false,
       "promoted_on_project": null,
       "review_note": null
     },
     "squareyards.com": {
-      "hit_count": 2,
+      "hit_count": 3,
       "projects": [
         "P51700031409",
-        "P51800077150"
+        "P51800077150",
+        "CONSTELLA_TS"
       ],
       "promoted": false,
       "promoted_on_project": null,

@@ -73,7 +73,7 @@ def _haversine_km(a: tuple, b: tuple) -> float:
     return 2 * r_km * math.asin(math.sqrt(x))
 
 
-def _geocode_query_for(address: str | None, district: str | None) -> str:
+def _geocode_query_for(address: str | None, district: str | None, state_name: str = "Maharashtra") -> str:
     """Builds the actual string to geocode for one past_experiences entry.
     Verified live against real MahaRERA data: its own `address` field is
     often a full legal land description (survey numbers, stray commas,
@@ -92,10 +92,10 @@ def _geocode_query_for(address: str | None, district: str | None) -> str:
         return f"{pincode_match.group(1)}, India"
     if address:
         return address
-    return f"{district}, Maharashtra, India"
+    return f"{district}, {state_name}, India"
 
 
-def extract_subject_project_location(partners_category_data: dict | None) -> str | None:
+def extract_subject_project_location(partners_category_data: dict | None, state_name: str = "Maharashtra") -> str | None:
     """Builds a geocodable locality string for the SUBJECT project (the one
     this portfolio is being built for context of) from its own `partners`
     category payload -- projectLegalLandAddressDetails.{locality, pinCode}
@@ -115,7 +115,7 @@ def extract_subject_project_location(partners_category_data: dict | None) -> str
     pincode = (addr.get("pinCode") or "").strip()
     if not locality and not pincode:
         return None
-    return ", ".join(part for part in (locality, pincode, "Maharashtra, India") if part)
+    return ", ".join(part for part in (locality, pincode, f"{state_name}, India") if part)
 
 
 def _count_records(data) -> int | None:
@@ -197,6 +197,7 @@ def build_promoter_portfolio(
     project_limit: int = config.PROMOTER_PROJECT_LIMIT,
     subject_project_partners_data: dict | None = None,
     subject_reg_no: str | None = None,
+    state_profile=None,
 ) -> dict:
     """Searches MahaRERA's Promoters tab for every project registered under
     `promoter_name`, then fetches each one's status/complaints/appeals to
@@ -220,6 +221,9 @@ def build_promoter_portfolio(
     self-reference rather than genuine other-project track record. It still
     counts normally toward total_projects/complaints/appeals/on_time_rate,
     matching this function's existing, unchanged behavior for those."""
+    # Geocoding needs a state name to disambiguate a locality; hardcoding
+    # "Maharashtra" sent a Hyderabad locality to a Maharashtra pin.
+    _state_name = state_profile.state_name if state_profile is not None else "Maharashtra"
     promoter_name = (promoter_name or "").strip()
     if not promoter_name:
         return _empty_portfolio(promoter_name, "No promoter name was available to search with.")
@@ -231,7 +235,7 @@ def build_promoter_portfolio(
             f"MahaRERA's Promoters-tab search returned no projects for '{promoter_name}'.",
         )
 
-    subject_location = extract_subject_project_location(subject_project_partners_data)
+    subject_location = extract_subject_project_location(subject_project_partners_data, _state_name)
     subject_coords = _geocode(subject_location) if subject_location else None
     geocode_cache = {}
 
@@ -397,7 +401,7 @@ def build_promoter_portfolio(
                         land_area_entries_found += 1
 
                         if subject_coords is not None:
-                            entry_location = _geocode_query_for(entry.get("address"), c.district)
+                            entry_location = _geocode_query_for(entry.get("address"), c.district, _state_name)
                             if entry_location not in geocode_cache:
                                 geocode_cache[entry_location] = _geocode(entry_location)
                             entry_coords = geocode_cache[entry_location]

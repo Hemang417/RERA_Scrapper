@@ -600,7 +600,7 @@ def _about_the_company(b: _Builder):
     b.para(
         f"{promoter} is {org_clause}{org_cite}, incorporated on "
         f"{profile.get('incorporation_date', 'an unconfirmed date')}, acting as the registered promoter for the "
-        f"project reviewed in this Charter. It is the Mumbai-market vehicle for the wider group described below, "
+        f"project reviewed in this Charter. It is the project-level vehicle for the wider group described below, "
         f"not a standalone developer with its own independent history."
     )
 

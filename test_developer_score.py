@@ -103,7 +103,12 @@ def test_gst_compliance_scores_when_data_available_else_unscored():
     no output/<reg_no>/gst_filing_input.json was dropped in)."""
     unscored = cc._score_gst_compliance({})
     assert unscored["score"] is None, unscored
-    assert "gst_filing_input.json" in unscored["reason"] or "no gst filing data" in unscored["reason"].lower(), unscored
+    assert "no gst filing data" in unscored["reason"].lower(), unscored
+    # The operator still learns what to supply -- from "field", not from a
+    # repo path rendered into the client-facing document.
+    assert unscored["field"] == "gst_compliance_check", unscored
+    assert ".json" not in unscored["reason"], unscored
+    assert "output/" not in unscored["reason"], unscored
 
     clean = cc._score_gst_compliance({
         "gst_compliance_check": {
@@ -139,7 +144,10 @@ def test_rera_compliance_scores_when_data_available_else_unscored():
     or one missing rera_core_fields entirely)."""
     unscored = cc._score_rera_compliance({})
     assert unscored["score"] is None, unscored
-    assert "not confidently parseable" in unscored["reason"].lower(), unscored
+    assert "could not be confidently determined" in unscored["reason"].lower(), unscored
+    # The pointer moved to "field"; the reason must not name internals.
+    assert unscored["field"] == "rera_core_fields.total_complaints_count", unscored
+    assert "rera_core_fields" not in unscored["reason"], unscored
 
     clean = cc._score_rera_compliance({
         "rera_core_fields": {

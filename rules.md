@@ -82,7 +82,7 @@ markers are parsed at runtime by `_read_rules_section()` in
   filenames appearing twice). Both are real disagreements in the source data,
   and silently choosing one side would present a guess as a fact.
 - **Template safety.** The `.docx` template
-  (`output/company_charters/Company_Charter_TEMPLATE_WebSourced.docx`) lives
+  (`output/company_charters/Company_Charter_TEMPLATE_Integrow_Branded.docx`) lives
   under the gitignored `output/` directory. Back it up (timestamped copy)
   before any change touching template structure.
 - **Restructure decisions.** If a generation run uses the newer Counterparty +
@@ -135,7 +135,7 @@ reason.
   the document says nothing at all: no sentence, no citation marker, no list of
   what was searched, no named sources. Delete the line. "No litigation found
   against the promoter, the project or the underlying land in any source
-  reviewed; MahaRERA's complaint, appeal and warrant records are empty[18]; the
+  reviewed; the state RERA authority's complaint, appeal and warrant records are empty[18]; the
   Title Report's 30-year search returned nothing[1]" is three citations spent
   establishing there is nothing to report: it all goes. The scope of what was
   checked stays in the facts file and does not reach the page. **Never attach a
@@ -243,13 +243,13 @@ as Section B: no em dashes, and no double hyphen used as a dash.
   at the end of the paragraph. A sentence carrying three claims from three
   sources gets three markers, each after its own clause; `[1][2][4]` parked
   after the final full stop is the failure this rule exists to prevent. A marker
-  never lands mid-word or mid-token ("MahaRERA[10]-registered").
+  never lands mid-word or mid-token ("RERA[10]-registered").
 - **Scope of the rule.** Every inline factual claim means every one: Executive
   Summary bullets, flag headlines, table cells, appendix prose and score-table
   notes are all in scope. A section shipping with no markers at all is a defect,
   not a stylistic choice. Treat full coverage as the target and check it.
 - **The marker must actually support the claim.** Cite the source that
-  establishes the specific statement. Citing the MahaRERA complaints record for
+  establishes the specific statement. Citing the state RERA complaints record for
   a sentence beginning "independent web research found..." is a mis-citation
   even though both are real sources. Where a claim rests on the absence of a
   result from a named search, cite that search. A missing marker is a lesser
@@ -257,7 +257,7 @@ as Section B: no em dashes, and no double hyphen used as a dash.
   adjacent source.
 - **Source labels.** External Sources entries are descriptive citations: issuer,
   what the document is, and its date ("Affidavit-cum-Declaration (Form B) under
-  Rule 3(6), notarized 12-13 March 2024, filed with MahaRERA"). Never a raw
+  Rule 3(6), notarized 12-13 March 2024, filed with the state RERA authority"). Never a raw
   internal filename, never a bare category label like "Project record" or
   "appeals data" that a reader cannot check. Internal keeps its own full
   bibliographic list with filenames; that list is not reused for External.
