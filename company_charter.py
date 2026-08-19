@@ -1515,6 +1515,84 @@ def _zaubacorp_core_fields(soup) -> dict:
     return fields
 
 
+def _zaubacorp_charges(table) -> list:
+    """MCA charge filings (Form CHG-1) from ZaubaCorp's "Charges (Secured
+    Loans)" table.
+
+    WHY THIS IS WORTH MORE THAN IT LOOKS. A charge is the borrower's own
+    filing to the Registrar, within 30 days, naming the LENDER, the AMOUNT
+    and the assets pledged -- and banks insist on it because an unregistered
+    charge is void against a liquidator. It is therefore the only
+    INDEPENDENT check this pipeline has on a promoter's declared mortgage:
+    the RERA record states a mortgage AREA and never a lender, and
+    fsi_metrics.mortgage_lender has had no corroborating source at all.
+
+    Confirmed live on a real promoter: four open charges totalling ~Rs 90.3
+    crore, to HDFC Bank and Catalyst Trusteeship, on a page this pipeline
+    was ALREADY fetching for the company profile. No new request, no new
+    portal, no cost.
+
+    A charge with no closure date is OPEN. That distinction is the whole
+    point of reading the table -- a satisfied charge is history, an open one
+    is a live encumbrance on the borrower's assets. `closure_date` of "-"
+    (ZaubaCorp's empty marker) means open, so it is normalised to None here
+    rather than left as a string that would read as a date."""
+    rows = _zaubacorp_director_table(table)
+    charges = []
+    for row in rows:
+        closure = (row.get("Charge Closure Date") or "").strip()
+        if closure in ("-", "", "--"):
+            closure = None
+        amount = (row.get("Amount") or "").strip()
+        if _looks_paywalled(amount):
+            amount = None
+        charges.append({
+            "charge_id": (row.get("Charge ID") or "").strip() or None,
+            "creation_date": (row.get("Charge Creation Date") or "").strip() or None,
+            "modification_date": ((row.get("Charge Modification Date") or "").strip() or None),
+            "closure_date": closure,
+            "assets_under_charge": (row.get("Assets Under Charge") or "").strip() or None,
+            "amount": amount,
+            "charge_holder": (row.get("Charge Holder") or "").strip() or None,
+            # Derived, not scraped -- see the docstring.
+            "is_open": closure is None,
+        })
+    return charges
+
+
+def summarise_charges(charges: list) -> dict:
+    """Reader-facing rollup: how much secured borrowing is OPEN, and to whom.
+
+    Returns amounts as floats where they parsed, and leaves `total_open_amount`
+    as None when NO amount could be read -- never 0, which would say
+    "no secured borrowing" when the truth is "the figures were unreadable"."""
+    charges = charges or []
+    open_charges = [c for c in charges if c.get("is_open")]
+
+    total = None
+    for charge in open_charges:
+        raw = (charge.get("amount") or "").replace(",", "").strip()
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        total = (total or 0.0) + value
+
+    lenders = []
+    for charge in open_charges:
+        holder = charge.get("charge_holder")
+        if holder and holder not in lenders:
+            lenders.append(holder)
+
+    return {
+        "total_charges": len(charges),
+        "open_charges": len(open_charges),
+        "satisfied_charges": len(charges) - len(open_charges),
+        "total_open_amount": total,
+        "open_lenders": lenders,
+    }
+
+
 def _zaubacorp_director_table(table) -> list:
     rows = []
     header_cells = [th.get_text(strip=True) for th in table.find_all("th")]
@@ -1591,7 +1669,7 @@ def lookup_company_by_cin(cin: str) -> dict:
     soup, url = result
 
     fields = _zaubacorp_core_fields(soup)
-    current_directors, past_directors = [], []
+    current_directors, past_directors, charges = [], [], []
     for table in soup.find_all("table"):
         heading = table.find_previous(["h1", "h2", "h3", "h4", "h5"])
         heading_text = heading.get_text(strip=True) if heading else ""
@@ -1599,6 +1677,8 @@ def lookup_company_by_cin(cin: str) -> dict:
             current_directors = _zaubacorp_director_table(table)
         elif heading_text.startswith("Past Directors"):
             past_directors = _zaubacorp_director_table(table)
+        elif heading_text.startswith("Charges"):
+            charges = _zaubacorp_charges(table)
 
     return {
         "found": True,
@@ -1614,6 +1694,10 @@ def lookup_company_by_cin(cin: str) -> dict:
         "paid_up_capital": _zaubacorp_clean(fields.get("Paid-up Share Capital")),
         "current_directors": current_directors,
         "past_directors": past_directors,
+        # MCA charge filings (Form CHG-1) -- secured borrowing, with the
+        # LENDER named. See _zaubacorp_charges for why this matters more
+        # than its size suggests.
+        "charges": charges,
         "shareholding_note": (
             "Per-shareholder/promoter shareholding percentages are gated behind ZaubaCorp's paid "
             "report and were not available on this pass; only aggregate authorised/paid-up capital "

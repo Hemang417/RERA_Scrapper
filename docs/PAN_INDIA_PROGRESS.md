@@ -1,6 +1,6 @@
 # Pan-India RERA — progress and resumption notes
 
-**Updated 19 August 2026.** Working tree is green: `python -m pytest -q` → **402 passed**.
+**Updated 19 August 2026.** Working tree is green: `python -m pytest -q` → **414 passed**.
 MahaRERA output is byte-identical to the pre-refactor baseline.
 
 Full plan: `~/.claude/plans/yes-make-the-plan-starry-neumann.md`
@@ -20,7 +20,7 @@ Data coverage: `docs/RERA_Data_Coverage.xlsx` (regenerate with `python build_dat
 | Phase 2b | Karnataka (K-RERA) adapter | **Adapter done + live-verified.** End-to-end run blocked on the portal being down — see below |
 | Phase 2c | Wrap `ts_rera_client` as the Telangana adapter | **Done**, mapper tested against the real CONSTELLA capture |
 | Phase 3 | Fix Maharashtra CTS land-record extraction | Not started |
-| Phase 4 | Group entity derivation + group-wide sweep | Not started |
+| Phase 4 | Group entity derivation + group-wide sweep | **4a + 4d done.** 4b/4c/4e (group-wide RERA, litigation, GST sweeps) not started |
 
 Registered states: **MH**, **GJ**, **KA**, **TG** — all four now have adapters.
 TG declares zero capabilities, which is a complete adapter, not a stub.
@@ -55,8 +55,48 @@ crashing, which is what it did this morning.
 
 ### Next up
 
-Phase 3 (CTS extraction — its first step needs a human CAPTCHA solve), then Phase 4
-(group entities). Phase 2 is otherwise complete.
+**Phase 3 (CTS extraction)** — its first step is re-running one Maharashtra land-record
+lookup, which NEEDS A HUMAN at the keyboard for a CAPTCHA solve. That single test decides
+whether it is a half-hour parser fix or a real project.
+
+**Phase 4b/4c/4e** — the group-wide sweeps. 4a built the entity graph they iterate, so
+they are unblocked: run `promoter_portfolio` per confirmed entity across the state
+adapters, then litigation and GST the same way. Use
+`group_entities.entity_names_for_sweep(graph)`, which defaults to director-or-filed links
+and deliberately excludes address-only ones.
+
+## Phase 4a/4d — what landed
+
+**Group entity graph** (`group_entities.py`). Propose by brand name, confirm by a hard
+link. On the real Pranami subject: 65 confirmed entities, and 6 name-matched candidates
+correctly held back as unconfirmed — including a Delhi hydro-power company and a Gujarat
+non-profit that merely share the word "PRANAMI".
+
+Link strength is tiered, because the three signals are not equal: **filed** relationship >
+**shared director** > **shared registered office**. 28 of those 65 were address-only, and a
+registered-office service provider in Mumbai hosts dozens of unrelated companies —
+`entity_names_for_sweep()` therefore excludes them by default, so a co-tenant's litigation
+never lands in this promoter's track record.
+
+**MCA charge filings** (`company_charter.summarise_charges`). Parsed from the ZaubaCorp page
+the pipeline was ALREADY fetching — no new request, no cost. Live on the real promoter:
+
+```
+100857390  2023-10-31  OPEN        3,491,110.00  HDFC BANK LIMITED
+100878097  2024-01-29  OPEN      300,000,000.00  CATALYST TRUSTEESHIP LIMITED
+100939871  2024-03-26  OPEN      300,000,000.00  CATALYST TRUSTEESHIP LIMITED
+100940922  2024-03-26  OPEN      300,000,000.00  CATALYST TRUSTEESHIP LIMITED
+=> Rs 90.35 crore of OPEN secured borrowing, 2 lenders
+```
+
+No closure date means the charge is live. This is the only independent check the pipeline
+has on a promoter's declared mortgage — the RERA record states an area and never a lender.
+
+**Still to wire:** neither is rendered into the Charter yet. The data is in
+`company_profile_check.charges`; a Charter section and the Developer Score's
+financial-strength sub-metric are the obvious consumers.
+
+---
 
 ## Bugs found by running things live
 

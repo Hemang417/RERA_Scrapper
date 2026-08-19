@@ -169,8 +169,10 @@ CIN_FINDINGS = [
     ("Group / affiliated companies", "ZaubaCorp director & address crosswalk", "Yes", "Free", "confirmed-live",
      "group_companies_check", "Hard links only: shared director, shared registered office, or filed subsidiary/associate/JV."),
     ("MCA CHARGE FILINGS (lender, amount, assets, satisfaction)", "ZaubaCorp (same page)",
-     "Partial", "Free", "observed", "(unmapped -- Phase 4d)",
-     "NOT PARSED YET. Page is already fetched. Covers corporate promoters nationally."),
+     "Yes", "Free", "confirmed-live", "company_profile_check.charges",
+     "NOW PARSED. Live on a real promoter: 4 OPEN charges, ~Rs 90.3 crore, to HDFC Bank and "
+     "Catalyst Trusteeship. No closure date = live encumbrance. The only independent check on "
+     "a promoter's declared mortgage -- the RERA record gives an area and never a lender."),
     ("Balance sheet / P&L", "MCA (paid) / Tofler / InstaFinancials (paywalled)",
      "No", "Paid", "confirmed-live", "n/a",
      "NOT freely available for a private SPV -- EXCEPT in Gujarat, where GujRERA publishes audited statements per project."),
@@ -186,9 +188,9 @@ UNMAPPED = [
     ("Audited balance sheet / P&L / ITR", "GujRERA findoc", "Gujarat projects only",
      "Financial strength sub-metric currently scores None for every project. This would score it for GJ.",
      "High"),
-    ("MCA charge filings", "ZaubaCorp, national", "All corporate promoters",
-     "fsi_metrics.mortgage_lender has no independent source today; a charge lookup names the lender.",
-     "High"),
+    ("Group entity graph (confirmed vs proposed)", "group_entities.py", "All corporate promoters",
+     "BUILT. Propose by brand name, confirm by shared director / office / filed relationship. "
+     "Link strength tiered -- address-only links excluded from sweeps.", "High"),
     ("K-RERA defaulters list", "K-RERA, observed", "Karnataka projects",
      "No equivalent exists in any other authority. Direct red-flag input.",
      "High"),
@@ -343,6 +345,13 @@ def build_readme(wb):
          "Reading the wrong page would have produced a false clean record.", None),
         ("6. K-RERA embeds its entire 9,888-project index client-side, giving a promoter-to-projects "
          "map for the whole state in one request -- the opposite of Gujarat.", None),
+        ("7. MCA charge filings were on the ZaubaCorp page all along. A real promoter shows 4 OPEN "
+         "charges totalling ~Rs 90.3 crore to HDFC Bank and Catalyst Trusteeship -- free, no extra "
+         "request, and the only independent check on a declared mortgage.", None),
+        ("8. Group membership CANNOT be derived from a brand name. Searching 'PRANAMI' returns a Delhi "
+         "hydro-power firm, a Gujarat non-profit and a Maharashtra castings company. Propose by name, "
+         "confirm by shared director / registered office / filed relationship -- and treat a shared "
+         "address as the weakest of the three (28 of 65 'group companies' were address-only).", None),
     ]
     for i, (text, font) in enumerate(lines, start=1):
         ws.cell(row=i, column=1, value=text)
