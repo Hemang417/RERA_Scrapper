@@ -212,14 +212,19 @@ with tab_run:
             # same Streamlit session.
             deep_research.reset_usage_log()
 
-            prior_research = None
+            # A one-slot mutable rather than `nonlocal`. This block runs at
+            # MODULE level -- Streamlit executes the script top-to-bottom --
+            # so there is no enclosing function for `nonlocal` to bind to,
+            # and it is a compile-time SyntaxError rather than something that
+            # shows up only when the branch is taken. main.py's identical
+            # callback sits inside def main(), which is why it works there.
+            _prior = {"research": None}
 
             def _archive_previous_run(reg_no: str) -> dict:
                 """Same callback contract main.py uses -- see
                 states.AcquisitionContext.on_resolved. Archiving is keyed on
                 reg_no and is state-neutral, so it stays with the caller."""
-                nonlocal prior_research
-                prior_research = run_archive.load_prior_research(reg_no)
+                _prior["research"] = run_archive.load_prior_research(reg_no)
                 archive_dir = run_archive.archive_previous_run(reg_no)
                 if archive_dir:
                     st.caption(f"Archived previous run to `{archive_dir}`")
@@ -253,7 +258,7 @@ with tab_run:
             with st.spinner("Fetching RERA data (categories, documents, promoter portfolio)..."):
                 try:
                     acquired = adapter.acquire(reg_no, ctx)
-                except states.StateResolutionError as e:
+                except states.StateAcquisitionError as e:
                     st.error(str(e))
                     st.stop()
 
@@ -273,7 +278,7 @@ with tab_run:
             research_data = None
             with st.spinner("Running agentic deep research (market + promoter profile) -- this calls the Claude API and can take several minutes..."):
                 try:
-                    research_data = deep_research.run_deep_research(reg_no, category_data, prior_research=prior_research)
+                    research_data = deep_research.run_deep_research(reg_no, category_data, prior_research=_prior["research"])
                     if research_data.get("_reused_prior"):
                         st.caption("Reused prior confirmed research sources -- only previously-open gaps were re-attempted.")
                 except Exception as e:

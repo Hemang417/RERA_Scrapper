@@ -287,7 +287,7 @@ def main() -> int:
                 continue
             try:
                 project_id, _detail_url, reg_no, token, _auth = verify_adapter.resolve_and_auth(query, ctx)
-            except states.StateResolutionError:
+            except states.StateAcquisitionError:
                 verify_adapter = None
                 continue
             profile = candidate
@@ -343,7 +343,7 @@ def main() -> int:
             reporter.info(f"Looking for {query} on {candidate.rera_acronym}...")
         try:
             acquired = adapter.acquire(query, ctx)
-        except states.StateResolutionError as e:
+        except states.StateAcquisitionError as e:
             attempted.append((candidate, str(e)))
             continue
         profile = candidate

@@ -51,6 +51,37 @@ def _imported_module_names(path):
     return names
 
 
+def test_every_entry_point_actually_compiles():
+    """ast.parse() is NOT enough, and this test exists because relying on it
+    shipped a broken app.py.
+
+    `nonlocal` binding, like several other scope rules, is resolved during
+    the SYMBOL-TABLE pass that compile() runs and ast.parse() skips. A
+    Stage 3 refactor moved main.py's archiving callback into app.py verbatim
+    -- but app.py runs at MODULE level (Streamlit executes the script
+    top-to-bottom), so its `nonlocal prior_research` had no enclosing
+    function to bind to. That is a hard SyntaxError on import. The
+    ast-based guards below all passed, the whole suite stayed green, and the
+    file was committed and pushed broken, because nothing ever imported or
+    compiled it.
+
+    compile() closes that gap for every entry point, not just app.py."""
+    import py_compile
+    import tempfile
+
+    for path in ("app.py", "main.py", "company_charter.py", "finalize_report.py"):
+        source = io.open(path, "r", encoding="utf-8").read()
+        try:
+            compile(source, path, "exec")
+        except SyntaxError as e:
+            raise AssertionError(
+                f"{path} does not compile: {e.msg} (line {e.lineno}). "
+                f"ast.parse() would not have caught this -- scope errors like a "
+                f"module-level `nonlocal` are resolved by compile(), not the parser."
+            ) from None
+    print("test_every_entry_point_actually_compiles: PASS")
+
+
 def test_app_does_not_import_the_acquisition_modules():
     imported = _imported_module_names(_APP)
     leaked = sorted(set(_FORBIDDEN) & imported)
@@ -86,6 +117,7 @@ def test_both_entry_points_call_the_same_acquire():
 
 
 if __name__ == "__main__":
+    test_every_entry_point_actually_compiles()
     test_app_does_not_import_the_acquisition_modules()
     test_app_still_goes_through_the_state_seam()
     test_both_entry_points_call_the_same_acquire()

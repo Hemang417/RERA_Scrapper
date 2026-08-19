@@ -55,7 +55,7 @@ import ssl
 
 import urllib3
 
-from .base import AcquisitionResult, StateResolutionError, storage_key
+from .base import AcquisitionResult, StateResolutionError, fetch_with_retry, storage_key
 from .gujarat import DMS_DOWNLOAD_URL, DMS_METADATA_URL, PROFILE, PROJECT_REG_API
 
 _TIMEOUT = 30
@@ -158,7 +158,10 @@ class GujaratAdapter:
         # --- resolve --------------------------------------------------
         # An exact registration number returns exactly one PROJECT row; a
         # free-text name may return several, so the caller chooses.
-        rows = search(pool, query.strip())
+        rows = fetch_with_retry(
+            lambda: search(pool, query.strip()),
+            what="GujRERA search", reporter=ctx.reporter,
+        )
         projects = [r for r in rows if r.get("entityType") == "PROJECT"]
         if not projects:
             raise StateResolutionError(

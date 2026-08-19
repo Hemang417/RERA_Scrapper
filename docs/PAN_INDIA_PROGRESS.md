@@ -1,6 +1,6 @@
 # Pan-India RERA — progress and resumption notes
 
-**Paused 18 August 2026.** Working tree is green: `python -m pytest -q` → **392 passed**.
+**Updated 19 August 2026.** Working tree is green: `python -m pytest -q` → **402 passed**.
 MahaRERA output is byte-identical to the pre-refactor baseline.
 
 Full plan: `~/.claude/plans/yes-make-the-plan-starry-neumann.md`
@@ -17,45 +17,68 @@ Data coverage: `docs/RERA_Data_Coverage.xlsx` (regenerate with `python build_dat
 | Stage 2 | Capability gates; state-independent bug fixes; `rules.md` generalised | **Done** |
 | Stage 3 | Acquisition extracted behind `StateAdapter`; `main.py` + `app.py` on one call | **Done** |
 | Phase 2a | Gujarat (GujRERA) adapter | **Done**, verified live end-to-end |
-| Phase 2b | Karnataka (K-RERA) adapter | **Adapter done + live-verified. One thing outstanding — see below** |
-| Phase 2c | Wrap `ts_rera_client` as the Telangana adapter | Not started |
+| Phase 2b | Karnataka (K-RERA) adapter | **Adapter done + live-verified.** End-to-end run blocked on the portal being down — see below |
+| Phase 2c | Wrap `ts_rera_client` as the Telangana adapter | **Done**, mapper tested against the real CONSTELLA capture |
 | Phase 3 | Fix Maharashtra CTS land-record extraction | Not started |
 | Phase 4 | Group entity derivation + group-wide sweep | Not started |
 
-Registered states: **MH** (full), **GJ** (full), **KA** (full), **TG** (profile only, no adapter).
+Registered states: **MH**, **GJ**, **KA**, **TG** — all four now have adapters.
+TG declares zero capabilities, which is a complete adapter, not a stub.
 
 ---
 
-## RESUME HERE — the one outstanding item
+## RESUME HERE
 
-Karnataka's adapter is built, live-verified, and fully tested. What has **not** been
-confirmed is a complete `main.py` run for a Karnataka project reaching `run_meta.json`.
+### Blocked, not broken: the Karnataka end-to-end run
 
-Three attempts, none of which invalidate the adapter:
-
-1. Killed by my own shell pipeline (`| head` sent SIGPIPE to python).
-2. Hung — a real bug, now fixed (see below).
-3. Stopped when work was paused.
-
-To finish it:
+`rera.karnataka.gov.in` has been **unreachable all of 19 August** — three consecutive
+connect timeouts, having worked fine on the 18th. The adapter is unaffected; it is the
+portal. Retry when it is back:
 
 ```bash
 python -u main.py "PRM/KA/RERA/1251/309/PR/201001/003607" --output-dir output
 ```
 
-Expect: ~9,900-project index, 122 documents listed / ~89 retrieved, **12 complaints**,
-2-project promoter portfolio. Deep research and the Charter will fail on the missing
-API key — that is the account limit, not a defect. Success looks like `run_meta.json`
-existing with `"state": "KA"` and a run summary printing.
+Expect ~9,900 projects indexed, 122 documents listed / ~89 retrieved, **12 complaints**,
+a 2-project promoter portfolio, and `run_meta.json` carrying `"state": "KA"`.
 
-Note the run is slow (large index + many documents). Run it unbuffered (`-u`) and
-redirect to a file; do not pipe through `head`.
+The outage did produce something useful: the run now **degrades cleanly** instead of
+crashing, which is what it did this morning.
 
----
+```
+[WARN] K-RERA project index failed (ConnectionError), attempt 1/3 -- retrying.
+[WARN] K-RERA project index failed (ReadTimeout), attempt 2/3 -- retrying.
+[ERROR] '...' could not be found on any authority whose registration format it matches.
+          - K-RERA: ... The portal appears to be unreachable right now; this is not a
+            problem with the project or the registration number.
+```
+
+### Next up
+
+Phase 3 (CTS extraction — its first step needs a human CAPTCHA solve), then Phase 4
+(group entities). Phase 2 is otherwise complete.
 
 ## Bugs found by running things live
 
 Each of these was invisible until a real portal was hit, and each now has a guard.
+
+**0. app.py did not compile — and was committed and pushed that way.**
+The Stage 3 refactor moved main.py's archiving callback into app.py verbatim, but app.py
+runs at MODULE level (Streamlit executes the script top-to-bottom), so its
+`nonlocal prior_research` had no enclosing function to bind to. A hard SyntaxError on
+import. Every guard passed and the suite stayed green because
+`test_app_no_duplicate_orchestration.py` used `ast.parse()`, which does NOT run the
+symbol-table pass that resolves scope — and nothing ever imported app.py. That test now
+uses `compile()` across every entry point; verified that `ast.parse` accepts the broken
+code and `compile()` rejects it.
+
+**0b. A portal outage escaped as a traceback.**
+`requests.exceptions.ConnectionError` propagated straight past main.py, which only caught
+`StateResolutionError`. There is now a `StateAcquisitionError` base (with
+`StateResolutionError`, `StateAuthError` and a new `StateFetchError` under it), callers
+catch the base, and `states.fetch_with_retry` retries connection-level failures with
+backoff — deliberately not parse or HTTP errors, which fail identically however often
+they are repeated.
 
 **1. False clean record (K-RERA) — the worst one.**
 K-RERA's per-project complaint page does not reliably carry complaints. For

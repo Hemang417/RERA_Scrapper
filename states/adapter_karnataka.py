@@ -44,7 +44,7 @@ import urllib.parse
 import requests
 from bs4 import BeautifulSoup
 
-from .base import AcquisitionResult, StateResolutionError, storage_key
+from .base import AcquisitionResult, StateResolutionError, fetch_with_retry, storage_key
 from .karnataka import (
     COMPLAINT_POST,
     COMPLAINT_REPORT,
@@ -147,7 +147,14 @@ class KarnatakaAdapter:
         query = query.strip()
 
         ctx.reporter.info("Loading the K-RERA project index...")
-        index_html = session.get(SEARCH_PAGE, timeout=_TIMEOUT).text
+        # The single most failure-prone request in this adapter: a 6.3 MB
+        # response from a portal that is not highly available. One dropped
+        # connection used to kill the whole run before anything was written,
+        # and escaped main.py as a raw requests traceback.
+        index_html = fetch_with_retry(
+            lambda: session.get(SEARCH_PAGE, timeout=_TIMEOUT).text,
+            what="K-RERA project index", reporter=ctx.reporter,
+        )
         index = parse_search_index(index_html)
         ctx.reporter.info(f"K-RERA index: {len(index)} registered project(s).")
 
@@ -166,11 +173,14 @@ class KarnatakaAdapter:
         os.makedirs(raw_dir, exist_ok=True)
 
         # --- summary row + the internal application id ------------------
-        summary_html = session.post(
-            SEARCH_POST,
-            data={"regNo": entry["reg_no"], "appNo": entry["ack_no"], "btn1": "Search"},
-            timeout=_TIMEOUT,
-        ).text
+        summary_html = fetch_with_retry(
+            lambda: session.post(
+                SEARCH_POST,
+                data={"regNo": entry["reg_no"], "appNo": entry["ack_no"], "btn1": "Search"},
+                timeout=_TIMEOUT,
+            ).text,
+            what="K-RERA project summary", reporter=ctx.reporter,
+        )
         summary, action_id = self._parse_summary(summary_html)
         if not action_id:
             raise StateResolutionError(
@@ -180,8 +190,14 @@ class KarnatakaAdapter:
 
         # --- detail + complaints ----------------------------------------
         ctx.reporter.info("Fetching K-RERA project record...")
-        detail_html = session.post(DETAIL_POST, data={"action": action_id}, timeout=_TIMEOUT).text
-        complaint_html = session.post(COMPLAINT_POST, data={"action": action_id}, timeout=_TIMEOUT).text
+        detail_html = fetch_with_retry(
+            lambda: session.post(DETAIL_POST, data={"action": action_id}, timeout=_TIMEOUT).text,
+            what="K-RERA project detail", reporter=ctx.reporter,
+        )
+        complaint_html = fetch_with_retry(
+            lambda: session.post(COMPLAINT_POST, data={"action": action_id}, timeout=_TIMEOUT).text,
+            what="K-RERA complaint page", reporter=ctx.reporter,
+        )
 
         detail_tables = [_table_to_rows(t) for t in BeautifulSoup(detail_html, "html.parser").find_all("table")]
         parsed = self._parse_detail(detail_tables, summary)

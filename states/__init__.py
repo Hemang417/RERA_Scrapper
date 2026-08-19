@@ -27,8 +27,11 @@ from .base import (  # noqa: F401  -- re-exported for callers
     AcquisitionContext,
     AcquisitionResult,
     ProgressReporter,
+    StateAcquisitionError,
     StateAdapter,
     StateAuthError,
+    StateFetchError,
+    fetch_with_retry,
     StateProfile,
     StateResolutionError,
 )
@@ -169,16 +172,16 @@ _ADAPTER_MODULES = {
     "MH": "states.adapter_maharashtra",
     "GJ": "states.adapter_gujarat",
     "KA": "states.adapter_karnataka",
+    "TG": "states.adapter_telangana",
 }
 
 
 def get_adapter(code: str):
     """The acquisition adapter for a state code.
 
-    Raises for a state that has a PROFILE but no adapter yet (Telangana is
-    registered as a profile so the MH/TG registration-number tiebreak is
-    real and testable, but its adapter is Phase 2 work). The error names the
-    escape hatch that does work today, rather than failing blankly."""
+    Raises for a state that has a PROFILE but no adapter yet. The error
+    names the escape hatch that does work today (pre_built_facts), rather
+    than failing blankly. Every registered state has one as of Phase 2."""
     profile = get_profile(code)
     module_path = _ADAPTER_MODULES.get(profile.code)
     if module_path is None:

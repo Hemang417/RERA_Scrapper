@@ -351,7 +351,17 @@ class StateAdapter(Protocol):
     def acquire(self, query: str, ctx: AcquisitionContext) -> AcquisitionResult: ...
 
 
-class StateResolutionError(Exception):
+class StateAcquisitionError(Exception):
+    """Base for everything an adapter can fail with.
+
+    Callers catch THIS, so a new failure mode added later degrades cleanly
+    instead of escaping as a traceback. That is not hypothetical: a
+    K-RERA run crashed with a raw requests.exceptions.ConnectionError
+    straight past main.py, because main.py only caught
+    StateResolutionError and a portal outage is not a resolution failure."""
+
+
+class StateResolutionError(StateAcquisitionError):
     """Could not find the project on the state's portal. Adapters wrap their
     own portal-specific errors (resolver.ProjectNotFoundError,
     ts_rera_client.TSReraNotFoundError) in this at their own boundary --
@@ -359,5 +369,58 @@ class StateResolutionError(Exception):
     usable standalone."""
 
 
-class StateAuthError(Exception):
+class StateAuthError(StateAcquisitionError):
     """CAPTCHA/token acquisition failed. Same wrapping discipline."""
+
+
+class StateFetchError(StateAcquisitionError):
+    """The authority's portal could not be reached, or kept failing.
+
+    Distinct from StateResolutionError on purpose: "the portal is down" and
+    "this project does not exist there" call for completely different
+    responses from whoever reads the message, and only one of them is worth
+    retrying later."""
+
+
+def fetch_with_retry(call, *, what, attempts=3, base_delay=3.0, reporter=None):
+    """Runs `call()`, retrying transient network failures with backoff.
+
+    Indian state portals are not highly available. K-RERA's search page is a
+    6.3 MB response and the single most failure-prone request in that
+    adapter; one dropped connection used to kill an entire run before a
+    single byte was written. This is deliberately NOT a general-purpose
+    retry: it retries CONNECTION-level failures only, because an HTTP 404 or
+    a bad parse will fail identically however many times it is repeated.
+
+    Raises StateFetchError once the attempts are exhausted, so the caller
+    gets a clean, catchable failure with the portal named."""
+    import time
+
+    last = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return call()
+        except Exception as e:  # noqa: BLE001 -- narrowed just below
+            name = type(e).__name__
+            transient = (
+                "ConnectionError" in name
+                or "Timeout" in name
+                or "RemoteDisconnected" in name
+                or "ProtocolError" in name
+                or "SSLError" in name
+            )
+            if not transient:
+                raise
+            last = e
+            if attempt < attempts and reporter is not None:
+                reporter.warn(
+                    f"{what} failed ({name}), attempt {attempt}/{attempts} -- retrying."
+                )
+            if attempt < attempts:
+                time.sleep(base_delay * attempt)
+
+    raise StateFetchError(
+        f"{what} failed after {attempts} attempts ({type(last).__name__}: {last}). "
+        f"The portal appears to be unreachable right now; this is not a problem with "
+        f"the project or the registration number."
+    )
