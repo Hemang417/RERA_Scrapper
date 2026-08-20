@@ -46,6 +46,68 @@ finding to an expired token would be worse than never running the stage.
 `main._run_gst_intake_step` exists as its own function purely so that contract
 is testable rather than asserted in a comment.
 
+`company_charter._safe_promoter_identity` wraps the promoter-PAN read. The
+underlying pass does not signal failure by raising -- it returns an explicit
+not-found or unverified result carrying its own reason -- so this wrapper only
+covers a hard failure of the OCR stack itself.
+
+## 2c. Coverage — "not found" and "never asked" are different findings
+
+`group_sweep.sweep` reports a STATUS per authority, and that table is the
+product, not the project list. GujRERA, WBRERA and TG-RERA publish no promoter
+search at all, and ~24 states have no adapter: in every one of those cases an
+empty result means nobody looked. Three bugs here each manufactured a clean
+record from a search that never ran, and each now has a guard:
+
+- an injected test searcher could stand in for a state with no promoter search,
+  reporting GujRERA and WBRERA as "searched". Capability comes from the adapter;
+  injection replaces only the implementation.
+- the search budget was global with the STATE as the outer loop, so the first
+  authority consumed it and the rest were reported "searched, 0 projects"
+  having run zero queries. Entity is now the outer loop, and a state the budget
+  never reached says so (`STATUS_BUDGET_EXHAUSTED`).
+- an unreachable portal is `STATUS_UNREACHABLE`, never a zero.
+
+`group_sweep.enrich_projects` opens each match, and that is what CONFIRMS or
+REFUTES it: seven of ten live matches were false brand hits. Three outcomes,
+because a project SPV is neither identity nor a stranger: **confirmed** (the
+project's promoter is the entity), **probable** (a separate entity sharing the
+group's distinctive name, the one-vehicle-per-project pattern), **refuted**.
+Demanding identity refuted the one genuine group project.
+
+`company_charter._safe_charge_movement` + `charge_watch.compare` answer whether
+secured borrowing was repaid. A failed fetch is `checked=False`, never "no
+change"; a charge that VANISHED from the register is not a satisfied one (a
+satisfied charge stays listed with a closure date); a CHG-1 modification is not
+a release. `charge_watch` never claims the mirror proves the money is still
+owed, only that no satisfaction has reached it.
+
+## 2b. Identity — a wrong PAN is worse than no PAN
+
+`promoter_identity.verify_pan` is the gate on every PAN read off a filed card.
+A PAN is a national join key: it pulls MCA charges, GST filings and litigation
+into the Charter, so a misread one returns another company's records, all
+internally consistent and all about the wrong entity. Two independent checks
+must pass -- the 4th character against the closed set of PAN holder-type codes,
+and the 5th against the initial of the promoter name **the portal itself
+published** (`company_charter._portal_promoter_name`, deliberately not the
+model-authored `corporate_identity.promoter_name`, so both sides of the check
+are non-model sources). A candidate that fails either is returned in
+`unverified_candidates` with its reason, never used and never silently dropped.
+
+`promoter_identity.tesseract_available` guards the failure this cost real
+debugging time for. pytesseract shells out to `tesseract` by NAME; when the
+binary is absent it does not raise, every scanned card OCRs to the empty
+string, and the run reports "no PAN found" -- which reads in the finished
+Charter as *the promoter filed no PAN card*. That is a different finding from
+*we could not read the card they filed*, and only the second one is true. The
+guard reports the tooling gap instead. `company_charter.py` carries the same
+warning about the same binary.
+
+`promoter_identity._content_crop` refuses to crop a page whose content already
+fills it. Cropping exists for a small card on a blank sheet; applied to a dense
+page it would shave margins off a document that was already OCRing correctly.
+
 ## 3. Fallbacks — a model can only match or improve, never degrade
 
 Each model-backed judgement keeps its deterministic predecessor behind it:

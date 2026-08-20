@@ -137,6 +137,36 @@ def _find_table_by_header(tables: list, *needles) -> list:
     return []
 
 
+_INDEX_CACHE = []
+
+
+def search_promoter_projects(name, reporter=None):
+    """Projects in the K-RERA state index under a promoter matching `name`.
+
+    K-RERA embeds the entire state register client-side, so this is one
+    request for the whole state. Matching is a normalised SUBSTRING here,
+    unlike the exact match _promoter_portfolio uses: a sweep is looking for
+    candidate group projects to confirm, not building a single promoter's
+    track record, and the caller labels every hit as unconfirmed.
+    """
+    # Cached for the process: the index is the WHOLE STATE in one page, and
+    # a group sweep asks about dozens of entities. Re-fetching a large page
+    # per entity would turn one request into dozens for identical bytes.
+    if not _INDEX_CACHE:
+        session = _session()
+        _INDEX_CACHE.extend(parse_search_index(session.get(SEARCH_PAGE, timeout=_TIMEOUT).text))
+    index = _INDEX_CACHE
+    needle = " ".join((name or "").split()).casefold()
+    if not needle:
+        return []
+    return [
+        {"reg_no": e["reg_no"], "project_name": e["project_name"],
+         "promoter_name": e["promoter_name"]}
+        for e in index
+        if needle in " ".join((e["promoter_name"] or "").split()).casefold()
+    ]
+
+
 class KarnatakaAdapter:
     """StateAdapter for K-RERA."""
 

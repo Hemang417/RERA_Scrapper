@@ -205,6 +205,90 @@ def test_state_round_trips_through_the_facts_record():
     print("test_state_round_trips_through_the_facts_record: PASS")
 
 
+def test_a_declared_absence_is_never_reported_as_a_failed_fetch():
+    """REGRESSION, found by the first real Karnataka end-to-end run.
+
+    K-RERA publishes no single-point-of-contact register, no sub-registrar
+    details, no past-experience list and no appeals register, and its
+    adapter declares all four in categories_not_published. The run summary's
+    per-category table said "not published by K-RERA" correctly -- and then
+    the run ended on:
+
+        [WARN] 4 categor(ies) failed to fetch: spocs, sro_details,
+               past_experiences, appeals
+
+    because the warning list was built before the declared-absence set was
+    read and never subtracted it. That invites a pointless retry and implies
+    the data exists somewhere it does not.
+    """
+    import main
+    import states
+
+    category_data = {"projects": {"a": 1}, "spocs": None, "sro_details": None,
+                     "past_experiences": None, "appeals": None, "documents": None}
+    declared = {"spocs", "sro_details", "past_experiences", "appeals"}
+
+    failed, _ = main.summarise_category_health(category_data, declared, states.PROFILES["KA"])
+    assert failed == ["documents"], failed
+    for category in declared:
+        assert category not in failed, category
+
+    # A genuine failure on a state that DOES publish the category is still
+    # reported -- the guard must not silence real problems.
+    failed_mh, _ = main.summarise_category_health(category_data, set(), states.PROFILES["MH"])
+    assert set(failed_mh) == set(category_data) - {"projects"}, failed_mh
+    print("test_a_declared_absence_is_never_reported_as_a_failed_fetch: PASS")
+
+
+def test_retrieved_documents_are_never_reported_as_a_failed_fetch():
+    """REGRESSION: the run summary contradicted itself in the same breath.
+
+    The first live JHARERA end-to-end run printed
+
+        documents            68 downloaded, 0 reused / 69 found
+        [WARN] 1 categor(ies) failed to fetch: documents
+
+    Documents do not live in category_data -- they are tracked by the
+    manifest, and JHARERA, WBRERA and Telangana all legitimately leave the
+    category key None while retrieving every file. The per-category table
+    already read the manifest; the warning did not.
+    """
+    import main
+    import states
+
+    category_data = {"projects": {"a": 1}, "documents": None, "spocs": None}
+    retrieved = [{"status": "downloaded"}] * 69
+
+    failed, _ = main.summarise_category_health(
+        category_data, {"spocs"}, states.PROFILES["JH"], documents_manifest=retrieved)
+    assert failed == [], failed
+
+    # An EMPTY manifest with no category data is a genuine failure and must
+    # still be reported -- the guard must not silence a real one.
+    failed_empty, _ = main.summarise_category_health(
+        category_data, {"spocs"}, states.PROFILES["JH"], documents_manifest=[])
+    assert failed_empty == ["documents"], failed_empty
+    print("test_retrieved_documents_are_never_reported_as_a_failed_fetch: PASS")
+
+
+def test_the_maharera_endpoint_warning_does_not_fire_for_other_states():
+    """config.CATEGORY_ENDPOINTS describes MAHARERA's endpoints and nothing
+    else. The observed-endpoint warning fired on every run regardless of
+    state, so a Karnataka project was told that 8 of its categories used
+    unverified endpoints -- endpoints its adapter never touches -- and
+    advised --verify, which probes MahaRERA."""
+    import main
+    import states
+
+    for code in states.PROFILES:
+        _, unconfirmed = main.summarise_category_health({}, set(), states.PROFILES[code])
+        if code == states.DEFAULT_STATE_CODE:
+            assert unconfirmed, "the MahaRERA endpoint warning stopped working"
+        else:
+            assert unconfirmed == [], (code, unconfirmed)
+    print("test_the_maharera_endpoint_warning_does_not_fire_for_other_states: PASS")
+
+
 if __name__ == "__main__":
     try:
         test_a_zero_capability_state_declares_nothing_and_that_is_valid()
@@ -213,6 +297,9 @@ if __name__ == "__main__":
         test_only_maharashtra_may_declare_the_maharera_only_capabilities()
         test_the_charter_renders_and_carries_the_states_own_limitations()
         test_state_round_trips_through_the_facts_record()
+        test_a_declared_absence_is_never_reported_as_a_failed_fetch()
+        test_retrieved_documents_are_never_reported_as_a_failed_fetch()
+        test_the_maharera_endpoint_warning_does_not_fire_for_other_states()
         print("\nAll tests passed.")
     finally:
         shutil.rmtree(_SCRATCH, ignore_errors=True)

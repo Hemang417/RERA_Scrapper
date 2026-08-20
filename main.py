@@ -122,6 +122,17 @@ def parse_args() -> argparse.Namespace:
             "would otherwise need to resolve via search."
         ),
     )
+    parser.add_argument(
+        "--group-sweep",
+        action="store_true",
+        help=(
+            "Search every RERA authority that can answer for OTHER projects belonging to this "
+            "promoter's corporate group, and open each match to confirm or refute it. Off by "
+            "default because it queries several state portals in sequence. The Charter then "
+            "carries a per-authority coverage table saying which registers were actually "
+            "searched, so a short result is never mistaken for a clean national record."
+        ),
+    )
     gst = parser.add_mutually_exclusive_group()
     gst.add_argument(
         "--gstin",
@@ -152,6 +163,47 @@ def parse_args() -> argparse.Namespace:
 # orchestration. _AUTH_SOURCE_LABELS moved with them and is re-exported
 # here for the run summary below.
 from states.adapter_maharashtra import _AUTH_SOURCE_LABELS  # noqa: E402
+
+
+def summarise_category_health(category_data: dict, not_published: set, profile,
+                              documents_manifest: list | None = None) -> tuple:
+    """(failed, unconfirmed) for the run summary's two warning lines.
+
+    Its own function so both contracts are testable rather than asserted in
+    a comment -- the same reason _run_gst_intake_step is one.
+
+    TWO THINGS IT GETS RIGHT THAT THE INLINE VERSION DID NOT, both found by
+    the first real Karnataka end-to-end run:
+
+    A category this AUTHORITY DOES NOT PUBLISH is an absence, not a failure.
+    The per-category table already drew that line; the warning did not, so
+    the run ended on "[WARN] 4 categor(ies) failed to fetch: spocs,
+    sro_details, past_experiences, appeals" -- exactly the four K-RERA
+    declares it has no endpoint for. That invites a pointless retry and
+    implies the data exists somewhere.
+
+    CATEGORY_ENDPOINTS describes MAHARERA's endpoints and nothing else, so
+    the observed-endpoint warning is meaningful only on a MahaRERA run. It
+    fired for every state: a Karnataka project was told 8 of its categories
+    used unverified endpoints its adapter never touches, and advised
+    --verify, which probes MahaRERA.
+    """
+    failed = [cat for cat, data in (category_data or {}).items()
+              if data is None and cat not in (not_published or set())]
+    # Documents do not live in category_data -- they are tracked by the
+    # manifest, and several adapters legitimately leave the category key
+    # None while retrieving every file. Left in, the run summary
+    # CONTRADICTED ITSELF in the same breath: "documents 68 downloaded, 0
+    # reused / 69 found" immediately above "[WARN] 1 categor(ies) failed to
+    # fetch: documents". Only a manifest with nothing in it is a real
+    # documents failure.
+    if documents_manifest:
+        failed = [cat for cat in failed if cat != "documents"]
+    if getattr(profile, "code", None) != states.DEFAULT_STATE_CODE:
+        return failed, []
+    unconfirmed = [cat for cat in config.CATEGORY_ORDER
+                   if config.CATEGORY_ENDPOINTS[cat]["status"] != "confirmed"]
+    return failed, unconfirmed
 
 
 def _run_gst_intake_step(gst_identifier: str | None, reg_no: str, output_dir: str) -> str:
@@ -428,7 +480,7 @@ def main() -> int:
             reg_no, category_data, documents_manifest, documents_dir, research_data, args.output_dir,
             complaint_orders_manifest=complaint_orders_manifest, complaint_orders_dir=complaint_orders_dir,
             reviews=reviews, promoter_portfolio=portfolio, pipeline_start_time=pipeline_start_time,
-            state_profile=profile,
+            state_profile=profile, group_sweep=args.group_sweep,
         )
         external_charter_path = charter_path.replace("_Internal.docx", "_External.docx")
         print(f"[OK] Company Charter (Internal) written to {charter_path}")
@@ -479,14 +531,15 @@ def main() -> int:
         state_profile=profile,
     )
 
-    failed = [cat for cat, data in category_data.items() if data is None]
-    unconfirmed = [cat for cat in config.CATEGORY_ORDER if config.CATEGORY_ENDPOINTS[cat]["status"] != "confirmed"]
+    _not_published = getattr(acquired, "categories_not_published", set()) or set()
+    failed, unconfirmed = summarise_category_health(
+        category_data, _not_published, profile, documents_manifest)
 
     print("\n" + "=" * 60)
     print("  Run summary")
     print("=" * 60)
     print(f"  auth source:         {_AUTH_SOURCE_LABELS[auth_source]}")
-    not_published = getattr(acquired, "categories_not_published", set()) or set()
+    not_published = _not_published
     for cat in config.CATEGORY_ORDER:
         data = category_data.get(cat)
         if data is None and cat in not_published:

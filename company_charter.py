@@ -60,6 +60,9 @@ from PIL import Image
 import config
 import deep_research
 import finalize_report
+import group_entities
+import group_sweep
+import promoter_identity
 import run_archive
 import states
 
@@ -2452,6 +2455,16 @@ def _run_mca_profile_chain(cin: str, company_name: str = "") -> dict:
     zaubacorp_result = dict(found_results).get("zaubacorp.com", {})
     merged["past_directors"] = zaubacorp_result.get("past_directors") or []
     merged["shareholding_note"] = zaubacorp_result.get("shareholding_note")
+    # Charges are ZaubaCorp-only too, and were being DROPPED here: the merge
+    # copies _SCALAR_PROFILE_FIELDS plus the three keys named above, so
+    # lookup_company_by_cin parsed the charge table correctly and this
+    # function then discarded it every single time. Confirmed live on a real
+    # promoter -- four open charges totalling Rs 90.35 crore, to HDFC Bank
+    # and Catalyst Trusteeship, parsed and lost. A caller reading `charges`
+    # off this result would have reported a promoter with no secured
+    # borrowing at all, which is the false-clean-record failure in its most
+    # expensive form.
+    merged["charges"] = zaubacorp_result.get("charges") or []
     # "url" always favors ZaubaCorp for backward-compatible citation
     # behavior (existing Charter runs already cite this URL) when present,
     # otherwise whichever source actually responded.
@@ -5788,6 +5801,25 @@ def _fill_template_inner(
         # explicit touch here. Internal leaves the template's own text
         # completely alone, as always.
         _set_cell(t[1], 3, 0, _externalize_prose(facts, t[1].rows[3].cells[0].text))
+    # Grown row: the promoter's Permanent Account Number, read off the PAN
+    # card the authority holds (see promoter_identity). The template predates
+    # it because no RERA portal publishes a PAN as a FIELD -- Maharashtra and
+    # Gujarat only ever file the card itself as a document. Appended, never
+    # inserted, so the fixed row indices above are unaffected. Only a PAN
+    # VERIFIED against the portal's own promoter name is ever printed; an
+    # unverified candidate is carried as a gap instead (see
+    # _record_promoter_identity_gap) and never shown as though it were this
+    # promoter's.
+    identity_check = facts.get("promoter_identity_check") or {}
+    if identity_check.get("verified") and identity_check.get("pan"):
+        pan_row = t[1].add_row()
+        _set_row_cell(pan_row, 0, "Promoter PAN (Permanent Account Number)")
+        pan_citation = _citation_text(facts, _clean_source_label(identity_check.get("source_document") or "PAN Card"))
+        pan_value = identity_check["pan"]
+        if identity_check.get("holder_type"):
+            pan_value = f"{pan_value} ({identity_check['holder_type'].lower()})"
+        _set_row_cell(pan_row, 1, f"{pan_value} {pan_citation}" if pan_citation else pan_value)
+
     # Row-index-sensitive fix above must run BEFORE any row removal --
     # removing a row shifts every later fixed index.
     _remove_gap_rows(t[1], value_col=1)
@@ -6054,7 +6086,10 @@ def _fill_template_inner(
         lambda: _append_credit_rating_section(doc, facts),
         lambda: _append_ibbi_check_section(doc, facts),
         lambda: _append_company_profile_section(doc, facts),
+        lambda: _append_secured_borrowing_section(doc, facts),
         lambda: _append_group_companies_section(doc, facts),
+        lambda: _append_state_footprint_section(doc, facts),
+        lambda: _append_group_rera_sweep_section(doc, facts),
         lambda: _append_developer_score_section(doc, facts),
     ):
         batch = _capture_batch(append_fn)
@@ -6464,6 +6499,7 @@ _RERA_JSON_GENERIC = (
     ("complaints.json", "{acronym} complaint record"),
     ("appeals.json", "{acronym} appeal record"),
     ("past_experiences.json", "{acronym} past-experience filing"),
+    ("pan card", "{acronym} promoter identity filing"),
     ("projects.json", "{acronym} project filing"),
     # Hand-written source strings, not filenames: a facts.json `source` can say
     # "MahaRERA complaints/appeals data" directly. Left unmapped, the generic
@@ -9078,6 +9114,297 @@ def _append_ibbi_check_section(doc, facts: dict) -> None:
     doc.add_paragraph(f"Source: {_citation_text(facts, _clean_source_label(check.get('url', '')) or check.get('url', ''))}")
 
 
+def _format_rupees(amount) -> str:
+    """Indian-convention rendering: crore above a crore, lakh above a lakh.
+
+    "Rs 90.35 crore" is what a reader here actually parses; "Rs 903,491,110"
+    makes them count digits. The exact figure is kept alongside so nothing
+    is lost to rounding."""
+    if amount is None:
+        return ""
+    if amount >= 1e7:
+        return f"Rs {amount / 1e7:,.2f} crore"
+    if amount >= 1e5:
+        return f"Rs {amount / 1e5:,.2f} lakh"
+    return f"Rs {amount:,.0f}"
+
+
+def _append_secured_borrowing_section(doc, facts: dict) -> None:
+    """Appends the promoter's registered charges: secured borrowing, with
+    the LENDER named.
+
+    Why this earns its own section rather than a line in the profile table:
+    it is the only INDEPENDENT check this pipeline has on a promoter's
+    declared mortgage. The RERA record states a mortgage AREA and never a
+    lender. A charge is the borrower's own filing to the Registrar of
+    Companies, within 30 days of creating it, and banks insist on it because
+    an unregistered charge is void against a liquidator, so it is both
+    reliable and free.
+
+    Section B compliance: a promoter with NO registered charges produces the
+    empty-section form (heading plus one bare line), never a sentence
+    explaining that the register was searched and came back clear. An
+    unreadable amount renders as unknown and never as zero, because those
+    are opposite claims about a company's debt.
+    """
+    profile = facts.get("company_profile_check") or {}
+    if not profile.get("found"):
+        return
+    charges = profile.get("charges")
+    if charges is None:
+        # The lookup did not run or predates charge parsing. Silence is
+        # correct: asserting "no charges" from a check that never happened
+        # would be the false-clean-record failure.
+        return
+
+    heading_style = doc.paragraphs[4].style
+    doc.add_page_break()
+    heading_para = doc.add_paragraph(_external_heading(
+        facts, "Secured Borrowing -- Registered Charges (Code-Computed)"
+    ))
+    heading_para.style = heading_style
+
+    if not charges:
+        doc.add_paragraph("Nothing found.")
+        return
+
+    summary = summarise_charges(charges)
+    _variant_paragraph(
+        doc, facts,
+        internal_text=(
+            "Charges registered by the promoter against its own assets, read directly from the "
+            "public corporate registry. A charge is the borrower's own filing to the Registrar of "
+            "Companies naming the lender, the amount and the assets pledged. A charge with no "
+            "closure date is still open, meaning the security has not been released. This is the "
+            "only independent check available on the promoter's declared mortgage, which the "
+            "project's own regulatory filing records as an area without ever naming a lender."
+        ),
+        external_text=(
+            "Charges the promoter has registered against its own assets, read from the public "
+            "corporate registry. A charge with no closure date is still open, meaning the security "
+            "has not been released."
+        ),
+    )
+
+    if summary["total_open_amount"] is not None:
+        headline = (
+            f"{summary['open_charges']} open charge(s) totalling "
+            f"{_format_rupees(summary['total_open_amount'])} "
+            f"(Rs {summary['total_open_amount']:,.0f}), to "
+            f"{len(summary['open_lenders'])} lender(s): "
+            f"{', '.join(summary['open_lenders'])}."
+        )
+    elif summary["open_charges"]:
+        # Amounts unreadable. Reporting Rs 0 here would state the opposite
+        # of the truth, so the count is given and the value withheld.
+        headline = (
+            f"{summary['open_charges']} open charge(s) on record; the amounts could not be read "
+            f"from the registry this pass, so the total is not stated. Lender(s): "
+            f"{', '.join(summary['open_lenders']) or 'not named'}."
+        )
+    else:
+        headline = f"No open charges. {summary['satisfied_charges']} satisfied and closed."
+    doc.add_paragraph(headline)
+
+    table = doc.add_table(rows=1, cols=5)
+    _set_table_borders(table)
+    for idx, label in enumerate(("Charge ID", "Created", "Status", "Amount", "Lender")):
+        cell = table.rows[0].cells[idx]
+        cell.text = label
+        _shade_cell(cell, "D9E2F3")
+        for para in cell.paragraphs:
+            for run in para.runs:
+                run.bold = True
+
+    for charge in charges:
+        row = table.add_row()
+        _set_row_cell(row, 0, charge.get("charge_id") or "")
+        _set_row_cell(row, 1, charge.get("creation_date") or "")
+        _set_row_cell(row, 2, "Open" if charge.get("is_open")
+                      else f"Satisfied {charge.get('closure_date') or ''}".strip())
+        _set_row_cell(row, 3, f"Rs {charge['amount']}" if charge.get("amount") else "Not stated")
+        _set_row_cell(row, 4, charge.get("charge_holder") or "")
+
+    # What has MOVED since the last run. A charge list is a snapshot; the
+    # question a lender actually asks is whether any of it has been repaid
+    # and whether more has been taken on. Only real movement is printed --
+    # Section B's clean-check rule means "no change since last time" is not
+    # a finding and produces no sentence.
+    movement = facts.get("charge_movement") or {}
+    for change in movement.get("changes") or []:
+        doc.add_paragraph(change.get("text", ""))
+    if movement.get("changes"):
+        doc.add_paragraph(movement.get("note", ""))
+
+    citation = _citation_text(facts, _clean_source_label(profile.get("url", "")) or profile.get("url", ""))
+    if citation:
+        doc.add_paragraph(f"Source: {citation}")
+
+
+def _append_group_rera_sweep_section(doc, facts: dict) -> None:
+    """Appends this group's projects found on other states' RERA registers.
+
+    THE COVERAGE LINE IS NOT OPTIONAL AND COMES FIRST. A list of three
+    projects from three reachable authorities is not a national footprint,
+    and a reader has no way to tell those apart unless the document says so.
+    Gujarat, West Bengal and Telangana publish no promoter search at all,
+    and roughly two dozen states have no adapter yet: in every one of those
+    cases "nothing found" means "never asked".
+
+    Every row is labelled a name match. No RERA register publishes a company
+    identity number to join on, so a hit is a candidate to confirm, never an
+    established group project. Same rule the affiliate graph applies.
+    """
+    sweep = facts.get("group_rera_sweep") or {}
+    coverage = sweep.get("coverage") or []
+    if not coverage:
+        return
+
+    heading_style = doc.paragraphs[4].style
+    doc.add_page_break()
+    heading_para = doc.add_paragraph(_external_heading(
+        facts, "Group Projects on Other State Registers (Code-Computed)"
+    ))
+    heading_para.style = heading_style
+
+    doc.add_paragraph(group_sweep.coverage_sentence(sweep))
+
+    projects = sweep.get("projects") or []
+    if projects:
+        table = doc.add_table(rows=1, cols=4)
+        _set_table_borders(table)
+        for idx, label in enumerate(("Authority", "Registration", "Project", "Matched entity")):
+            cell = table.rows[0].cells[idx]
+            cell.text = label
+            _shade_cell(cell, "D9E2F3")
+            for para in cell.paragraphs:
+                for run in para.runs:
+                    run.bold = True
+        for project in projects:
+            row = table.add_row()
+            _set_row_cell(row, 0, project.get("authority") or project.get("state") or "")
+            _set_row_cell(row, 1, project.get("reg_no") or "")
+            _set_row_cell(row, 2, project.get("project_name") or "")
+            _set_row_cell(row, 3, project.get("matched_entity") or "")
+        doc.add_paragraph(
+            "Each row above is a match on NAME. No state register publishes a company identity "
+            "number, so these are projects to confirm against the promoter's own records, not "
+            "established group projects."
+        )
+
+    # Which authorities were asked, and which could not be. This table is
+    # the reason the section exists at all.
+    sub = doc.add_paragraph("Authorities searched")
+    for run in sub.runs:
+        run.bold = True
+    coverage_table = doc.add_table(rows=1, cols=3)
+    _set_table_borders(coverage_table)
+    for idx, label in enumerate(("Authority", "Searched", "If not, why")):
+        cell = coverage_table.rows[0].cells[idx]
+        cell.text = label
+        _shade_cell(cell, "D9E2F3")
+        for para in cell.paragraphs:
+            for run in para.runs:
+                run.bold = True
+    for row_data in coverage:
+        row = coverage_table.add_row()
+        _set_row_cell(row, 0, row_data.get("authority") or row_data.get("state_name") or "")
+        _set_row_cell(row, 1, "Yes" if row_data.get("status") == group_sweep.STATUS_SEARCHED else "No")
+        _set_row_cell(row, 2, row_data.get("reason") or "")
+
+    for limitation in sweep.get("limitations") or []:
+        doc.add_paragraph(limitation)
+
+
+def _append_state_footprint_section(doc, facts: dict) -> None:
+    """Appends where this promoter's group is registered and where it has
+    actually built.
+
+    Why a reader needs it: a RERA registration names exactly one state, so a
+    promoter read from one register alone looks smaller and cleaner than
+    they are. The worked example this was built from is a Mumbai project
+    whose promoter is a Ranchi group: one Maharashtra registration, and a
+    completed Rs 128 crore Jharkhand mall declared to Maharashtra's own
+    regulator that no Maharashtra-only view would ever surface.
+
+    The two halves are reported separately and must stay that way.
+    Incorporation is not operation -- a special purpose vehicle registered
+    in Maharashtra says nothing about where the group delivers -- and only
+    the declared past projects speak to track record.
+
+    Section B: the limitations are GAPS, not absences. "20 of these entities
+    are partnerships whose identifier carries no state" is an open unknown a
+    reader can act on, so it is kept in full rather than compressed away.
+    """
+    footprint = facts.get("state_footprint") or {}
+    built = footprint.get("built_in") or []
+    incorporated = footprint.get("incorporated_in") or []
+    if not built and not incorporated:
+        return
+
+    heading_style = doc.paragraphs[4].style
+    doc.add_page_break()
+    heading_para = doc.add_paragraph(_external_heading(
+        facts, "Where This Group Operates -- State Footprint (Code-Computed)"
+    ))
+    heading_para.style = heading_style
+    _variant_paragraph(
+        doc, facts,
+        internal_text=(
+            "Derived from two independent signals already on file: the state of registration "
+            "encoded in each linked entity's own corporate identity number, and the state named in "
+            "each past project the promoter itself declared to the regulator. Neither is a search "
+            "of another state's property regulator, so this is a map of where to look, not a "
+            "record of what those regulators hold."
+        ),
+        external_text=(
+            "Derived from the state of registration of each linked entity and the location of each "
+            "past project the promoter declared to the regulator. This shows where the group is "
+            "present, not what another state's regulator holds on it."
+        ),
+    )
+
+    if built:
+        sub = doc.add_paragraph("Declared past projects, by state")
+        for run in sub.runs:
+            run.bold = True
+        table = doc.add_table(rows=1, cols=3)
+        _set_table_borders(table)
+        for idx, label in enumerate(("State", "Projects", "Named")):
+            cell = table.rows[0].cells[idx]
+            cell.text = label
+            _shade_cell(cell, "D9E2F3")
+            for para in cell.paragraphs:
+                for run in para.runs:
+                    run.bold = True
+        for row_data in built:
+            row = table.add_row()
+            _set_row_cell(row, 0, row_data["state"])
+            _set_row_cell(row, 1, str(row_data["count"]))
+            _set_row_cell(row, 2, ", ".join(row_data["items"]))
+
+    if incorporated:
+        sub = doc.add_paragraph("Linked entities, by state of registration")
+        for run in sub.runs:
+            run.bold = True
+        table = doc.add_table(rows=1, cols=2)
+        _set_table_borders(table)
+        for idx, label in enumerate(("State", "Linked entities")):
+            cell = table.rows[0].cells[idx]
+            cell.text = label
+            _shade_cell(cell, "D9E2F3")
+            for para in cell.paragraphs:
+                for run in para.runs:
+                    run.bold = True
+        for row_data in incorporated:
+            row = table.add_row()
+            _set_row_cell(row, 0, row_data["state"])
+            _set_row_cell(row, 1, str(row_data["count"]))
+
+    for limitation in footprint.get("limitations") or []:
+        doc.add_paragraph(limitation)
+
+
 def _clean_scraped_address(address: str) -> str:
     """Registry-scraped addresses (ZaubaCorp/Tofler/InstaFinancials) come
     from concatenating separate HTML fields with no space normalization --
@@ -9800,6 +10127,172 @@ def _safe_group_companies(identifier: str) -> dict:
         return {"found": False, "note": f"ZaubaCorp group-companies crosswalk could not run this pass: {e}"}
 
 
+def _record_promoter_identity_gap(facts: dict) -> None:
+    """Turns a failed PAN read into a gap, and a successful one into a source.
+
+    Deliberately NOT a gap when no PAN card was filed at all. That is an
+    authority-level fact (Karnataka and Telangana do not require the card in
+    the public library), already carried in the acquisition notes, and
+    raising it per project would put a boilerplate line in every Charter
+    that Section B's clean-check rule exists to keep out.
+
+    A card that WAS filed and could not be read, or whose number could not
+    be tied to this promoter, is the opposite: a specific, actionable
+    anomaly on this project. It is either a portal/scan problem or somebody
+    else's PAN on this promoter's file, and both are worth the reader's
+    time. Written as plain prose with no filenames, keys or error text, so
+    it satisfies Section B without relying on the process-text sanitizer.
+    """
+    check = facts.get("promoter_identity_check") or {}
+    status = check.get("status")
+    if check.get("verified"):
+        facts.setdefault("sources", []).append({
+            "label": "PAN Card",
+            "ref": "Promoter PAN card filed with the authority and published in the project document library",
+            "topic": "company_profile",
+            "published_date": "unknown",
+            "accessed_date": datetime.now().strftime("%Y-%m-%d"),
+        })
+        return
+
+    if status == "unverified_candidate":
+        facts.setdefault("gaps", []).append(
+            "Promoter identity: a Permanent Account Number was read from the PAN card filed "
+            "with the authority, but it could not be matched to the promoter named on the same "
+            "registration, so it has not been used anywhere in this Charter. Confirm the "
+            "promoter's PAN directly before relying on any corporate, tax or charge search "
+            "keyed to it."
+        )
+        return
+
+    # A card is on file but produced nothing readable, or the OCR stack could
+    # not run at all. Both are distinguished from "no card filed", because a
+    # reader must not read silence here as an authority that publishes none.
+    # Keyed on the explicit status, never on the prose of the notes: the note
+    # for "no card filed" also contains the words "could not be read".
+    if status in ("unreadable", "ocr_unavailable"):
+        facts.setdefault("gaps", []).append(
+            "Promoter identity: the promoter's PAN card is on file with the authority but could "
+            "not be read from the filed copy, so the promoter's Permanent Account Number is not "
+            "established in this Charter. Obtain it from the promoter to enable tax, corporate "
+            "and secured-lending searches keyed to it."
+        )
+
+
+def _safe_charge_movement(profile_result: dict, output_dir: str) -> dict:
+    """Whether the promoter's secured borrowing has MOVED since the last run.
+
+    A charge list is a snapshot; what a lender actually asks is "has any of
+    this been repaid, and has more been taken on?" That needs two readings,
+    so every run records one. The first run for a promoter has nothing to
+    compare against and says so.
+
+    Never fatal, and never silent about its own failure: charge_watch.compare
+    returns checked=False when either side could not be read, because a
+    broken fetch reported as "no change" is the reassuring silence this whole
+    codebase keeps having to guard against.
+    """
+    cin = (profile_result or {}).get("cin")
+    if not profile_result or not profile_result.get("found") or not cin:
+        return {}
+    try:
+        import charge_watch
+
+        charge_watch.SNAPSHOT_DIR = os.path.join(output_dir, "_charge_watch")
+        previous = charge_watch.load_previous(cin)
+        current = charge_watch.snapshot(cin, profile_result.get("name") or "",
+                                        profile_lookup=lambda c, n: profile_result)
+        movement = charge_watch.compare(previous, current) if previous else {
+            "checked": False, "changes": [], "still_open": [],
+            "note": "This is the first recorded reading of this promoter's charge register, so "
+                    "there is nothing yet to compare it against. A later run will report what "
+                    "has moved.",
+        }
+        if current.get("ok"):
+            charge_watch.save(current)
+        return movement
+    except Exception as e:
+        return {"checked": False, "changes": [], "still_open": [],
+                "note": f"Charge movement could not be checked this pass: {e}"}
+
+
+def _safe_group_rera_sweep(group_result: dict, subject_promoter: str = "",
+                          enabled: bool | None = None) -> dict:
+    """Searches every RERA authority that can answer, for this group's other
+    projects. Never fatal: a sweep that cannot run costs one section.
+
+    OPT-IN, because it is the only step here that queries several state
+    portals in sequence and a group can carry dozens of entities. Set
+    CHARTER_GROUP_SWEEP=1 to enable. Off, the Charter simply does not carry
+    the section -- which is different from carrying an empty one, and the
+    difference is the whole point of group_sweep's coverage reporting.
+    """
+    if enabled is None:
+        enabled = os.environ.get("CHARTER_GROUP_SWEEP") == "1"
+    if not enabled:
+        return {}
+    try:
+        graph = group_entities.build_entity_graph(
+            subject_promoter, (group_result or {}).get("cin"), group_result, proposer=lambda b: []
+        )
+        names = group_entities.entity_names_for_sweep(graph)
+        # Open the matched projects too: a bare list of registrations proves
+        # they exist and says nothing about litigation, sales or who is
+        # building them. Bounded, and unopened ones say so.
+        return group_sweep.enrich_projects(group_sweep.sweep(names))
+    except Exception as e:
+        return {"coverage": [], "projects": [],
+                "limitations": [f"The group-wide RERA sweep could not run this pass: {e}"]}
+
+
+def _safe_state_footprint(group_result: dict, category_data: dict) -> dict:
+    """Never fatal: a footprint that cannot be derived costs one section."""
+    try:
+        graph = {"confirmed": [
+            {"name": c.get("name"), "cin": c.get("cin")}
+            for c in ((group_result or {}).get("companies") or [])
+        ]}
+        past = (category_data or {}).get("past_experiences")
+        return group_entities.state_footprint(graph, past if isinstance(past, list) else None)
+    except Exception as e:
+        return {"incorporated_in": [], "built_in": [], "unmapped_entities": 0,
+                "unrecognised_codes": [],
+                "limitations": [f"State footprint could not be derived this pass: {e}"]}
+
+
+def _portal_promoter_name(category_data: dict) -> str:
+    """The promoter's name AS THE AUTHORITY PUBLISHES IT.
+
+    Deliberately not facts["corporate_identity"]["promoter_name"], which is
+    model-authored: this is used to verify a PAN read by OCR, so both sides
+    of that check have to come from independent, non-model sources or the
+    check proves nothing. Every state adapter shapes partners.promoterDetails
+    the same way (MahaRERA's own shape, which Gujarat and Telangana map
+    onto), so this reads identically for all of them.
+    """
+    partners = (category_data or {}).get("partners") or {}
+    details = partners.get("promoterDetails") or {}
+    return str(details.get("promoterName") or "").strip()
+
+
+def _safe_promoter_identity(documents_manifest: list, documents_dir: str, category_data: dict) -> dict:
+    """Reads the promoter's PAN off the PAN card in the document library.
+
+    Never fatal, and never guessed: promoter_identity returns an explicit
+    unverified/not-found result with its own reason rather than raising, and
+    this wrapper only covers a hard failure of the OCR stack itself.
+    """
+    try:
+        return promoter_identity.extract_promoter_pan(
+            documents_manifest, documents_dir, _portal_promoter_name(category_data)
+        )
+    except Exception as e:
+        return {
+            "pan": None, "verified": False, "unverified_candidates": [],
+            "notes": [f"Promoter PAN extraction could not run this pass: {e}"],
+        }
+
+
 def _safe_judgments_search(project_name: str) -> tuple:
     """Returns (judgments, error_note) instead of raising, matching the
     other _safe_* wrappers -- error_note is None on success."""
@@ -10020,6 +10513,7 @@ def run_company_charter(
     pre_built_facts: dict | None = None,
     pipeline_start_time: float | None = None,
     state_profile=None,
+    group_sweep: bool = False,
 ) -> tuple[str, dict]:
     """Returns (out_path, facts) -- facts is the complete, code-and-model
     -assembled Charter data (same content as the .facts.json written
@@ -10088,6 +10582,18 @@ def run_company_charter(
     facts = _verify_material_claims(facts)
     facts = _check_document_grounding(facts, extracted_docs, category_data, documents_manifest)
     facts["document_library"] = doc_library_status  # always the full, code-computed list -- not model-generated
+
+    # The promoter's PAN, read off the PAN card the authority already holds.
+    # Neither MahaRERA nor GujRERA publishes a PAN as a FIELD, but both
+    # require the card to be uploaded and both serve it from the document
+    # library downloaded above -- so the one identifier that joins this
+    # promoter to the MCA, GST and income-tax records is already on disk.
+    # Code-computed and verified against the portal's own promoter name;
+    # never model-authored, because its whole value is being a hard key.
+    facts["promoter_identity_check"] = _safe_promoter_identity(
+        documents_manifest, documents_dir, category_data
+    )
+    _record_promoter_identity_gap(facts)
 
     # Also code-computed, never model-authored (see summarize_professionals'
     # own note for the real mis-reporting this replaces): MahaRERA's
@@ -10210,9 +10716,23 @@ def run_company_charter(
             for conflict in profile_result.get("roster_conflicts") or []:
                 facts.setdefault("gaps", []).append(conflict)
 
+        # Recorded on every run, beside the charges themselves, so the NEXT
+        # run can say what was repaid and what was newly borrowed.
+        facts["charge_movement"] = _safe_charge_movement(profile_result, output_dir)
+
     if "group" in results:
         group_result = results["group"]
         facts["group_companies_check"] = group_result
+        # Where this group is incorporated, and where it has actually
+        # built. A RERA registration names ONE state; a promoter's spread
+        # across the others is the thing a single-register read silently
+        # hides. Derived from evidence already held -- the CIN state code on
+        # each linked entity, and the state named in each declared past
+        # project's own address -- never from a fixed list of states.
+        facts["state_footprint"] = _safe_state_footprint(group_result, category_data)
+        facts["group_rera_sweep"] = _safe_group_rera_sweep(
+            group_result, _portal_promoter_name(category_data), enabled=group_sweep
+        )
         if group_result.get("found") and group_result.get("companies"):
             facts.setdefault("sources", []).append({
                 "label": "ZaubaCorp director/address crosswalk",

@@ -85,6 +85,34 @@ def test_brand_token_skips_legal_forms_and_common_prefixes():
     print("test_brand_token_skips_legal_forms_and_common_prefixes: PASS")
 
 
+def test_a_place_or_a_trade_is_not_a_brand():
+    """Found by running a real sweep, and it produced exactly the confident
+    nonsense this module exists to prevent, one layer down.
+
+    Falling back to the brand token for 38 group entities returned 39
+    "candidate" projects across JHARERA, of which almost all were noise:
+    "MALL" (from Mall of Ranchi Private Limited) matched ten unrelated
+    shopping centres, "BIHAR" (from Bihar Carbons) six unrelated housing
+    projects, "INDIA" (from ABN India Infrastructure) more. A Charter
+    listing AL-KHALIFA MALL as a possible Pranami group project would be a
+    fabrication.
+
+    A company whose every word is a place or a trade has NO brand, and
+    (None, reason) is the correct answer -- the same answer the function
+    already gives for "REALTY VENTURES PRIVATE LIMITED"."""
+    for name in ("Mall of Ranchi Private Limited",
+                 "Bihar Carbons Private Limited",
+                 "Abn India Infrastructure Private Limited",
+                 "West Bengal Housing Projects Limited"):
+        token, note = ge.brand_token(name)
+        assert token is None, (name, token)
+        assert note, name
+    # ...and a real brand is untouched.
+    assert ge.brand_token("Pranami Builders Private Limited")[0] == "PRANAMI"
+    assert ge.brand_token("Bhawani Concrete Private Limited")[0] == "BHAWANI"
+    print("test_a_place_or_a_trade_is_not_a_brand: PASS")
+
+
 def test_a_name_match_alone_is_never_confirmed():
     """The central rule. All four live candidates match the brand and none
     has a registry link, so all four must stay unconfirmed."""
@@ -227,6 +255,7 @@ def test_no_charges_is_a_clean_zero_not_an_unknown():
 
 if __name__ == "__main__":
     test_brand_token_skips_legal_forms_and_common_prefixes()
+    test_a_place_or_a_trade_is_not_a_brand()
     test_a_name_match_alone_is_never_confirmed()
     test_a_hard_link_confirms_even_without_the_brand()
     test_link_strength_ranks_filed_over_director_over_address()

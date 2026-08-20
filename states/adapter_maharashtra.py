@@ -67,6 +67,24 @@ def _extract_promoter_name(category_data: dict):
     return None
 
 
+def search_promoter_projects(name, reporter=None):
+    """Projects on MahaRERA registered under a promoter matching `name`.
+
+    Wraps the existing Promoters-tab search. This is the one state whose
+    promoter search needs a headless BROWSER rather than an HTTP call, so a
+    sweep across many entities is materially slower here than elsewhere --
+    the sweep bounds its fan-out for that reason.
+    """
+    import resolver
+
+    candidates = resolver.search_promoters(name, headless=True)
+    return [
+        {"reg_no": c.reg_no, "project_name": c.project_name,
+         "promoter_name": c.promoter_name, "project_id": c.project_id}
+        for c in candidates
+    ]
+
+
 class MaharashtraAdapter:
     """StateAdapter for MahaRERA.
 

@@ -14,7 +14,7 @@ layer, whose default is and remains Maharashtra.
 
 import re
 
-from . import gujarat, karnataka, maharashtra, telangana
+from . import gujarat, jharkhand, karnataka, maharashtra, telangana, westbengal
 from .base import (  # noqa: F401  -- re-exported for callers
     ALL_CAPABILITIES,
     CAP_CATEGORY_API,
@@ -41,6 +41,8 @@ PROFILES = {
     telangana.PROFILE.code: telangana.PROFILE,
     gujarat.PROFILE.code: gujarat.PROFILE,
     karnataka.PROFILE.code: karnataka.PROFILE,
+    jharkhand.PROFILE.code: jharkhand.PROFILE,
+    westbengal.PROFILE.code: westbengal.PROFILE,
 }
 
 DEFAULT_STATE_CODE = "MH"
@@ -173,6 +175,8 @@ _ADAPTER_MODULES = {
     "GJ": "states.adapter_gujarat",
     "KA": "states.adapter_karnataka",
     "TG": "states.adapter_telangana",
+    "JH": "states.adapter_jharkhand",
+    "WB": "states.adapter_westbengal",
 }
 
 

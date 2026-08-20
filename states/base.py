@@ -46,6 +46,7 @@ declarative seam that already existed: config.NO_AUTH_CATEGORIES, read by
 main.py to decide which categories to even attempt.
 """
 
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Protocol
@@ -210,6 +211,45 @@ class StateProfile:
 
 
 # --- The acquisition seam --------------------------------------------------
+
+
+# Windows refuses to create a path longer than 260 characters unless long
+# paths are explicitly enabled, and it reports the refusal as
+# FileNotFoundError -- which reads like "the directory is missing", not
+# "your filename is too long". Confirmed live: a JHARERA document whose
+# derived label was the sentence "The names and addresses of the
+# contractors, archiect, structural engineer, if any..." produced a
+# 262-character path and aborted the whole acquisition partway through
+# downloading, AFTER a dozen files had already been written.
+_MAX_PATH = 255
+_MIN_STEM = 8
+
+
+def safe_document_filename(documents_dir: str, label: str, used_names: set,
+                           extension: str = ".pdf", suffix: str = "") -> str:
+    """A filename that is unique, readable, and short enough to actually write.
+
+    Budgeted against the CALLER'S OWN output directory rather than a fixed
+    cap, because how much room is left depends entirely on how deep the
+    user's --output-dir is. A fixed 80-character cap is fine under
+    `output/` and overflows under a temp path, which is exactly how this
+    surfaced.
+
+    `suffix` (e.g. the portal's document id) is preserved whole when the
+    name has to be truncated: it is what makes the name unique, so trimming
+    it would turn a length problem into a collision.
+    """
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", label or "").strip("_") or "document"
+    tail = f"{suffix}{extension}" if suffix else extension
+    room = _MAX_PATH - len(os.path.join(documents_dir, "")) - len(tail) - 4
+    stem = cleaned[:max(_MIN_STEM, room)]
+
+    candidate, counter = f"{stem}{tail}", 2
+    while candidate in used_names:
+        candidate = f"{stem}_{counter}{tail}"
+        counter += 1
+    used_names.add(candidate)
+    return candidate
 
 
 def storage_key(reg_no: str) -> str:

@@ -76,6 +76,40 @@ def normalise(name: str) -> str:
     return " ".join(cleaned.split())
 
 
+# Words that name a PLACE or a TRADE rather than a group. A company called
+# "Mall of Ranchi" has no brand word at all: "MALL" identifies a building
+# type and "RANCHI" a city, and searching either against a state register
+# returns every unrelated mall and every project in the city.
+#
+# This list exists because of a real sweep. Falling back to the brand token
+# for 38 group entities produced 39 "candidate" projects, of which almost
+# all were noise: "MALL" matched ten unrelated shopping centres, "BIHAR"
+# six unrelated housing projects, "INDIA" more. Presenting those in a
+# Charter as possible group projects would be exactly the confident nonsense
+# this module was written to prevent, one layer further down.
+_NON_IDENTIFYING = {
+    # Geography
+    "INDIA", "BHARAT", "HINDUSTAN", "NATIONAL", "BIHAR", "JHARKHAND", "RANCHI",
+    "BENGAL", "KOLKATA", "CALCUTTA", "MUMBAI", "BOMBAY", "DELHI", "GUJARAT",
+    "MAHARASHTRA", "KARNATAKA", "BANGALORE", "BENGALURU", "TELANGANA",
+    "HYDERABAD", "CHENNAI", "PUNE", "PATNA", "ASSAM", "GUWAHATI", "SURAT",
+    "AHMEDABAD", "JAMSHEDPUR", "DHANBAD", "EAST", "WEST", "NORTH", "SOUTH",
+    "CENTRAL", "METRO", "URBAN",
+    # Building types and trades
+    "MALL", "PLAZA", "TOWER", "TOWERS", "ENCLAVE", "COMPLEX", "GREENS",
+    "RESIDENCY", "APARTMENT", "APARTMENTS", "HEIGHTS", "PARK", "CITY",
+    "CONSTRUCTION", "CONSTRUCTIONS", "INFRA", "INFRASTRUCTURE", "DEVELOPERS",
+    "DEVELOPER", "DEVCON", "REALTY", "REALTORS", "ESTATE", "ESTATES",
+    "BUILDERS", "BUILDCON", "HOUSING", "PROPERTIES", "PROPERTY", "PROJECTS",
+    "GROUP", "VENTURES", "VENTURE", "HOLDINGS", "TRADING", "TRADERS",
+    "INDUSTRIES", "INDUSTRIAL", "ENTERPRISES", "ENTERPRISE", "SERVICES",
+    "SOLUTIONS", "TECHNOLOGIES", "TECHNOLOGY", "LOGISTICS", "MINERALS",
+    "CARBON", "CARBONS", "MILLS", "DISTRIBUTORS", "FOUNDATION", "ADVISORY",
+    "ENGINEERS", "ENGINEERING", "ENERGY", "POWER", "FINANCIAL", "FINANCE",
+    "CAPITAL", "ENTERTAINMENT", "MEDIA", "HOSPITALITY", "ENGG",
+}
+
+
 def brand_token(name: str) -> tuple:
     """(token, note) -- the word most likely to identify the group.
 
@@ -94,6 +128,11 @@ def brand_token(name: str) -> tuple:
             skipped.append(word)
             continue
         if len(word) < _MIN_BRAND_LENGTH:
+            skipped.append(word)
+            continue
+        if word in _NON_IDENTIFYING:
+            # A place or a trade, not a brand. Skipped for the same reason
+            # an honorific is: searching it returns noise, not a group.
             skipped.append(word)
             continue
         note = None
@@ -344,3 +383,183 @@ def entity_names_for_sweep(
             seen.add(key)
             out.append(name)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Where does this group actually operate?
+#
+# The diligence question behind this: a promoter's RERA registration tells
+# you one state. It does not tell you the other four they build in, and a
+# track record read from one register alone reads as thinner and cleaner
+# than it is. Pranami is the worked example -- one MahaRERA project, and a
+# completed Rs 128 crore mall in Ranchi that MahaRERA itself is told about
+# and that no Maharashtra-only view would ever surface.
+#
+# The footprint is DERIVED FROM EVIDENCE, never from a fixed list of states
+# to sweep. Two independent signals, both already in the pipeline's data:
+#
+#   1. The CIN's own state code. Characters 6-7 of a CIN are the state of
+#      incorporation, so the group graph carries its own geography.
+#   2. The promoter's DECLARED past projects, whose addresses name a state
+#      outright. This is the stronger signal for track record, because a
+#      company incorporated in Delhi may only ever have built in Bihar.
+#
+# What this deliberately does NOT do is claim the list is complete. An LLP
+# identifier encodes no state at all (20 of Pranami's 65 linked entities are
+# LLPs), so those entities contribute nothing here and are counted out loud
+# rather than quietly omitted.
+# ---------------------------------------------------------------------------
+
+# MCA state codes as they appear in a CIN. Codes NOT in this map are
+# reported as unrecognised rather than guessed at -- a wrong state here
+# sends a sweep to the wrong authority and reports a clean record from it.
+_CIN_STATE_CODES = {
+    "AP": "Andhra Pradesh", "AR": "Arunachal Pradesh", "AS": "Assam",
+    "BR": "Bihar", "CH": "Chandigarh", "CG": "Chhattisgarh", "CT": "Chhattisgarh",
+    "DL": "Delhi", "GA": "Goa", "GJ": "Gujarat", "HR": "Haryana",
+    "HP": "Himachal Pradesh", "JK": "Jammu and Kashmir", "JH": "Jharkhand",
+    "KA": "Karnataka", "KL": "Kerala", "MP": "Madhya Pradesh",
+    "MH": "Maharashtra", "MN": "Manipur", "ML": "Meghalaya", "MZ": "Mizoram",
+    "NL": "Nagaland", "OR": "Odisha", "OD": "Odisha", "PB": "Punjab",
+    "PY": "Puducherry", "RJ": "Rajasthan", "SK": "Sikkim", "TN": "Tamil Nadu",
+    "TG": "Telangana", "TS": "Telangana", "TR": "Tripura", "UP": "Uttar Pradesh",
+    "UK": "Uttarakhand", "UA": "Uttarakhand", "UT": "Uttarakhand",
+    "WB": "West Bengal", "AN": "Andaman and Nicobar Islands",
+    "DN": "Dadra and Nagar Haveli", "DD": "Daman and Diu", "LD": "Lakshadweep",
+}
+
+_CIN_STATE_RE = re.compile(r"^[UL]\d{5}([A-Z]{2})\d{4}")
+
+# First two digits of an Indian PIN code, used ONLY when an address does not
+# name its state outright. Deliberately coarse, and only where unambiguous:
+# several ranges straddle two states and are left out of this table entirely
+# rather than resolved by a guess.
+_PIN_PREFIX_STATES = {
+    "11": "Delhi", "13": "Haryana", "14": "Punjab", "15": "Punjab",
+    "17": "Himachal Pradesh", "18": "Jammu and Kashmir", "19": "Jammu and Kashmir",
+    "30": "Rajasthan", "31": "Rajasthan", "32": "Rajasthan", "33": "Rajasthan",
+    "36": "Gujarat", "37": "Gujarat", "38": "Gujarat", "39": "Gujarat",
+    "40": "Maharashtra", "41": "Maharashtra", "42": "Maharashtra",
+    "43": "Maharashtra", "44": "Maharashtra",
+    "45": "Madhya Pradesh", "46": "Madhya Pradesh", "47": "Madhya Pradesh",
+    "48": "Madhya Pradesh", "49": "Chhattisgarh",
+    "50": "Telangana", "56": "Karnataka", "57": "Karnataka", "58": "Karnataka",
+    "59": "Karnataka", "60": "Tamil Nadu", "61": "Tamil Nadu", "62": "Tamil Nadu",
+    "63": "Tamil Nadu", "64": "Tamil Nadu", "67": "Kerala", "68": "Kerala",
+    "69": "Kerala", "70": "West Bengal", "71": "West Bengal", "72": "West Bengal",
+    "73": "West Bengal", "74": "West Bengal", "75": "Odisha", "76": "Odisha",
+    "77": "Odisha", "78": "Assam", "80": "Bihar", "81": "Jharkhand",
+    "82": "Jharkhand", "83": "Jharkhand", "84": "Bihar", "85": "Bihar",
+}
+
+_PIN_RE = re.compile(r"\b(\d{6})\b")
+
+_STATE_ALIASES = (
+    ("ORISSA", "Odisha"), ("PONDICHERRY", "Puducherry"),
+    ("UTTARANCHAL", "Uttarakhand"), ("NEW DELHI", "Delhi"),
+)
+
+
+def state_from_cin(cin):
+    """(state_name, code) for a CIN, or (None, code_or_None).
+
+    Returns the code even when it is unrecognised, so a caller can report
+    exactly what it could not resolve instead of silently dropping it. An
+    LLP identifier (for example "AAM-0112") encodes no state at all and
+    yields (None, None).
+    """
+    match = _CIN_STATE_RE.match((cin or "").strip().upper())
+    if not match:
+        return None, None
+    code = match.group(1)
+    return _CIN_STATE_CODES.get(code), code
+
+
+def state_from_address(address):
+    """The state an address sits in, by NAME first and PIN code second.
+
+    Name first because it is unambiguous where present, and the RERA
+    past-experience addresses usually carry it outright ("Ratu Road Ranchi
+    Jharkhand 835222"). The PIN fallback is coarse by design.
+    """
+    text = (address or "").upper()
+    if not text.strip():
+        return None
+    for name in sorted(set(_CIN_STATE_CODES.values()), key=len, reverse=True):
+        if name.upper() in text:
+            return name
+    for alias, name in _STATE_ALIASES:
+        if alias in text:
+            return name
+    for pin in _PIN_RE.findall(text):
+        resolved = _PIN_PREFIX_STATES.get(pin[:2])
+        if resolved:
+            return resolved
+    return None
+
+
+def state_footprint(graph=None, past_experiences=None):
+    """Where this group is incorporated, and where it has actually built.
+
+    Two separate answers, kept separate on purpose. Incorporation is not
+    operation: a special purpose vehicle registered in Maharashtra says
+    nothing about where the group delivers, and the declared past projects
+    are the ones that speak to track record.
+
+    Every state entry carries its own count AND the entities or projects
+    behind it, so nothing in the output is a bare number the reader has to
+    take on trust.
+    """
+    graph = graph or {}
+    incorporated = {}
+    unmapped = 0
+    unrecognised = {}
+
+    for entity in graph.get("confirmed") or []:
+        name, code = state_from_cin(entity.get("cin"))
+        if name:
+            incorporated.setdefault(name, []).append(entity.get("name"))
+        elif code:
+            unrecognised.setdefault(code, []).append(entity.get("name"))
+        else:
+            unmapped += 1
+
+    built = {}
+    for entry in past_experiences or []:
+        if not isinstance(entry, dict):
+            continue
+        state = state_from_address(entry.get("address"))
+        if state:
+            built.setdefault(state, []).append(entry.get("projectName") or "unnamed project")
+
+    def _rows(mapping):
+        return [
+            {"state": state, "count": len(items), "items": sorted(x for x in items if x)}
+            for state, items in sorted(mapping.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+        ]
+
+    limitations = []
+    if unmapped:
+        limitations.append(
+            f"{unmapped} linked entities are limited liability partnerships, whose identifier "
+            f"encodes no state of registration, so they do not appear in the incorporation "
+            f"footprint. Their absence from it is not evidence that they operate nowhere."
+        )
+    if unrecognised:
+        limitations.append(
+            "Registration codes not recognised, and therefore not mapped to any state: "
+            + ", ".join(sorted(unrecognised))
+            + ". Those entities are excluded rather than assigned to a guessed state."
+        )
+    if not past_experiences:
+        limitations.append(
+            "No declared past projects were available, so the footprint below rests on state of "
+            "incorporation alone, which is a weaker signal for where a group actually builds."
+        )
+    return {
+        "incorporated_in": _rows(incorporated),
+        "built_in": _rows(built),
+        "unmapped_entities": unmapped,
+        "unrecognised_codes": sorted(unrecognised),
+        "limitations": limitations,
+    }

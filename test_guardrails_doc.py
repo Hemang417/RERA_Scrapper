@@ -21,6 +21,9 @@ import re
 
 import charter_report
 import company_charter
+import charge_watch
+import group_sweep
+import promoter_identity
 import states
 import deep_research
 import main
@@ -34,6 +37,15 @@ _MODULES = {
     # The state seam documents its guards in guardrails.md too, so the same
     # rename-protection applies to them.
     "states": states,
+    # As does the promoter-identity pass, whose guards are the only thing
+    # standing between a misread PAN and another company's records being
+    # reported as this promoter's.
+    "promoter_identity": promoter_identity,
+    # The group sweep and the charge watch are the two passes that report
+    # COVERAGE as well as findings -- their guards are what stop "we did not
+    # look" being read as "there is nothing there".
+    "group_sweep": group_sweep,
+    "charge_watch": charge_watch,
 }
 
 
