@@ -1288,14 +1288,159 @@ def _lookup_infomerics_rating(company_name: str) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# CRISIL credit-rating lookup.
+#
+# WHY THIS WAS ADDED, AND WHAT IT COST TO BE WITHOUT IT. CRISIL is India's
+# largest rating agency and this pipeline did not check it. For a real
+# subject the structured check reported "no public rating found from any
+# agency checked (ICRA, Infomerics)" -- while CRISIL had the promoter's
+# parent rated the whole time. The only reason it reached the Charter at all
+# was the agentic web-search pass, which found a single rationale document
+# from JANUARY 2022 saying "Issuer Not Cooperating".
+#
+# That stale finding was then reported as a live governance flag. CRISIL's
+# own factsheet for the same company reads Crisil BBB / Stable, reaffirmed
+# 4 June 2026 -- investment grade, four years newer, and the opposite
+# conclusion. A structured check would have had the current rating; a
+# one-off search result had a snapshot of the worst moment in its history.
+#
+# HOW IT WORKS. CRISIL publishes its ENTIRE rated universe as one JSON
+# document -- 33,367 companies, name to internal code -- the same
+# whole-index-in-one-request shape K-RERA has. The per-company factsheet at
+# company-factsheet.<CODE>.html is server-rendered, so no browser is needed
+# despite the site being a JavaScript application.
+_CHARTER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+)
+
+_CRISIL_BASE = "https://www.crisilratings.com"
+_CRISIL_INDEX_URL = _CRISIL_BASE + "/content/crisil/en/_jcr_content/header.all.crisilratings.json"
+_CRISIL_FACTSHEET_URL = _CRISIL_BASE + "/en/home/our-business/ratings/company-factsheet.{code}.html"
+
+# The index is ~2.8 MB and the same for every company, so it is fetched once
+# per process. A group sweep asks about dozens of entities.
+_CRISIL_INDEX_CACHE = []
+
+
+# Legal-form spellings that mean the SAME legal person. Canonicalising these
+# is not fuzzy matching -- "Pvt. Ltd." and "Private Limited" are the same
+# suffix, and MCA, the RERA registers and the rating agencies each pick a
+# different one. Without this, "Pranami Estates Pvt. Ltd." (the MCA spelling)
+# missed "Pranami Estates Private Limited" (CRISIL's), and the entity read as
+# unrated when it holds a live investment-grade rating.
+_LEGAL_FORM_CANON = (
+    (r"\bpvt\.?\b", "private"),
+    (r"\bltd\.?\b", "limited"),
+    (r"\bcorp\.?\b", "corporation"),
+    (r"\bco\.\b", "company"),
+    (r"\bandcompany\b", "and company"),
+    (r"\s*&\s*", " and "),
+    (r"[.,]", " "),
+)
+
+
+def canonical_company_name(name: str) -> str:
+    """A company name reduced to a form two registries can be compared on.
+
+    Only legal-form spelling and punctuation are touched. The distinctive
+    words are left exactly as they are, because "Pranami Builders" and
+    "Pranami Estates" are different companies and must never collapse.
+    """
+    text = " ".join((name or "").split()).casefold()
+    for pattern, replacement in _LEGAL_FORM_CANON:
+        text = re.sub(pattern, replacement, text)
+    return " ".join(text.split())
+
+
+def _crisil_company_index() -> list:
+    """[{name, code}] for every company CRISIL rates. Cached per process."""
+    if _CRISIL_INDEX_CACHE:
+        return _CRISIL_INDEX_CACHE
+    resp = requests.get(_CRISIL_INDEX_URL, timeout=config.REQUEST_TIMEOUT * 3,
+                        headers={"User-Agent": _CHARTER_USER_AGENT})
+    resp.raise_for_status()
+    for entry in resp.json().get("suggestions") or []:
+        # ServiceType separates rated COMPANIES from the site's articles and
+        # press releases, which share the same suggestion list.
+        if entry.get("ServiceType") == "RATING" and entry.get("data") and entry.get("value"):
+            _CRISIL_INDEX_CACHE.append({"name": entry["value"], "code": entry["data"]})
+    return _CRISIL_INDEX_CACHE
+
+
+def _crisil_fetch_rating_detail(code: str) -> dict:
+    from bs4 import BeautifulSoup
+
+    url = _CRISIL_FACTSHEET_URL.format(code=code)
+    resp = requests.get(url, timeout=config.REQUEST_TIMEOUT,
+                        headers={"User-Agent": _CHARTER_USER_AGENT})
+    resp.raise_for_status()
+    text = BeautifulSoup(resp.text, "html.parser").get_text(" ", strip=True)
+
+    instruments = []
+    # "Instrument Category Long Term Ratings Crisil BBB Outlook Stable as of June 04, 2026"
+    for match in re.finditer(
+        r"Instrument Category\s+(.{0,40}?)\s+Ratings\s+(Crisil [^\s]+(?:\s*/\s*\w+)?)"
+        r"(?:\s+Outlook\s+(\w+))?(?:\s+as of\s+([A-Z][a-z]+ \d{1,2}, \d{4}))?",
+        text,
+    ):
+        category, rating, outlook, as_of = match.groups()
+        if outlook:
+            rating = f"{rating} (Outlook: {outlook})"
+        if as_of:
+            rating = f"{rating}, as of {as_of}"
+        instruments.append({"instrument": category or "Long Term", "rating": rating})
+
+    rationale = None
+    hit = re.search(r"Rating Rationale\s+(.{0,220}?)(?:Past rating rationales|Interested in)", text)
+    if hit:
+        rationale = hit.group(1).strip()
+    return {"instruments": instruments, "url": url, "rationale": rationale}
+
+
+def _lookup_crisil_rating(company_name: str) -> dict:
+    try:
+        index = _crisil_company_index()
+    except (requests.RequestException, ValueError) as e:
+        return {"found": False, "note": f"CRISIL lookup could not run this pass: {e}"}
+
+    target = canonical_company_name(company_name)
+    if not target:
+        return {"found": False, "note": "No company name supplied for the CRISIL lookup."}
+    # EXACT match only, same discipline as ICRA and Infomerics: attributing
+    # another company's rating would be a serious error in a due-diligence
+    # document, and "Pranami Builders" vs "Pranami Estates" are both rated.
+    exact = next((e for e in index if canonical_company_name(e["name"]) == target), None)
+    if not exact:
+        return {"found": False, "note": "No public CRISIL rating found for this exact legal entity name."}
+
+    try:
+        detail = _crisil_fetch_rating_detail(exact["code"])
+    except requests.RequestException as e:
+        return {"found": False,
+                "note": f"Found a matching CRISIL entity ({exact['name']}) but could not fetch its "
+                        f"rating detail this pass: {e}"}
+
+    return {
+        "found": True,
+        "agency": "CRISIL",
+        "company_name": exact["name"],
+        "instruments": detail["instruments"],
+        "rationale": detail["rationale"],
+        "url": detail["url"],
+    }
+
+
 _CREDIT_RATING_AGENCIES = (
+    ("CRISIL", _lookup_crisil_rating),
     ("ICRA", _lookup_icra_rating),
     ("Infomerics", _lookup_infomerics_rating),
 )
 
 
 def lookup_credit_rating(company_name: str) -> dict:
-    """Checks EVERY agency above (currently ICRA and Infomerics) for a
+    """Checks EVERY agency above (currently CRISIL, ICRA and Infomerics) for a
     public rating under an EXACT (case-insensitive) match on
     `company_name` -- never a fuzzy "probably the same company" guess,
     since misattributing a rating to the wrong legal entity would be a
@@ -3899,16 +4044,33 @@ def _remove_fully_empty_rows(table, header_rows: int = 1) -> None:
 # subjects come first. Used only when no field-level source exists -- see
 # _set_paragraph_as_bullets. Anything not matched here stays uncited on
 # purpose; Section C would rather have a missing marker than a wrong one.
+# Every alternation below is closed by a trailing \b, which means a TRUNCATED
+# STEM can never match: "incorporat" required a word boundary immediately after
+# the "t", so "incorporated" and "incorporation" failed and, with no fallback
+# alternative, the whole pattern missed. That token was dead from the day it was
+# written, and every clause whose only company keyword was "incorporated" shipped
+# uncited (observed live on the Maya charter, 2026-08-20). The same trailing \b
+# also meant singular-only stems never matched their plurals, so "directors",
+# "complaints", "appeals", "warrants", "rates", "prices" and "schools" all silently
+# missed. Stems are therefore spelled out with explicit endings rather than
+# truncated, and plurals are given an optional "s".
+#
+# Deliberately NOT widened to \w*: "incorporat\w*" would also catch the ordinary
+# verb ("the design incorporates a podium"), citing a corporate-registry source
+# for an architectural sentence. rules.md Section C is explicit that a wrong
+# marker is worse than a missing one, so only the registry senses are listed.
+# "built-up" was checked and is fine: the hyphen is interior, so both boundaries
+# land on real word edges.
 _CLAUSE_TOPIC_PATTERNS = (
-    (r"\b(?:CRISIL|ICRA|credit rating|rating rationale|downgrade[ds]?)\b", ("credit_rating",)),
+    (r"\b(?:CRISIL|ICRA|credit rating|rating rationale|downgrad(?:e|es|ed|ing))\b", ("credit_rating",)),
     (r"\b(?:insolvency|IBBI|NCLT|CIRP)\b", ("insolvency_status",)),
-    (r"\b(?:title|encumbrance|sale deed|conveyance|lis pendens|MHADA|land|plot|CTS)\b", ("land_title", "legal_documents")),
-    (r"\b(?:FSI|floor space|built-up|BUA|sanctioned plan|IOD|DCPR|setback|fungible)\b", ("legal_documents",)),
-    (r"\b(?:sold|unsold|units?|carpet area|booking|inventory|completion|quarterly)\b", ("project_registration",)),
-    (r"\b(?:director|CIN|incorporat|registered office|shareholding|paid-up|authorized capital)\b", ("company_profile",)),
-    (r"\b(?:price|pricing|rate|psf|per sq)\b", ("pricing", "market_trend")),
-    (r"\b(?:school|college|hospital|mall|station|metro|connectivity|locality|neighbourhood|located|situated|complex)\b", ("distance", "market_trend")),
-    (r"\b(?:complaint|appeal|warrant|litigation)\b", ("project_registration",)),
+    (r"\b(?:title|encumbrance|sale deed|conveyance|lis pendens|MHADA|land|plots?|CTS)\b", ("land_title", "legal_documents")),
+    (r"\b(?:FSI|floor space|built-up|BUA|sanctioned plans?|IOD|DCPR|setback|fungible)\b", ("legal_documents",)),
+    (r"\b(?:sold|unsold|units?|carpet area|bookings?|inventory|completion|quarterly)\b", ("project_registration",)),
+    (r"\b(?:directors?|CIN|incorporat(?:ed|ion)|registered office|shareholding|paid[- ]up|authori[sz]ed capital)\b", ("company_profile",)),
+    (r"\b(?:prices?|pricing|rates?|psf|per sq)\b", ("pricing", "market_trend")),
+    (r"\b(?:schools?|colleges?|hospitals?|malls?|stations?|metro|connectivity|locality|neighbou?rhood|located|situated|complex)\b", ("distance", "market_trend")),
+    (r"\b(?:complaints?|appeals?|warrants?|litigation)\b", ("project_registration",)),
 )
 
 
@@ -5678,7 +5840,7 @@ def _fill_template_inner(
         (13, lambda f: f["corporate_registry_cross_check"], _always_suppress, None, None),
         (17, lambda f: f["location_coordinates_note"], _always_suppress, None, lambda f: _cite_marker("distance", facts=f)),
         (18, lambda f: "Map screenshot not embedded -- a live map cannot be fetched programmatically, so distances below were sourced from mapping-service queries instead (see Sources).", _always_suppress, None, None),
-        (36, lambda f: f"Governing act: {rs.get('governing_act', '')}", _always_suppress, lambda f: rs.get("governing_act", ""), lambda f: _cite_marker("project_registration", facts=f)),
+        (36, lambda f: f"Governing act: {rs.get('governing_act', '')}", _project_is_rera_registered, lambda f: rs.get("governing_act", ""), lambda f: _cite_marker("project_registration", "legal_documents", facts=f)),
         (38, lambda f: allotment_text, lambda f: _externalize_prose(f, allotment_text) == "", lambda f: rs.get("allotment_mechanics", ""), None),
         (58, lambda f: f.get("rera_scraping_note", f"Extracted directly from the live {_state_profile().rera_acronym} public project page for registration number {reg_no}."), _always_suppress, None, None),
         (63, lambda f: f["documents_reviewed_note"], _always_suppress, None, None),
@@ -5696,8 +5858,14 @@ def _fill_template_inner(
     #     distances are estimated from the locality, not an exact pin) --
     #     no decision-relevant content given the actual Distances table
     #     right below.
-    #   36 -- every MahaRERA-registered project is governed by the same Act
-    #     by definition; carries no signal about THIS project.
+    #   36 -- every RERA-REGISTERED project is governed by the same Act by
+    #     definition, so for those it carries no signal about THIS project and
+    #     is dropped. Suppressed on that condition only, not unconditionally:
+    #     an unregistered project (a co-operative society redevelopment, say)
+    #     is governed by different legislation entirely, whose consent
+    #     thresholds and developer security requirements are among the most
+    #     decision-relevant facts available, and dropping them left External
+    #     materially incomplete. See _project_is_rera_registered.
     #   38 -- see suppress_fn above.
     #   58 -- a sourcing/methodology note ("where did this data come
     #     from"), not a project fact.
@@ -5717,15 +5885,29 @@ def _fill_template_inner(
 
     gaps = facts.get("gaps", [])
     if facts.get("_doc_variant") == "external":
-        # External: show ONLY gaps that were serious enough to also earn an
-        # Imminent/Structural flag above (see _classify_flags), colored to
-        # match that same severity -- a long, uniformly grey/italic list of
-        # every minor caveat wasn't legible or prioritized for a reader who
-        # skips straight to this section. Monitor-only/unflagged gaps are
-        # dropped from THIS section entirely, not lost -- they're still
-        # visible in Overview & Flags' own Monitor list. _classify_flags is
-        # a pure reader of facts with no side effects, safe to call again
-        # here rather than threading its result through the call chain.
+        # External prints EVERY gap, with its full explanation, exactly as
+        # Internal does. rules.md Section B is explicit: "Gaps & Sources keeps
+        # every item with its full explanation, including permanent ones. Never
+        # compress or delete a gap under the clean-check rule."
+        #
+        # This section used to print only gaps that had also earned an
+        # Imminent/Structural flag, on the reasoning that a long uniform list
+        # was not legible for a reader who skips straight here. That reasoning
+        # cost more than it bought. On a project whose gaps are ALL monitor
+        # severity, the subset came out empty and the section then asserted
+        # "No additional material gaps identified" directly beneath a dozen
+        # unresolved gaps printed in full in Overview & Flags: a statement that
+        # was both false and self-contradicting (observed live on the Maya
+        # charter, 2026-08-20). It also inverted "Flags summarise, Gaps
+        # explain", because _flag_headline only compresses a flag whose gap is
+        # actually printed here, so dropping the gaps forced every flag to
+        # carry its whole explanation instead.
+        #
+        # The legibility intent is kept by SEVERITY COLOUR rather than by
+        # omission: imminent red, structural amber, monitor left in the body
+        # colour. _classify_flags is a pure reader of facts with no side
+        # effects, safe to call again here rather than threading its result
+        # through the call chain.
         gap_severity = {}
         flags_for_gaps = _classify_flags(facts)
         for severity in ("structural", "imminent"):  # imminent checked last so it wins on the (should never happen) double-tag case
@@ -5737,18 +5919,27 @@ def _fill_template_inner(
         for run in list(p[66].runs):
             run.text = ""
             run._r.getparent().remove(run._r)
-        material = [(i, g) for i, g in enumerate(gaps) if i in gap_severity]
-        if not material:
+        # A gap that externalizes to nothing is pure process detail with no
+        # finding inside it, which Section B keeps out of External. Anything
+        # with real content left survives, numbered as always.
+        rendered = []
+        for i, g in enumerate(gaps):
+            body = _externalize_prose(facts, str(g)).strip()
+            if body:
+                rendered.append((i, body))
+        if not rendered:
             p[66].add_run(_externalize_prose(facts, "No additional material gaps identified beyond the standing gap below."))
         else:
             # Numbered to match the "(Gap N)" pointers in Overview & Flags.
-            # The number is the gap's stable identity (see _classify_flags),
-            # so External's subset reads "Gap 3.", "Gap 7." rather than
-            # renumbering -- a pointer means the same thing in both variants.
-            for idx, (i, g) in enumerate(material):
-                run = p[66].add_run(_externalize_prose(facts, f"Gap {i + 1}. {g}"))
-                _color_run(run, _TEXT_RED if gap_severity[i] == "imminent" else _TEXT_AMBER)
-                if idx < len(material) - 1:
+            # The number is the gap's stable identity (see _classify_flags), so
+            # a pointer means the same thing in both variants even when one
+            # gap drops out as pure process detail.
+            for idx, (i, body) in enumerate(rendered):
+                run = p[66].add_run(f"Gap {i + 1}. {body}")
+                severity = gap_severity.get(i)
+                if severity:
+                    _color_run(run, _TEXT_RED if severity == "imminent" else _TEXT_AMBER)
+                if idx < len(rendered) - 1:
                     run.add_break()
     else:
         _set_paragraph_text(
@@ -7069,6 +7260,32 @@ _EXTERNAL_PROSE_SUBSTITUTIONS = (
     # from the API, not stale), but reads as an odd internal-process note
     # to an External/client reader, so it's dropped there rather than kept.
     (r"\s*\(per live RERA record\)", ""),
+    # The CTS land-record gap (see run_cts_land_lookup, which re-adds it every
+    # run until the input file exists) is written as an instruction to whoever
+    # operates this pipeline: which candidates file to open, which office to
+    # pick, which step to run next. Internal keeps that verbatim -- it is the
+    # standing reminder, and losing it means the step gets forgotten.
+    #
+    # External must not carry it. rules.md Section B: "Internal keeps process
+    # failures, External does not ... a pending manual step, stays in the
+    # Internal document". The same rule says that where such an item also
+    # contains a genuine finding, the finding is preserved in one consolidated
+    # line and the process text dropped, which is exactly this case: the plot's
+    # land record really was not obtained, and that is a fact the reader needs.
+    # Three separate projects patched this by hand post-render before it was
+    # fixed here (P52100055794, Karmashine, Maya), so the wording below matches
+    # what those settled on.
+    #
+    # Two patterns, longest FIRST: the Gaps entry carries the whole instruction,
+    # while the Overview & Flags headline carries only its first sentence (see
+    # _flag_headline), and a short pattern applied first would rewrite the
+    # opening of the long form and leave the rest of the instruction stranded.
+    (r"CTS land-record lookup: office candidates for .*?Property Card fetch\)\.?",
+     "The City Survey land record for this plot was not obtained, so the owner of record, the plot "
+     "area and any registered encumbrance remain unconfirmed."),
+    (r"CTS land-record lookup: office candidates for .*?(?:own run output|cts_office_candidates\.json)\.?",
+     "The City Survey land record for this plot was not obtained, so the owner of record, the plot "
+     "area and any registered encumbrance remain unconfirmed."),
 )
 
 # Matches "(see gaps[0])", "(see fsi_interpretation)", "(see local_planning
@@ -8024,27 +8241,65 @@ def _classify_flags(facts: dict) -> dict:
     return {"imminent": imminent, "structural": structural, "monitor": monitor}
 
 
+# Prose that means "there is no registration", as opposed to a registration
+# number. A project record may carry either, and an empty string is not the
+# only way to say no.
+_UNREGISTERED_VALUE_PREFIXES = (
+    "not registered", "no registration", "unregistered", "not applicable",
+    "not found", "not available", "not disclosed", "none", "n/a", "nil",
+)
+
+
+def _project_is_rera_registered(facts: dict) -> bool:
+    """Whether this project actually holds a registration with the state RERA.
+
+    Reads the registration number as filed. Empty means no; so does prose
+    saying there is none ("Not registered with the Maharashtra Real Estate
+    Regulatory Authority, per the client's project record."), which is what an
+    unregistered project's record carries instead of a number.
+
+    Used to decide whether the Statutory Framework's governing-act line is
+    generic boilerplate or a project specific fact. Every RERA-registered
+    project is governed by the same Act by definition, so for those it carries
+    no signal and External drops it. An unregistered project is a different
+    case entirely: a co-operative society redevelopment is governed by the
+    society legislation instead, whose consent thresholds and developer
+    security requirements are among the most decision relevant facts in the
+    document, and dropping them leaves External materially incomplete."""
+    value = ((facts.get("rera_core_fields") or {}).get("registration_number") or "").strip()
+    if not value:
+        return False
+    return not value.lower().startswith(_UNREGISTERED_VALUE_PREFIXES)
+
+
 def _rendered_gap_numbers(facts: dict) -> set:
     """The stable gap numbers (see _classify_flags) that THIS document variant
     actually prints under Gaps & Sources.
 
-    Internal prints every gap. External prints only those material enough to
-    have also earned an Imminent or Structural flag -- see _fill_template's own
-    note where that list is built. _append_flag_list consults this before
-    emitting a "(Gap N)" pointer, so External can never point at a number it
-    does not print. Numbers stay stable either way: External's list reads
-    "Gap 3.", "Gap 7." rather than renumbering to 1, 2, because the number is
-    the gap's identity, not its position in one variant's list."""
+    BOTH variants print every gap with its full explanation, as rules.md
+    Section B requires. The one exception is External, which drops a gap that
+    externalizes to nothing at all: an item that was pure process detail with
+    no finding inside it, which Section B keeps out of External anyway. That
+    is the same test _fill_template applies when it renders the list, and the
+    two must agree, because _append_flag_list consults this before emitting a
+    "(Gap N)" pointer and External must never point at a number it does not
+    print.
+
+    Numbers stay stable either way: if one gap drops out, External's list
+    reads "Gap 3.", "Gap 5." rather than renumbering to 1, 2, because the
+    number is the gap's identity, not its position in one variant's list.
+
+    Until 2026-08-20 External printed only gaps that had also earned an
+    Imminent or Structural flag. See _fill_template's own note where the list
+    is built for why that was removed."""
     gaps = facts.get("gaps", []) or []
     if facts.get("_doc_variant") != "external":
         return set(range(1, len(gaps) + 1))
 
-    flags = _classify_flags(facts)
     return {
-        item["gap_number"]
-        for severity in ("imminent", "structural")
-        for item in flags.get(severity, [])
-        if item.get("gap_number")
+        i + 1
+        for i, g in enumerate(gaps)
+        if _externalize_prose(facts, str(g)).strip()
     }
 
 
@@ -9021,7 +9276,8 @@ def _append_credit_rating_section(doc, facts: dict) -> None:
     credit_rating_check was never set (e.g. no promoter name was available
     to check against)."""
     check = facts.get("credit_rating_check")
-    if not check:
+    group = facts.get("group_credit_ratings") or {}
+    if not check and not group.get("rated"):
         return
 
     heading_style = doc.paragraphs[4].style
@@ -9032,7 +9288,7 @@ def _append_credit_rating_section(doc, facts: dict) -> None:
     _variant_paragraph(
         doc, facts,
         internal_text=(
-            "Checked directly against every rating agency's public database (currently ICRA and Infomerics) "
+            "Checked directly against every rating agency's public database (currently CRISIL, ICRA and Infomerics) "
             "for an exact match on the promoter's own legal name -- not a fuzzy or \"probably the same "
             "company\" guess, since attributing a rating to the wrong legal entity would itself be a serious "
             "error. Every agency is checked regardless of whether an earlier one already found something, so "
@@ -9063,6 +9319,34 @@ def _append_credit_rating_section(doc, facts: dict) -> None:
         else:
             doc.add_paragraph(parent_result.get("note", "No result recorded."))
 
+
+    # THE RATED ENTITY IS USUALLY NOT THE SUBJECT. A project promoter is a
+    # special purpose vehicle nobody rates, so a subject-only check reports
+    # nothing while the parent that actually borrows carries a live rating.
+    # On the worked subject the SPV was unrated and two group companies held
+    # investment-grade ratings, none of which reached the page.
+    if group.get("rated"):
+        sub = doc.add_paragraph("Ratings held by group entities")
+        for run in sub.runs:
+            run.bold = True
+        table = doc.add_table(rows=1, cols=3)
+        _set_table_borders(table)
+        for idx, label in enumerate(("Entity", "Agency", "Rating")):
+            cell = table.rows[0].cells[idx]
+            cell.text = label
+            _shade_cell(cell, "D9E2F3")
+            for para in cell.paragraphs:
+                for run in para.runs:
+                    run.bold = True
+        for entry in group["rated"]:
+            for rating in entry["ratings"]:
+                for instrument in rating.get("instruments") or [{}]:
+                    row = table.add_row()
+                    _set_row_cell(row, 0, entry["company_name"])
+                    _set_row_cell(row, 1, rating.get("agency") or "")
+                    _set_row_cell(row, 2, instrument.get("rating") or "")
+    for note in group.get("notes") or []:
+        doc.add_paragraph(note)
 
 def _append_ibbi_check_section(doc, facts: dict) -> None:
     """Appends a section reporting the code-computed IBBI insolvency check
@@ -10179,6 +10463,82 @@ def _record_promoter_identity_gap(facts: dict) -> None:
         )
 
 
+def _safe_group_credit_ratings(group_result: dict, subject_name: str = "",
+                              limit: int = 12) -> dict:
+    """Public credit ratings across the promoter's GROUP, not just itself.
+
+    WHY THE SUBJECT ALONE IS THE WRONG THING TO ASK. A project promoter is
+    typically a special purpose vehicle incorporated months before the
+    registration; no agency rates it, so the check returns "not found" and
+    the Charter records no rating information at all. The RATED entity is
+    the parent that actually borrows. On the worked subject the SPV was
+    unrated while two group companies carried live investment-grade
+    ratings, and neither reached the document.
+
+    Bounded, because a group can carry dozens of entities and each miss
+    costs a request. Entities past the limit are reported as not checked,
+    never as unrated.
+
+    Never fatal.
+    """
+    companies = (group_result or {}).get("companies") or []
+    names = []
+    for name in [subject_name] + [c.get("name") for c in companies]:
+        if name and name not in names:
+            names.append(name)
+    if not names:
+        return {}
+
+    # ORDER MATTERS AS MUCH AS THE LIMIT. The group list arrives in the
+    # registry's own scrape order, which is arbitrary, so a bounded check
+    # walking it front-to-back checks whatever happens to be first. On the
+    # worked subject that was fourteen carbon and logistics entities, while
+    # the two companies that actually hold ratings -- the ones sharing the
+    # promoter's own brand -- sat at positions 28 and 29 and were never
+    # reached. The pass reported "0 rated" and said so honestly, which is
+    # not the same as being useful.
+    #
+    # An entity sharing the subject's distinctive name is the likeliest
+    # parent, so it is checked first. This changes only the ORDER, never
+    # which entities are eligible.
+    brand, _ = group_entities.brand_token(subject_name or "")
+    if brand:
+        names.sort(key=lambda n: (0 if brand.casefold() in (n or "").casefold() else 1))
+    if subject_name in names:
+        names.remove(subject_name)
+        names.insert(0, subject_name)
+
+    rated, unrated, checked = [], [], 0
+    for name in names:
+        if checked >= limit:
+            break
+        checked += 1
+        try:
+            result = lookup_credit_rating(name)
+        except Exception:
+            continue
+        hits = [r for r in (result.get("ratings") or []) if r.get("found")]
+        if hits:
+            rated.append({"company_name": name, "ratings": hits})
+        else:
+            unrated.append(name)
+
+    notes = []
+    if checked < len(names):
+        notes.append(
+            f"{checked} of {len(names)} group entities were checked for a public credit rating; "
+            f"the rest were not checked at all. Nothing here says whether they are rated."
+        )
+    if unrated:
+        notes.append(
+            f"{len(unrated)} of the {checked} entities checked carry no public rating from any "
+            f"agency queried. That is normal for a private company: agencies rate only entities "
+            f"that sought a rating, so it is not itself an adverse signal."
+        )
+    return {"rated": rated, "unrated_count": len(unrated),
+            "entities_checked": checked, "entities_total": len(names), "notes": notes}
+
+
 def _safe_charge_movement(profile_result: dict, output_dir: str) -> dict:
     """Whether the promoter's secured borrowing has MOVED since the last run.
 
@@ -10730,6 +11090,9 @@ def run_company_charter(
         # each linked entity, and the state named in each declared past
         # project's own address -- never from a fixed list of states.
         facts["state_footprint"] = _safe_state_footprint(group_result, category_data)
+        facts["group_credit_ratings"] = _safe_group_credit_ratings(
+            group_result, _portal_promoter_name(category_data)
+        )
         facts["group_rera_sweep"] = _safe_group_rera_sweep(
             group_result, _portal_promoter_name(category_data), enabled=group_sweep
         )
