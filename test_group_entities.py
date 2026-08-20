@@ -253,6 +253,33 @@ def test_no_charges_is_a_clean_zero_not_an_unknown():
     print("test_no_charges_is_a_clean_zero_not_an_unknown: PASS")
 
 
+def test_the_pune_registrar_code_maps_to_maharashtra():
+    """PN is a CITY-level registrar code, not a state code, and Maharashtra
+    is the only state that issues one. Omitting it did not fail loudly: it
+    silently emptied the state footprint of a group whose every linked
+    company was Pune-registered, which reads as "operates nowhere" rather
+    than "operates in the state this project is in"."""
+    for cin in ("U45200PN2013PTC146381", "U95202PN1993PTC073644", "U45203PN2008PTC131400"):
+        state, code = ge.state_from_cin(cin)
+        assert code == "PN", (cin, code)
+        assert state == "Maharashtra", (cin, state)
+    # The Mumbai code must keep resolving to the same state, not be displaced.
+    assert ge.state_from_cin("U88900MH2024NPL420592")[0] == "Maharashtra"
+    print("test_the_pune_registrar_code_maps_to_maharashtra: PASS")
+
+
+def test_an_undocumented_code_is_reported_not_guessed():
+    """The counterpart guard. "MR" appears in real scraped data but maps to
+    no state or registrar in any source checked, so it must come back as an
+    unrecognised code rather than be rounded to a neighbouring guess. A wrong
+    state here sends a group sweep to the wrong authority and reports a clean
+    record from it."""
+    state, code = ge.state_from_cin("U35201MR2026PTC475989")
+    assert code == "MR", code
+    assert state is None, state
+    print("test_an_undocumented_code_is_reported_not_guessed: PASS")
+
+
 if __name__ == "__main__":
     test_brand_token_skips_legal_forms_and_common_prefixes()
     test_a_place_or_a_trade_is_not_a_brand()
@@ -267,4 +294,6 @@ if __name__ == "__main__":
     test_summarise_charges_separates_open_from_satisfied()
     test_unreadable_amounts_give_none_not_zero()
     test_no_charges_is_a_clean_zero_not_an_unknown()
+    test_the_pune_registrar_code_maps_to_maharashtra()
+    test_an_undocumented_code_is_reported_not_guessed()
     print("\nAll tests passed.")

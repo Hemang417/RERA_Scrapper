@@ -407,12 +407,19 @@ def test_llps_are_counted_out_loud_not_quietly_omitted():
 
 def test_an_unrecognised_state_code_is_named_never_guessed():
     """A wrong state here sends a sweep to the wrong regulator, which then
-    reports a clean record. "PN" is real and live in this promoter's own
-    group graph, and it is not a code this map recognises."""
+    reports a clean record, so an unknown code is named rather than
+    assigned.
+
+    This test used to assert that on "PN", which was wrong twice over: PN is
+    a real code, and it is Maharashtra's -- ROC Pune, the one CITY-level
+    registrar code any state issues. Treating it as unknown silently emptied
+    the state footprint of every Pune-registered group, which reads as
+    "operates nowhere". It is now mapped, so this uses a code that really
+    does not exist."""
     footprint = ge.state_footprint({"confirmed": [
-        {"name": "Bord Systems India Private Limited", "cin": "U72900PN2021FTC204054"},
+        {"name": "Nowhere Systems Private Limited", "cin": "U72900ZZ2021FTC204054"},
     ]})
-    assert footprint["unrecognised_codes"] == ["PN"], footprint
+    assert footprint["unrecognised_codes"] == ["ZZ"], footprint
     assert not footprint["incorporated_in"], "an unknown code was assigned to a state anyway"
     assert any("not recognised" in l for l in footprint["limitations"]), footprint["limitations"]
     print("test_an_unrecognised_state_code_is_named_never_guessed: PASS")
@@ -433,7 +440,10 @@ def test_the_state_comes_from_the_address_name_before_the_pin_code():
 
 def test_cin_state_extraction_handles_llpins_and_junk():
     assert ge.state_from_cin("U93000JH2020PTC014638") == ("Jharkhand", "JH")
-    assert ge.state_from_cin("U72900PN2021FTC204054") == (None, "PN")
+    # PN is ROC Pune -- a city-level registrar code, and Maharashtra is the
+    # only state that issues one. It is NOT an unknown code.
+    assert ge.state_from_cin("U72900PN2021FTC204054") == ("Maharashtra", "PN")
+    assert ge.state_from_cin("U72900ZZ2021FTC204054") == (None, "ZZ")
     assert ge.state_from_cin("AAM-0112") == (None, None)
     assert ge.state_from_cin(None) == (None, None)
     assert ge.state_from_cin("") == (None, None)

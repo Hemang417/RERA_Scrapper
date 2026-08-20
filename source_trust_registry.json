@@ -1,24 +1,27 @@
 {
   "domains": {
     "99acres.com": {
-      "hit_count": 5,
+      "hit_count": 7,
       "projects": [
         "P52100019639",
         "P51800077150",
         "P51700048590",
         "P51700031409",
-        "CONSTELLA_TS"
+        "CONSTELLA_TS",
+        "ABB-2329_MAYA-411038",
+        "KARMASHINE_MARKETYARD_411037"
       ],
       "promoted": true,
       "promoted_on_project": "CONSTELLA_TS",
       "review_note": "Source \"99acres.com\" auto-promoted to trusted status after 5 corroborating uses across separate projects (most recently CONSTELLA_TS) -- this was an automatic, frequency-based promotion, not a manual accuracy review; recommend a one-time spot-check of this source's reliability."
     },
     "nobroker.in": {
-      "hit_count": 3,
+      "hit_count": 4,
       "projects": [
         "P52100019639",
         "P51800077150",
-        "P51700048590"
+        "P51700048590",
+        "KARMASHINE_MARKETYARD_411037"
       ],
       "promoted": false,
       "promoted_on_project": null,
@@ -43,25 +46,29 @@
       "review_note": null
     },
     "wikipedia.org": {
-      "hit_count": 2,
+      "hit_count": 4,
       "projects": [
         "P51800077150",
-        "CONSTELLA_TS"
+        "CONSTELLA_TS",
+        "ABB-2329_MAYA-411038",
+        "KARMASHINE_MARKETYARD_411037"
       ],
       "promoted": false,
       "promoted_on_project": null,
       "review_note": null
     },
     "squareyards.com": {
-      "hit_count": 3,
+      "hit_count": 5,
       "projects": [
         "P51700031409",
         "P51800077150",
-        "CONSTELLA_TS"
+        "CONSTELLA_TS",
+        "ABB-2329_MAYA-411038",
+        "KARMASHINE_MARKETYARD_411037"
       ],
-      "promoted": false,
-      "promoted_on_project": null,
-      "review_note": null
+      "promoted": true,
+      "promoted_on_project": "KARMASHINE_MARKETYARD_411037",
+      "review_note": "Source \"squareyards.com\" auto-promoted to trusted status after 5 corroborating uses across separate projects (most recently KARMASHINE_MARKETYARD_411037) -- this was an automatic, frequency-based promotion, not a manual accuracy review; recommend a one-time spot-check of this source's reliability."
     },
     "indextap.com": {
       "hit_count": 1,

@@ -206,6 +206,48 @@ def test_an_unrecognisable_clause_stays_uncited_rather_than_mis_cited():
     print("test_an_unrecognisable_clause_stays_uncited_rather_than_mis_cited: PASS")
 
 
+def test_no_topic_pattern_carries_a_stem_its_own_word_boundary_kills():
+    """Regression: every alternation in _CLAUSE_TOPIC_PATTERNS is closed by a
+    trailing \\b, so a TRUNCATED stem can never match anything. "incorporat"
+    was dead from the day it was written: after matching those ten characters
+    the pattern demanded a word boundary, but "incorporated" continues with a
+    word character, and there was no fallback alternative. Every clause whose
+    only company keyword was "incorporated" therefore shipped uncited, which
+    Section C counts as a defect.
+
+    This asserts the real-world forms resolve, and that the singular-only
+    stems now also match their plurals ("directors", "complaints", "appeals",
+    "rates" and friends all silently missed for the same reason)."""
+    facts = {
+        "_doc_variant": "external",
+        "_citation_registry": {"order": [], "index": {}},
+        "sources": [
+            {"label": "z.html", "ref": "Corporate registry record", "topic": "company_profile"},
+            {"label": "r.html", "ref": "Complaint register", "topic": "project_registration"},
+            {"label": "p.html", "ref": "Price trend record", "topic": "pricing"},
+        ],
+    }
+    must_cite = (
+        "The promoter was incorporated on 31 May 2022.",
+        "Its incorporation predates the project.",
+        "The directors were appointed that day.",
+        "Authorised capital stands at 30,500,000 rupees.",
+        "Paid up capital stands at 100,000 rupees.",
+        "Two complaints were filed against the promoter.",
+        "Three appeals remain pending.",
+        "Prevailing rates reached 14,000 rupees per square foot.",
+    )
+    for clause in must_cite:
+        assert cc._clause_topic_citation(facts, clause), f"silently uncited: {clause!r}"
+
+    # The other half of the rule: a wrong marker is worse than a missing one,
+    # so the ordinary verb must NOT drag in a corporate-registry source.
+    assert cc._clause_topic_citation(
+        facts, "The design incorporates a landscaped podium."
+    ) is None, "'incorporates' must not resolve to the corporate registry"
+    print("test_no_topic_pattern_carries_a_stem_its_own_word_boundary_kills: PASS")
+
+
 # --- External drops process failures -----------------------------------------
 
 def test_external_drops_process_failures_internal_keeps_them():
@@ -223,6 +265,66 @@ def test_external_drops_process_failures_internal_keeps_them():
     assert "Could not resolve authentication" not in internal, "raw exception text must not survive anywhere"
     assert "the verification step could not run" in internal, "Internal must still keep the process failure itself"
     print("test_external_drops_process_failures_internal_keeps_them: PASS")
+
+
+_CTS_GAP = (
+    "CTS land-record lookup: office candidates for Pune are in "
+    "output/P51800077150/cts_office_candidates.json. Pick the office covering this project's own "
+    "recorded taluka/village, then run cts_resolve.py to continue (villages, then CTS-number "
+    "candidates, then the final Property Card fetch)."
+)
+_CTS_GAP_SANITIZED = (
+    "CTS land-record lookup: office candidates for pune are in this project's own run output. Pick "
+    "the office covering this project's own recorded taluka/village, then run the cts resolve step "
+    "to continue (villages, then CTS-number candidates, then the final Property Card fetch)."
+)
+
+
+def test_the_pending_land_record_step_is_cut_from_external_keeping_its_finding():
+    """Section B: "Internal keeps process failures, External does not ... a
+    pending manual step, stays in the Internal document", and where such an
+    item also carries a genuine finding, the finding is preserved and the
+    process text dropped.
+
+    The CTS gap is written as an instruction to whoever operates the pipeline
+    (which candidates file to open, which office to pick, what to run next).
+    The finding inside it is that the plot's land record was never obtained,
+    which the reader does need. Three projects patched this by hand
+    post-render before it was fixed at source."""
+    ext = {"_doc_variant": "external"}
+    internal = {"_doc_variant": "internal"}
+
+    for form in (_CTS_GAP, _CTS_GAP_SANITIZED):
+        out = cc._externalize_prose(ext, form)
+        assert "land record" in out and "unconfirmed" in out, out
+        for leak in ("Pick the office", "cts_resolve", "cts resolve step",
+                     "cts_office_candidates", "own run output", "Property Card fetch"):
+            assert leak not in out, f"External still leaks the pending step: {leak!r}"
+        # Internal is the standing reminder and must survive untouched.
+        assert cc._externalize_prose(internal, form) == form
+
+    print("test_the_pending_land_record_step_is_cut_from_external_keeping_its_finding: PASS")
+
+
+def test_the_land_record_flag_headline_is_converted_too():
+    """_flag_headline renders a flag from the gap's FIRST SENTENCE, so the
+    opening clause has to convert on its own. A rule matching only the whole
+    instruction would clean Gaps & Sources and leave the Overview & Flags
+    headline still reading like a to-do item."""
+    ext = {"_doc_variant": "external"}
+    headline_form = _CTS_GAP_SANITIZED.split(". ")[0] + "."
+    out = cc._externalize_prose(ext, headline_form)
+    assert "land record" in out and "unconfirmed" in out, out
+    assert "run output" not in out and "candidates" not in out, out
+
+    # And the ordering that makes both work: the long rule must be tried before
+    # the short one, or the short one rewrites the opening of the long form and
+    # strands the rest of the instruction.
+    full = cc._externalize_prose(ext, _CTS_GAP_SANITIZED)
+    assert "taluka" not in full and "villages" not in full, (
+        f"the short rule fired first and stranded the instruction: {full!r}"
+    )
+    print("test_the_land_record_flag_headline_is_converted_too: PASS")
 
 
 def test_single_source_finding_survives_as_one_consolidated_line():
@@ -253,6 +355,9 @@ if __name__ == "__main__":
     test_no_orphan_sources_and_no_dangling_markers()
     test_clause_topic_resolution_picks_a_supporting_topic()
     test_an_unrecognisable_clause_stays_uncited_rather_than_mis_cited()
+    test_no_topic_pattern_carries_a_stem_its_own_word_boundary_kills()
     test_external_drops_process_failures_internal_keeps_them()
+    test_the_pending_land_record_step_is_cut_from_external_keeping_its_finding()
+    test_the_land_record_flag_headline_is_converted_too()
     test_single_source_finding_survives_as_one_consolidated_line()
     print("\nAll tests passed.")

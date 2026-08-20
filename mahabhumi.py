@@ -50,6 +50,7 @@ nothing is silently lost if a future page happens to render differently.
 """
 
 import os
+import re
 import shutil
 import time
 
@@ -84,6 +85,15 @@ _SEL_DISTRICT = "#ContentPlaceHolder1_ddlMainDist"
 _SEL_OFFICE = "#ContentPlaceHolder1_ddlTalForAll"
 _SEL_VILLAGE = "#ContentPlaceHolder1_ddlVillForAll"
 _SEL_CTS_INPUT = "#ContentPlaceHolder1_txtcsno"
+# Added by the site some time before 2026-08-20: a second "what are you
+# searching by" dropdown that sits between the CTS radio and the number
+# box. Until it is set, btnsearchfind posts back but ddlsurveyno is never
+# populated -- so EVERY CTS lookup silently returned zero candidates,
+# including numbers that certainly exist (confirmed live: CTS "1" in
+# village gulTekdi returns 1/a, 1/k/1, ... once this is selected, and
+# nothing at all when it is skipped). A missing dropdown is tolerated so
+# this still works if the site reverts.
+_SEL_SEARCH_TYPE_DDL = "#ContentPlaceHolder1_ddlSelectSearchType"
 _SEL_CTS_SEARCH_BTN = "#ContentPlaceHolder1_btnsearchfind"
 _SEL_CTS_CANDIDATES = "#ContentPlaceHolder1_ddlsurveyno"
 _SEL_MOBILE = "#ContentPlaceHolder1_txtmobile1"
@@ -176,14 +186,37 @@ def _launch(headless: bool):
     return p, browser, page
 
 
-def _settle(page) -> None:
+def _settle(page, ms: int = 3000) -> None:
     """Bounded wait for an ASP.NET partial postback to settle when nothing
     downstream repopulates (so _wait_for_repopulated's polling doesn't
     apply) -- e.g. after selecting a village, or after checking the CTS
     radio reveals the number input. The page never reaches networkidle
     (something on it polls continuously), so a fixed wait is used instead,
-    same as session_auth.py's SPA-bootstrap wait."""
-    page.wait_for_timeout(1500)
+    same as session_auth.py's SPA-bootstrap wait.
+
+    Raised from 1500ms to 3000ms on 2026-08-20: the site had slowed enough
+    that the shorter wait let the next step run against a half-applied
+    postback. Prefer _wait_for_repopulated or _wait_for_cts_results wherever
+    there IS something specific to poll for; this is the fallback."""
+    page.wait_for_timeout(ms)
+
+
+def _wait_for_cts_results(page, timeout_ms: int = 25000) -> None:
+    """Polls until the CTS search has actually produced a result.
+
+    A completed search leaves ddlsurveyno holding EITHER real candidates OR
+    the site's own "no CTS number available" entry, so in both cases it goes
+    from zero options to at least one. Waiting a fixed interval instead was
+    the bug that made every CTS lookup in the repo report zero candidates:
+    the read happened before the postback landed, and an empty dropdown is
+    indistinguishable from a genuine no-match (confirmed live 2026-08-20 -
+    CTS "1" in village gulTekdi returned nothing on a fixed wait and 17 real
+    sub-divisions once polled for)."""
+    page.wait_for_function(
+        "(sel) => { const el = document.querySelector(sel); return el && el.options.length > 0; }",
+        arg=_SEL_CTS_CANDIDATES,
+        timeout=timeout_ms,
+    )
 
 
 def _wait_for_repopulated(page, selector: str, timeout_ms: int = 10000) -> None:
@@ -238,6 +271,24 @@ _CTS_NO_MATCH_TEXT = "न.भु.क्र./CTS नंबर उपलब्ध 
 def _read_options(page, selector: str) -> list:
     texts = page.locator(f"{selector} option").all_inner_texts()
     return [t.strip() for t in texts if t.strip() and "--" not in t and t.strip() != _CTS_NO_MATCH_TEXT]
+
+
+def _select_cts_search_type(page) -> None:
+    """Sets the search-by dropdown to its CTS-number option, if present.
+
+    See _SEL_SEARCH_TYPE_DDL: skipping this makes every CTS search return an
+    empty candidate list rather than an error, which reads as "this number
+    does not exist" when in fact nothing was ever searched."""
+    if not page.query_selector(_SEL_SEARCH_TYPE_DDL):
+        return
+    values = page.eval_on_selector_all(
+        _SEL_SEARCH_TYPE_DDL + " option",
+        "opts => opts.filter(o => o.value && !o.value.includes('--')).map(o => o.value)",
+    )
+    if not values:
+        return
+    page.select_option(_SEL_SEARCH_TYPE_DDL, value=values[0])
+    _settle(page)
 
 
 def _open_property_card_search(page, district_label: str):
@@ -325,13 +376,13 @@ def _search_cts_candidates_once(district_label: str, office_label: str, village_
 
         page.check(_SEL_CTS_RADIO)
         _settle(page)  # checking the radio itself reveals/resets the CTS input via another postback
+        _select_cts_search_type(page)
         page.fill(_SEL_CTS_INPUT, str(cts_query).strip())
         page.click(_SEL_CTS_SEARCH_BTN)
-        # A genuine no-match leaves ddlsurveyno at its placeholder-only state
-        # forever, so waiting for it to repopulate would misreport "no
-        # matches" as an error -- a fixed settle then reading whatever's
-        # there treats an empty result as the valid outcome it is.
-        _settle(page)
+        # A genuine no-match still populates ddlsurveyno, with the site's own
+        # "no CTS number available" entry, so this polls for the search having
+        # landed at all and _read_options filters that entry out afterwards.
+        _wait_for_cts_results(page)
 
         candidates = _read_options(page, _SEL_CTS_CANDIDATES)
         return {"found": True, "candidates": candidates}
@@ -416,6 +467,141 @@ def _ocr_image(path: str) -> str:
         return pytesseract.image_to_string(Image.open(path), lang="eng").strip()
 
 
+# ---------------------------------------------------------------------------
+# Property Card field extraction.
+#
+# WHAT THE CARD ACTUALLY IS, and why this replaces the OCR workaround. The
+# Property Card is a rendered HTML page -- crisp text in real <table>
+# elements, with the "For View Only - Not For Legal Purpose" watermark as a
+# light overlay behind it. It is NOT a scanned image. OCR was only ever
+# needed because page.content() was reading the search form instead of the
+# card (the card lives in an iframe), and a screenshot was the only thing
+# that saw the real page.
+#
+# So the right extraction is to parse the tables. OCR stays as a fallback,
+# but on a machine without the Marathi language pack it produces garbled
+# Latin guesses at Devanagari and cannot be relied on -- see _ocr_image.
+#
+# THE PARSER MATCHES ON LABEL TEXT, NEVER ON POSITION. The card has three
+# shapes: a header table of survey/area/tenure columns, a block of
+# label-and-value rows, and the फेरफार (mutation) table. Column counts vary
+# between cards, so every field is found by its own Marathi label.
+
+# Marathi label -> the English key this pipeline uses. The labels are what
+# the Maharashtra Land Records rules print on Form D; they do not change
+# between districts.
+_CARD_LABELS = {
+    "\u0928\u0917\u0930 \u092d\u0942\u092e\u093e\u092a\u0928 \u0915\u094d\u0930\u092e\u093e\u0902\u0915": "city_survey_number",
+    "\u0936\u093f\u091f \u0928\u0902\u092c\u0930": "sheet_number",
+    "\u092a\u094d\u0932\u0949\u091f \u0928\u0902\u092c\u0930": "plot_number",
+    "\u0915\u094d\u0937\u0947\u0924\u094d\u0930": "area_sq_m",
+    "\u0927\u093e\u0930\u0923\u093e\u0927\u093f\u0915\u093e\u0930": "tenure",
+    "\u0939\u0915\u094d\u0915\u093e\u091a\u093e \u092e\u0942\u0933 \u0927\u093e\u0930\u0915": "original_holder",
+    "\u092a\u091f\u094d\u091f\u0947\u0926\u093e\u0930": "lessee",
+    "\u0907\u0924\u0930 \u092d\u093e\u0930": "encumbrance",
+    "\u0907\u0924\u0930 \u0936\u0947\u0930\u0947": "other_remarks",
+    "\u0917\u093e\u0935": "village",
+    "\u091c\u093f\u0932\u094d\u0939\u093e": "district",
+    "\u0935\u0930\u094d\u0937": "holder_year",
+}
+
+# Mutation-table column labels.
+_MUTATION_COLUMNS = {
+    "\u0926\u093f\u0928\u093e\u0902\u0915": "date",
+    "\u0935\u094d\u092f\u0935\u0939\u093e\u0930": "transaction",
+    "\u092b\u0947\u0930\u092b\u093e\u0930": "mutation_number",
+    "\u0938\u093e\u0915\u094d\u0937\u093e\u0902\u0915\u0928": "attestation",
+}
+
+_PU_ID_RE = re.compile(r"PU[\s-]?ID\s*[:\-]?\s*(\d{6,})", re.I)
+
+
+def _cell_text(cell) -> str:
+    return " ".join(cell.get_text(" ", strip=True).split())
+
+
+def parse_property_card(html: str) -> dict:
+    """The Property Card's fields, from its own HTML.
+
+    Pure: HTML in, dict out, no browser -- so it is testable against a
+    saved capture rather than only against a live CAPTCHA-gated session.
+
+    Returns {} when the HTML carries no card at all, which is how a caller
+    tells "the card was not on this page" from "the card was there and this
+    field was blank". A blank field on a real card is a FINDING: an empty
+    इतर भार row means no encumbrance is recorded, and that is exactly
+    what a reader needs to know.
+    """
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html or "", "html.parser")
+    text = soup.get_text(" ", strip=True)
+    fields, mutations = {}, []
+
+    pu_id = _PU_ID_RE.search(text)
+    if pu_id:
+        fields["pu_id"] = pu_id.group(1)
+
+    for table in soup.find_all("table"):
+        rows = table.find_all("tr")
+        if not rows:
+            continue
+        header_cells = [_cell_text(c) for c in rows[0].find_all(["th", "td"])]
+
+        # Shape 1: the mutation table, matched on its own column labels.
+        if any(any(k in h for k in ("\u0926\u093f\u0928\u093e\u0902\u0915",)) for h in header_cells) and \
+           any(any(k in h for k in ("\u0935\u094d\u092f\u0935\u0939\u093e\u0930",)) for h in header_cells):
+            index = {}
+            for position, header in enumerate(header_cells):
+                for label, key in _MUTATION_COLUMNS.items():
+                    if label in header:
+                        index[key] = position
+            for row in rows[1:]:
+                cells = [_cell_text(c) for c in row.find_all(["td", "th"])]
+                if not any(cells):
+                    continue
+                entry = {key: (cells[pos] if pos < len(cells) else "")
+                         for key, pos in index.items()}
+                if any(entry.values()):
+                    mutations.append(entry)
+            continue
+
+        # Shape 2: a header row of column labels over one value row.
+        #
+        # Only a row of real <th> cells counts as a header. A label-and-value
+        # row (<td>label</td><td>value</td>) also has its label in the first
+        # cell, so treating it as a header made the parser read the NEXT
+        # row's first cell as the value: "हक्काचा मूळ धारक" came back as
+        # "वर्ष:", the label of the row below it, instead of the holder's
+        # name.
+        matched = {}
+        if not rows[0].find_all("th"):
+            header_cells = []
+        for position, header in enumerate(header_cells):
+            for label, key in _CARD_LABELS.items():
+                if label in header and key not in matched:
+                    matched[key] = position
+        if matched and len(rows) > 1:
+            values = [_cell_text(c) for c in rows[1].find_all(["td", "th"])]
+            for key, position in matched.items():
+                if position < len(values) and key not in fields:
+                    fields[key] = values[position]
+            continue
+
+        # Shape 3: label-and-value rows down the left column.
+        for row in rows:
+            cells = [_cell_text(c) for c in row.find_all(["td", "th"])]
+            if len(cells) < 2:
+                continue
+            for label, key in _CARD_LABELS.items():
+                if label in cells[0] and key not in fields:
+                    fields[key] = cells[1]
+
+    if not fields and not mutations:
+        return {}
+    return {"fields": fields, "mutations": mutations}
+
+
 def _scrape_result_page(page, screenshot_path: str | None = None) -> dict:
     """Best-effort extraction from whatever page the site shows after a
     successful CAPTCHA submission. Tries the two structural patterns already
@@ -443,6 +629,7 @@ def _scrape_result_page(page, screenshot_path: str | None = None) -> dict:
 
     raw_text_parts = []
     fields = {}
+    mutations = []
     for frame in page.frames:
         try:
             html = frame.content()
@@ -450,10 +637,20 @@ def _scrape_result_page(page, screenshot_path: str | None = None) -> dict:
             continue  # a detached/cross-origin frame mid-navigation -- skip it, not fatal
         soup = BeautifulSoup(html, "html.parser")
         raw_text_parts.append(soup.get_text("\n", strip=True))
+        # The Property Card, parsed from its own tables. This is the real
+        # extraction path: the card is rendered HTML, not a scan, and the
+        # docstring above promised table support that was never written --
+        # so `fields` came back {} on every lookup this repo has ever done.
+        card = parse_property_card(html)
+        if card:
+            fields.update(card["fields"])
+            if card["mutations"]:
+                mutations.extend(card["mutations"])
+        # The li.row shape, kept as a fallback for any page that uses it.
         for li in soup.find_all("li", class_="row"):
             parts = li.find_all(["span", "label"])
             if len(parts) >= 2:
-                fields[parts[0].get_text(strip=True)] = parts[1].get_text(strip=True)
+                fields.setdefault(parts[0].get_text(strip=True), parts[1].get_text(strip=True))
     raw_text = "\n".join(part for part in raw_text_parts if part)
 
     ocr_text = ""
@@ -464,7 +661,8 @@ def _scrape_result_page(page, screenshot_path: str | None = None) -> dict:
         except Exception as e:
             ocr_text = f"[OCR unavailable: {e}]"
 
-    return {"fields": fields, "raw_text": raw_text, "ocr_text": ocr_text, "url": page.url}
+    return {"fields": fields, "mutations": mutations, "raw_text": raw_text,
+            "ocr_text": ocr_text, "url": page.url}
 
 
 def fetch_property_card(
@@ -526,9 +724,10 @@ def fetch_property_card(
 
                 page.check(_SEL_CTS_RADIO)
                 _settle(page)
+                _select_cts_search_type(page)
                 page.fill(_SEL_CTS_INPUT, str(cts_number).strip())
                 page.click(_SEL_CTS_SEARCH_BTN)
-                _settle(page)
+                _wait_for_cts_results(page)
 
                 cts_options = _read_options(page, _SEL_CTS_CANDIDATES)
                 _select_option_exact(page, _SEL_CTS_CANDIDATES, str(cts_number).strip(), cts_options)

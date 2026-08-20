@@ -33,6 +33,13 @@ def _all_text(path: str) -> str:
     return "\n".join(parts)
 
 
+def _printed_gap_numbers(blob: str) -> set:
+    """The gap numbers actually printed under Gaps & Sources. Both variants
+    render the list inside one paragraph with line breaks between entries,
+    which python-docx surfaces as newlines."""
+    return {int(n) for n in re.findall(r"^Gap (\d+)\.", blob, re.M)}
+
+
 def _build(variant: str) -> str:
     os.makedirs(_SCRATCH, exist_ok=True)
     with open(_PRANAMI_FACTS, encoding="utf-8") as f:
@@ -96,24 +103,59 @@ def test_a_flag_with_no_gap_keeps_its_full_text():
     print("test_a_flag_with_no_gap_keeps_its_full_text: PASS")
 
 
-def test_external_never_points_at_a_gap_it_does_not_print():
-    """External prints only gaps that also earned an Imminent/Structural flag.
-    A monitor-only gap must therefore keep its full text rather than emit a
-    pointer into a list that will not contain it."""
+def test_external_prints_monitor_only_gaps_too():
+    """rules.md Section B: "Gaps & Sources keeps every item with its full
+    explanation, including permanent ones."
+
+    External used to print only gaps that had also earned an Imminent or
+    Structural flag. On a project whose gaps were ALL monitor severity that
+    subset came out empty, and the section then asserted "No additional
+    material gaps identified" directly beneath a dozen unresolved gaps printed
+    in full as flags: false, and self-contradicting. Both variants now print
+    every gap, so a monitor-only gap gets a pointer in External exactly as it
+    does in Internal."""
     monitor_only = "Some minor detail could not be confirmed. It is not material to this project."
     facts = {"gaps": [monitor_only], "_doc_variant": "external"}
-    assert cc._rendered_gap_numbers(facts) == set(), "premise: this gap is monitor-only"
+    assert cc._rendered_gap_numbers(facts) == {1}, "External must print a monitor-only gap"
 
     item = _gap_item(facts)
     text, points_at_a_gap = cc._flag_headline(facts, item)
-    assert points_at_a_gap is False
-    assert text == monitor_only, text
+    assert points_at_a_gap is True
+    assert text.endswith("(Gap 1)"), text
 
-    # The very same gap DOES get a pointer in Internal, which prints every gap.
+    # Internal is unchanged, and the two now agree.
     internal = dict(facts, _doc_variant="internal")
     assert cc._rendered_gap_numbers(internal) == {1}
     text_i, points_i = cc._flag_headline(internal, item)
     assert points_i is True and text_i.endswith("(Gap 1)"), text_i
+    print("test_external_prints_monitor_only_gaps_too: PASS")
+
+
+def test_external_never_points_at_a_gap_it_does_not_print():
+    """The invariant that survives the change above: a "(Gap N)" a reader
+    cannot follow is worse than no pointer at all.
+
+    The one gap External still does not print is one that externalizes to
+    nothing, meaning it was pure internal-process phrasing with no finding
+    left once Section B's "Internal keeps process failures, External does not"
+    rule has been applied. Such a gap must keep its full text rather than emit
+    a pointer into a list that will not contain it."""
+    vanishes = ("Specific schools/hospitals within a fixed radius were not "
+                "independently verified this pass.")
+    facts = {"gaps": [vanishes], "_doc_variant": "external"}
+    assert cc._externalize_prose(facts, vanishes).strip() == "", "premise: this gap externalizes away"
+    assert cc._rendered_gap_numbers(facts) == set()
+
+    item = _gap_item(facts)
+    text, points_at_a_gap = cc._flag_headline(facts, item)
+    assert points_at_a_gap is False
+    assert text == vanishes, text
+
+    # Internal prints it, so Internal still gets its pointer.
+    internal = dict(facts, _doc_variant="internal")
+    assert cc._rendered_gap_numbers(internal) == {1}
+    _, points_i = cc._flag_headline(internal, item)
+    assert points_i is True
     print("test_external_never_points_at_a_gap_it_does_not_print: PASS")
 
 
@@ -142,6 +184,100 @@ def test_internal_numbers_every_gap_contiguously():
     print(f"test_internal_numbers_every_gap_contiguously: PASS ({expected} gaps)")
 
 
+def test_external_prints_every_gap_internal_does():
+    """rules.md Section B: "Gaps & Sources keeps every item with its full
+    explanation, including permanent ones."
+
+    Regression for a real defect: External printed only Imminent/Structural
+    gaps, so on a project whose gaps were all monitor severity the section came
+    out empty. The only gaps External may now omit are ones that externalize to
+    nothing, which carry no finding to report."""
+    internal = _printed_gap_numbers(_all_text(_build("internal")))
+    external = _printed_gap_numbers(_all_text(_build("external")))
+    assert internal, "fixture must produce gaps at all"
+    assert external, "External printed no gaps at all"
+    assert external <= internal, f"External invented gap numbers: {sorted(external - internal)}"
+
+    # The regression itself: monitor-severity gaps used to be excluded from
+    # External outright, which is what let the section collapse to empty. At
+    # least one must now survive. (Some gaps legitimately drop out here, being
+    # pure process detail that externalizes to nothing, so this asserts the
+    # rule rather than an exact count.)
+    with open(_PRANAMI_FACTS, encoding="utf-8") as f:
+        flags = cc._classify_flags({"gaps": json.load(f).get("gaps", [])})
+    escalated = {i["gap_number"] for tier in ("imminent", "structural")
+                 for i in flags.get(tier, []) if i.get("gap_number")}
+    monitor_printed = external - escalated
+    assert monitor_printed, (
+        "External printed only escalated gaps; monitor-severity gaps are still being dropped"
+    )
+    print(f"test_external_prints_every_gap_internal_does: PASS "
+          f"({len(external)} printed, {len(monitor_printed)} of them monitor-severity)")
+
+
+def test_external_never_claims_no_gaps_while_gaps_exist():
+    """The exact false sentence this change removes: "No additional material
+    gaps identified beyond the standing gap below.", printed directly beneath a
+    list of unresolved gaps."""
+    blob = _all_text(_build("external"))
+    printed = re.findall(r"^Gap (\d+)\.", blob, re.M)
+    assert printed, "fixture must print gaps in External"
+    assert "No additional material gaps identified" not in blob, (
+        "External claimed there are no material gaps while printing "
+        f"{len(printed)} of them"
+    )
+    print("test_external_never_claims_no_gaps_while_gaps_exist: PASS")
+
+
+# --- the governing-act line, and who it is generic for -----------------------
+
+def test_project_is_rera_registered_reads_the_registration_number():
+    reg = lambda v: {"rera_core_fields": {"registration_number": v}}
+    assert cc._project_is_rera_registered(reg("P51800077150")) is True
+    assert cc._project_is_rera_registered(reg("")) is False
+    assert cc._project_is_rera_registered({}) is False
+    for prose in ("Not registered with the Maharashtra Real Estate Regulatory Authority, "
+                  "per the client's project record.",
+                  "No registration on record.", "Unregistered.", "N/A", "None", "Not available"):
+        assert cc._project_is_rera_registered(reg(prose)) is False, prose
+    print("test_project_is_rera_registered_reads_the_registration_number: PASS")
+
+
+def test_governing_act_is_dropped_from_external_only_when_registered():
+    """It is generic-by-definition for a RERA-registered project, so External
+    drops it there. For an UNREGISTERED project the governing legislation is
+    different, and its consent thresholds and developer security requirements
+    are among the most decision-relevant facts in the document, so it stays.
+
+    Regression: this suppression used to be unconditional, which silently
+    stripped that statutory basis out of every unregistered project's External
+    document."""
+    os.makedirs(_SCRATCH, exist_ok=True)
+    with open(_PRANAMI_FACTS, encoding="utf-8") as f:
+        base = json.load(f)
+    act = (base.get("rules_statutory") or {}).get("governing_act", "")
+    assert act, "fixture must carry a governing act"
+    probe = act.split(".")[0][:60]
+
+    def build(reg_value, name):
+        facts = json.loads(json.dumps(base))
+        facts.setdefault("rera_core_fields", {})["registration_number"] = reg_value
+        out = os.path.join(_SCRATCH, name)
+        cc._fill_template("P51800077150", facts, out, doc_variant="external")
+        return _all_text(out)
+
+    registered = build("P51800077150", "gov_registered.docx")
+    unregistered = build("Not registered with MahaRERA, per the project record.",
+                         "gov_unregistered.docx")
+
+    assert probe not in registered, "registered project: generic act line should be dropped"
+    assert probe in unregistered, (
+        "unregistered project: the governing legislation is a project-specific fact "
+        "and must survive into External"
+    )
+    print("test_governing_act_is_dropped_from_external_only_when_registered: PASS")
+
+
 def test_gap_pointers_replace_the_raw_facts_path_annotation():
     """CLAUDE.md Section B forbids a JSON key in EITHER document. A flag that
     points at a gap must render "(Gap N)", never "(see gaps[3])"."""
@@ -165,9 +301,14 @@ if __name__ == "__main__":
     test_non_gap_flags_carry_no_gap_number()
     test_headline_takes_the_first_sentence_and_appends_the_pointer()
     test_a_flag_with_no_gap_keeps_its_full_text()
+    test_external_prints_monitor_only_gaps_too()
     test_external_never_points_at_a_gap_it_does_not_print()
     test_every_pointer_resolves_in_both_variants()
     test_internal_numbers_every_gap_contiguously()
+    test_external_prints_every_gap_internal_does()
+    test_external_never_claims_no_gaps_while_gaps_exist()
+    test_project_is_rera_registered_reads_the_registration_number()
+    test_governing_act_is_dropped_from_external_only_when_registered()
     test_gap_pointers_replace_the_raw_facts_path_annotation()
     test_an_empty_flag_tier_still_collapses_to_nothing_found()
     print("\nAll tests passed.")

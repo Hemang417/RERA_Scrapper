@@ -413,13 +413,28 @@ def entity_names_for_sweep(
 # MCA state codes as they appear in a CIN. Codes NOT in this map are
 # reported as unrecognised rather than guessed at -- a wrong state here
 # sends a sweep to the wrong authority and reports a clean record from it.
+#
+# Mostly, but NOT only, state codes. Maharashtra is the one state that also
+# issues a city-level registrar code: companies registered with ROC Pune
+# carry "PN" rather than "MH" (confirmed live -- 321 of the CINs across this
+# repo's stored runs are PN, second only to MH's 406, and every DIN-linked
+# entity of the Pune promoter on P52100055794 is one). Leaving it out did not
+# fail loudly; it silently emptied the state footprint of an entirely
+# Maharashtra group. Tamil Nadu's second registrar at Coimbatore does NOT get
+# its own code and shares "TN", so PN is the only such case.
+#
+# Deliberately still absent: "MR", observed once in the wild
+# (U35201MR2026PTC475989, Govindam Bio Energy Private Limited) but not
+# documented as any state or registrar by any source checked. An unrecognised
+# code is reported honestly; a guessed one is not recoverable.
 _CIN_STATE_CODES = {
     "AP": "Andhra Pradesh", "AR": "Arunachal Pradesh", "AS": "Assam",
     "BR": "Bihar", "CH": "Chandigarh", "CG": "Chhattisgarh", "CT": "Chhattisgarh",
     "DL": "Delhi", "GA": "Goa", "GJ": "Gujarat", "HR": "Haryana",
     "HP": "Himachal Pradesh", "JK": "Jammu and Kashmir", "JH": "Jharkhand",
     "KA": "Karnataka", "KL": "Kerala", "MP": "Madhya Pradesh",
-    "MH": "Maharashtra", "MN": "Manipur", "ML": "Meghalaya", "MZ": "Mizoram",
+    "MH": "Maharashtra", "PN": "Maharashtra",  # PN = ROC Pune, see note above
+    "MN": "Manipur", "ML": "Meghalaya", "MZ": "Mizoram",
     "NL": "Nagaland", "OR": "Odisha", "OD": "Odisha", "PB": "Punjab",
     "PY": "Puducherry", "RJ": "Rajasthan", "SK": "Sikkim", "TN": "Tamil Nadu",
     "TG": "Telangana", "TS": "Telangana", "TR": "Tripura", "UP": "Uttar Pradesh",

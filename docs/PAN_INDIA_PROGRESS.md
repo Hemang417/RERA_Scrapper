@@ -1,6 +1,6 @@
 # Pan-India RERA — progress and resumption notes
 
-**Updated 19 August 2026.** Working tree is green: `python -m pytest -q` → **474 passed**.
+**Updated 19 August 2026.** Working tree is green: `python -m pytest -q` → **543 passed**.
 MahaRERA output is byte-identical to the pre-refactor baseline.
 
 Full plan: `~/.claude/plans/yes-make-the-plan-starry-neumann.md`
@@ -28,6 +28,51 @@ TG declares zero capabilities, which is a complete adapter, not a stub.
 ---
 
 ## RESUME HERE
+
+### Step 6 (CTS land records): ONE CAPTCHA SOLVE AWAY
+
+Everything up to the CAPTCHA is verified working as of 2026-08-20:
+
+```
+district "Mumbai Suburban" -> मुंबई उपनगर
+search_cts_candidates(...) -> found: True, candidates: ['183']
+```
+
+Run this, solve the CAPTCHA in the window that opens, and paste the output:
+
+```bash
+python run_cts_capture.py <your-mobile-number>
+```
+
+It defaults to CTS 183, village आंबिवली, office नगर भूमापन अधिकारी,अंधेरी,
+Mumbai Suburban -- the one record with a saved screenshot
+(`output/_pending/Mumbai_Suburban_आंबिवली_183/property_card_screenshot.png`),
+so every parsed field can be checked against a picture of the same card.
+
+**The one number that decides Step 6** is `fields parsed off the card`.
+It has been 0 on every lookup this repo has ever made. If it comes back
+non-zero the land-record workflow is done; if it is still 0, `card.json`
+and `card.png` are saved side by side to show what the page actually
+returned.
+
+**What was found and fixed getting here.** The Property Card is CRISP HTML
+in three `<table>` elements, not a scan -- OCR was only ever a workaround
+for `page.content()` reading the search form because the card renders in an
+iframe. So this was a parser fix, not an OCR project.
+`mahabhumi.parse_property_card` matches every field by its Marathi label
+(never by column position, since cards differ in whether they carry sheet
+and plot numbers) and returns `{}` for "no card here" versus an empty
+string for "the row is blank", because a blank इतर भार row means NO
+encumbrance is recorded and that is the finding.
+
+**Still worth doing, separately:** `tesseract --list-langs` shows only
+`eng` and `osd` on this machine, so every OCR attempt has run English
+against Devanagari -- which is why the old `ocr_text` was Latin noise. The
+fix is documented in `mahabhumi.py` above `_TESSDATA_DIR` (fetch
+`mar.traineddata` into a gitignored project-local `tessdata/`, ~3MB). Only
+needed for the fallback; the HTML parse should make it unnecessary.
+
+
 
 ### Blocked, not broken: the Karnataka end-to-end run
 
