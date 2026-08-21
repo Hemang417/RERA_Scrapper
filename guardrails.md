@@ -53,6 +53,25 @@ covers a hard failure of the OCR stack itself.
 
 ## 2c. Coverage — "not found" and "never asked" are different findings
 
+`states.candidate_profiles` REFUSES a registration number it recognises but
+cannot serve. A Chennai or Noida number used to fall through to the free-text
+branch and be searched against MahaRERA, which found nothing -- and a nil from
+the wrong portal reads as "this project does not exist", not "that authority
+has no adapter". The old message compounded it by announcing the number as
+"not a recognised registration number", which was simply false.
+
+`_UNSUPPORTED_AUTHORITIES` carries a pattern ONLY with evidence, and each entry
+records that evidence. **Haryana is deliberately absent**: its portal published
+no registration number to derive a format from on 2026-08-21, and a guessed
+pattern would either miss real numbers or capture another authority's. A test
+asserts no entry lacks its evidence, that none shadows a registered authority,
+and that a project NAME still reaches the free-text path.
+
+The refusal says outright that the query **was not searched anywhere**, so the
+refusal cannot itself be read as evidence about the project. `main.py` exits 2
+rather than falling back.
+
+
 `group_sweep.sweep` reports a STATUS per authority, and that table is the
 product, not the project list. GujRERA, WBRERA and TG-RERA publish no promoter
 search at all, and ~24 states have no adapter: in every one of those cases an

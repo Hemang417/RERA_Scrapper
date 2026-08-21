@@ -133,6 +133,79 @@ def test_a_wrong_ordering_hint_is_self_correcting():
     print("test_a_wrong_ordering_hint_is_self_correcting: PASS")
 
 
+def test_a_known_but_unsupported_authority_is_refused_by_name():
+    """THE BUG THIS FIXES. A Chennai or Noida registration number used to
+    fall through to the free-text branch and get searched against
+    MahaRERA, which then found nothing -- and "not found" reads as "this
+    project does not exist", not "that state has no adapter yet".
+
+    Worse, the fallback announced it as "not a recognised registration
+    number", which is the wrong diagnosis: UPRERAPRJ18905075 is a
+    perfectly valid registration number. It belongs to an authority
+    this pipeline cannot serve."""
+    import states
+
+    for query, acronym in (("UPRERAPRJ18905075", "UP-RERA"),
+                           ("TN/29/Building/0000/2026", "TNRERA"),
+                           ("tn/29/layout/12/2025", "TNRERA")):
+        try:
+            states.candidate_profiles(query)
+        except states.StateResolutionError as e:
+            message = str(e)
+            assert acronym in message, message
+            # It must say it searched NOWHERE, so a reader cannot take
+            # the refusal as evidence about the project.
+            assert "NOT searched anywhere else" in message, message
+            assert "no adapter" in message, message
+        else:
+            raise AssertionError(query + " was routed somewhere instead of refused")
+    print("test_a_known_but_unsupported_authority_is_refused_by_name: PASS")
+
+
+def test_a_project_name_is_still_free_text_not_an_unsupported_state():
+    """The refusal must not swallow the free-text path. A project name is
+    not a registration number and still falls back to the default,
+    announced -- that is the production path for name searches."""
+    import states
+
+    for name in ("Kalpataru Height", "Pranami Bliss", "TN Towers", "UP Residency"):
+        profiles, note = states.candidate_profiles(name)
+        assert profiles, name
+        assert profiles[0].code == states.DEFAULT_STATE_CODE, (name, profiles[0].code)
+        assert note, name
+    print("test_a_project_name_is_still_free_text_not_an_unsupported_state: PASS")
+
+
+def test_no_unsupported_pattern_collides_with_a_registered_one():
+    """A pattern added to the unsupported table must never shadow an
+    authority that IS built -- that would refuse a project the pipeline
+    can actually fetch."""
+    import states
+
+    live = ["P51800077150", "P02400003865",
+            "PRM/KA/RERA/1251/446/PR/220422/004789",
+            "PR/GJ/SURAT/SURATCITY/SUDA/RAA05825/030819"]
+    for query in live:
+        assert states.unsupported_authority(query) is None, query
+        assert states.candidate_profiles(query)[0], query
+    print("test_no_unsupported_pattern_collides_with_a_registered_one: PASS")
+
+
+def test_every_unsupported_entry_carries_its_evidence():
+    """A pattern here is a claim about another authority's format, and a
+    guessed one either misses real numbers or captures someone else's.
+    Haryana is deliberately absent for exactly that reason: its portal
+    published no registration number to derive a format from."""
+    import states
+
+    for entry in states._UNSUPPORTED_AUTHORITIES:
+        for field in ("pattern", "acronym", "authority", "covers", "evidence"):
+            assert entry.get(field), (entry.get("acronym"), field)
+    acronyms = {e["acronym"] for e in states._UNSUPPORTED_AUTHORITIES}
+    assert "HARERA" not in acronyms, "a Haryana format was added without evidence"
+    print("test_every_unsupported_entry_carries_its_evidence: PASS")
+
+
 def test_resolve_state_still_answers_for_render_only_callers():
     """Rendering needs a profile before any portal is contacted, so the
     first-candidate shortcut has to keep working -- it just must not be used
@@ -162,6 +235,10 @@ if __name__ == "__main__":
     test_free_text_falls_back_to_the_default_announced()
     test_the_ladder_skips_an_authority_that_cannot_be_searched_by_reg_no()
     test_a_wrong_ordering_hint_is_self_correcting()
+    test_a_known_but_unsupported_authority_is_refused_by_name()
+    test_a_project_name_is_still_free_text_not_an_unsupported_state()
+    test_no_unsupported_pattern_collides_with_a_registered_one()
+    test_every_unsupported_entry_carries_its_evidence()
     test_resolve_state_still_answers_for_render_only_callers()
     test_every_registered_state_has_an_adapter_or_a_clear_refusal()
     print("\nAll tests passed.")

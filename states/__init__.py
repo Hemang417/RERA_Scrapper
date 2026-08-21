@@ -99,6 +99,50 @@ _LIKELIHOOD_ORDERS = {
 }
 
 
+# Authorities this pipeline does NOT have an adapter for, whose registration
+# format is nonetheless KNOWN. Without this table a Chennai or Noida number
+# falls through to the free-text branch and gets searched against MahaRERA,
+# which then finds nothing -- and "not found" reads as "this project does not
+# exist" rather than "that state is not supported yet". Same species as every
+# other defect this pipeline has had to guard: a check that could not run
+# presenting as one that found nothing.
+#
+# A pattern goes in here ONLY with evidence. Haryana (HARERA Gurugram /
+# Panchkula) is deliberately ABSENT: its portal published no registration
+# number this could be derived from on 2026-08-21, and a guessed pattern
+# would either miss real numbers or capture someone else's.
+_UNSUPPORTED_AUTHORITIES = (
+    {
+        "pattern": r"^UPRERAPRJ\w+$",
+        "acronym": "UP-RERA",
+        "authority": "Uttar Pradesh Real Estate Regulatory Authority",
+        "covers": "Noida, Greater Noida and Ghaziabad -- most of NCR by volume",
+        "evidence": "format recorded in this repo's verified reg-no table",
+    },
+    {
+        "pattern": r"^TN/\d{2}/(?:BUILDING|LAYOUT)/\d+/\d{4}$",
+        "acronym": "TNRERA",
+        "authority": "Tamil Nadu Real Estate Regulatory Authority",
+        "covers": "Chennai",
+        "evidence": "observed on rera.tn.gov.in, 2026-08-21 "
+                    "(e.g. TN/29/Building/0000/2026)",
+    },
+)
+
+
+def unsupported_authority(query: str):
+    """The known authority a query belongs to, when there is no adapter for
+    it -- or None. Matching is case-insensitive; portals print these in
+    mixed case."""
+    query = (query or "").strip()
+    if not query:
+        return None
+    for entry in _UNSUPPORTED_AUTHORITIES:
+        if re.match(entry["pattern"], query, re.IGNORECASE):
+            return entry
+    return None
+
+
 def candidate_profiles(query: str, explicit_code: str | None = None) -> tuple[list, str | None]:
     """(ordered candidate profiles, note) for a query.
 
@@ -124,6 +168,21 @@ def candidate_profiles(query: str, explicit_code: str | None = None) -> tuple[li
     )
 
     if not matched:
+        # A registration number we RECOGNISE but cannot serve. Refused by
+        # name, because searching another state's portal for it would
+        # return nothing and read as "no such project".
+        known = unsupported_authority(query)
+        if known:
+            raise StateResolutionError(
+                f"{query!r} is a {known['acronym']} registration number "
+                f"({known['authority']}), which covers {known['covers']}. "
+                f"This pipeline has no adapter for that authority yet, so the "
+                f"project cannot be fetched. It was NOT searched anywhere else: "
+                f"a nil result from another state's portal would mean nothing. "
+                f"Registered authorities: "
+                + ", ".join(f"{c} ({PROFILES[c].rera_acronym})" for c in sorted(PROFILES))
+            )
+
         # Free text, not a registration number. Cannot probe by reg no;
         # fall back to the default, announced.
         default = PROFILES[DEFAULT_STATE_CODE]

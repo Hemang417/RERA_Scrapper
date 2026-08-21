@@ -305,7 +305,15 @@ def main() -> int:
     # registration-number format, with the Maharashtra/Telangana collision
     # settled by an announced, documented tiebreak (states.resolve_state).
     reporter = CliReporter()
-    candidates, candidates_note = states.candidate_profiles(query, args.state)
+    try:
+        candidates, candidates_note = states.candidate_profiles(query, args.state)
+    except states.StateResolutionError as e:
+        # A registration number belonging to an authority with no adapter.
+        # Exit rather than fall back: searching another state's portal for
+        # it would return nothing, and that nil would read as "no such
+        # project" rather than "that state is not supported".
+        print(f"[!] {e}")
+        return 2
     if candidates_note:
         reporter.info(candidates_note)
     profile = candidates[0]
