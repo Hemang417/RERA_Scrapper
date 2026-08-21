@@ -144,6 +144,16 @@ def parse_args() -> argparse.Namespace:
             "checked out of how many exist, and names the ones that were not."
         ),
     )
+    parser.add_argument(
+        "--group-litigation",
+        action="store_true",
+        help=(
+            "Search open case law for every group entity and director. Off by default: it "
+            "queries a public index once per name, and every hit is a NAME match that must "
+            "be confirmed, not a finding. The Charter section names the forums open search "
+            "does not reliably cover, so an empty table is never read as a clean record."
+        ),
+    )
     gst = parser.add_mutually_exclusive_group()
     gst.add_argument(
         "--gstin",
@@ -492,7 +502,7 @@ def main() -> int:
             complaint_orders_manifest=complaint_orders_manifest, complaint_orders_dir=complaint_orders_dir,
             reviews=reviews, promoter_portfolio=portfolio, pipeline_start_time=pipeline_start_time,
             state_profile=profile, group_sweep=args.group_sweep,
-            group_gst=args.group_gst,
+            group_gst=args.group_gst, group_litigation=args.group_litigation,
         )
         external_charter_path = charter_path.replace("_Internal.docx", "_External.docx")
         print(f"[OK] Company Charter (Internal) written to {charter_path}")

@@ -46,6 +46,7 @@ from bs4 import BeautifulSoup
 
 from .base import AcquisitionResult, StateResolutionError, fetch_with_retry, storage_key
 from .karnataka import (
+    ORDERS_PAGE,
     COMPLAINT_POST,
     COMPLAINT_REPORT,
     DETAIL_POST,
@@ -96,6 +97,50 @@ def parse_search_index(html: str) -> list:
             f"pair them, since a mismatch would attach the wrong promoter to a project."
         )
     return [dict(zip(_INDEX_FIELDS, row)) for row in zip(*(buckets[f] for f in _INDEX_FIELDS))]
+
+
+_ORDERS_CACHE = []
+
+
+def fetch_order_index(fetcher=None) -> list:
+    """K-RERA's whole order-search register, as
+    [{ack_no, reg_no, project_name, promoter_name}].
+
+    Same four parallel arrays as the project index, so it reuses
+    parse_search_index -- including its refusal to zip mismatched lists.
+    Here `ack_no` is the complaint/application number the order was made
+    under (e.g. "00862/2025") and `reg_no` is the portal's own TMP
+    reference, not a RERA registration number.
+
+    One request for the entire state, so it is cached for the process.
+    """
+    global _ORDERS_CACHE
+    if _ORDERS_CACHE:
+        return _ORDERS_CACHE
+    if fetcher is None:
+        session = _session()
+        html = fetch_with_retry(
+            lambda: session.get(ORDERS_PAGE, timeout=_TIMEOUT).text,
+            what="K-RERA order register",
+        )
+    else:
+        html = fetcher()
+    _ORDERS_CACHE = parse_search_index(html)
+    return _ORDERS_CACHE
+
+
+def search_orders_by_promoter(name: str, fetcher=None) -> list:
+    """Entries in the order register whose PROMOTER name contains `name`.
+
+    A substring match on a name, so every row is a candidate: K-RERA
+    publishes no company identity number to join on, exactly as the RERA
+    sweep and the affiliate graph already have to assume.
+    """
+    needle = " ".join(str(name or "").upper().split())
+    if not needle:
+        return []
+    return [row for row in fetch_order_index(fetcher)
+            if needle in " ".join((row.get("promoter_name") or "").upper().split())]
 
 
 def _table_to_rows(table) -> list:

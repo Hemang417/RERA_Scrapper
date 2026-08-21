@@ -96,6 +96,41 @@ looked at. Guards:
 - the entity limit is a HUMAN budget (two CAPTCHA solves each, minimum), and
   anything past it is `STATUS_BUDGET_EXHAUSTED`, never a silent truncation.
 
+`litigation_sweep.sweep` searches case law by NAME, and returns CANDIDATES.
+The first live query proved why: searching "Pranami Builders", a Ranchi company,
+returned "Pranami Builders , **Ahmedabad** vs Department Of Income Tax" plus two
+judgments that merely shared tokens on a full-text index. Guards:
+
+- every hit records whether the searched name is in the CASE TITLE or only in
+  the body (`MATCH_TITLE` / `MATCH_BODY`); a body mention on a full-text index
+  is very often an unrelated judgment.
+- the place in the title is checked against the group's known footprint. It is a
+  CAUTION, never an exclusion -- a company litigates where the cause of action
+  arose -- so the wording claims only what was established.
+- a director query carries a STANDING caution: Indian personal names repeat
+  enormously, and it is the highest false-positive search this pipeline makes.
+- entities are searched before directors, so a small budget is not spent on the
+  noisiest queries first; unsearched names are reported, "neither clear nor
+  implicated".
+
+**The absence side is the more dangerous half.** `NOT_RELIABLY_INDEXED` names
+what open case-law search does not carry -- consumer fora, most of NCLT/NCLAT,
+district courts, arbitration, and the RERA authorities' own orders -- and the
+document says so. A clean paragraph drawn from a source that would not have
+carried the bad news anyway is the worst false clean record this pipeline could
+produce. `coverage_sentence` may not use the words "clean" or "no litigation".
+
+`litigation_sweep.state_order_sweep` searches the regulators' OWN order
+registers, which case-law indexes do not carry. Only Karnataka is wired, and the
+limitation names every register that was NOT searched. K-RERA's own POST
+(`/viewJudgementDetails`) does **not** filter server-side: a real firm name and a
+nonsense string return byte-identical pages apart from the visitor counter, so
+wiring it up as a search would have reported "no orders" for every promoter ever
+queried. The whole register ships to the browser instead and is filtered there;
+validated with a control -- 111 entries for a known developer, 0 for a nonsense
+name. `parse_search_index` refuses to zip the four parallel arrays when their
+lengths disagree, since a mismatch attaches the wrong promoter to an order.
+
 `company_charter._safe_charge_movement` + `charge_watch.compare` answer whether
 secured borrowing was repaid. A failed fetch is `checked=False`, never "no
 change"; a charge that VANISHED from the register is not a satisfied one (a

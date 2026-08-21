@@ -13,7 +13,7 @@ not be skipped.
 
 ## Entry point
 
-`python main.py <REG_NO|project name> [--state MH|GJ|KA|TG|JH|WB] [--group-sweep] [--group-gst]
+`python main.py <REG_NO|project name> [--state MH|GJ|KA|TG|JH|WB] [--group-sweep] [--group-gst] [--group-litigation]
 [--gstin X | --pan Y] [--headed] [--token T] [--no-auto-auth] [--project-id N] [--output-dir D]`
 
 Everything below runs from `main.py::main()` in this order. Stages marked
@@ -50,12 +50,12 @@ the run continue. Nothing else may swallow an error.
    **[opt-in]** — each does nothing without its human-supplied input file.
 2b. **Identity and group passes** — code-computed, never model-authored, each
    with its own Charter section: `_safe_promoter_identity()` (PAN off the filed
-   card), `_safe_charge_movement()` (secured borrowing moved since last run),
+   card), `_safe_charge_movement()` (borrowing moved since last run),
    `_safe_state_footprint()` (registered vs built), `_safe_group_rera_sweep()`
-   **[opt-in: `--group-sweep`]** (group projects on other registers, opened to
-   confirm or refute), `_safe_group_gst()` **[opt-in: `--group-gst`]** (GST per
-   entity; PAN-keyed, so most of a group is unreachable). Each reports its own
-   coverage: absence of a finding never means absence of a check (`guardrails.md`).
+   **[`--group-sweep`]**, `_safe_group_gst()` **[`--group-gst`]** (PAN-keyed, so
+   most of a group is unreachable), `_safe_group_litigation()`
+   **[`--group-litigation`]** (case law + K-RERA orders; every hit a NAME match).
+   Each reports its own coverage: no finding never means no check (`guardrails.md`).
 3. `_record_source_hits_and_promote()` — cross-run source-trust bookkeeping.
 4. `_normalize_misfiled_facts()` then `run_finding_research()` **[never fatal]**
    — per-finding deep research. Confirmed findings only, never gaps. A failed

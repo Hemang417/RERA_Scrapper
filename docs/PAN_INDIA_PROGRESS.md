@@ -23,10 +23,56 @@ Data coverage: `docs/RERA_Data_Coverage.xlsx` (regenerate with `python build_dat
 | Phase 3 | Fix Maharashtra CTS land-record extraction | **Done**, live-verified 2026-08-21. 15 fields + 3 mutation entries off the real card (was `{}` on every prior lookup) |
 | Phase 4a | Group entity graph (propose by name, confirm by hard link) | **Done** |
 | Phase 4b | Group-wide RERA sweep | **Done** — `group_sweep.py`, with per-authority coverage and confirm/refute |
-| Phase 4c | Litigation across the group | **Partial.** Per-project litigation tables read for JH/WB; no Indian Kanoon sweep, no cross-state orders search, no NCLT/consumer fora |
+| Phase 4c | Litigation across the group | **Largely done** 2026-08-21 — `litigation_sweep.py`, opt-in `--group-litigation`: case law per entity and director, plus K-RERA's own order register. Other states' order registers remain |
 | Phase 4d | Finances (charges, ratings) | **Done** — MCA charges, `charge_watch.py`, CRISIL added, ratings across group entities |
 | Phase 4e | Statutory (GST) across the group | **Done** 2026-08-21 — `gst_group.py`, opt-in `--group-gst`. Coverage-first: GST is PAN-keyed, so most of a group is unreachable |
 | Phase 2 (rest) | ~24 remaining state portals | Not started — always a separate plan |
+
+### Phase 4c (group litigation): names propose, nothing here confirms
+
+`litigation_sweep.py`, opt-in via `--group-litigation` /
+`CHARTER_GROUP_LITIGATION=1`, rendering a "Group Case-Law Search" section.
+Two sources, deliberately kept apart.
+
+**Case law (Indian Kanoon), per entity and per director.** Every hit is a
+CANDIDATE. The first live query proved why: searching *Pranami Builders* -- a
+Ranchi company, `U51909JH1995PTC013805` -- returned *"Pranami Builders,
+**Ahmedabad** vs Department Of Income Tax"*, plus an Indore income-tax matter
+and a thermal-spray case that merely shared tokens on a full-text index.
+Rendering any of them as this promoter's litigation would invent a finding out
+of a name collision. So each row carries whether the name is in the CASE TITLE
+or only in the body, and the place named in the title is checked against the
+group's known footprint -- a CAUTION, never an exclusion, since a company
+litigates where the cause of action arose. Director queries carry a standing
+caution: Indian personal names repeat enormously.
+
+**The absence side is the more dangerous half.** Open case-law search does not
+reliably carry consumer fora, most of NCLT/NCLAT, district courts, arbitration,
+or the RERA authorities' own orders. `coverage_sentence` may not use the words
+"clean" or "no litigation", and the forums NOT indexed are named on the page. A
+clean paragraph drawn from a source that would not have carried the bad news
+anyway is the worst false clean record this pipeline could produce.
+
+**K-RERA's own order register**, searched by promoter name. 11,732 entries
+across 1,821 promoters, one request, no CAPTCHA -- the same
+whole-state-index-in-one-request pattern as the project index, so it reuses
+`parse_search_index` including its refusal to zip mismatched arrays.
+
+> **The trap here, and it was nearly walked into.** K-RERA's own
+> `/viewJudgementDetails` POST does NOT filter server-side. A real firm name and
+> a nonsense string return byte-identical pages apart from the visitor counter,
+> because the whole register ships to the browser and is filtered there. Wiring
+> that POST up as a search would have reported "no orders" for every promoter
+> ever queried -- the Maha Bhulekh bug again. The control lookup caught it:
+> 111 entries for a known developer, 0 for a nonsense name.
+
+**What remains:** other states' order registers. MahaRERA's own orders search is
+per-project rather than per-promoter; GujRERA's judgements sit behind a flow
+this pipeline does not query; TG/JH/WB publish no promoter-keyed register. The
+section names all of them, so an empty table is never read as a clean record.
+K-RERA also publishes five further order endpoints not yet read
+(`/viewAllInterimOrders`, `/viewAllProjectOrders`, `/viewAllAOorders`,
+`/viewAllComplaints`, `/viewAllComplaintDetails`).
 
 ### Phase 4e (group GST): the join key is the whole problem
 

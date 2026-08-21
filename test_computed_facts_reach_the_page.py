@@ -539,6 +539,57 @@ def test_the_group_gst_section_is_absent_when_the_check_never_ran():
     print("test_the_group_gst_section_is_absent_when_the_check_never_ran: PASS")
 
 
+def test_a_case_law_candidate_reaches_the_page_carrying_its_caution():
+    """A name match on a full-text index is not this promoter's litigation.
+    The first live run returned a same-name AHMEDABAD company's tax appeals
+    for a Ranchi promoter, so the caution and the strength of the match
+    have to travel onto the page with the row -- a bare case title in a
+    Charter reads as an established proceeding."""
+    import litigation_sweep
+
+    facts = _base_facts()
+    facts["group_litigation"] = {
+        "subjects": [{"name": "Pranami Builders Pvt Ltd",
+                      "status": litigation_sweep.STATUS_SEARCHED, "hit_count": 1}],
+        "candidates": [{
+            "searched_name": "Pranami Builders Pvt Ltd",
+            "title": "Pranami Builders , Ahmedabad vs Department Of Income Tax on 2 June, 2016",
+            "match": litigation_sweep.MATCH_TITLE, "place": "Ahmedabad",
+            "subject_kind": litigation_sweep.SUBJECT_ENTITY,
+            "caution": "The case title names Ahmedabad, which does not appear in this "
+                       "group's known footprint. It may be a different party of the same name.",
+        }],
+        "searched": 1, "total": 1,
+        "limitations": ["Open case-law search does not reliably index consumer fora."],
+    }
+    text = _all_text(_render(facts, "internal", "grouplitig"))
+    assert "Ahmedabad" in text, "the caution never reached the page"
+    assert "different party of the same name" in text, text[-700:]
+    assert "matters to confirm" in text, "the page asserted these as this promoter's cases"
+    print("test_a_case_law_candidate_reaches_the_page_carrying_its_caution: PASS")
+
+
+def test_an_empty_case_law_result_still_warns_against_reading_it_as_clean():
+    """The most dangerous output in this document: an empty table drawn
+    from an index that would not have carried consumer fora, NCLT or RERA
+    orders anyway. The section must say so even when it found nothing."""
+    import litigation_sweep
+
+    facts = _base_facts()
+    facts["group_litigation"] = {
+        "subjects": [{"name": "Quiet Entity Ltd", "status": litigation_sweep.STATUS_SEARCHED,
+                      "hit_count": 0}],
+        "candidates": [], "searched": 1, "total": 1,
+        "limitations": ["Open case-law search does not reliably index consumer fora; NCLT. "
+                        "A nil result here means nothing was found in that index, not that "
+                        "no proceedings exist."],
+    }
+    text = _all_text(_render(facts, "internal", "grouplitigempty"))
+    assert "not that no proceedings exist" in text, text[-700:]
+    assert "clean" not in text.lower().split("group case-law")[-1][:400], "an empty search read as clean"
+    print("test_an_empty_case_law_result_still_warns_against_reading_it_as_clean: PASS")
+
+
 def test_every_stage_this_session_added_is_reachable_from_the_pipeline():
     """Anti-drift guard, and the reason this file exists: each of these was
     at some point computed correctly and rendered nowhere. A stage must be
@@ -555,13 +606,15 @@ def test_every_stage_this_session_added_is_reachable_from_the_pipeline():
         ("state_footprint", "_append_state_footprint_section"),
         ("group_rera_sweep", "_append_group_rera_sweep_section"),
         ("group_gst_check", "_append_group_gst_section"),
+        ("group_litigation", "_append_group_litigation_section"),
     ):
         assert f'facts["{key}"] =' in source, f"{key} is never written into facts"
         assert f'facts.get("{key}")' in source, f"{key} is written but never read back"
         assert section in source, f"{section} vanished"
     # ...and each render section is actually registered to run.
     for section in ("_append_secured_borrowing_section", "_append_state_footprint_section",
-                    "_append_group_rera_sweep_section", "_append_group_gst_section"):
+                    "_append_group_rera_sweep_section", "_append_group_gst_section",
+                    "_append_group_litigation_section"):
         assert f"lambda: {section}(doc, facts)" in source,             f"{section} exists but is never called during a render"
     print("test_every_stage_this_session_added_is_reachable_from_the_pipeline: PASS")
 
@@ -596,6 +649,8 @@ if __name__ == "__main__":
         test_the_group_sweep_is_opt_in_and_says_nothing_when_off()
         test_unchecked_group_entities_are_named_on_the_page()
         test_the_group_gst_section_is_absent_when_the_check_never_ran()
+        test_a_case_law_candidate_reaches_the_page_carrying_its_caution()
+        test_an_empty_case_law_result_still_warns_against_reading_it_as_clean()
         test_every_stage_this_session_added_is_reachable_from_the_pipeline()
         print("\nAll tests passed.")
     finally:

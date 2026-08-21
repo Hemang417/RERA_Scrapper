@@ -24,6 +24,7 @@ import company_charter
 import charge_watch
 import group_sweep
 import gst_group
+import litigation_sweep
 import promoter_identity
 import states
 import deep_research
@@ -45,6 +46,9 @@ _MODULES = {
     # And the group GST check, whose coverage line is nearly its whole
     # product: GST is PAN-keyed and most of a group has no public PAN.
     "gst_group": gst_group,
+    # And the case-law sweep, whose every hit is a name match that must
+    # never be rendered as an established proceeding.
+    "litigation_sweep": litigation_sweep,
     # The group sweep and the charge watch are the two passes that report
     # COVERAGE as well as findings -- their guards are what stop "we did not
     # look" being read as "there is nothing there".

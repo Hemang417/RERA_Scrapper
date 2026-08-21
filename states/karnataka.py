@@ -46,6 +46,14 @@ COMPLAINT_POST = BASE_URL + "/projectComplaintDetails"
 # a complaint, with its count. This is the authoritative source; see the
 # adapter's _complaint_count for why the per-project page is not.
 COMPLAINT_REPORT = BASE_URL + "/projectComplaintReport"
+# The STATE-WIDE ORDER-SEARCH index, in one request, keyed by promoter --
+# 11,732 entries across 1,821 promoters when first read on 2026-08-21. The
+# page's own POST (/viewJudgementDetails) does NOT filter server-side: a
+# real firm name and a nonsense one return byte-identical pages apart from
+# the visitor counter, because the whole register ships to the browser and
+# is filtered there. Wiring that POST up as a search would have returned
+# "no orders" for every promoter ever queried.
+ORDERS_PAGE = BASE_URL + "/viewAllJudgements"
 CERTIFICATE_URL = BASE_URL + "/certificate?CER_NO={}"
 DOWNLOAD_URL = BASE_URL + "/download_jc?DOC_ID={}"
 

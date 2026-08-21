@@ -63,6 +63,7 @@ import finalize_report
 import group_entities
 import group_sweep
 import gst_group
+import litigation_sweep
 import promoter_identity
 import run_archive
 import states
@@ -6283,6 +6284,7 @@ def _fill_template_inner(
         lambda: _append_state_footprint_section(doc, facts),
         lambda: _append_group_rera_sweep_section(doc, facts),
         lambda: _append_group_gst_section(doc, facts),
+        lambda: _append_group_litigation_section(doc, facts),
         lambda: _append_developer_score_section(doc, facts),
     ):
         batch = _capture_batch(append_fn)
@@ -9070,6 +9072,116 @@ def _append_group_gst_section(doc, facts: dict) -> None:
         doc.add_paragraph(limitation)
 
 
+def _append_group_litigation_section(doc, facts: dict) -> None:
+    """Appends case-law candidates for the group's entities and directors.
+
+    NOT A LITIGATION LIST. Every row is a NAME match on a full-text index,
+    and the first live run of this search returned a same-name Ahmedabad
+    company's tax appeals for a Ranchi promoter, plus two judgments that
+    merely shared tokens with the query. So the table carries the strength
+    of each match and any caution, and the prose says outright that these
+    are matters to confirm.
+
+    THE FORUMS NOT COVERED ARE NAMED. Consumer fora, most of NCLT/NCLAT,
+    district courts and the RERA authorities' own orders are not reliably
+    in this index. A reader who sees an empty table needs to know that
+    silence here is not the absence of disputes, or the section becomes the
+    most dangerous kind of clean record: one drawn from a source that would
+    not have carried the bad news anyway.
+    """
+    sweep = facts.get("group_litigation") or {}
+    subjects = sweep.get("subjects") or []
+    if not subjects:
+        return
+
+    heading_style = doc.paragraphs[4].style
+    doc.add_page_break()
+    heading_para = doc.add_paragraph(_external_heading(
+        facts, "Group Case-Law Search (Code-Computed)"
+    ))
+    heading_para.style = heading_style
+
+    doc.add_paragraph(litigation_sweep.coverage_sentence(sweep))
+
+    candidates = sweep.get("candidates") or []
+    if candidates:
+        table = doc.add_table(rows=1, cols=4)
+        _set_table_borders(table)
+        for idx, label in enumerate(("Name searched", "Case", "Strength of match", "Caution")):
+            cell = table.rows[0].cells[idx]
+            cell.text = label
+            _shade_cell(cell, "D9E2F3")
+            for para in cell.paragraphs:
+                for run in para.runs:
+                    run.bold = True
+        for row_data in candidates:
+            row = table.add_row()
+            _set_row_cell(row, 0, row_data.get("searched_name") or "")
+            _set_row_cell(row, 1, row_data.get("title") or "")
+            _set_row_cell(row, 2, row_data.get("match") or "")
+            _set_row_cell(row, 3, row_data.get("caution") or "")
+        doc.add_paragraph(
+            "Each row above is a match on NAME in a full-text index. None of them is "
+            "established to involve this group: they are matters to confirm against the "
+            "promoter's own records before being treated as this promoter's litigation."
+        )
+    else:
+        doc.add_paragraph(
+            "No candidate matches were returned for the names searched. See the "
+            "limitation below before reading that as an absence of proceedings."
+        )
+
+    # The regulators' OWN orders -- a different source from case law, and
+    # one open indexes do not carry. Named authorities only; the limitation
+    # says which registers were NOT searched.
+    orders = sweep.get("state_orders") or {}
+    order_entries = orders.get("entries") or []
+    if order_entries:
+        sub = doc.add_paragraph("RERA authorities' own orders")
+        for run in sub.runs:
+            run.bold = True
+        orders_table = doc.add_table(rows=1, cols=4)
+        _set_table_borders(orders_table)
+        for idx, label in enumerate(("Authority", "Application no.", "Project", "Promoter named")):
+            cell = orders_table.rows[0].cells[idx]
+            cell.text = label
+            _shade_cell(cell, "D9E2F3")
+            for para in cell.paragraphs:
+                for run in para.runs:
+                    run.bold = True
+        for row_data in order_entries:
+            row = orders_table.add_row()
+            _set_row_cell(row, 0, row_data.get("authority") or "")
+            _set_row_cell(row, 1, row_data.get("application_no") or "")
+            _set_row_cell(row, 2, row_data.get("project_name") or "")
+            _set_row_cell(row, 3, row_data.get("promoter_name") or "")
+    for limitation in orders.get("limitations") or []:
+        doc.add_paragraph(limitation)
+
+    # Which names were searched, and which were not.
+    unsearched = [s for s in subjects if s.get("status") != litigation_sweep.STATUS_SEARCHED]
+    if unsearched:
+        sub = doc.add_paragraph("Names not searched")
+        for run in sub.runs:
+            run.bold = True
+        unsearched_table = doc.add_table(rows=1, cols=2)
+        _set_table_borders(unsearched_table)
+        for idx, label in enumerate(("Name", "Why not")):
+            cell = unsearched_table.rows[0].cells[idx]
+            cell.text = label
+            _shade_cell(cell, "D9E2F3")
+            for para in cell.paragraphs:
+                for run in para.runs:
+                    run.bold = True
+        for row_data in unsearched:
+            row = unsearched_table.add_row()
+            _set_row_cell(row, 0, row_data.get("name") or "")
+            _set_row_cell(row, 1, row_data.get("status") or "")
+
+    for limitation in sweep.get("limitations") or []:
+        doc.add_paragraph(limitation)
+
+
 def _append_developer_score_section(doc, facts: dict) -> None:
     """Renders facts["developer_score"] (see _compute_developer_score) as a
     per-sub-metric table against the 3-bucket / 9-sub-metric AAA-D
@@ -10713,6 +10825,55 @@ def _safe_group_gst(group_result: dict, subject_promoter: str = "",
                 "limitations": [f"The group-wide GST check could not run this pass: {e}"]}
 
 
+def _safe_group_litigation(group_result: dict, subject_promoter: str = "",
+                           state_footprint: dict | None = None,
+                           enabled: bool | None = None, searcher=None) -> dict:
+    """Open case-law search across every group entity and director.
+
+    OPT-IN (CHARTER_GROUP_LITIGATION=1). It is a bounded run of plain HTTP
+    queries against a free public index, so the cost is not a human's time
+    the way the GST sweep is -- it is opt-in because it queries a third
+    party once per name and because its output needs reading, not skimming.
+
+    EVERY HIT IS A CANDIDATE. A name search cannot establish that a case
+    belongs to this group: searching a Ranchi company returned a same-name
+    Ahmedabad company's tax appeals the first time this ran. The known
+    footprint is passed in so a place named in a case title can be checked
+    against where this group actually operates. Never fatal.
+    """
+    if enabled is None:
+        enabled = os.environ.get("CHARTER_GROUP_LITIGATION") == "1"
+    if not enabled:
+        return {}
+    try:
+        graph = group_entities.build_entity_graph(
+            subject_promoter, (group_result or {}).get("cin"), group_result,
+            proposer=lambda b: [],
+        )
+        directors = []
+        for person in (group_result or {}).get("current_directors") or []:
+            name = (person or {}).get("name") if isinstance(person, dict) else person
+            if name:
+                directors.append(name)
+        footprint = state_footprint or {}
+        known_places = list(footprint.get("incorporated_in") or []) +             list(footprint.get("built_in") or [])
+        result = litigation_sweep.sweep(graph, directors=directors,
+                                        known_places=known_places, searcher=searcher)
+        # The regulator's OWN orders are a different source from case law,
+        # and open case-law indexes do not carry them at all. Never fatal:
+        # a failure here costs the sub-table, not the section.
+        try:
+            result["state_orders"] = litigation_sweep.state_order_sweep(graph)
+        except Exception as e:
+            result["state_orders"] = {"entries": [], "searched": 0, "total": 0,
+                                      "limitations": [f"RERA order registers could not be "
+                                                      f"searched this pass: {e}"]}
+        return result
+    except Exception as e:
+        return {"subjects": [], "candidates": [], "searched": 0, "total": 0,
+                "limitations": [f"The group case-law sweep could not run this pass: {e}"]}
+
+
 def _safe_state_footprint(group_result: dict, category_data: dict) -> dict:
     """Never fatal: a footprint that cannot be derived costs one section."""
     try:
@@ -10983,6 +11144,7 @@ def run_company_charter(
     state_profile=None,
     group_sweep: bool = False,
     group_gst: bool = False,
+    group_litigation: bool = False,
 ) -> tuple[str, dict]:
     """Returns (out_path, facts) -- facts is the complete, code-and-model
     -assembled Charter data (same content as the .facts.json written
@@ -11209,6 +11371,11 @@ def run_company_charter(
             group_result, _portal_promoter_name(category_data),
             facts.get("promoter_identity_check"),
             enabled=group_gst or None,
+        )
+        facts["group_litigation"] = _safe_group_litigation(
+            group_result, _portal_promoter_name(category_data),
+            state_footprint=facts.get("state_footprint"),
+            enabled=group_litigation or None,
         )
         if group_result.get("found") and group_result.get("companies"):
             facts.setdefault("sources", []).append({
