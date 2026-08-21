@@ -503,6 +503,42 @@ def test_the_group_sweep_is_opt_in_and_says_nothing_when_off():
     print("test_the_group_sweep_is_opt_in_and_says_nothing_when_off: PASS")
 
 
+def test_unchecked_group_entities_are_named_on_the_page():
+    """The whole point of the group GST section. GST is keyed on PAN, the
+    group graph is keyed on CIN, and no public MCA source publishes a PAN --
+    so most of a group cannot be reached. A page showing only the entities
+    that WERE checked reads as a clean bill of health for the group; the
+    ones that were not have to appear by name, with the reason."""
+    import gst_group
+
+    facts = _base_facts()
+    facts["group_gst_check"] = {
+        "entities": [
+            {"name": "Pranami Neev Realty Limited", "status": gst_group.STATUS_CHECKED,
+             "gstin": "27AANCP0234D1ZO", "period_count": 76,
+             "pan_source": gst_group.PAN_SOURCE_FILED_CARD, "summary": {}},
+            {"name": "Bihar Carbons Ltd", "status": gst_group.STATUS_NO_PAN},
+        ],
+        "checked": 1, "total": 2, "without_pan": 1,
+        "limitations": ["1 of 2 group entities have no PAN on record."],
+    }
+    text = _all_text(_render(facts, "internal", "groupgst"))
+    assert "1 of 2" in text, "the coverage line never reached the page"
+    assert "Bihar Carbons Ltd" in text, "an unchecked entity was omitted from the page"
+    assert "neither compliant nor non-compliant" in text, text[-600:]
+    print("test_unchecked_group_entities_are_named_on_the_page: PASS")
+
+
+def test_the_group_gst_section_is_absent_when_the_check_never_ran():
+    """Opt-in means absent, not empty. An empty section asserts that a check
+    happened and found nothing."""
+    facts = _base_facts()
+    facts["group_gst_check"] = {}
+    text = _all_text(_render(facts, "internal", "groupgstoff"))
+    assert "Group GST" not in text, "a section was rendered for a check that never ran"
+    print("test_the_group_gst_section_is_absent_when_the_check_never_ran: PASS")
+
+
 def test_every_stage_this_session_added_is_reachable_from_the_pipeline():
     """Anti-drift guard, and the reason this file exists: each of these was
     at some point computed correctly and rendered nowhere. A stage must be
@@ -518,13 +554,14 @@ def test_every_stage_this_session_added_is_reachable_from_the_pipeline():
         ("charge_movement", "_append_secured_borrowing_section"),
         ("state_footprint", "_append_state_footprint_section"),
         ("group_rera_sweep", "_append_group_rera_sweep_section"),
+        ("group_gst_check", "_append_group_gst_section"),
     ):
         assert f'facts["{key}"] =' in source, f"{key} is never written into facts"
         assert f'facts.get("{key}")' in source, f"{key} is written but never read back"
         assert section in source, f"{section} vanished"
     # ...and each render section is actually registered to run.
     for section in ("_append_secured_borrowing_section", "_append_state_footprint_section",
-                    "_append_group_rera_sweep_section"):
+                    "_append_group_rera_sweep_section", "_append_group_gst_section"):
         assert f"lambda: {section}(doc, facts)" in source,             f"{section} exists but is never called during a render"
     print("test_every_stage_this_session_added_is_reachable_from_the_pipeline: PASS")
 
@@ -557,6 +594,8 @@ if __name__ == "__main__":
         test_no_footprint_data_renders_no_section()
         test_charge_movement_reaches_the_page_but_only_when_something_moved()
         test_the_group_sweep_is_opt_in_and_says_nothing_when_off()
+        test_unchecked_group_entities_are_named_on_the_page()
+        test_the_group_gst_section_is_absent_when_the_check_never_ran()
         test_every_stage_this_session_added_is_reachable_from_the_pipeline()
         print("\nAll tests passed.")
     finally:

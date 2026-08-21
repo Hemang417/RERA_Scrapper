@@ -75,6 +75,27 @@ project's promoter is the entity), **probable** (a separate entity sharing the
 group's distinctive name, the one-vehicle-per-project pattern), **refuted**.
 Demanding identity refuted the one genuine group project.
 
+`gst_group.sweep` reports GST standing per group entity, and here the coverage
+line is nearly the whole product. **GST is keyed on PAN; the entity graph is
+keyed on CIN; no public MCA source publishes a company's PAN** -- so most of a
+group is structurally unreachable, and a section listing only findings would
+read as a clean bill of health for the whole group when two of sixty-five were
+looked at. Guards:
+
+- every entity appears with a STATUS, including `STATUS_NO_PAN`. An omitted
+  entity reads as one with nothing to report.
+- `gst_group.entities_with_findings` is the only way into the findings table,
+  so an unchecked entity cannot be rendered with a blank filing record.
+- `gst_group.coverage_sentence` leads with the denominator and states outright
+  that the rest are not being called compliant or non-compliant.
+- a PAN is never guessed. Each carries a provenance
+  (`PAN_SOURCE_FILED_CARD`, `..._RERA_FILING`, `..._FROM_GSTIN`, `..._SUPPLIED`),
+  strongest wins, and an `unverified_candidate` from `promoter_identity` is
+  refused outright -- it would spend a human's CAPTCHA solve looking up possibly
+  the wrong company and then attribute the answer to this one.
+- the entity limit is a HUMAN budget (two CAPTCHA solves each, minimum), and
+  anything past it is `STATUS_BUDGET_EXHAUSTED`, never a silent truncation.
+
 `company_charter._safe_charge_movement` + `charge_watch.compare` answer whether
 secured borrowing was repaid. A failed fetch is `checked=False`, never "no
 change"; a charge that VANISHED from the register is not a satisfied one (a

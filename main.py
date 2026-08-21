@@ -133,6 +133,17 @@ def parse_args() -> argparse.Namespace:
             "searched, so a short result is never mistaken for a clean national record."
         ),
     )
+    parser.add_argument(
+        "--group-gst",
+        action="store_true",
+        help=(
+            "Check GST filing standing for every group entity a PAN is actually held for. "
+            "Off by default because each entity costs a human at least two CAPTCHA solves. "
+            "GST is keyed on PAN and no public MCA source publishes one, so most of a group "
+            "cannot be reached at all; the Charter section leads with how many entities were "
+            "checked out of how many exist, and names the ones that were not."
+        ),
+    )
     gst = parser.add_mutually_exclusive_group()
     gst.add_argument(
         "--gstin",
@@ -481,6 +492,7 @@ def main() -> int:
             complaint_orders_manifest=complaint_orders_manifest, complaint_orders_dir=complaint_orders_dir,
             reviews=reviews, promoter_portfolio=portfolio, pipeline_start_time=pipeline_start_time,
             state_profile=profile, group_sweep=args.group_sweep,
+            group_gst=args.group_gst,
         )
         external_charter_path = charter_path.replace("_Internal.docx", "_External.docx")
         print(f"[OK] Company Charter (Internal) written to {charter_path}")

@@ -62,6 +62,7 @@ import deep_research
 import finalize_report
 import group_entities
 import group_sweep
+import gst_group
 import promoter_identity
 import run_archive
 import states
@@ -6281,6 +6282,7 @@ def _fill_template_inner(
         lambda: _append_group_companies_section(doc, facts),
         lambda: _append_state_footprint_section(doc, facts),
         lambda: _append_group_rera_sweep_section(doc, facts),
+        lambda: _append_group_gst_section(doc, facts),
         lambda: _append_developer_score_section(doc, facts),
     ):
         batch = _capture_batch(append_fn)
@@ -8993,6 +8995,81 @@ def _append_overview_section(doc, facts: dict, flags: dict) -> None:
     _append_flag_list("Monitor Flags -- re-check on a future pass", flags.get("monitor", []), None)
 
 
+def _append_group_gst_section(doc, facts: dict) -> None:
+    """Appends GST filing standing across the group.
+
+    THE COVERAGE LINE COMES FIRST, and here it matters more than in any
+    other section of this document. GST is keyed on PAN; the group graph is
+    keyed on CIN; no public MCA source publishes a company's PAN. So a
+    typical group has a handful of checkable entities and dozens that
+    cannot be reached at all -- and a reader shown only findings would read
+    the silence as a clean bill of health across the whole group.
+
+    Unchecked entities are listed BY NAME with the reason. Omitting them
+    would leave a table that looks complete, which is the failure this
+    codebase keeps meeting: a check that could not run being read as a
+    check that found nothing.
+    """
+    check = facts.get("group_gst_check") or {}
+    entities = check.get("entities") or []
+    if not entities:
+        return
+
+    heading_style = doc.paragraphs[4].style
+    doc.add_page_break()
+    heading_para = doc.add_paragraph(_external_heading(
+        facts, "Group GST Filing Standing (Code-Computed)"
+    ))
+    heading_para.style = heading_style
+
+    doc.add_paragraph(gst_group.coverage_sentence(check))
+
+    checked = gst_group.entities_with_findings(check)
+    if checked:
+        table = doc.add_table(rows=1, cols=4)
+        _set_table_borders(table)
+        for idx, label in enumerate(("Entity", "GSTIN", "Periods on record", "PAN source")):
+            cell = table.rows[0].cells[idx]
+            cell.text = label
+            _shade_cell(cell, "D9E2F3")
+            for para in cell.paragraphs:
+                for run in para.runs:
+                    run.bold = True
+        for row_data in checked:
+            row = table.add_row()
+            _set_row_cell(row, 0, row_data.get("name") or "")
+            _set_row_cell(row, 1, row_data.get("gstin") or "")
+            _set_row_cell(row, 2, str(row_data.get("period_count") or 0))
+            _set_row_cell(row, 3, row_data.get("pan_source") or "")
+
+    # The entities that could NOT be checked. This half is the point.
+    unchecked = [row for row in entities if row.get("status") != gst_group.STATUS_CHECKED]
+    if unchecked:
+        sub = doc.add_paragraph("Entities not checked")
+        for run in sub.runs:
+            run.bold = True
+        unchecked_table = doc.add_table(rows=1, cols=2)
+        _set_table_borders(unchecked_table)
+        for idx, label in enumerate(("Entity", "Why not")):
+            cell = unchecked_table.rows[0].cells[idx]
+            cell.text = label
+            _shade_cell(cell, "D9E2F3")
+            for para in cell.paragraphs:
+                for run in para.runs:
+                    run.bold = True
+        for row_data in unchecked:
+            row = unchecked_table.add_row()
+            _set_row_cell(row, 0, row_data.get("name") or "")
+            _set_row_cell(row, 1, row_data.get("status") or "")
+        doc.add_paragraph(
+            "The entities above are neither compliant nor non-compliant on this record: "
+            "no filing history was obtained for them."
+        )
+
+    for limitation in check.get("limitations") or []:
+        doc.add_paragraph(limitation)
+
+
 def _append_developer_score_section(doc, facts: dict) -> None:
     """Renders facts["developer_score"] (see _compute_developer_score) as a
     per-sub-metric table against the 3-bucket / 9-sub-metric AAA-D
@@ -10605,6 +10682,37 @@ def _safe_group_rera_sweep(group_result: dict, subject_promoter: str = "",
                 "limitations": [f"The group-wide RERA sweep could not run this pass: {e}"]}
 
 
+def _safe_group_gst(group_result: dict, subject_promoter: str = "",
+                    identity_result: dict | None = None,
+                    enabled: bool | None = None, intake=None) -> dict:
+    """GST standing across the group, for every entity a PAN is held for.
+
+    OPT-IN (CHARTER_GROUP_GST=1) for the same reason the RERA sweep is, only
+    more so: each entity costs a human at least two fresh CAPTCHA solves,
+    one for the PAN search and one per GSTIN found under it.
+
+    The PAN is the whole difficulty. GST is keyed on PAN, the entity graph
+    is keyed on CIN, and no public MCA source publishes a company's PAN --
+    so most of a group is structurally unreachable and the section's real
+    content is its coverage line. An entity with no PAN is reported as
+    unchecked; it is never counted as compliant. Never fatal.
+    """
+    if enabled is None:
+        enabled = os.environ.get("CHARTER_GROUP_GST") == "1"
+    if not enabled:
+        return {}
+    try:
+        graph = group_entities.build_entity_graph(
+            subject_promoter, (group_result or {}).get("cin"), group_result,
+            proposer=lambda b: [],
+        )
+        pans = gst_group.known_pans(identity_result=identity_result)
+        return gst_group.sweep(graph, pans, intake=intake)
+    except Exception as e:
+        return {"entities": [], "checked": 0, "total": 0, "without_pan": 0,
+                "limitations": [f"The group-wide GST check could not run this pass: {e}"]}
+
+
 def _safe_state_footprint(group_result: dict, category_data: dict) -> dict:
     """Never fatal: a footprint that cannot be derived costs one section."""
     try:
@@ -10874,6 +10982,7 @@ def run_company_charter(
     pipeline_start_time: float | None = None,
     state_profile=None,
     group_sweep: bool = False,
+    group_gst: bool = False,
 ) -> tuple[str, dict]:
     """Returns (out_path, facts) -- facts is the complete, code-and-model
     -assembled Charter data (same content as the .facts.json written
@@ -11095,6 +11204,11 @@ def run_company_charter(
         )
         facts["group_rera_sweep"] = _safe_group_rera_sweep(
             group_result, _portal_promoter_name(category_data), enabled=group_sweep
+        )
+        facts["group_gst_check"] = _safe_group_gst(
+            group_result, _portal_promoter_name(category_data),
+            facts.get("promoter_identity_check"),
+            enabled=group_gst or None,
         )
         if group_result.get("found") and group_result.get("companies"):
             facts.setdefault("sources", []).append({

@@ -25,8 +25,35 @@ Data coverage: `docs/RERA_Data_Coverage.xlsx` (regenerate with `python build_dat
 | Phase 4b | Group-wide RERA sweep | **Done** — `group_sweep.py`, with per-authority coverage and confirm/refute |
 | Phase 4c | Litigation across the group | **Partial.** Per-project litigation tables read for JH/WB; no Indian Kanoon sweep, no cross-state orders search, no NCLT/consumer fora |
 | Phase 4d | Finances (charges, ratings) | **Done** — MCA charges, `charge_watch.py`, CRISIL added, ratings across group entities |
-| Phase 4e | Statutory (GST) across the group | **Not started.** GST intake is still single-subject and opt-in |
+| Phase 4e | Statutory (GST) across the group | **Done** 2026-08-21 — `gst_group.py`, opt-in `--group-gst`. Coverage-first: GST is PAN-keyed, so most of a group is unreachable |
 | Phase 2 (rest) | ~24 remaining state portals | Not started — always a separate plan |
+
+### Phase 4e (group GST): the join key is the whole problem
+
+`gst_group.py`, opt-in via `--group-gst` / `CHARTER_GROUP_GST=1`, rendering a
+"Group GST Filing Standing" section.
+
+**GST is keyed on PAN. The entity graph is keyed on CIN. No public MCA source
+publishes a company PAN.** So most of a group cannot be reached at all, and the
+section leads with that: on the real Pranami graph it reads *"GST filing history
+was obtained for 2 of 65 group entities. The remaining 63 could not be checked
+and are not reported as compliant or non-compliant."*
+
+A PAN is never guessed. Each carries a provenance -- read off a filed PAN card
+(`promoter_identity`), named in another authority's filing (this is how
+JHARERA gave up Pranami Builders' `AAECP0371L`), extracted arithmetically from
+a known GSTIN, or supplied by hand. An `unverified_candidate` from the OCR pass
+is refused: it would spend a human CAPTCHA solve on possibly the wrong company
+and then attribute the answer to this one.
+
+The bound is a HUMAN budget, not a rate limit -- two CAPTCHA solves per entity
+minimum (one PAN search, one per GSTIN found). Anything past the limit is
+`STATUS_BUDGET_EXHAUSTED`, never a silent truncation.
+
+**What would widen coverage** (not built): PANs are printed on RERA filings in
+several states, so extending `promoter_identity`-style extraction across the
+group sweep's document libraries would convert unreachable entities into
+checkable ones. That is the natural next step and it needs no new source.
 
 Registered states: **MH**, **GJ**, **KA**, **TG**, **JH**, **WB** — all six have adapters.
 TG declares zero capabilities, which is a complete adapter, not a stub.

@@ -23,6 +23,7 @@ import charter_report
 import company_charter
 import charge_watch
 import group_sweep
+import gst_group
 import promoter_identity
 import states
 import deep_research
@@ -41,6 +42,9 @@ _MODULES = {
     # standing between a misread PAN and another company's records being
     # reported as this promoter's.
     "promoter_identity": promoter_identity,
+    # And the group GST check, whose coverage line is nearly its whole
+    # product: GST is PAN-keyed and most of a group has no public PAN.
+    "gst_group": gst_group,
     # The group sweep and the charge watch are the two passes that report
     # COVERAGE as well as findings -- their guards are what stop "we did not
     # look" being read as "there is nothing there".
