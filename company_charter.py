@@ -3138,44 +3138,116 @@ def run_cts_lookup_standalone(
 # ---------------------------------------------------------------------------
 
 _MAHARERA_ORDERS_URL = "https://maharera.maharashtra.gov.in/orders-judgements"
-_MAHARERA_COMPLAINT_TYPES = ("rulings_of_MahaRERA", "judgements_by_adjudicating_officers")
+_MAHARERA_COMPLAINT_TYPES = ("rulings_of_MahaRERA", "judgements_by_adjudicating_officer")
 _BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 
 
-def _maharera_orders_search_once(project_name: str, complaint_type: str) -> list:
-    """Single attempt -- may return [] either because there are genuinely
-    no matches, or because of the BigPipe flakiness noted above; the caller
-    (search_maharera_judgments) is responsible for retrying."""
-    headers = {"User-Agent": _BROWSER_UA}
-    session = requests.Session()
-    resp1 = session.get(_MAHARERA_ORDERS_URL, headers=headers, timeout=config.REQUEST_TIMEOUT)
-    resp1.raise_for_status()
-    build_id_match = re.search(r'name="form_build_id" value="([^"]+)"', resp1.text)
-    if not build_id_match:
-        return None  # the page did not even render its form -- not an empty result
+def _maharera_orders_form_defaults(html: str) -> dict | None:
+    """Every field the orders form actually posts, at its default value.
 
-    data = {
-        "order_complaint_type": complaint_type,
-        "order_project_name": project_name,
-        "form_build_id": build_id_match.group(1),
-        "form_id": "orders_judgements_form",
-        "op": "Search",
-    }
-    resp2 = session.post(_MAHARERA_ORDERS_URL, data=data, headers=headers, timeout=config.REQUEST_TIMEOUT)
-    resp2.raise_for_status()
-    if "bg-body rounded" not in resp2.text:
-        # THE SHELL CASE, AND IT IS NOT AN EMPTY RESULT. MahaRERA answers
-        # this POST with a Drupal BigPipe payload whose result container
-        # arrives separately; when it does not, the page carries the form
-        # back and no results region at all. Confirmed live 2026-08-21: a
-        # search for a large, certainly-litigated promoter returned this
-        # shell on every attempt, and the caller's [] then reads as "no
-        # orders". Marked so callers can tell the two apart.
-        return None
-
+    THE OLD REQUEST SENT FIVE FIELDS AND THE FORM HAS EIGHTEEN. Two of the
+    missing ones decide whether a search runs at all: `orders_judgements_type`
+    is a required radio, and `ruling_judgement_from`/`_to` are a date window
+    the page pre-fills. Posting without them returned the form back with no
+    results region, which the old code reported as "no orders".
+    """
     from bs4 import BeautifulSoup
 
-    soup = BeautifulSoup(resp2.text, "lxml")
+    form = BeautifulSoup(html or "", "lxml").find("form", id="orders-judgements-form")
+    if not form:
+        return None
+    data = {}
+    for element in form.find_all(["input", "select"]):
+        name = element.get("name")
+        if not name or name == "op":
+            continue
+        if element.name == "select":
+            # has_attr, not .get(): a bare `selected` (no ="selected") reads
+            # back as "" and would silently drop the default -- which for
+            # order_state means posting no state at all.
+            selected = [o.get("value") for o in element.find_all("option")
+                        if o.has_attr("selected")]
+            data[name] = selected[0] if selected else ""
+        elif element.get("type") == "radio":
+            if element.has_attr("checked"):
+                data[name] = element.get("value")
+        else:
+            data[name] = element.get("value") or ""
+    return data
+
+
+# RERA commenced on 1 May 2017; the form defaults to the last three years,
+# which would silently hide everything older than that.
+_MAHARERA_ORDERS_SINCE = "01-05-2017"
+
+_ORDERS_NO_RECORD_MARKER = "No Record"
+# Ten rows a page. Bounded, and the shortfall is visible because the
+# page states its own total.
+_MAHARERA_ORDERS_MAX_PAGES = 12
+_ORDERS_RESULT_MARKER = "bg-body rounded"
+
+
+def _maharera_orders_search_once(project_name: str = "", complaint_type: str = "",
+                                 respondent_name: str = "") -> list | None:
+    """One search. Returns rows, [] for a genuine nil, or None if the search
+    did not actually run.
+
+    HOW THIS PORTAL ACTUALLY WORKS, established live 2026-08-21 after the
+    old request had been returning nothing for every query:
+
+      1. `big_pipe_nojs=1` MUST be set. Without it Drupal serves the results
+         region as a BigPipe placeholder that only a browser resolves, so
+         the response carries the form and no results at all.
+      2. The POST must carry the WHOLE form (see _maharera_orders_form_
+         defaults), not the five fields the old code sent.
+      3. The POST stores the filter in the session and returns the form.
+         The results come from a FOLLOW-UP GET on the same URL in the same
+         session. Reading only the POST response is why this looked broken.
+
+    Three outcomes are then distinguishable, and keeping them apart is the
+    whole point: result cards, the portal's own "No Record" (a real nil),
+    or neither -- which means the filter never applied and the caller must
+    NOT read it as an absence.
+    """
+    from bs4 import BeautifulSoup
+
+    headers = {"User-Agent": _BROWSER_UA}
+    session = requests.Session()
+    session.cookies.set("big_pipe_nojs", "1", domain="maharera.maharashtra.gov.in")
+
+    first = session.get(_MAHARERA_ORDERS_URL, headers=headers, timeout=config.REQUEST_TIMEOUT)
+    first.raise_for_status()
+    data = _maharera_orders_form_defaults(first.text)
+    if data is None:
+        return None  # the page did not even render its form
+
+    if complaint_type:
+        data["order_complaint_type"] = complaint_type
+    if project_name:
+        data["order_project_name"] = project_name
+    if respondent_name:
+        data["order_respondent_name"] = respondent_name
+    data["ruling_judgement_from"] = _MAHARERA_ORDERS_SINCE
+    data["op"] = "Search"
+
+    posted = session.post(_MAHARERA_ORDERS_URL, data=data, headers=headers,
+                          timeout=config.REQUEST_TIMEOUT)
+    posted.raise_for_status()
+    text = posted.text
+
+    if _ORDERS_RESULT_MARKER not in text:
+        if _ORDERS_NO_RECORD_MARKER in text:
+            return []  # the portal said so itself
+        # The filter did not apply. Ask once more via the session, which
+        # holds it, before giving up -- and NEVER report this as an absence.
+        listing = session.get(_MAHARERA_ORDERS_URL, headers=headers,
+                              timeout=config.REQUEST_TIMEOUT)
+        listing.raise_for_status()
+        text = listing.text
+        if _ORDERS_RESULT_MARKER not in text:
+            return [] if _ORDERS_NO_RECORD_MARKER in text else None
+
+    soup = BeautifulSoup(text, "lxml")
     cards = [d for d in soup.find_all("div") if d.get("class") and "shadow" in d.get("class")]
 
     def _label_value(card, label_text):
@@ -3184,6 +3256,26 @@ def _maharera_orders_search_once(project_name: str, complaint_type: str) -> list
             return None
         p = label.find_next("p")
         return p.get_text(strip=True) if p else None
+
+    # PAGINATED, TEN AT A TIME. The page states its own total ("Showing
+    # Final 20 Result"), so a caller can tell a complete read from a
+    # truncated one instead of inferring it from the row count.
+    total_match = re.search(r"Showing\s*Final\s*<span[^>]*>\s*([\d,]+)", text)
+    total = int(total_match.group(1).replace(",", "")) if total_match else None
+    page = 1
+    while total is not None and len(cards) < total and page <= _MAHARERA_ORDERS_MAX_PAGES:
+        try:
+            more = session.get(_MAHARERA_ORDERS_URL, params={"page": page},
+                               headers=headers, timeout=config.REQUEST_TIMEOUT)
+            more.raise_for_status()
+        except requests.RequestException:
+            break
+        extra = [d for d in BeautifulSoup(more.text, "lxml").find_all("div")
+                 if d.get("class") and "shadow" in d.get("class")]
+        if not extra:
+            break
+        cards.extend(extra)
+        page += 1
 
     results = []
     for card in cards:
@@ -3312,6 +3404,32 @@ def search_maharera_judgments_status(project_name: str, max_attempts: int = 3) -
             "orders against this project."
         ),
     }
+
+
+def search_maharera_orders_by_promoter(promoter_name: str) -> dict:
+    """MahaRERA orders naming this promoter as RESPONDENT.
+
+    A complaint is filed AGAINST the promoter, so the respondent is the
+    promoter -- which makes this a promoter-keyed order search, the thing
+    a group sweep needs and which this pipeline previously believed
+    MahaRERA did not offer. Both adjudicating categories are searched.
+
+    Returns {"searched": bool, "results": [...]}. searched is False when
+    the portal never applied the filter, and then the empty result means
+    nothing at all.
+    """
+    rows, searched = [], False
+    for complaint_type in _MAHARERA_COMPLAINT_TYPES:
+        try:
+            outcome = _maharera_orders_search_once(
+                respondent_name=promoter_name, complaint_type=complaint_type)
+        except requests.RequestException:
+            outcome = None
+        if outcome is None:
+            continue
+        searched = True
+        rows.extend(outcome)
+    return {"searched": searched, "results": rows}
 
 
 def cross_reference_appeals(judgments: list, appeals_data: list) -> list:

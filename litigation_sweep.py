@@ -239,15 +239,12 @@ def sweep(graph, directors=None, known_places=None, searcher=None,
 # Which RERA authorities' own order registers this pipeline can search by
 # promoter name, and which it cannot. The second list is the important one:
 # a group with orders against it in Maharashtra would not show up here.
-ORDERS_SEARCHABLE = ("Karnataka (K-RERA)",)
+ORDERS_SEARCHABLE = ("Karnataka (K-RERA)", "MahaRERA")
 
 # Why each of the others is not, established by probing them on 2026-08-21
 # rather than assumed. These are source limits, not findings about any
 # promoter, and the section says so.
 ORDERS_NOT_SEARCHABLE = (
-    "MahaRERA -- its Orders/Judgements search DOES accept a respondent (promoter) "
-    "name, but the portal answered every attempt with its empty BigPipe shell, so "
-    "no search could be performed at all",
     "WBRERA -- publishes 4,881 authority orders, but keyed only by complaint "
     "number, with no promoter or party named in any column",
     "GujRERA and JHARERA -- single-page applications whose order pages are not "
@@ -273,10 +270,17 @@ def state_order_sweep(graph, searcher=None, register_coverage=None):
     developer, 0 for a nonsense name.
     """
     subjects = [s for s in _subjects(graph) if s["kind"] == SUBJECT_ENTITY]
+    maharera = None
     if searcher is None:
         from states import adapter_karnataka
 
         searcher = adapter_karnataka.search_all_orders_by_promoter
+        # MahaRERA searches by RESPONDENT, and a complaint is filed against
+        # the promoter -- so the respondent IS the promoter. Kept separate
+        # from the injected searcher so an offline test stays offline.
+        import company_charter
+
+        maharera = company_charter.search_maharera_orders_by_promoter
 
     entries, limitations = [], []
     searched = 0
@@ -290,6 +294,25 @@ def state_order_sweep(graph, searcher=None, register_coverage=None):
             )
             continue
         searched += 1
+        if maharera is not None:
+            outcome = maharera(subject["name"]) or {}
+            if not outcome.get("searched"):
+                limitations.append(
+                    f"MahaRERA's order search never applied its filter for "
+                    f"{subject['name']}, so no MahaRERA result was obtained either way."
+                )
+            for row in outcome.get("results") or []:
+                entries.append({
+                    "authority": "MahaRERA",
+                    "register": "Orders and judgements",
+                    "searched_name": subject["name"],
+                    "application_no": row.get("complainant_no") or "",
+                    "order_date": row.get("uploaded_date") or "",
+                    "project_name": row.get("project_name") or "",
+                    "promoter_name": row.get("respondent_name") or "",
+                    "detail": row.get("complaint_type") or "",
+                    "penalty_amount": "",
+                })
         for row in rows:
             entries.append({
                 "authority": "Karnataka (K-RERA)",

@@ -153,6 +153,34 @@ it did not -- but its portal answered every attempt with an empty BigPipe shell;
 no party named in any column; **GujRERA and JHARERA** are single-page apps whose
 order pages need JavaScript; **TG-RERA** publishes no such register.
 
+**MahaRERA's orders search, fixed 2026-08-21.** It had been returning nothing
+for every query. Four faults, and all four had to go:
+
+1. **`big_pipe_nojs=1` must be set for that host.** Without it Drupal serves the
+   results region as a BigPipe placeholder only a browser resolves, so the
+   response carries the form and no results at all.
+2. **The POST must carry the WHOLE form.** The old request sent five fields; the
+   form posts eighteen. `orders_judgements_type` is a required radio and was
+   never sent, and `ruling_judgement_from`/`_to` are a date window the page
+   pre-fills.
+3. **The date window defaults to the last three years**, which would hide
+   everything older. `_MAHARERA_ORDERS_SINCE` widens it to 01-05-2017, when RERA
+   commenced.
+4. **`judgements_by_adjudicating_officers` was wrong** -- the form posts
+   `..._officer`, SINGULAR -- so half of every search had been matching nothing.
+
+`_maharera_orders_form_defaults` uses `has_attr("selected")`, not
+`.get("selected")`: a bare `selected` reads back as `""`, which would silently
+drop `order_state` and post no state at all. Three outcomes stay distinguishable
+-- result cards, the portal's own "No Record" (a real nil), or neither, which
+means the filter never applied and must NOT be read as an absence.
+
+**MahaRERA is now promoter-searchable**, correcting an earlier note here: the
+form accepts a RESPONDENT name, and a complaint is filed against the promoter,
+so `search_maharera_orders_by_promoter` gives the group sweep its second
+authority. Results paginate ten at a time and the page states its own total, so
+`_MAHARERA_ORDERS_MAX_PAGES` truncation is visible rather than inferred.
+
 `company_charter.search_maharera_judgments` returned `[]` both for "no order
 published" and for "every attempt hit the shell". Its own docstring warned
 callers not to read an empty result as an absence, while giving them no way to

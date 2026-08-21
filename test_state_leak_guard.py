@@ -69,6 +69,12 @@ _ALLOWED = {
         # never run for another state.
         "_MAHARERA_ORDERS_URL": ("https://maharera.maharashtra.gov.in/orders-judgements",),
         "_MAHARERA_COMPLAINT_TYPES": ("rulings_of_MahaRERA",),
+        # The cookie that makes MahaRERA's own orders search work at all.
+        # Drupal serves the results region as a BigPipe placeholder unless
+        # big_pipe_nojs is set for THAT host, so the domain has to be named
+        # here -- it is the MahaRERA host, and the search is gated by
+        # CAP_ORDERS_SEARCH like every other MahaRERA-only path.
+        "_maharera_orders_search_once": ("maharera.maharashtra.gov.in",),
         # Domain -> display-name tables. These answer "what is this DOMAIN
         # called", which is a fact about the domain and not about the state
         # being rendered: a Telangana Charter citing a maharera.maharashtra

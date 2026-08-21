@@ -79,7 +79,7 @@ K-RERA also publishes five further order endpoints not yet read
 | Authority | Promoter-keyed order register? |
 |---|---|
 | **Karnataka** | **Yes — five of them.** Order-search index (11,732), authority orders, AO orders, interim orders, complaints under process. 15,600+ rows, including a **penalty table with violation, section and amount** (440 rows) |
-| **MahaRERA** | **Yes in principle** — the form DOES accept `order_respondent_name`, correcting an earlier note here. But the portal answered every attempt with its empty BigPipe shell, so no search could run |
+| **MahaRERA** | **Yes — fixed 2026-08-21.** `order_respondent_name` is promoter-keyed. Needed `big_pipe_nojs=1`, the whole 18-field form, a widened date window, and the singular complaint-type value. Validated: 40 rows for a real respondent, 0 for a control |
 | **WBRERA** | No. 4,881 authority orders published, keyed only by complaint number; no party named in any column. Joinable via complaint numbers the adapter already reads per project |
 | **GujRERA / JHARERA** | No. Single-page apps; order pages not reachable without executing their JavaScript |
 | **TG-RERA** | No such register |
@@ -97,7 +97,7 @@ K-RERA also publishes five further order endpoints not yet read
 > for "every attempt hit the shell". Confirmed live: a search for a large,
 > certainly-litigated promoter hit the shell every time, so the pipeline was
 > reporting no orders for it. `search_maharera_judgments_status` now exposes
-> `{"searched": bool}`; **fixing the BigPipe follow-up itself remains open.**
+> `{"searched": bool}`. **The BigPipe follow-up is now fixed** — see the row above.
 
 ### Phase 4e (group GST): the join key is the whole problem
 

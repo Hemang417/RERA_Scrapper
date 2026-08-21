@@ -264,6 +264,51 @@ def test_a_register_that_did_not_load_is_named_not_counted_as_empty():
     print("test_a_register_that_did_not_load_is_named_not_counted_as_empty: PASS")
 
 
+def test_maharera_is_now_searchable_by_promoter():
+    """CORRECTION, established by fixing the portal request. An earlier note
+    in this repo said MahaRERA orders search was per-project only. It is
+    not: the form accepts a RESPONDENT name, and a complaint is filed
+    against the promoter, so the respondent IS the promoter."""
+    assert "MahaRERA" in ls.ORDERS_SEARCHABLE, ls.ORDERS_SEARCHABLE
+    still_listed = "MahaRERA" in " ".join(ls.ORDERS_NOT_SEARCHABLE)
+    assert not still_listed, "MahaRERA is still listed as unsearchable"
+    print("test_maharera_is_now_searchable_by_promoter: PASS")
+
+
+def test_the_maharera_request_carries_what_the_form_actually_needs():
+    """THE FIX. The old request sent five fields; the form posts eighteen,
+    and two of the missing ones decide whether a search runs at all:
+    orders_judgements_type is a required radio, and ruling_judgement_from
+    and _to are a date window the page pre-fills to the last three years.
+    The complaint-type value was wrong too -- the form posts
+    judgements_by_adjudicating_officer, SINGULAR, so that half of every
+    search had been matching nothing."""
+    import company_charter as charter
+
+    form_html = """<form id="orders-judgements-form">
+      <input type="radio" name="order_complaint_type" value="rulings_of_MahaRERA" checked />
+      <input type="radio" name="orders_judgements_type" value="59" checked />
+      <input type="text" name="order_respondent_name" value="" />
+      <input type="text" name="ruling_judgement_from" value="21-08-2023" />
+      <select name="order_state"><option value="27" selected>MAHARASHTRA</option></select>
+      <input type="hidden" name="form_id" value="orders_judgements_form" />
+      <input type="submit" name="op" value="Search" />
+    </form>"""
+    data = charter._maharera_orders_form_defaults(form_html)
+    assert data["orders_judgements_type"] == "59", data
+    assert data["ruling_judgement_from"] == "21-08-2023", data
+    assert data["order_state"] == "27", data
+    assert "op" not in data, "the submit button must not be posted as a default"
+    assert charter._maharera_orders_form_defaults("<p>no form</p>") is None
+
+    # RERA commenced 1 May 2017; the form 3-year window would hide older.
+    assert charter._MAHARERA_ORDERS_SINCE == "01-05-2017"
+    types = charter._MAHARERA_COMPLAINT_TYPES
+    assert "judgements_by_adjudicating_officer" in types, types
+    assert "judgements_by_adjudicating_officers" not in types, types
+    print("test_the_maharera_request_carries_what_the_form_actually_needs: PASS")
+
+
 def test_why_each_authority_is_unsearchable_is_stated_not_assumed():
     """Each of these was PROBED on 2026-08-21, not assumed. MahaRERA does
     accept a respondent (promoter) name -- an earlier note in this repo
@@ -273,8 +318,6 @@ def test_why_each_authority_is_unsearchable_is_stated_not_assumed():
     session re-deriving it, and stops a reader treating silence as a clean
     record."""
     joined = " ".join(ls.ORDERS_NOT_SEARCHABLE)
-    assert "respondent (promoter) name" in joined, joined
-    assert "BigPipe shell" in joined, joined
     assert "4,881" in joined and "complaint number" in joined, joined
     assert "single-page applications" in joined, joined
     print("test_why_each_authority_is_unsearchable_is_stated_not_assumed: PASS")
@@ -333,6 +376,8 @@ if __name__ == "__main__":
     test_only_entities_are_searched_in_order_registers()
     test_the_karnataka_order_index_refuses_to_pair_mismatched_arrays()
     test_a_register_that_did_not_load_is_named_not_counted_as_empty()
+    test_maharera_is_now_searchable_by_promoter()
+    test_the_maharera_request_carries_what_the_form_actually_needs()
     test_why_each_authority_is_unsearchable_is_stated_not_assumed()
     test_a_maharera_shell_response_is_not_an_absence_of_orders()
     test_the_group_litigation_stage_is_opt_in_and_silent_when_off()
