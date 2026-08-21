@@ -6,7 +6,7 @@
 | **Document** | Software Architecture Document |
 | **System** | RERA Scrapper (pan-India RERA project due-diligence and Company Charter generator) |
 | **Repository root** | `RERA_Scrapper/` |
-| **Version** | 1.2 |
+| **Version** | 2.0 |
 | **Date** | 21 August 2026 |
 | **Status** | Baseline — describes the system as implemented |
 | **Owner** | Integrow Asset Management |
@@ -385,7 +385,7 @@ The punctuation constraint on B and C is not stylistic. `_verify_external_docume
 | `build_report.py` | 11.8 KB | One-off | Hand-curated research for one engagement; "delete or rewrite per engagement" |
 | `finalize_report.py` | 4.6 KB | Entry | Rebuild the summary PDF from disk with **zero network calls** |
 
-**Added since v1.1 -- the state seam and group-level diligence:**
+**Added in v2.0 -- the state seam and group-level diligence:**
 
 | Module | LOC/size | Layer | Role |
 |---|---|---|---|

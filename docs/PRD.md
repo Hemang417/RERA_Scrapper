@@ -5,7 +5,7 @@
 |---|---|
 | **Document** | Product Requirements Document |
 | **Product** | RERA Scrapper |
-| **Version** | 1.2 |
+| **Version** | 2.0 |
 | **Date** | 21 August 2026 |
 | **Status** | Baseline — documents the product as built, plus forward roadmap |
 | **Owner** | Integrow Asset Management |
@@ -1366,6 +1366,25 @@ These are product requirements, not style preferences. They are the reason the d
             spend, deep research and Charter generation combined
         [x] cache_control on every agentic pass; cache write/read tokens
             priced and reported separately from plain input tokens
+
+  v2.0  PAN-INDIA + GROUP-LEVEL DILIGENCE  (2026-08-17 -- 2026-08-21)
+        [x] states/ seam: StateProfile (data) + StateAdapter (one
+            acquire()); capability declaration; state resolved from the
+            registration number, --state always overriding
+        [x] Six authorities: MH, GJ, KA, TG, JH, WB. app.py deleted its
+            ~160 duplicated lines and calls the same acquire()
+        [x] Group entity graph -- brand name PROPOSES, a hard link
+            CONFIRMS -- then group-wide RERA sweep, GST, case law
+        [x] Promoter PAN off the filed card; charge movement; state
+            footprint; CRISIL added to the rating chain
+        [x] CTS land records fixed: fields had been {} on EVERY lookup
+            this repo had ever made; now 15 fields plus mutation entries
+        [x] Promoter-keyed order registers from four authorities, and
+            MahaRERA's own orders search repaired after it was found to
+            have been returning nothing for every query
+        [x] Every group pass reports its own COVERAGE, because the
+            recurring defect in all of the above was a check that could
+            not run being read as a check that found nothing
 ```
 
 ### 18.2 Roadmap
