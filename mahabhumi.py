@@ -49,6 +49,7 @@ whatever structured fields/raw text soup parsing manages to find, so
 nothing is silently lost if a future page happens to render differently.
 """
 
+import io
 import os
 import re
 import shutil
@@ -98,6 +99,42 @@ _SEL_CTS_SEARCH_BTN = "#ContentPlaceHolder1_btnsearchfind"
 _SEL_CTS_CANDIDATES = "#ContentPlaceHolder1_ddlsurveyno"
 _SEL_MOBILE = "#ContentPlaceHolder1_txtmobile1"
 _SEL_SUBMIT_BTN = "#ContentPlaceHolder1_btnmainsubmit"
+# The card renders in whichever language THIS dropdown holds, and every
+# label on it changes with the choice -- so it silently decides whether
+# parse_property_card can read anything at all. Confirmed live 2026-08-21:
+# a human picked "English" at the CAPTCHA step and every table field came
+# back empty from a card that had rendered perfectly, because the parser
+# matches Marathi labels ("Area Sq.Mt.." is not "क्षेत्र चौ.मी.").
+# The site itself settles which language is authoritative -- its own
+# disclaimer says the transliterated text is "prone to occasional
+# inconsistencies" and that the Marathi content "will be considered as
+# sacrosanct" -- so the code sets it rather than leaving it to whoever is
+# at the keyboard alongside the CAPTCHA.
+# How long to keep waiting for the card after a weak "something moved"
+# signal before scraping whatever is on screen. Covers the "Processing ,
+# Please wait.." overlay without ever discarding a human's CAPTCHA solve.
+_WEAK_SIGNAL_GRACE_SECONDS = 45.0
+# How long _scrape_result_page waits for the card to appear in the DOM
+# before reading whatever is there anyway (never silently -- see the note
+# parse_property_card returns).
+_CARD_DOM_WAIT_SECONDS = 20.0
+_SEL_LANGUAGE = "#ContentPlaceHolder1_ddllangforAll"
+# WHY ENGLISH, given the portal calls its Marathi text sacrosanct.
+# Because in Marathi the card is not text at all: it is a base64 JPEG in an
+# <img> src (confirmed live 2026-08-21 over five CAPTCHA solves, every one
+# of which returned a perfect card and zero parseable rows). Reading it
+# would need a Marathi Tesseract pack this machine does not have, and OCR
+# of a watermarked Devanagari table is far less reliable than parsing the
+# English HTML the same portal serves.
+#
+# The transliteration risk is real but bounded, and it does NOT touch the
+# values diligence turns on: CTS number, area, dates and mutation numbers
+# are digits, identical in both renderings. Only Marathi WORDS are
+# transliterated (a holder name, a tenure class) -- and for those the
+# authoritative Marathi card image is saved alongside every capture by
+# save_embedded_card_image. The goal here is extracted data, with the
+# original kept as evidence; it is not to produce a legal copy.
+_CARD_LANGUAGE = "English"
 
 # Maharashtra's 36 districts -- a fixed, hardcodable list (confirmed against
 # the live ddlMainDist option set), mapped from common English spellings
@@ -219,7 +256,12 @@ def _wait_for_cts_results(page, timeout_ms: int = 25000) -> None:
     )
 
 
-def _wait_for_repopulated(page, selector: str, timeout_ms: int = 10000) -> None:
+def _wait_for_repopulated(page, selector: str, timeout_ms: int = 30000) -> None:
+    # 10s was too tight. Confirmed live 2026-08-21: on a slow afternoon the
+    # portal took 13s just to serve the search form, so all three setup
+    # attempts blew this wait and the run died BEFORE the human was ever
+    # shown a CAPTCHA. The cost of waiting longer is seconds; the cost of
+    # giving up early is the whole lookup.
     """ASP.NET UpdatePanel postbacks repopulate a dependent <select> a
     moment after its parent changes -- polls for that rather than a fixed
     sleep, since the real delay varies with server load."""
@@ -505,15 +547,128 @@ _CARD_LABELS = {
     "\u0935\u0930\u094d\u0937": "holder_year",
 }
 
+# The SAME card in the portal's machine-transliterated English rendering.
+# Needed because the Marathi card is a JPEG (see save_embedded_card_image)
+# and cannot be parsed at all without a Marathi OCR pack, which this
+# machine does not have. Taken verbatim from a live capture on 2026-08-21,
+# including "Tennure" and the double-dotted "Area Sq.Mt.." -- those are the
+# portal's own spellings and must not be tidied up here.
+#
+# Ordered most-specific-first: matching is by substring, and "Lessee"
+# occurs inside the mutation header "New Holder (H), Lessee(L) or
+# Encumbrances(E)".
+_CARD_LABELS_EN = {
+    "Other Encumbrances": "encumbrance",
+    "Other Remarks": "other_remarks",
+    "Name of the Holder": "original_holder",
+    "Area Sq.Mt": "area_sq_m",
+    "Sheet Number": "sheet_number",
+    "Plot Number": "plot_number",
+    "Village/peth": "village",
+    "Easements": "easements",
+    "Tennure": "tenure",
+    "CTS No": "city_survey_number",
+    "Taluka": "office",
+    "District": "district",
+    "Lessee": "lessee",
+    "varsh": "holder_year",
+}
+
 # Mutation-table column labels.
+# CORRECTED against the real card 2026-08-21. The live card's third column
+# is Khand Kramank (Vol.No.), NOT Pherphar Kramank -- the mutation number
+# is written INSIDE the attestation cell ("ferafar kran. 599 pramane"),
+# which is why _mutation_number_from exists. The Pherphar key is kept for
+# any card that does carry it as its own column.
 _MUTATION_COLUMNS = {
     "\u0926\u093f\u0928\u093e\u0902\u0915": "date",
     "\u0935\u094d\u092f\u0935\u0939\u093e\u0930": "transaction",
     "\u092b\u0947\u0930\u092b\u093e\u0930": "mutation_number",
+    "\u0916\u0902\u0921 \u0915\u094d\u0930\u092e\u093e\u0902\u0915": "volume_number",
+    "\u0928\u0935\u093f\u0928 \u0927\u093e\u0930\u0915": "new_holder",
     "\u0938\u093e\u0915\u094d\u0937\u093e\u0902\u0915\u0928": "attestation",
 }
 
+_MUTATION_COLUMNS_EN = {
+    "Date": "date",
+    "Transaction": "transaction",
+    "Vol.No": "volume_number",
+    "New Holder": "new_holder",
+    "Attestation": "attestation",
+}
+
+_MUTATION_NO_RE = re.compile(
+    r"(?:\u092b\u0947\u0930\u092b\u093e\u0930|ferafar)[^0-9]{0,20}([0-9]{1,6})", re.I)
+
+
+def _mutation_number_from(entry: dict) -> str:
+    """The mutation (pherphar) number, wherever the card put it. On the real
+    card it is prose inside the attestation cell, not its own column."""
+    for value in entry.values():
+        found = _MUTATION_NO_RE.search(value or "")
+        if found:
+            return found.group(1)
+    return ""
+
+# Both renderings of the same card. English first: its order is
+# significant (substring matching), and the two alphabets never collide.
+_ALL_CARD_LABELS = {**_CARD_LABELS_EN, **_CARD_LABELS}
+_ALL_MUTATION_COLUMNS = {**_MUTATION_COLUMNS_EN, **_MUTATION_COLUMNS}
+
 _PU_ID_RE = re.compile(r"PU[\s-]?ID\s*[:\-]?\s*(\d{6,})", re.I)
+
+
+_CARD_MARKERS = ("PU-ID", "PU_ID", "pu-id", "मागे जा")
+
+
+def _card_frame_text(page) -> str:
+    """The first frame whose HTML actually carries the Property Card, or "".
+
+    page.get_by_text() searches the MAIN frame only. The card renders in a
+    child frame on this site (the documented reason page.content() once
+    returned the search form while a screenshot showed the card), so a
+    main-frame-only check can never see it -- confirmed live 2026-08-21:
+    a fully rendered Marathi card sat on screen, screenshotted correctly,
+    while every strong signal read False and raw_text stayed at the bare
+    3694-character form."""
+    for frame in page.frames:
+        try:
+            html = frame.content()
+        except Exception:
+            continue
+        if any(marker in html for marker in _CARD_MARKERS):
+            return html
+    return ""
+
+
+# Keys the card writes as "Label : value" inside a single cell.
+_SAME_CELL_KEYS = {"village", "office", "district", "holder_year"}
+
+
+def _same_cell_value(text: str, label: str) -> str:
+    """The value from a "Label : value" cell, or "".
+
+    Handles the card's "Taluka / C.T.S.Office : ..." where punctuation sits
+    between the label and its colon, and stops at the next label when one
+    cell carries several pairs -- otherwise the village reads as "ambivli
+    Taluka / C.T.S.Office : andheri District : mumbai upanagar", swallowing
+    its neighbours. The live card puts each in its own cell, but the same
+    block is rendered as one cell elsewhere on the portal."""
+    index = text.find(label)
+    if index < 0:
+        return ""
+    remainder = text[index + len(label):]
+    if ":" not in remainder:
+        return ""
+    value = remainder.split(":", 1)[1]
+    cut = len(value)
+    for other in _ALL_CARD_LABELS:
+        if other == label:
+            continue
+        position = value.find(other)
+        if 0 <= position < cut:
+            cut = position
+    return value[:cut].strip()
 
 
 def _cell_text(cell) -> str:
@@ -543,17 +698,34 @@ def parse_property_card(html: str) -> dict:
         fields["pu_id"] = pu_id.group(1)
 
     for table in soup.find_all("table"):
-        rows = table.find_all("tr")
+        # NESTING IS HANDLED PER-ROW, NOT PER-TABLE, and both halves matter.
+        #
+        # get_text() on a cell that wraps another table returns every inner
+        # label run together, so a wrapper row makes every label match at
+        # position 0: all eight header fields once came back holding the
+        # single string "Village/peth : ambivli Taluka / C.T.S.Office :
+        # ...", reported as the area, the tenure and the district alike.
+        #
+        # But skipping any table that CONTAINS a table is too blunt -- the
+        # real card puts the village/taluka/district table INSIDE the same
+        # table that carries the CTS/Area/Tennure header, so that dropped
+        # every header field. Exactly the JHARERA nested-table lesson.
+        #
+        # find_all("tr") also descends into nested tables, so rows must be
+        # restricted to this table's own.
+        rows = [tr for tr in table.find_all("tr")
+                if tr.find_parent("table") is table and not tr.find("table")]
         if not rows:
             continue
         header_cells = [_cell_text(c) for c in rows[0].find_all(["th", "td"])]
 
         # Shape 1: the mutation table, matched on its own column labels.
-        if any(any(k in h for k in ("\u0926\u093f\u0928\u093e\u0902\u0915",)) for h in header_cells) and \
-           any(any(k in h for k in ("\u0935\u094d\u092f\u0935\u0939\u093e\u0930",)) for h in header_cells):
+        # The mutation table, in either rendering of the card.
+        if any(any(k in h for k in ("\u0926\u093f\u0928\u093e\u0902\u0915", "Date")) for h in header_cells) and \
+           any(any(k in h for k in ("\u0935\u094d\u092f\u0935\u0939\u093e\u0930", "Transaction")) for h in header_cells):
             index = {}
             for position, header in enumerate(header_cells):
-                for label, key in _MUTATION_COLUMNS.items():
+                for label, key in _ALL_MUTATION_COLUMNS.items():
                     if label in header:
                         index[key] = position
             for row in rows[1:]:
@@ -562,6 +734,8 @@ def parse_property_card(html: str) -> dict:
                     continue
                 entry = {key: (cells[pos] if pos < len(cells) else "")
                          for key, pos in index.items()}
+                if not entry.get("mutation_number"):
+                    entry["mutation_number"] = _mutation_number_from(entry)
                 if any(entry.values()):
                     mutations.append(entry)
             continue
@@ -578,7 +752,7 @@ def parse_property_card(html: str) -> dict:
         if not rows[0].find_all("th"):
             header_cells = []
         for position, header in enumerate(header_cells):
-            for label, key in _CARD_LABELS.items():
+            for label, key in _ALL_CARD_LABELS.items():
                 if label in header and key not in matched:
                     matched[key] = position
         if matched and len(rows) > 1:
@@ -588,21 +762,131 @@ def parse_property_card(html: str) -> dict:
                     fields[key] = values[position]
             continue
 
-        # Shape 3: label-and-value rows down the left column.
+        # Shape 3: label-and-value rows.
         for row in rows:
             cells = [_cell_text(c) for c in row.find_all(["td", "th"])]
+
+            # 3a: label and value inside ONE cell -- "Village/peth :
+            # ambivli". Restricted to the keys that really are written that
+            # way, because a cell like "Name of the Holder : varsh : 1964"
+            # would otherwise yield "varsh : 1964" as the holder's name.
+            for cell in cells:
+                for label, key in _ALL_CARD_LABELS.items():
+                    if key not in _SAME_CELL_KEYS or key in fields:
+                        continue
+                    value = _same_cell_value(cell, label)
+                    if value:
+                        fields[key] = value
+
+            # 3b: label in one cell, value in the NEXT. The label is NOT
+            # always in cells[0]: the real card's label block opens each row
+            # with an empty spacer <td>, which is why the holder, lessee,
+            # encumbrance and remarks rows all read as blank.
             if len(cells) < 2:
                 continue
-            for label, key in _CARD_LABELS.items():
-                if label in cells[0] and key not in fields:
-                    fields[key] = cells[1]
+            for position, cell in enumerate(cells[:-1]):
+                for label, key in _ALL_CARD_LABELS.items():
+                    if label in cell and key not in fields:
+                        fields[key] = cells[position + 1]
 
     if not fields and not mutations:
         return {}
-    return {"fields": fields, "mutations": mutations}
+
+    # A CARD THAT IS THERE BUT UNREADABLE IS NOT A CARD THAT IS ABSENT.
+    # The PU-ID is matched by regex over the whole page, so it survives any
+    # language; every other field is matched by its Marathi label. PU-ID
+    # present with nothing else means a real card rendered and this parser
+    # could not read a single row of it -- the exact shape of the 2026-08-21
+    # English-transliteration run. Reporting that as an ordinary sparse
+    # result would let a wrong-language capture reach the Charter looking
+    # like a plot with no owner, no area and no encumbrance recorded.
+    result = {"fields": fields, "mutations": mutations}
+    if list(fields) == ["pu_id"] and not mutations:
+        result["note"] = (
+            "A Property Card rendered (PU-ID " + fields["pu_id"] + ") but none of "
+            "its labelled rows could be read. The most likely cause is that the "
+            "card was requested in a language other than Marathi: the portal "
+            "transliterates every label, and this parser matches the Marathi "
+            "wording the Land Records rules print on Form D. Re-run with the "
+            "language left at Marathi. Treat this as NO READING TAKEN, never as "
+            "an absence of owner, encumbrance or mutation entries."
+        )
+    return result
 
 
-def _scrape_result_page(page, screenshot_path: str | None = None) -> dict:
+_CARD_IMAGE_MIN_BYTES = 20000
+
+
+def save_embedded_card_image(page, directory: str) -> dict:
+    """Save the card image the result page embeds as a data: URI.
+
+    CONFIRMED LIVE 2026-08-21, and it overturns what this module used to
+    say about itself. In Marathi -- the language the portal calls
+    sacrosanct -- the Property Card is NOT markup at all. It is a single
+    base64 JPEG inlined into an <img> src, which is why PU-ID appears in no
+    frame's HTML, why a screenshot always showed a card the DOM did not,
+    and why OCR was ever in this file. The English card, by contrast, is
+    real HTML tables (machine transliterated, and the portal warns that
+    transliteration is "prone to occasional inconsistencies").
+
+    So the image is the authoritative artifact whatever language is used,
+    and it is worth keeping in both: it is the evidence behind whatever the
+    parser reports. Returns {} when the page embeds no such image."""
+    try:
+        sources = page.evaluate(
+            """() => Array.from(document.querySelectorAll('img'))
+                 .map(e => e.src || '')
+                 .filter(s => s.startsWith('data:image'))"""
+        )
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+    import base64
+
+    best = None
+    for src in sources:
+        head, _, b64 = src.partition(",")
+        try:
+            raw = base64.b64decode(b64)
+        except Exception:
+            continue
+        # The CAPTCHA is also a data: image on this page. The card is an
+        # order of magnitude larger; size is what separates them.
+        if len(raw) < _CARD_IMAGE_MIN_BYTES:
+            continue
+        if best is None or len(raw) > len(best[1]):
+            best = (head.split("/")[1].split(";")[0], raw)
+    if not best:
+        return {}
+    extension, raw = best
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, f"property_card.{extension}")
+    with open(path, "wb") as fh:
+        fh.write(raw)
+    return {"path": path, "bytes": len(raw)}
+
+
+def _dom_inventory(page) -> dict:
+    """What kinds of embedded object are on the result page, and where they
+    point. Diagnostic only -- it never decides anything, it just makes the
+    next failure readable without spending another human CAPTCHA solve."""
+    try:
+        return page.evaluate(
+            """() => {
+                const src = sel => Array.from(document.querySelectorAll(sel))
+                    .map(e => e.src || e.data || e.getAttribute('src') || '(none)');
+                return {
+                    iframe: src('iframe'), embed: src('embed'),
+                    object: src('object'), img: src('img').slice(0, 25),
+                    canvas: document.querySelectorAll('canvas').length,
+                };
+            }"""
+        )
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+def _scrape_result_page(page, screenshot_path: str | None = None, captured: dict | None = None) -> dict:
     """Best-effort extraction from whatever page the site shows after a
     successful CAPTCHA submission. Tries the two structural patterns already
     proven elsewhere in this codebase (ZaubaCorp's li.row pairs, and plain
@@ -627,9 +911,23 @@ def _scrape_result_page(page, screenshot_path: str | None = None) -> dict:
     or OCR step itself fails."""
     from bs4 import BeautifulSoup
 
+    # WAIT FOR THE CARD TO REACH THE DOM BEFORE READING IT.
+    # Confirmed live 2026-08-21: this function read every frame FIRST and
+    # took the screenshot AFTER, so a card that landed in between produced
+    # the exact contradiction seen that day -- a screenshot showing a
+    # complete Marathi Property Card beside a raw_text holding nothing but
+    # the 3694-character search form. Reading the DOM is what the parser
+    # depends on; the screenshot is only evidence. So poll for the card,
+    # then read both from the same moment.
+    for _ in range(int(_CARD_DOM_WAIT_SECONDS / 0.5)):
+        if _card_frame_text(page):
+            break
+        time.sleep(0.5)
+
     raw_text_parts = []
     fields = {}
     mutations = []
+    notes = []
     for frame in page.frames:
         try:
             html = frame.content()
@@ -646,12 +944,22 @@ def _scrape_result_page(page, screenshot_path: str | None = None) -> dict:
             fields.update(card["fields"])
             if card["mutations"]:
                 mutations.extend(card["mutations"])
+            if card.get("note") and card["note"] not in notes:
+                notes.append(card["note"])
         # The li.row shape, kept as a fallback for any page that uses it.
         for li in soup.find_all("li", class_="row"):
             parts = li.find_all(["span", "label"])
             if len(parts) >= 2:
                 fields.setdefault(parts[0].get_text(strip=True), parts[1].get_text(strip=True))
     raw_text = "\n".join(part for part in raw_text_parts if part)
+
+    if not fields.get("pu_id") and not mutations:
+        notes.append(
+            "The Property Card was not present in any frame's HTML when this "
+            "page was read. If the saved screenshot shows a card, the reading "
+            "raced the page: the card arrived after the DOM was read. This is "
+            "NO READING TAKEN, not an empty record."
+        )
 
     ocr_text = ""
     if screenshot_path:
@@ -661,8 +969,53 @@ def _scrape_result_page(page, screenshot_path: str | None = None) -> dict:
         except Exception as e:
             ocr_text = f"[OCR unavailable: {e}]"
 
+    # A note here means the card was ON the page and could not be read --
+    # see parse_property_card. It must reach the caller, not be inferred
+    # from an empty `fields`.
+    if mutations or len(fields) > 1:
+        notes = [n for n in notes if "none of" not in n]
+    card_html = _card_frame_text(page)
+    if card_html and screenshot_path:
+        try:
+            path = os.path.join(os.path.dirname(screenshot_path), "card_page.html")
+            with io.open(path, "w", encoding="utf-8") as fh:
+                fh.write(card_html)
+        except Exception:
+            pass  # diagnostics must never break a capture
+
+    card_image = {}
+    if screenshot_path:
+        card_image = save_embedded_card_image(page, os.path.dirname(screenshot_path))
+        if card_image.get("path"):
+            notes.append(
+                "The card image the page embedded was saved to "
+                f"{card_image['path']} -- this is the authoritative record; "
+                "in Marathi it is the ONLY form the card takes."
+            )
+
+    diagnostics = {"dom": _dom_inventory(page)}
+    if captured is not None:
+        diagnostics["responses"] = captured.get("responses", [])[-60:]
+        saved = []
+        for i, pdf in enumerate(captured.get("pdfs", [])):
+            if not screenshot_path:
+                continue
+            path = os.path.join(os.path.dirname(screenshot_path), f"card_{i}.pdf")
+            try:
+                with open(path, "wb") as fh:
+                    fh.write(pdf["body"])
+                saved.append({"url": pdf["url"], "path": path, "bytes": len(pdf["body"])})
+            except Exception as e:
+                saved.append({"url": pdf["url"], "error": str(e)})
+        diagnostics["pdfs"] = saved
+        if saved:
+            notes.append(
+                f"{len(saved)} PDF response(s) captured from the result page and saved "
+                "beside the screenshot. If the card is not in the DOM, it is in there."
+            )
     return {"fields": fields, "mutations": mutations, "raw_text": raw_text,
-            "ocr_text": ocr_text, "url": page.url}
+            "ocr_text": ocr_text, "url": page.url, "notes": notes,
+            "card_image": card_image, "diagnostics": diagnostics}
 
 
 def fetch_property_card(
@@ -702,6 +1055,25 @@ def fetch_property_card(
         return {"found": False, "note": f"district name {district_name!r} not recognized -- see _DISTRICT_NAME_MAP"}
 
     p, browser, page = _launch(headless=False)
+    captured = {"responses": [], "pdfs": []}
+
+    def _on_response(response):
+        # The card may never enter the DOM (confirmed live 2026-08-21: a
+        # fully rendered Marathi card, screenshotted correctly, absent from
+        # every frame's HTML). If the site delivers it as a document rather
+        # than as markup, this is the only place it can be caught.
+        try:
+            content_type = (response.header_value("content-type") or "")
+        except Exception:
+            content_type = ""
+        captured["responses"].append({"url": response.url[:300], "content_type": content_type})
+        if "pdf" in content_type.lower() or response.url.lower().endswith(".pdf"):
+            try:
+                captured["pdfs"].append({"url": response.url, "body": response.body()})
+            except Exception:
+                pass
+
+    page.on("response", _on_response)
     try:
         # The same postback occasionally times out here as in
         # search_cts_candidates (confirmed live: identical inputs succeed on
@@ -733,6 +1105,8 @@ def fetch_property_card(
                 _select_option_exact(page, _SEL_CTS_CANDIDATES, str(cts_number).strip(), cts_options)
 
                 page.fill(_SEL_MOBILE, str(mobile).strip())
+                # Set BEFORE the human takes over -- see _SEL_LANGUAGE.
+                page.select_option(_SEL_LANGUAGE, label=_CARD_LANGUAGE)
                 setup_error = None
                 break
             except AmbiguousSelectionError:
@@ -744,10 +1118,13 @@ def fetch_property_card(
 
         print(f"[INFO] A browser window has opened at {_BASE_URL}")
         print("[INFO] Please read the CAPTCHA shown there, type it in, and click Submit.")
+        print(f"[INFO] Language is already set to {_CARD_LANGUAGE} -- please leave it alone;")
+        print("[INFO] the Marathi card is served as an image and cannot be parsed.")
         print(f"[INFO] Waiting up to {timeout_seconds}s for you to finish...")
 
         elapsed = 0.0
         last_status_at = 0.0
+        weak_signal_seconds = 0.0
         starting_url = page.url
         # Confirmed live (a real CAPTCHA solve, content changed in the SAME
         # window, no new tab, no download -- and a screenshot of the actual
@@ -770,13 +1147,34 @@ def fetch_property_card(
                 raise BrowserClosedError("Browser window was closed before the CAPTCHA was solved.")
             try:
                 current_visible_text_len = len(page.inner_text("body"))
-                page_changed = (
-                    page.get_by_text("मागे जा").count() > 0
-                    or page.get_by_text("PU-ID", exact=False).count() > 0
-                    or page.url != starting_url
+                # STRONG signals: the card itself is on screen. Nothing else
+                # on this site shows a "मागे जा" (Go Back) button or a PU-ID.
+                card_on_screen = bool(_card_frame_text(page))
+                # WEAK signals: something moved. Confirmed live 2026-08-21 --
+                # these ALL fire during the site's "Processing , Please
+                # wait.." overlay, which hides the submit button and changes
+                # the rendered text length while the card is still being
+                # fetched. Treating them as equal to the strong signals
+                # scraped the overlay instead of the card and threw away a
+                # human CAPTCHA solve: raw_text came back as the bare search
+                # form, no PU-ID, no rows.
+                something_moved = (
+                    page.url != starting_url
                     or not page.locator(_SEL_SUBMIT_BTN).is_visible()
                     or abs(current_visible_text_len - starting_visible_text_len) > 200
                 )
+                page_changed = card_on_screen or (
+                    something_moved and weak_signal_seconds >= _WEAK_SIGNAL_GRACE_SECONDS
+                )
+                if something_moved and not card_on_screen:
+                    # Give the card time to arrive rather than scraping the
+                    # loading state. Still bounded: on expiry we scrape
+                    # whatever is there, so a solve is never lost outright,
+                    # and parse_property_card reports an unreadable result
+                    # rather than an empty one.
+                    weak_signal_seconds += poll_interval
+                elif card_on_screen:
+                    _settle(page, 1500)  # let the last rows paint
             except Exception:
                 # Confirmed live: the moment a human submits the CAPTCHA, the
                 # resulting postback can destroy Playwright's execution
@@ -802,7 +1200,7 @@ def fetch_property_card(
                 scrape_error = None
                 for _scrape_attempt in range(3):
                     try:
-                        return {"found": True, **_scrape_result_page(page, screenshot_path)}
+                        return {"found": True, **_scrape_result_page(page, screenshot_path, captured)}
                     except Exception as e:
                         scrape_error = e
                         time.sleep(poll_interval)

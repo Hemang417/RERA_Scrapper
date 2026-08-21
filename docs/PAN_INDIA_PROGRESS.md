@@ -17,10 +17,16 @@ Data coverage: `docs/RERA_Data_Coverage.xlsx` (regenerate with `python build_dat
 | Stage 2 | Capability gates; state-independent bug fixes; `rules.md` generalised | **Done** |
 | Stage 3 | Acquisition extracted behind `StateAdapter`; `main.py` + `app.py` on one call | **Done** |
 | Phase 2a | Gujarat (GujRERA) adapter | **Done**, verified live end-to-end |
-| Phase 2b | Karnataka (K-RERA) adapter | **Adapter done + live-verified.** End-to-end run blocked on the portal being down — see below |
+| Phase 2b | Karnataka (K-RERA) adapter | **Done**, end-to-end run completed 2026-08-19 (12 complaints, 122 docs / 88 retrieved) |
 | Phase 2c | Wrap `ts_rera_client` as the Telangana adapter | **Done**, mapper tested against the real CONSTELLA capture |
-| Phase 3 | Fix Maharashtra CTS land-record extraction | Not started |
-| Phase 4 | Group entity derivation + group-wide sweep | **4a + 4d done.** 4b/4c/4e (group-wide RERA, litigation, GST sweeps) not started |
+| Phase 2d | Jharkhand (JHARERA) + West Bengal (WBRERA) adapters | **Done**, both live-verified |
+| Phase 3 | Fix Maharashtra CTS land-record extraction | **Done**, live-verified 2026-08-21. 15 fields + 3 mutation entries off the real card (was `{}` on every prior lookup) |
+| Phase 4a | Group entity graph (propose by name, confirm by hard link) | **Done** |
+| Phase 4b | Group-wide RERA sweep | **Done** — `group_sweep.py`, with per-authority coverage and confirm/refute |
+| Phase 4c | Litigation across the group | **Partial.** Per-project litigation tables read for JH/WB; no Indian Kanoon sweep, no cross-state orders search, no NCLT/consumer fora |
+| Phase 4d | Finances (charges, ratings) | **Done** — MCA charges, `charge_watch.py`, CRISIL added, ratings across group entities |
+| Phase 4e | Statutory (GST) across the group | **Not started.** GST intake is still single-subject and opt-in |
+| Phase 2 (rest) | ~24 remaining state portals | Not started — always a separate plan |
 
 Registered states: **MH**, **GJ**, **KA**, **TG**, **JH**, **WB** — all six have adapters.
 TG declares zero capabilities, which is a complete adapter, not a stub.
@@ -29,49 +35,61 @@ TG declares zero capabilities, which is a complete adapter, not a stub.
 
 ## RESUME HERE
 
-### Step 6 (CTS land records): ONE CAPTCHA SOLVE AWAY
+### Step 6 (CTS land records): DONE, live-verified 2026-08-21
 
-Everything up to the CAPTCHA is verified working as of 2026-08-20:
+`fields` was `{}` on every lookup this repo had ever made. It is now 15
+fields plus 3 mutation entries, cross-checked value by value against the
+card image. CTS 183, village आंबिवली, Mumbai Suburban:
 
 ```
-district "Mumbai Suburban" -> मुंबई उपनगर
-search_cts_candidates(...) -> found: True, candidates: ['183']
+owner/holder  'h sheti' (year 1964)      area      '25562.70'
+tenure        '[- - 25562.70] sheti'     encumbrance ''  <- none recorded
+mutations     19/11/1979, 16/12/2015, 02/06/2025  (nos. 599, 922)
+PU-ID 88331721167 | CTS 183 | ambivli / nagar bhumapan adhikari,andheri
 ```
 
-Run this, solve the CAPTCHA in the window that opens, and paste the output:
+**The finding that cost five CAPTCHA solves: the Marathi card is a JPEG.**
+This module used to assert the opposite -- "real structured Devanagari text
+... NOT a scanned image" -- and the test file called the work "a parser fix
+rather than an OCR project". Both were false. In Marathi the card is a
+single base64 JPEG in an `<img>` src, so `PU-ID` appears in no frame's HTML
+while a screenshot shows it plainly. The **English** rendering is real HTML
+tables and is the only machine-readable form without a Marathi OCR pack
+(not installed). The values diligence turns on -- CTS number, area, dates,
+mutation numbers -- are digits and identical in both; only Marathi words
+transliterate, and the authoritative Marathi JPEG is saved beside every
+capture by `save_embedded_card_image`.
 
-```bash
-python run_cts_capture.py <your-mobile-number>
-```
+**Structure notes, each of which silently emptied or corrupted fields:**
 
-It defaults to CTS 183, village आंबिवली, office नगर भूमापन अधिकारी,अंधेरी,
-Mumbai Suburban -- the one record with a saved screenshot
-(`output/_pending/Mumbai_Suburban_आंबिवली_183/property_card_screenshot.png`),
-so every parsed field can be checked against a picture of the same card.
+- The village/taluka/district table is nested INSIDE the table carrying the
+  CTS/Area/Tennure header. Skipping wrapper *rows* is required; skipping
+  wrapper *tables* destroys every header field. Both halves matter -- the
+  same lesson the JHARERA adapter taught.
+- Those three are written `Label : value` inside ONE cell.
+- The label block opens each row with an empty spacer `<td>`, so the label
+  is in `cells[1]` and the value in `cells[2]`.
+- The mutation table's third column is खंड क्रमांक (Vol.No.), NOT the
+  mutation number -- that is prose inside the attestation cell
+  ("ferafar kran. 599 pramane"), extracted by regex.
 
-**The one number that decides Step 6** is `fields parsed off the card`.
-It has been 0 on every lookup this repo has ever made. If it comes back
-non-zero the land-record workflow is done; if it is still 0, `card.json`
-and `card.png` are saved side by side to show what the page actually
-returned.
+**Every failure was the same species: something unreadable presenting
+itself as something absent.** Wrong language, a "Processing, Please wait"
+overlay scraped instead of the card, a main-frame-only text check that
+could never see a child frame, a DOM/screenshot race, the spacer `<td>`,
+and a success test that passed on a PU-ID alone (PU-ID is regex-matched
+over the whole page, so it survives a card whose every row failed). On a
+Charter each renders as "no owner, no encumbrance, no mutation entries" --
+a clean title on a plot nobody read. Guards now: a card yielding only a
+PU-ID reports "NO READING TAKEN"; `run_cts_capture.py` judges on labelled
+rows, not `len(fields)`; no field may carry another field's text.
 
-**What was found and fixed getting here.** The Property Card is CRISP HTML
-in three `<table>` elements, not a scan -- OCR was only ever a workaround
-for `page.content()` reading the search form because the card renders in an
-iframe. So this was a parser fix, not an OCR project.
-`mahabhumi.parse_property_card` matches every field by its Marathi label
-(never by column position, since cards differ in whether they carry sheet
-and plot numbers) and returns `{}` for "no card here" versus an empty
-string for "the row is blank", because a blank इतर भार row means NO
-encumbrance is recorded and that is the finding.
+`card_page.html` is saved on every capture, so the next failure can be
+diagnosed offline without spending a human CAPTCHA solve.
 
-**Still worth doing, separately:** `tesseract --list-langs` shows only
-`eng` and `osd` on this machine, so every OCR attempt has run English
-against Devanagari -- which is why the old `ocr_text` was Latin noise. The
-fix is documented in `mahabhumi.py` above `_TESSDATA_DIR` (fetch
-`mar.traineddata` into a gitignored project-local `tessdata/`, ~3MB). Only
-needed for the fallback; the HTML parse should make it unnecessary.
-
+**Left for a human eye:** `original_holder` reads `'h sheti'`. That is what
+the card shows (the holder column reads "H" over "शेती"), not a parse
+error, but it should be reviewed before it reaches a Charter.
 
 
 ### Blocked, not broken: the Karnataka end-to-end run

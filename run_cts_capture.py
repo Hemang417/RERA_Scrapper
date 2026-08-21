@@ -80,15 +80,43 @@ def main() -> int:
     print()
     print("=" * 62)
     # THE ONE THING THIS RUN EXISTS TO ANSWER.
-    print(f"  fields parsed off the card : {len(fields)}")
+    print(f"  labelled rows off the card : {len([k for k in fields if k != 'pu_id'])}")
+    print(f"  fields total (incl. PU-ID) : {len(fields)}")
     print(f"  mutation entries           : {len(mutations)}")
     print(f"  raw page text              : {len(result.get('raw_text') or '')} chars")
     print(f"  OCR text (fallback only)   : {len(result.get('ocr_text') or '')} chars")
     print("=" * 62)
 
-    if not fields:
+    # PU-ID ALONE IS NOT A SUCCESS. It is matched by regex over the whole
+    # page, so it survives a card this parser could not read one row of --
+    # which is exactly what the 2026-08-21 English run produced, and it
+    # exited 0. Judge on the LABELLED rows, not on len(fields).
+    for note in result.get("notes") or []:
         print()
-        print("  fields is EMPTY -- the card's HTML still is not reaching the parser.")
+        print("  [!] " + note)
+    diag = result.get("diagnostics") or {}
+    dom = diag.get("dom") or {}
+    if dom:
+        print()
+        print("  DOM inventory of the result page:")
+        for tag in ("iframe", "embed", "object"):
+            for src in (dom.get(tag) or []):
+                print(f"    <{tag}> {src[:120]}")
+        print(f"    <canvas> x{dom.get('canvas')}   <img> x{len(dom.get('img') or [])}")
+    for pdf in diag.get("pdfs") or []:
+        print(f"    PDF saved: {pdf}")
+    interesting = [r for r in (diag.get("responses") or [])
+                   if not r["content_type"].startswith(("image/", "text/css", "font/"))
+                   and "javascript" not in r["content_type"]]
+    if interesting:
+        print("  Last responses (non-asset):")
+        for r in interesting[-8:]:
+            print(f"    {r['content_type'][:32]:34} {r['url'][-70:]}")
+
+    table_fields = [k for k in fields if k != "pu_id"]
+    if not table_fields and not mutations:
+        print()
+        print("  No labelled row was read off the card.")
         print(f"  Compare {screenshot} against the raw text in card.json to see what")
         print("  the page actually returned.")
         return 1

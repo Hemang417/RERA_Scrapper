@@ -156,6 +156,178 @@ def test_the_scrape_no_longer_claims_a_pattern_it_does_not_implement():
     print("test_the_scrape_no_longer_claims_a_pattern_it_does_not_implement: PASS")
 
 
+def test_the_english_card_parses_because_the_marathi_one_is_an_image():
+    """CONFIRMED LIVE 2026-08-21, and it overturned what this module used to
+    claim about itself.
+
+    mahabhumi.py said the result page was "real structured Devanagari text
+    ... NOT a scanned image", and this file said the fix was "a parser fix
+    rather than an OCR project". Both are false for Marathi: the Marathi
+    card is a single base64 JPEG inlined into an <img> src. That is why
+    PU-ID appears in no frame HTML, why a screenshot always showed a card
+    the DOM did not, and why five CAPTCHA solves produced zero rows.
+
+    The ENGLISH rendering is real HTML tables, so it is the only
+    machine-readable form available without a Marathi OCR pack. The values
+    that matter for diligence -- CTS number, area, dates, mutation numbers
+    -- are digits and are not transliterated at all. The Marathi JPEG is
+    still saved alongside as the authoritative artifact.
+
+    Labels here are verbatim from the live capture, misspellings included:
+    the portal writes "Tennure" and "Area Sq.Mt..".
+    """
+    english_card = """
+    <table>
+     <tr><th>CTS No</th><th>Sheet Number</th><th>Area Sq.Mt..</th><th>Tennure</th></tr>
+     <tr><td>183</td><td></td><td>25562.70</td><td>[- - 25562.70] sheti</td></tr>
+    </table>
+    <table>
+     <tr><td>Name of the Holder :</td><td>ramchandra patil</td></tr>
+     <tr><td>Lessee :</td><td></td></tr>
+     <tr><td>Other Encumbrances/Rights :</td><td></td></tr>
+    </table>
+    <table>
+     <tr><th>Date</th><th>Transaction</th><th>Vol.No.</th><th>Attestation</th></tr>
+     <tr><td>16/12/2015</td><td>kshetra durusti</td><td></td>
+         <td>ferafar kran. 599 pramane sahi- 16/12/2015</td></tr>
+    </table>
+    <p>pu-id : 88331721167</p>
+    """
+    card = mb.parse_property_card(english_card)
+    fields = card["fields"]
+    assert fields["city_survey_number"] == "183", fields
+    assert fields["area_sq_m"] == "25562.70", fields
+    assert fields["tenure"] == "[- - 25562.70] sheti", fields
+    assert fields["original_holder"] == "ramchandra patil", fields
+    assert fields["encumbrance"] == "", fields
+    assert fields["pu_id"] == "88331721167", fields
+    # The mutation number is PROSE inside the attestation cell on the real
+    # card -- the third column is Vol.No., not the mutation number. The old
+    # fixture, rebuilt from a screenshot, got that column wrong.
+    assert card["mutations"][0]["mutation_number"] == "599", card["mutations"]
+    assert "note" not in card, card.get("note")
+    print("test_the_english_card_parses_because_the_marathi_one_is_an_image: PASS")
+
+
+def test_an_unreadable_card_is_reported_not_silently_empty():
+    """The dangerous shape, and the reason run 1 was mistaken for a success:
+    PU-ID is matched by regex over the whole page, so it survives a card
+    whose every labelled row failed to parse. `fields` is then non-empty,
+    the capture script exits 0, and a card reporting no owner, no tenure,
+    no encumbrance and no mutation entries renders into a Charter as though
+    the plot were clean. A reading that did not happen must never look like
+    a finding that nothing is recorded."""
+    unknown_rendering = "<table><tr><td>Ainm</td><td>x</td></tr></table><p>PU-ID: 88331721167</p>"
+    card = mb.parse_property_card(unknown_rendering)
+    assert card, "a rendered card must never parse to {} -- that reads as 'no card'"
+    assert list(card["fields"]) == ["pu_id"], card["fields"]
+    note = card.get("note", "")
+    assert "NO READING TAKEN" in note, note
+    assert "note" not in mb.parse_property_card(_CARD), "the real card was flagged"
+    print("test_an_unreadable_card_is_reported_not_silently_empty: PASS")
+
+
+def test_a_wrapper_table_does_not_swallow_every_label():
+    """CONFIRMED LIVE 2026-08-21, on the first run that read real rows.
+
+    The card nests: an outer table holds the header table, the label block
+    and the mutation table inside single cells. get_text() on such a
+    wrapper cell returns every inner label concatenated, so EVERY label
+    matched inside header_cells[0] and all eight header fields came back
+    holding one identical string -- "Village/peth : ambivli Taluka /
+    C.T.S.Office : nagar bhumapan adhikari,andheri District : mumbai
+    upanagar" as the area, the tenure, the plot number and the district
+    alike. Plausible-looking values in every field, all of them wrong,
+    which is worse than an empty result because nothing announces it.
+
+    Only innermost tables are parsed now. Same failure the JHARERA adapter
+    hit on nested director tables."""
+    nested = """
+    <table><tr><td>
+      <table>
+       <tr><th>CTS No</th><th>Plot Number</th><th>Area Sq.Mt..</th><th>Tennure</th></tr>
+       <tr><td>183</td><td></td><td>25562.70</td><td>sheti</td></tr>
+      </table>
+    </td></tr>
+    <tr><td>Village/peth : ambivli Taluka / C.T.S.Office : andheri District : mumbai upanagar</td></tr>
+    </table>
+    """
+    fields = mb.parse_property_card(nested)["fields"]
+    assert fields["area_sq_m"] == "25562.70", fields
+    assert fields["city_survey_number"] == "183", fields
+    assert fields["tenure"] == "sheti", fields
+    # The giveaway: no field may carry the wrapper row's concatenated text.
+    for key, value in fields.items():
+        assert "Taluka" not in value, (key, value)
+    distinct = [v for v in fields.values() if v]
+    assert len(set(distinct)) == len(distinct), fields
+    print("test_a_wrapper_table_does_not_swallow_every_label: PASS")
+
+
+def test_the_real_cards_own_structure_parses():
+    """The shape of the ACTUAL live card, captured 2026-08-21 and reduced
+    to its three structural quirks -- each of which silently emptied or
+    corrupted fields until it was seen:
+
+    1. The village/taluka/district table is nested INSIDE the same table
+       that carries the CTS/Area/Tennure header. Skipping any table that
+       contains a table therefore dropped every header field; not skipping
+       the wrapper ROW made all eight fields identical.
+    2. Those three are written "Label : value" inside ONE cell.
+    3. The label block opens every row with an empty spacer <td>, so the
+       label is in cells[1] and the value in cells[2] -- reading cells[0]
+       returned blank holder, blank lessee and blank encumbrance on a card
+       that plainly showed them.
+
+    A blank encumbrance here is a real finding (nothing charged against
+    the plot). A blank one caused by (3) is a false clean record. They are
+    indistinguishable downstream, which is why this is pinned."""
+    real = """
+    <table><tbody>
+     <tr><td>
+      <table><tbody>
+       <tr><td colspan="6"><table><tbody><tr>
+         <td>Village/peth :<span>ambivli</span></td>
+         <td><center>Taluka / C.T.S.Office :<span>nagar bhumapan adhikari,andheri</span></center></td>
+         <td>District :<span>mumbai upanagar</span></td>
+       </tr></tbody></table></td></tr>
+       <tr><th>CTS No</th><th>Sheet Number</th><th>Plot Number</th>
+           <th>Area Sq.Mt..</th><th>Tennure</th><th>Assessment</th></tr>
+       <tr><td>183</td><td></td><td></td><td>25562.70</td>
+           <td>[- - 25562.70] <br> sheti</td><td></td></tr>
+      </tbody></table>
+     </td></tr>
+     <tr><td>
+      <table><tbody>
+       <tr><td></td><td>Easements :</td><td></td></tr>
+       <tr><td></td><td>Name of the Holder :<br> varsh : 1964<br></td><td> h <br> sheti <br></td></tr>
+       <tr><td></td><td>Lessee :</td><td></td></tr>
+       <tr><td></td><td>Other Encumbrances/Rights :</td><td><br></td></tr>
+       <tr><td></td><td>Other Remarks :</td><td></td></tr>
+      </tbody></table>
+     </td></tr>
+    </tbody></table>
+    <p>pu-id : 88331721167</p>
+    """
+    fields = mb.parse_property_card(real)["fields"]
+    # Header table -- lost entirely when whole nested tables were skipped.
+    assert fields["city_survey_number"] == "183", fields
+    assert fields["area_sq_m"] == "25562.70", fields
+    assert fields["tenure"] == "[- - 25562.70] sheti", fields
+    # Same-cell labels -- once returned the NEIGHBOUR cell's text.
+    assert fields["village"] == "ambivli", fields
+    assert fields["office"] == "nagar bhumapan adhikari,andheri", fields
+    assert fields["district"] == "mumbai upanagar", fields
+    # Spacer-cell label block -- once returned blank for every row.
+    assert fields["original_holder"] == "h sheti", fields
+    assert fields["holder_year"] == "1964", fields
+    assert fields["encumbrance"] == "", fields
+    assert fields["lessee"] == "", fields
+    # No field may carry another field's text.
+    assert "Taluka" not in fields["village"], fields
+    print("test_the_real_cards_own_structure_parses: PASS")
+
+
 if __name__ == "__main__":
     test_all_five_requested_fields_come_off_the_card()
     test_a_blank_row_is_a_finding_not_a_miss()
@@ -164,4 +336,8 @@ if __name__ == "__main__":
     test_fields_are_found_by_label_not_by_column_position()
     test_the_pu_id_is_captured_because_it_identifies_the_card()
     test_the_scrape_no_longer_claims_a_pattern_it_does_not_implement()
+    test_the_english_card_parses_because_the_marathi_one_is_an_image()
+    test_an_unreadable_card_is_reported_not_silently_empty()
+    test_a_wrapper_table_does_not_swallow_every_label()
+    test_the_real_cards_own_structure_parses()
     print("\nAll tests passed.")
