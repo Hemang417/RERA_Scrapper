@@ -11,7 +11,7 @@ NOT to do -- the next run overwrites it.
 Every row records how the finding was established. "confirmed-live" means
 this pipeline actually fetched it; "observed" means it was seen on the
 portal but not yet fetched by code; "unaudited" means nobody has looked.
-That distinction matters because 26 of ~30 state portals are unaudited, and
+That distinction matters because 24 of ~30 state portals are unaudited, and
 a coverage matrix that hides its own uncertainty is worse than none.
 
     python build_data_coverage.py
@@ -59,65 +59,97 @@ _EVIDENCE_FILL = {
 # WORKFLOW A -- RERA. What each authority publishes, per data item.
 # =========================================================================
 # Columns are authorities; the last two record where it lands in the Charter.
-RERA_STATES = ["MahaRERA", "TG-RERA", "GujRERA", "K-RERA"]
+RERA_STATES = ["MahaRERA", "TG-RERA", "GujRERA", "K-RERA", "JHARERA", "WBRERA"]
 
 RERA_FINDINGS = [
-    # (data item, MH, TG, GJ, KA, charter facts field, note)
+    # (data item, MH, TG, GJ, KA, JH, WB, charter facts field, note)
     ("Project identity (name, status, type, dates)",
-     "Yes", "Yes", "Yes", "Yes", "rera_core_fields", ""),
+     "Yes", "Yes", "Yes", "Yes", "Yes", "Yes", "rera_core_fields", ""),
     ("Registration number retrievable from the portal",
-     "Yes", "No", "Yes", "Yes", "rera_core_fields.registration_number",
+     "Yes", "No", "Yes", "Yes", "Yes", "Yes", "rera_core_fields.registration_number",
      "TG-RERA's public record does not display its own registration number; search is by project name."),
     ("Promoter / partner identity",
-     "Yes", "Yes", "Yes", "Yes", "corporate_identity",
+     "Yes", "Yes", "Yes", "Yes", "Yes", "Yes", "corporate_identity",
      "K-RERA publishes partner PANs and land-owner SHARES -- neither appears on a MahaRERA record."),
     ("Professionals of record (architect/engineer/CA)",
-     "Yes", "No", "Yes", "Yes", "local_planning.professionals_of_record",
-     "GujRERA splits these across englist/calist/acrchlist/contr; the adapter normalises to one list."),
+     "Yes", "No", "Yes", "Yes", "Yes", "Yes", "local_planning.professionals_of_record",
+     "GujRERA splits these across englist/calist/acrchlist/contr; the adapter normalises to one list. "
+     "JHARERA is the only authority here that files a professional's PAN as a plain text field -- for "
+     "the contractor, architect and structural engineer -- rather than a scanned card."),
     ("Land details / survey numbers",
-     "Yes", "Yes", "Yes", "Yes", "land_identification",
-     "K-RERA gives per-owner shares against survey numbers."),
+     "Yes", "Yes", "Yes", "Yes", "Yes", "Not built", "land_identification",
+     "K-RERA gives per-owner shares against survey numbers. WBRERA's project page carries no land/"
+     "survey table; not captured by this adapter, and whether the portal itself publishes one at all "
+     "is unaudited."),
     ("Bank accounts (escrow / collection)",
-     "Yes", "Yes", "Yes", "Yes", "rera_compliance.collection_account",
-     "TG-RERA publishes the 100% collection account but leaves the 70/30 split accounts blank."),
+     "Yes", "Yes", "Yes", "Yes", "Yes", "Not built", "rera_compliance.collection_account",
+     "TG-RERA publishes the 100% collection account but leaves the 70/30 split accounts blank. "
+     "WBRERA's project page carries no bank-account table either -- same caveat as land details."),
     ("Document library (downloadable files)",
-     "Yes", "No", "Yes", "Yes", "document_library",
-     "GujRERA 42/42 retrieved. K-RERA 112/152 -- the other 40 are LISTED but the portal serves 0 bytes."),
+     "Yes", "No", "Yes", "Yes", "Yes", "Yes", "document_library",
+     "GujRERA 42/42 retrieved. K-RERA 112/152 -- the other 40 are LISTED but the portal serves 0 bytes. "
+     "JHARERA labels every document link 'View'; document_label() derives the real name from the "
+     "surrounding table or header. WBRERA's links already carry real text, so no derivation is needed."),
     ("Complaints register",
-     "Yes", "No", "Not published", "Yes", "rera_core_fields.total_complaints_count",
-     "K-RERA: use the STATE-WIDE /projectComplaintReport. The per-project page is NOT reliable -- it showed no complaints for a project the register lists with 12."),
+     "Yes", "No", "Not published", "Yes", "Partial", "Not published",
+     "rera_core_fields.total_complaints_count",
+     "K-RERA: use the STATE-WIDE /projectComplaintReport. The per-project page is NOT reliable -- it "
+     "showed no complaints for a project the register lists with 12. JHARERA has no per-project count "
+     "either; the adapter name-matches the promoter against the state-wide disposed-complaint "
+     "register, which yields POSSIBLE matches to confirm, not a confirmed count. WBRERA publishes no "
+     "complaint register through this interface at all -- recorded as None, never 0."),
     ("Appeals register",
-     "Yes", "No", "Not published", "Not published", "rera_core_fields.total_appeals_count", ""),
+     "Yes", "No", "Not published", "Not published", "Not published", "Not published",
+     "rera_core_fields.total_appeals_count", ""),
     ("Orders / judgments search",
-     "Yes", "No", "Not published", "Partial", "sources[] (topic=litigation)",
-     "K-RERA /viewAllJudgements exists; the adapter reads complaints but not judgements yet."),
+     "Yes", "No", "Not published", "Yes", "Yes", "Partial", "sources[] (topic=litigation)",
+     "K-RERA now reads FIVE promoter-keyed registers (order search, authority orders, AO orders, "
+     "interim orders, complaints under process) -- 15,600+ rows including a penalty table naming the "
+     "violation, section and amount. JHARERA's judgement/order register is searchable by promoter, "
+     "though a share of rows name both parties in one unsplit column and are therefore invisible to "
+     "that search. WBRERA's order register names no party at all; the join runs through its cause "
+     "lists instead, so its coverage note matters more than its row count."),
     ("Promoter's other projects (track record)",
-     "Yes", "No", "No", "Yes", "promoter_portfolio",
-     "K-RERA embeds the WHOLE state index client-side (9,888 projects with promoter names), so a portfolio is one request. GujRERA confirmed absent."),
+     "Yes", "No", "No", "Yes", "Yes", "No", "promoter_portfolio",
+     "K-RERA embeds the WHOLE state index client-side (9,888 projects with promoter names), so a "
+     "portfolio is one request. GujRERA confirmed absent. WBRERA publishes no promoter search and its "
+     "state index does not name the promoter either, so a portfolio there would mean opening all "
+     "~4,700 project pages -- the adapter returns None and says why rather than sampling a partial set."),
     ("Past-experience declarations",
-     "Yes", "No", "Yes", "Not published", "promoter_portfolio.totals", ""),
+     "Yes", "No", "Yes", "Not published", "Yes", "Yes", "promoter_portfolio.totals", ""),
     ("AUDITED BALANCE SHEET",
-     "No", "No", "Yes", "Partial", "(unmapped -- see Charter Mapping sheet)",
-     "GujRERA findoc block. MahaRERA publishes nothing equivalent. Highest-value differential finding."),
+     "No", "No", "Yes", "Partial", "Yes", "No", "(unmapped -- see Charter Mapping sheet)",
+     "GujRERA findoc block. MahaRERA publishes nothing equivalent. Highest-value differential finding. "
+     "JHARERA also files an audited balance sheet as a downloadable document, labelled directly on "
+     "the project page."),
     ("Audited profit & loss statement",
-     "No", "No", "Yes", "No", "(unmapped)", "GujRERA findoc block."),
+     "No", "No", "Yes", "No", "No", "No", "(unmapped)", "GujRERA findoc block."),
     ("Income-tax returns",
-     "No", "No", "Yes", "No", "(unmapped)", "GujRERA findoc block."),
+     "No", "No", "Yes", "No", "Yes", "No", "(unmapped)",
+     "GujRERA findoc block. JHARERA files three years of income-tax returns per project, also as "
+     "downloadable documents."),
     ("Defaulters list",
-     "No", "No", "No", "Partial", "(unmapped)",
-     "K-RERA /viewDefaultProjects -- observed, not yet built. No other authority publishes one."),
+     "No", "No", "No", "Partial", "Partial", "Partial", "(unmapped)",
+     "K-RERA /viewDefaultProjects -- observed, not yet built. JHARERA's REJECTED and SURRENDERED "
+     "registers are the closest equivalent: their URLs are imported into the adapter but nothing "
+     "fetches them yet. WBRERA's defaulters list (17 rejected/defaulting applications by name) IS "
+     "parsed by adapter_westbengal.fetch_defaulters(), but that function is called from nowhere in "
+     "acquire() or the litigation sweep -- written, untested against a live page, and unused."),
     ("Projects under investigation",
-     "No", "No", "No", "Partial", "(unmapped)",
+     "No", "No", "No", "Partial", "No", "No", "(unmapped)",
      "K-RERA /unregProjectList -- observed, not yet built."),
     ("Cost incurred vs estimated cost",
-     "No", "No", "Partial", "Yes", "(unmapped)",
+     "No", "No", "Partial", "Yes", "No", "No", "(unmapped)",
      "K-RERA publishes both, per particular. Direct input to the financial-strength sub-metric."),
     ("Delay reasons (promoter-declared)",
-     "No", "No", "No", "Yes", "(unmapped)", "K-RERA detail page carries a delay-reason table."),
+     "No", "No", "No", "Yes", "No", "No", "(unmapped)", "K-RERA detail page carries a delay-reason table."),
     ("NOC expiry and renewal tracking",
-     "No", "No", "No", "Yes", "(unmapped)", "K-RERA tracks NOC validity dates and whether renewed."),
+     "No", "No", "No", "Yes", "No", "No", "(unmapped)",
+     "K-RERA tracks NOC validity dates and whether renewed."),
     ("Construction progress / QPR",
-     "Yes", "Partial", "Yes", "Yes", "rera_compliance.construction_progress", ""),
+     "Yes", "Partial", "Yes", "Yes", "Unaudited", "Unaudited", "rera_compliance.construction_progress",
+     "Not confirmed either way for JHARERA or WBRERA -- neither adapter currently extracts a "
+     "QPR-equivalent field, and nobody has checked whether either portal even publishes one."),
 ]
 
 # =========================================================================
@@ -205,6 +237,18 @@ UNMAPPED = [
     ("Maha Bhulekh card fields", "Free portal, extraction broken", "Maharashtra projects",
      "Owner, area, tenure, encumbrance and mutation are all ON the card and none reach the document.",
      "High"),
+    ("JHARERA audited balance sheet + 3 years ITR", "adapter_jharkhand.py document library (labelled, downloaded)",
+     "Jharkhand projects",
+     "Same gap as GujRERA's findoc block: the financial-strength sub-metric scores None for every "
+     "project regardless of state. This would score it for JH too.", "High"),
+    ("JHARERA rejected + surrendered registration lists",
+     "REJECTED_LIST / SURRENDERED_LIST, imported into the adapter but never fetched", "Jharkhand projects",
+     "A rejected or surrendered registration is diligence material with no equivalent on MahaRERA. "
+     "The URLs are already wired into the import list; nothing calls them yet.", "Medium"),
+    ("WBRERA defaulters list", "adapter_westbengal.fetch_defaulters() -- written, unwired, untested live",
+     "West Bengal projects",
+     "17 rejected/defaulting applications keyed by name -- a cheap, direct red-flag input. The parser "
+     "exists but is called from nowhere in acquire() or the litigation sweep.", "Medium"),
 ]
 
 
@@ -242,7 +286,7 @@ def build_rera_sheet(wb):
     ncols = 3 + len(RERA_STATES)
     _title(ws, "Workflow A: RERA -- what each authority publishes",
            "Yes / Partial / No / Not published / Unaudited. 'Unaudited' means nobody has looked yet -- "
-           "26 of ~30 state portals are in that state.", ncols)
+           "24 of ~30 state portals are in that state.", ncols)
     header = ["Data item"] + RERA_STATES + ["Charter facts field", "Note"]
     ws.append([])
     ws.append(header)
@@ -329,7 +373,7 @@ def build_readme(wb):
         ("Evidence levels -- read these before trusting a row", Font(bold=True, size=12)),
         ("confirmed-live   this pipeline actually fetched it", None),
         ("observed         seen on the portal, not yet fetched by code", None),
-        ("unaudited        nobody has looked. 26 of ~30 state portals are here.", None),
+        ("unaudited        nobody has looked. 24 of ~30 state portals are here.", None),
         ("", None),
         ("Biggest findings so far", Font(bold=True, size=12)),
         ("1. GujRERA publishes AUDITED BALANCE SHEETS, P&L and income-tax returns per project. "
@@ -352,6 +396,16 @@ def build_readme(wb):
          "hydro-power firm, a Gujarat non-profit and a Maharashtra castings company. Propose by name, "
          "confirm by shared director / registered office / filed relationship -- and treat a shared "
          "address as the weakest of the three (28 of 65 'group companies' were address-only).", None),
+        ("9. Two more states are live: Jharkhand (JHARERA) and West Bengal (WBRERA), taking coverage to "
+         "six authorities. JHARERA is the only authority anywhere in this pipeline that files a "
+         "professional's PAN as a plain readable field rather than a scanned card, and it also publishes "
+         "a declared past-projects table and a genuine litigation disclosure per project.", None),
+        ("10. Karnataka's order/judgment coverage grew from one register to five (15,600+ rows across "
+         "order search, authority orders, AO orders, interim orders and complaints-under-process), "
+         "including a penalty table naming the violation, section and amount -- the single most "
+         "consequential regulatory-history record any authority here publishes. JHARERA and WBRERA "
+         "orders are now searchable by promoter too; WBRERA's join runs through its cause lists, "
+         "since its own order register names no party directly.", None),
     ]
     for i, (text, font) in enumerate(lines, start=1):
         ws.cell(row=i, column=1, value=text)
