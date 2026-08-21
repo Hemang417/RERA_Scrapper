@@ -239,7 +239,7 @@ def sweep(graph, directors=None, known_places=None, searcher=None,
 # Which RERA authorities' own order registers this pipeline can search by
 # promoter name, and which it cannot. The second list is the important one:
 # a group with orders against it in Maharashtra would not show up here.
-ORDERS_SEARCHABLE = ("Karnataka (K-RERA)", "MahaRERA")
+ORDERS_SEARCHABLE = ("Karnataka (K-RERA)", "MahaRERA", "JHARERA")
 
 # Why each of the others is not, established by probing them on 2026-08-21
 # rather than assumed. These are source limits, not findings about any
@@ -247,8 +247,9 @@ ORDERS_SEARCHABLE = ("Karnataka (K-RERA)", "MahaRERA")
 ORDERS_NOT_SEARCHABLE = (
     "WBRERA -- publishes 4,881 authority orders, but keyed only by complaint "
     "number, with no promoter or party named in any column",
-    "GujRERA and JHARERA -- single-page applications whose order pages are not "
-    "reachable without executing their JavaScript",
+    "GujRERA -- its e-court judgement endpoint is complain/SECURE/complaint-"
+    "judgments-Details and returns 'Invalid Request' without a login; only "
+    "complaint COUNTS are public",
     "TG-RERA -- publishes no promoter-keyed order register",
     "every state with no adapter yet",
 )
@@ -271,6 +272,7 @@ def state_order_sweep(graph, searcher=None, register_coverage=None):
     """
     subjects = [s for s in _subjects(graph) if s["kind"] == SUBJECT_ENTITY]
     maharera = None
+    jharkhand = None
     if searcher is None:
         from states import adapter_karnataka
 
@@ -281,6 +283,9 @@ def state_order_sweep(graph, searcher=None, register_coverage=None):
         import company_charter
 
         maharera = company_charter.search_maharera_orders_by_promoter
+        from states import adapter_jharkhand
+
+        jharkhand = adapter_jharkhand.search_orders_by_promoter
 
     entries, limitations = [], []
     searched = 0
@@ -313,6 +318,26 @@ def state_order_sweep(graph, searcher=None, register_coverage=None):
                     "detail": row.get("complaint_type") or "",
                     "penalty_amount": "",
                 })
+        if jharkhand is not None:
+            try:
+                for row in jharkhand(subject["name"]) or []:
+                    entries.append({
+                        "authority": "JHARERA",
+                        "register": "Judgement and order register",
+                        "searched_name": subject["name"],
+                        "application_no": row.get("case_no") or "",
+                        "order_date": "",
+                        "project_name": "",
+                        "promoter_name": row.get("respondent") or "",
+                        "detail": "%s (%s)" % (row.get("category") or "",
+                                               row.get("court") or ""),
+                        "penalty_amount": "",
+                    })
+            except Exception as e:
+                limitations.append(
+                    f"JHARERA's order register could not be searched for "
+                    f"{subject['name']} this pass: {type(e).__name__}: {e}"
+                )
         for row in rows:
             entries.append({
                 "authority": "Karnataka (K-RERA)",
@@ -336,6 +361,24 @@ def state_order_sweep(graph, searcher=None, register_coverage=None):
             register_coverage = adapter_karnataka.order_register_coverage()
         except Exception:
             register_coverage = None
+    # JHARERA writes both parties in ONE column; a row whose separator is
+    # not recognised has no respondent, and is therefore invisible to a
+    # promoter search. Say how many rather than let them vanish.
+    if jharkhand is not None:
+        try:
+            from states import adapter_jharkhand as _jh
+
+            register = _jh.fetch_order_register()
+            unparsed = sum(1 for row in register if not row.get("respondent"))
+            if unparsed:
+                limitations.append(
+                    f"{unparsed} of {len(register)} JHARERA order entries name their "
+                    "parties in a form this parser could not split, so those rows were "
+                    "not searchable by promoter."
+                )
+        except Exception:
+            pass
+
     missing = (register_coverage or {}).get("missing") or []
     if missing:
         limitations.append(

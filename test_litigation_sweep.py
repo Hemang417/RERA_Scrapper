@@ -309,6 +309,61 @@ def test_the_maharera_request_carries_what_the_form_actually_needs():
     print("test_the_maharera_request_carries_what_the_form_actually_needs: PASS")
 
 
+def test_jharkhand_splits_both_parties_out_of_one_column():
+    """JHARERA names both sides in a SINGLE column, and writes the
+    separator four ways: "Vs", "-Vs-", "V/s" and "versus". Handling only
+    the first parsed 38 of 228 rows; handling all four parses 225.
+
+    " & " and " And " are deliberately NOT separators. "& Others" and
+    "& Ors." are part of a party name, and splitting on them would file a
+    complainant's name as the promoter -- attributing a homeowner's own
+    complaint to the developer, or the reverse."""
+    from states import adapter_jharkhand as jh
+
+    html = """<table>
+      <tr><th>Sl.No.</th><th>Name</th><th>Case Number</th>
+          <th>Court Name</th><th>Category</th><th>Download</th></tr>
+      <tr><td>1</td><td>Reena Gupta Vs M/s Kailash Construction &amp; Others</td>
+          <td>Complaint Case- 09 of 2020</td><td>Adjudicating Officer</td>
+          <td>Judgement</td><td>View</td></tr>
+      <tr><td>2</td><td>Mrs. Renu Rajgariah -Vs- M/s Rebloon Impex &amp; Ors.</td>
+          <td>CC 11 of 2021</td><td>Authority</td><td>Judgement</td><td>View</td></tr>
+      <tr><td>3</td><td>Someone V/s Another Builders Pvt Ltd</td>
+          <td>CC 12 of 2021</td><td>Authority</td><td>Order</td><td>View</td></tr>
+      <tr><td>4</td><td>Ishvinder Chandra &amp; Yasodhara Associates</td>
+          <td>CC 13 of 2021</td><td>Authority</td><td>Order</td><td>View</td></tr>
+    </table>"""
+    rows = jh.parse_order_register(html)
+    assert len(rows) == 4, rows
+    assert rows[0]["respondent"] == "M/s Kailash Construction & Others", rows[0]
+    assert rows[0]["complainant"] == "Reena Gupta", rows[0]
+    assert rows[1]["respondent"] == "M/s Rebloon Impex & Ors.", rows[1]
+    assert rows[2]["respondent"] == "Another Builders Pvt Ltd", rows[2]
+    # The ampersand row is ambiguous, so it gets NO respondent rather
+    # than a guessed one.
+    assert rows[3]["respondent"] == "", rows[3]
+
+    hits = jh.search_orders_by_promoter("Rebloon", fetcher=lambda: html)
+    assert len(hits) == 1, hits
+    # A complainant name must NOT match -- only the respondent side.
+    assert jh.search_orders_by_promoter("Reena Gupta", fetcher=lambda: html) == []
+    print("test_jharkhand_splits_both_parties_out_of_one_column: PASS")
+
+
+def test_gujrera_judgements_are_behind_a_login_and_that_is_recorded():
+    """Probed 2026-08-21: GujRERA e-court judgement data is served by
+    complain/SECURE/complaint-judgments-Details, which answers
+    {"Error":"Invalid Request"} without a token. Only complaint COUNTS
+    are public. Recording the endpoint stops the next session guessing
+    paths, and stops a reader reading its absence as a clean record."""
+    joined = " ".join(ls.ORDERS_NOT_SEARCHABLE)
+    assert "GujRERA" in joined, joined
+    assert "SECURE" in joined or "secure" in joined, joined
+    assert "JHARERA" not in joined, "JHARERA is searchable now"
+    assert "JHARERA" in ls.ORDERS_SEARCHABLE, ls.ORDERS_SEARCHABLE
+    print("test_gujrera_judgements_are_behind_a_login_and_that_is_recorded: PASS")
+
+
 def test_why_each_authority_is_unsearchable_is_stated_not_assumed():
     """Each of these was PROBED on 2026-08-21, not assumed. MahaRERA does
     accept a respondent (promoter) name -- an earlier note in this repo
@@ -319,7 +374,6 @@ def test_why_each_authority_is_unsearchable_is_stated_not_assumed():
     record."""
     joined = " ".join(ls.ORDERS_NOT_SEARCHABLE)
     assert "4,881" in joined and "complaint number" in joined, joined
-    assert "single-page applications" in joined, joined
     print("test_why_each_authority_is_unsearchable_is_stated_not_assumed: PASS")
 
 
@@ -378,6 +432,8 @@ if __name__ == "__main__":
     test_a_register_that_did_not_load_is_named_not_counted_as_empty()
     test_maharera_is_now_searchable_by_promoter()
     test_the_maharera_request_carries_what_the_form_actually_needs()
+    test_jharkhand_splits_both_parties_out_of_one_column()
+    test_gujrera_judgements_are_behind_a_login_and_that_is_recorded()
     test_why_each_authority_is_unsearchable_is_stated_not_assumed()
     test_a_maharera_shell_response_is_not_an_absence_of_orders()
     test_the_group_litigation_stage_is_opt_in_and_silent_when_off()

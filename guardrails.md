@@ -153,6 +153,24 @@ it did not -- but its portal answered every attempt with an empty BigPipe shell;
 no party named in any column; **GujRERA and JHARERA** are single-page apps whose
 order pages need JavaScript; **TG-RERA** publishes no such register.
 
+**JHARERA's order register** is `/Home/judgement_order` -- the whole state in one
+request, 228 entries. It names BOTH parties in a single column and writes the
+separator four ways ("Vs", "-Vs-", "V/s", "versus"); handling only the first
+parsed 38 of 228, all four parse 225. `" & "` and `" And "` are deliberately NOT
+separators -- "& Others" and "& Ors." are part of a party name, and splitting on
+them would file a complainant's name as the promoter, attributing a homeowner's
+own complaint to the developer. Only the RESPONDENT side is matched, since a
+complaint is filed against the promoter. Rows whose separator is unrecognised
+have no respondent, are invisible to a promoter search, and their count is
+reported rather than left to vanish.
+
+**GujRERA publishes no order register.** Probed 2026-08-21: its e-court
+judgement data comes from `complain/SECURE/complaint-judgments-Details`, which
+answers `{"Error":"Invalid Request"}` without a login. The only public e-court
+endpoint is `complain/ecourt/public/find-all-complaint-count/`, which returns
+COUNTS. The endpoint names are recorded so the next session does not re-derive
+them by guessing paths.
+
 **MahaRERA's orders search, fixed 2026-08-21.** It had been returning nothing
 for every query. Four faults, and all four had to go:
 

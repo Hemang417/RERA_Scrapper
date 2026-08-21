@@ -56,6 +56,11 @@ PROJECT_DETAIL = BASE_URL + "/Home/ViewProjectProfile/{}"
 REJECTED_LIST = BASE_URL + "/Home/RejectedList"
 SURRENDERED_LIST = BASE_URL + "/Home/SurrenderedList"
 DISPOSED_COMPLAINTS = BASE_URL + "/Home/DisposedComplaintList"
+# JHARERA's ORDER REGISTER -- the whole state in one request, 228 entries
+# when first read on 2026-08-21. The party column is a single free-text
+# "Complainant Vs Respondent" string rather than two columns, so the
+# promoter has to be taken from the side after the "Vs".
+JUDGEMENT_ORDERS = BASE_URL + "/Home/judgement_order"
 EXTENSION_LIST = BASE_URL + "/Home/PrjtExtensionlist"
 
 PROFILE = StateProfile(

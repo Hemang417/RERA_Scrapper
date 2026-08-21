@@ -81,7 +81,8 @@ K-RERA also publishes five further order endpoints not yet read
 | **Karnataka** | **Yes — five of them.** Order-search index (11,732), authority orders, AO orders, interim orders, complaints under process. 15,600+ rows, including a **penalty table with violation, section and amount** (440 rows) |
 | **MahaRERA** | **Yes — fixed 2026-08-21.** `order_respondent_name` is promoter-keyed. Needed `big_pipe_nojs=1`, the whole 18-field form, a widened date window, and the singular complaint-type value. Validated: 40 rows for a real respondent, 0 for a control |
 | **WBRERA** | No. 4,881 authority orders published, keyed only by complaint number; no party named in any column. Joinable via complaint numbers the adapter already reads per project |
-| **GujRERA / JHARERA** | No. Single-page apps; order pages not reachable without executing their JavaScript |
+| **JHARERA** | **Yes — added 2026-08-21.** `/Home/judgement_order`, 228 entries in one request. Both parties in one column, four separator spellings; 225 parse, 3 do not and are counted |
+| **GujRERA** | No. Judgement data is `complain/SECURE/complaint-judgments-Details` (login required); only complaint COUNTS are public |
 | **TG-RERA** | No such register |
 
 > **Two silent-failure bugs found, both of the same species.**

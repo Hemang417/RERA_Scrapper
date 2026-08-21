@@ -43,6 +43,7 @@ from .base import (
     storage_key,
 )
 from .jharkhand import (
+    JUDGEMENT_ORDERS,
     BASE_URL,
     DISPOSED_COMPLAINTS,
     PROFILE,
@@ -95,6 +96,83 @@ def _get(session, url, ctx, params=None, what="page"):
             f"JHARERA {what} could not be fetched: {e}. The portal appears to be unreachable "
             f"right now; this is not a problem with the project or the registration number."
         ) from e
+
+
+# The register writes the separator four ways -- "Vs", "-Vs-", "V/s",
+# "versus". Only 38 of 228 rows parsed until all four were handled.
+# " & " and " And " are deliberately NOT separators: "& Others" and
+# "& Ors." are part of a party name, and splitting on them would file a
+# complainant's name as the promoter.
+_VS_RE = re.compile(r"\s*-?\s*\b(?:vs\.?|v/s|versus)\b\s*-?\s*", re.I)
+_ORDER_CACHE = []
+
+
+def parse_order_register(html: str) -> list:
+    """JHARERA's order register, as [{parties, complainant, respondent,
+    case_no, court, category}].
+
+    The register names both sides in ONE column -- "Reena Gupta Vs M/s
+    Kailash ..." -- so the respondent (the promoter, since a complaint is
+    filed against them) is the text after the "Vs". A row whose party
+    string has no separator keeps `respondent` empty rather than guessing:
+    matching a promoter against a complainant's name would attribute a
+    homeowner's complaint to the developer's record, or the reverse.
+    """
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html or "", "html.parser")
+    table = find_table(soup, "case number")
+    if not table:
+        return []
+    entries = []
+    for cells in _rows(table):   # already cell strings, and nested-table safe
+        cells = [" ".join(str(c).split()) for c in cells]
+        if len(cells) < 5:
+            continue
+        parties = cells[1]
+        halves = _VS_RE.split(parties, maxsplit=1)
+        entries.append({
+            "parties": parties,
+            "complainant": halves[0].strip() if len(halves) == 2 else "",
+            "respondent": halves[1].strip() if len(halves) == 2 else "",
+            "case_no": cells[2],
+            "court": cells[3],
+            "category": cells[4],
+        })
+    return entries
+
+
+def fetch_order_register(fetcher=None) -> list:
+    """The whole register in one request, cached for the process."""
+    global _ORDER_CACHE
+    if _ORDER_CACHE and fetcher is None:
+        return _ORDER_CACHE
+    if fetcher is not None:
+        html = fetcher()
+    else:
+        session = _session()
+        html = fetch_with_retry(
+            lambda: session.get(JUDGEMENT_ORDERS, timeout=_TIMEOUT).text,
+            what="JHARERA order register",
+        )
+    parsed = parse_order_register(html)
+    if fetcher is None:
+        _ORDER_CACHE = parsed
+    return parsed
+
+
+def search_orders_by_promoter(name: str, fetcher=None) -> list:
+    """Register rows whose RESPONDENT names this promoter.
+
+    Only the respondent side is matched. JHARERA publishes no company
+    identity number, so this is a name candidate like every other RERA
+    match in this pipeline.
+    """
+    needle = " ".join(str(name or "").upper().split())
+    if not needle:
+        return []
+    return [row for row in fetch_order_register(fetcher)
+            if needle in " ".join((row.get("respondent") or "").upper().split())]
 
 
 def _rows(table):
