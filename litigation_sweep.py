@@ -240,15 +240,24 @@ def sweep(graph, directors=None, known_places=None, searcher=None,
 # promoter name, and which it cannot. The second list is the important one:
 # a group with orders against it in Maharashtra would not show up here.
 ORDERS_SEARCHABLE = ("Karnataka (K-RERA)",)
+
+# Why each of the others is not, established by probing them on 2026-08-21
+# rather than assumed. These are source limits, not findings about any
+# promoter, and the section says so.
 ORDERS_NOT_SEARCHABLE = (
-    "MahaRERA (its orders search is per-project, not per-promoter)",
-    "GujRERA (judgements sit behind a flow this pipeline does not query)",
-    "TG-RERA, JHARERA and WBRERA (no promoter-keyed order register published)",
+    "MahaRERA -- its Orders/Judgements search DOES accept a respondent (promoter) "
+    "name, but the portal answered every attempt with its empty BigPipe shell, so "
+    "no search could be performed at all",
+    "WBRERA -- publishes 4,881 authority orders, but keyed only by complaint "
+    "number, with no promoter or party named in any column",
+    "GujRERA and JHARERA -- single-page applications whose order pages are not "
+    "reachable without executing their JavaScript",
+    "TG-RERA -- publishes no promoter-keyed order register",
     "every state with no adapter yet",
 )
 
 
-def state_order_sweep(graph, searcher=None):
+def state_order_sweep(graph, searcher=None, register_coverage=None):
     """RERA authorities' OWN order registers, searched by promoter name.
 
     Separate from the case-law sweep because it is a different kind of
@@ -267,7 +276,7 @@ def state_order_sweep(graph, searcher=None):
     if searcher is None:
         from states import adapter_karnataka
 
-        searcher = adapter_karnataka.search_orders_by_promoter
+        searcher = adapter_karnataka.search_all_orders_by_promoter
 
     entries, limitations = [], []
     searched = 0
@@ -284,18 +293,42 @@ def state_order_sweep(graph, searcher=None):
         for row in rows:
             entries.append({
                 "authority": "Karnataka (K-RERA)",
+                "register": row.get("register") or "Order search index",
                 "searched_name": subject["name"],
-                "application_no": row.get("ack_no") or "",
+                "application_no": row.get("complaint_no") or row.get("ack_no") or "",
+                "order_date": row.get("order_date") or "",
                 "project_name": row.get("project_name") or "",
                 "promoter_name": row.get("promoter_name") or "",
+                "detail": row.get("detail") or "",
+                "penalty_amount": row.get("penalty_amount") or "",
             })
+    # WHICH OF K-RERA'S OWN REGISTERS ACTUALLY LOADED. Its authority-orders
+    # page is 10.4 MB and has been seen to arrive truncated, dropping the
+    # PENALTY table entirely -- a promoter with penalties would then show
+    # none. A register that did not load is named, never counted as empty.
+    if register_coverage is None and searcher is None:
+        try:
+            from states import adapter_karnataka
+
+            register_coverage = adapter_karnataka.order_register_coverage()
+        except Exception:
+            register_coverage = None
+    missing = (register_coverage or {}).get("missing") or []
+    if missing:
+        limitations.append(
+            "These K-RERA registers did not load this pass and were NOT searched: "
+            + "; ".join(missing) + ". Their absence from the table above means "
+            "nothing was read, not that nothing is recorded."
+        )
+
     limitations.append(
         "Only these RERA authorities' own order registers were searched by promoter "
-        "name: " + "; ".join(ORDERS_SEARCHABLE) + ". NOT searched: "
-        + "; ".join(ORDERS_NOT_SEARCHABLE) + ". An empty result says nothing about "
-        "orders made by any authority in that second list."
+        "name: " + "; ".join(ORDERS_SEARCHABLE) + ". NOT searched -- " 
+        + " | ".join(ORDERS_NOT_SEARCHABLE) + ". An empty result says nothing about "
+        "orders made by any authority in that list."
     )
     return {"entries": entries, "searched": searched, "total": len(subjects),
+            "register_coverage": register_coverage or {},
             "limitations": limitations}
 
 

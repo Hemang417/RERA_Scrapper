@@ -590,6 +590,38 @@ def test_an_empty_case_law_result_still_warns_against_reading_it_as_clean():
     print("test_an_empty_case_law_result_still_warns_against_reading_it_as_clean: PASS")
 
 
+def test_a_penalty_order_reaches_the_page_with_its_amount():
+    """K-RERA's penalty register names the violation, the section and the
+    amount -- 440 rows of it -- and it lives inside a 10.4 MB page that has
+    been seen to arrive truncated, dropping the whole table. It is the most
+    consequential thing any authority in this pipeline publishes about a
+    promoter, so it has to survive onto the page with its amount."""
+    import litigation_sweep
+
+    facts = _base_facts()
+    facts["group_litigation"] = {
+        "subjects": [{"name": "Apple Nest Phase II",
+                      "status": litigation_sweep.STATUS_SEARCHED, "hit_count": 0}],
+        "candidates": [], "searched": 1, "total": 1, "limitations": [],
+        "state_orders": {
+            "entries": [{"authority": "Karnataka (K-RERA)", "register": "Authority orders",
+                         "searched_name": "Apple Nest Phase II",
+                         "application_no": "PRM/KA/RERA/1254/464/PR/220325",
+                         "promoter_name": "Apple Nest Phase II",
+                         "detail": "NON-SUBMISSION-OF-ANNUAL-REPORT-2021-22",
+                         "penalty_amount": "80000"}],
+            "searched": 1, "total": 1,
+            "limitations": ["These K-RERA registers did not load this pass and were "
+                            "NOT searched: Interim orders."],
+        },
+    }
+    text = _all_text(_render(facts, "internal", "grouporders"))
+    assert "Rs 80000" in text, "the penalty amount never reached the page"
+    assert "NON-SUBMISSION-OF-ANNUAL-REPORT" in text, "the violation was dropped"
+    assert "did not load this pass" in text, "a register that failed was not disclosed"
+    print("test_a_penalty_order_reaches_the_page_with_its_amount: PASS")
+
+
 def test_every_stage_this_session_added_is_reachable_from_the_pipeline():
     """Anti-drift guard, and the reason this file exists: each of these was
     at some point computed correctly and rendered nowhere. A stage must be
@@ -651,6 +683,7 @@ if __name__ == "__main__":
         test_the_group_gst_section_is_absent_when_the_check_never_ran()
         test_a_case_law_candidate_reaches_the_page_carrying_its_caution()
         test_an_empty_case_law_result_still_warns_against_reading_it_as_clean()
+        test_a_penalty_order_reaches_the_page_with_its_amount()
         test_every_stage_this_session_added_is_reachable_from_the_pipeline()
         print("\nAll tests passed.")
     finally:

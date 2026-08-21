@@ -3152,7 +3152,7 @@ def _maharera_orders_search_once(project_name: str, complaint_type: str) -> list
     resp1.raise_for_status()
     build_id_match = re.search(r'name="form_build_id" value="([^"]+)"', resp1.text)
     if not build_id_match:
-        return []
+        return None  # the page did not even render its form -- not an empty result
 
     data = {
         "order_complaint_type": complaint_type,
@@ -3164,7 +3164,14 @@ def _maharera_orders_search_once(project_name: str, complaint_type: str) -> list
     resp2 = session.post(_MAHARERA_ORDERS_URL, data=data, headers=headers, timeout=config.REQUEST_TIMEOUT)
     resp2.raise_for_status()
     if "bg-body rounded" not in resp2.text:
-        return []  # the truncated-shell case -- treat as "try again", not "no results"
+        # THE SHELL CASE, AND IT IS NOT AN EMPTY RESULT. MahaRERA answers
+        # this POST with a Drupal BigPipe payload whose result container
+        # arrives separately; when it does not, the page carries the form
+        # back and no results region at all. Confirmed live 2026-08-21: a
+        # search for a large, certainly-litigated promoter returned this
+        # shell on every attempt, and the caller's [] then reads as "no
+        # orders". Marked so callers can tell the two apart.
+        return None
 
     from bs4 import BeautifulSoup
 
@@ -3214,7 +3221,8 @@ def _maharera_orders_search_with_retry(project_name: str, complaint_type: str, m
     try:
         results = _maharera_orders_search_once(project_name, complaint_type)
     except requests.RequestException:
-        results = []
+        results = None
+    searched_at_least_once = results is not None
     if results or max_attempts <= 1:
         return results
 
@@ -3225,10 +3233,15 @@ def _maharera_orders_search_with_retry(project_name: str, complaint_type: str, m
             try:
                 retry_results = future.result()
             except requests.RequestException:
-                retry_results = []
+                retry_results = None
             if retry_results:
                 return retry_results
-        return []
+            if retry_results == []:
+                searched_at_least_once = True
+        # [] only if some attempt actually reached the results region.
+        # None means every attempt came back as the shell, which is a
+        # search that did not happen -- not an absence of orders.
+        return [] if searched_at_least_once else None
     finally:
         # Deliberately wait=False: once a good result is found (or every
         # retry is exhausted empty), there's no reason to block returning
@@ -3261,9 +3274,44 @@ def search_maharera_judgments(project_name: str, max_attempts: int = 3) -> list:
             for complaint_type in _MAHARERA_COMPLAINT_TYPES
         ]
         all_results = []
+        any_searched = False
         for future in futures:
-            all_results.extend(future.result())
+            outcome = future.result()
+            if outcome is None:
+                continue
+            any_searched = True
+            all_results.extend(outcome)
+    # Stashed rather than returned, so every existing caller keeps its list
+    # and the ones that care can ask. See search_maharera_judgments_status.
+    search_maharera_judgments.last_search_reached_the_portal = any_searched
     return all_results
+
+
+def search_maharera_judgments_status(project_name: str, max_attempts: int = 3) -> dict:
+    """The same search, but saying whether it actually ran.
+
+    THE REASON THIS EXISTS. search_maharera_judgments returns [] both when
+    a project genuinely has no published order and when every attempt hit
+    the BigPipe shell -- its own docstring says callers "should not treat
+    an empty result as a confirmed absence", but it gave them no way to
+    tell. Confirmed live 2026-08-21: a search for a large, certainly-
+    litigated Maharashtra promoter returned the shell on every attempt, so
+    the pipeline would have reported no orders for it.
+
+    Returns {"searched": bool, "results": [...], "note": str}. When
+    searched is False the results are empty and mean nothing.
+    """
+    results = search_maharera_judgments(project_name, max_attempts)
+    searched = getattr(search_maharera_judgments, "last_search_reached_the_portal", False)
+    return {
+        "searched": bool(searched),
+        "results": results,
+        "note": "" if searched else (
+            "MahaRERA's Orders/Judgements search returned its empty shell on every "
+            "attempt, so no search was actually performed. This is NOT an absence of "
+            "orders against this project."
+        ),
+    }
 
 
 def cross_reference_appeals(judgments: list, appeals_data: list) -> list:
@@ -9140,9 +9188,10 @@ def _append_group_litigation_section(doc, facts: dict) -> None:
         sub = doc.add_paragraph("RERA authorities' own orders")
         for run in sub.runs:
             run.bold = True
-        orders_table = doc.add_table(rows=1, cols=4)
+        orders_table = doc.add_table(rows=1, cols=5)
         _set_table_borders(orders_table)
-        for idx, label in enumerate(("Authority", "Application no.", "Project", "Promoter named")):
+        for idx, label in enumerate(("Register", "Complaint / order no.", "Promoter named",
+                                     "What it concerns", "Penalty")):
             cell = orders_table.rows[0].cells[idx]
             cell.text = label
             _shade_cell(cell, "D9E2F3")
@@ -9151,10 +9200,13 @@ def _append_group_litigation_section(doc, facts: dict) -> None:
                     run.bold = True
         for row_data in order_entries:
             row = orders_table.add_row()
-            _set_row_cell(row, 0, row_data.get("authority") or "")
+            _set_row_cell(row, 0, "%s -- %s" % (row_data.get("authority") or "",
+                                                row_data.get("register") or ""))
             _set_row_cell(row, 1, row_data.get("application_no") or "")
-            _set_row_cell(row, 2, row_data.get("project_name") or "")
-            _set_row_cell(row, 3, row_data.get("promoter_name") or "")
+            _set_row_cell(row, 2, row_data.get("promoter_name") or "")
+            _set_row_cell(row, 3, row_data.get("detail") or row_data.get("project_name") or "")
+            amount = (row_data.get("penalty_amount") or "").strip()
+            _set_row_cell(row, 4, ("Rs " + amount) if amount else "")
     for limitation in orders.get("limitations") or []:
         doc.add_paragraph(limitation)
 

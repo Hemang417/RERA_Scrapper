@@ -131,6 +131,38 @@ validated with a control -- 111 entries for a known developer, 0 for a nonsense
 name. `parse_search_index` refuses to zip the four parallel arrays when their
 lengths disagree, since a mismatch attaches the wrong promoter to an order.
 
+**The order registers, probed rather than assumed (2026-08-21).** K-RERA
+publishes five promoter-keyed registers, not one: the order-search index plus
+authority orders, Adjudicating Officer orders, interim orders and complaints
+under process -- 15,600+ rows, including a **penalty table naming the violation,
+the section and the amount**. Two guards:
+
+- `adapter_karnataka._looks_complete` rejects a body with no closing `</html>`.
+  These pages truncate silently: the 10.4 MB authority-orders page arrived once
+  with 2 of its 3 tables, **dropping the penalty register entirely**, and the
+  AO-orders page truncated mid-attribute on another fetch. A partial register
+  reads as a smaller one, so it is refused, not trimmed.
+- `adapter_karnataka.order_register_coverage` names any register that did not
+  load. Missing is not empty.
+
+The others were probed, and the reasons are recorded in
+`litigation_sweep.ORDERS_NOT_SEARCHABLE` so they are not re-derived: **MahaRERA
+does accept a respondent (promoter) name** -- an earlier note in this repo said
+it did not -- but its portal answered every attempt with an empty BigPipe shell;
+**WBRERA** publishes 4,881 authority orders keyed only by complaint number, with
+no party named in any column; **GujRERA and JHARERA** are single-page apps whose
+order pages need JavaScript; **TG-RERA** publishes no such register.
+
+`company_charter.search_maharera_judgments` returned `[]` both for "no order
+published" and for "every attempt hit the shell". Its own docstring warned
+callers not to read an empty result as an absence, while giving them no way to
+tell -- and on 2026-08-21 a large, certainly-litigated promoter hit the shell
+every time, so the pipeline would have reported no orders for it.
+`_maharera_orders_search_once` now returns `None` for the shell and `[]` only
+for a real empty result, and `search_maharera_judgments_status` exposes
+`{"searched": bool}`. **A caller that does not check `searched` is asserting an
+absence it has not established.**
+
 `company_charter._safe_charge_movement` + `charge_watch.compare` answer whether
 secured borrowing was repaid. A failed fetch is `checked=False`, never "no
 change"; a charge that VANISHED from the register is not a satisfied one (a

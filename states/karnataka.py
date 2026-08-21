@@ -54,6 +54,15 @@ COMPLAINT_REPORT = BASE_URL + "/projectComplaintReport"
 # is filtered there. Wiring that POST up as a search would have returned
 # "no orders" for every promoter ever queried.
 ORDERS_PAGE = BASE_URL + "/viewAllJudgements"
+# The rest of K-RERA's order and complaint registers, each a whole-state
+# table in one request. Read together they are the closest thing any
+# authority in this pipeline publishes to a promoter's regulatory history.
+# The penalty table inside PROJECT_ORDERS_PAGE is the single most useful:
+# it names the violation, the section, and the amount.
+INTERIM_ORDERS_PAGE = BASE_URL + "/viewAllInterimOrders"
+PROJECT_ORDERS_PAGE = BASE_URL + "/viewAllProjectOrders"
+AO_ORDERS_PAGE = BASE_URL + "/viewAllAOorders"
+COMPLAINT_DETAILS_PAGE = BASE_URL + "/viewAllComplaintDetails"
 CERTIFICATE_URL = BASE_URL + "/certificate?CER_NO={}"
 DOWNLOAD_URL = BASE_URL + "/download_jc?DOC_ID={}"
 

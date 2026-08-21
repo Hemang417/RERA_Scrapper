@@ -47,6 +47,10 @@ from bs4 import BeautifulSoup
 from .base import AcquisitionResult, StateResolutionError, fetch_with_retry, storage_key
 from .karnataka import (
     ORDERS_PAGE,
+    INTERIM_ORDERS_PAGE,
+    PROJECT_ORDERS_PAGE,
+    AO_ORDERS_PAGE,
+    COMPLAINT_DETAILS_PAGE,
     COMPLAINT_POST,
     COMPLAINT_REPORT,
     DETAIL_POST,
@@ -119,14 +123,192 @@ def fetch_order_index(fetcher=None) -> list:
         return _ORDERS_CACHE
     if fetcher is None:
         session = _session()
-        html = fetch_with_retry(
-            lambda: session.get(ORDERS_PAGE, timeout=_TIMEOUT).text,
-            what="K-RERA order register",
-        )
+        html = _fetch_complete(session, ORDERS_PAGE, "K-RERA order register")
     else:
         html = fetcher()
     _ORDERS_CACHE = parse_search_index(html)
     return _ORDERS_CACHE
+
+
+# K-RERA's order and complaint registers, and the column each one names the
+# promoter in. Some say PROMOTER NAME, some say RESPONDENT NAME -- a
+# complaint is filed against the promoter, so the respondent IS the
+# promoter in the adjudication registers.
+_ORDER_REGISTERS = (
+    ("Authority orders", PROJECT_ORDERS_PAGE),
+    ("Adjudicating Officer orders", AO_ORDERS_PAGE),
+    ("Interim orders", INTERIM_ORDERS_PAGE),
+    ("Complaints under process", COMPLAINT_DETAILS_PAGE),
+)
+_PROMOTER_COLUMNS = ("promoter name", "respondent name")
+_REGISTER_CACHE = {}
+
+
+def _looks_complete(html) -> bool:
+    """Did the whole page arrive?
+
+    THESE PAGES TRUNCATE SILENTLY, and a short read is indistinguishable
+    from a smaller register unless this is checked. Confirmed 2026-08-21:
+    the 10.4 MB authority-orders page came back once with 2 of its 3
+    tables, dropping the PENALTY register entirely -- so a promoter with
+    penalties would have been reported as having none. The AO-orders page
+    truncated mid-attribute on another fetch. Every one of these pages
+    ends with a closing </html>; a body that does not is a partial read,
+    never a smaller register.
+    """
+    return str(html or "").rstrip().endswith("</html>")
+
+
+def _fetch_complete(session, url, what, attempts=3):
+    """Fetch until the page arrives whole. Raises rather than returning a
+    truncated body -- a partial register must never look like a short one."""
+    last = ""
+    for _ in range(attempts):
+        last = fetch_with_retry(
+            lambda: session.get(url, timeout=_TIMEOUT).text, what=what,
+        )
+        if _looks_complete(last):
+            return last
+    raise StateResolutionError(
+        f"{what} came back truncated on every attempt ({len(last)} chars, no closing "
+        f"</html>). Refusing it: a partial register reads as a smaller one, and this "
+        f"page has already been seen to drop its penalty table that way."
+    )
+
+
+def _header_key(text):
+    return " ".join(str(text or "").split()).lower()
+
+
+def parse_register_tables(html: str) -> list:
+    """Every headed table on a register page, as [{headers, rows}].
+
+    These pages carry MORE THAN ONE register in one document -- the
+    authority-orders page holds complaint orders, project orders and a
+    PENALTY table with violation sections and amounts, each with its own
+    header row. Reading only the first would silently drop the penalties,
+    which are the most consequential rows K-RERA publishes.
+    """
+    from bs4 import BeautifulSoup
+
+    tables = []
+    for table in BeautifulSoup(html or "", "html.parser").find_all("table"):
+        rows = table.find_all("tr")
+        if len(rows) < 2:
+            continue
+        headers = [_header_key(c.get_text(" ", strip=True))
+                   for c in rows[0].find_all(["th", "td"])]
+        if not any(headers):
+            continue
+        parsed = []
+        for row in rows[1:]:
+            cells = [" ".join(c.get_text(" ", strip=True).split())
+                     for c in row.find_all(["td", "th"])]
+            if not any(cells):
+                continue
+            parsed.append({headers[i]: cells[i]
+                           for i in range(min(len(headers), len(cells)))})
+        if parsed:
+            tables.append({"headers": headers, "rows": parsed})
+    return tables
+
+
+def fetch_order_registers(fetcher=None) -> dict:
+    """All of K-RERA's order and complaint registers, keyed by name.
+
+    Roughly 22 MB across five requests, so it is cached for the process
+    and should be treated as a once-per-run cost. A register that fails to
+    load is OMITTED FROM THE RESULT rather than returned empty, so a
+    caller can tell "no orders in that register" from "that register did
+    not load" -- the distinction the whole litigation section rests on.
+    """
+    if _REGISTER_CACHE and fetcher is None:
+        return _REGISTER_CACHE
+    session = _session()
+    out = {}
+    for label, url in _ORDER_REGISTERS:
+        try:
+            html = fetcher(url) if fetcher else _fetch_complete(
+                session, url, f"K-RERA {label}")
+            out[label] = parse_register_tables(html)
+        except Exception:
+            continue  # omitted, never an empty register
+    if fetcher is None:
+        _REGISTER_CACHE.update(out)
+    return out
+
+
+def search_registers_by_promoter(name: str, fetcher=None) -> list:
+    """Rows from every K-RERA register naming this promoter.
+
+    Matched on a NAME substring, because K-RERA publishes no company
+    identity number to join on -- so each row is a candidate, exactly as
+    the project sweep and the affiliate graph already assume.
+    """
+    needle = " ".join(str(name or "").upper().split())
+    if not needle:
+        return []
+    hits = []
+    for label, tables in fetch_order_registers(fetcher).items():
+        for table in tables:
+            columns = [c for c in _PROMOTER_COLUMNS if c in table["headers"]]
+            if not columns:
+                continue
+            for row in table["rows"]:
+                for column in columns:
+                    value = " ".join((row.get(column) or "").upper().split())
+                    if needle and needle in value:
+                        hits.append({
+                            "register": label,
+                            "promoter_name": row.get(column) or "",
+                            "complaint_no": row.get("complaint no") or row.get("project no")
+                            or row.get("registration number") or "",
+                            "order_date": row.get("order date") or row.get("k-rera order date")
+                            or row.get("penalty order date") or row.get("complaint date") or "",
+                            "project_name": row.get("project name") or "",
+                            "district": row.get("district") or "",
+                            "detail": row.get("relief sought") or row.get("nature of disposal")
+                            or row.get("violation") or row.get("order category")
+                            or row.get("complaint on") or "",
+                            "penalty_amount": row.get("penalty amount") or "",
+                        })
+                        break
+    return hits
+
+
+def order_register_coverage(fetcher=None) -> dict:
+    """Which of K-RERA's registers actually loaded this pass.
+
+    A register that failed is MISSING, not empty. Without this the section
+    would show four registers' worth of silence and one register's worth
+    of orders as though they were the same thing.
+    """
+    loaded = sorted(fetch_order_registers(fetcher))
+    expected = [label for label, _ in _ORDER_REGISTERS]
+    return {"loaded": loaded,
+            "missing": [label for label in expected if label not in loaded]}
+
+
+def search_all_orders_by_promoter(name: str, fetcher=None) -> list:
+    """Every K-RERA row naming this promoter, across all its registers.
+
+    The order-search index and the four order/complaint registers are
+    different documents on the portal, and a promoter can appear in one
+    and not the others.
+    """
+    hits = list(search_registers_by_promoter(name, fetcher))
+    for row in search_orders_by_promoter(name):
+        hits.append({
+            "register": "Order search index",
+            "promoter_name": row.get("promoter_name") or "",
+            "complaint_no": row.get("ack_no") or "",
+            "order_date": "",
+            "project_name": row.get("project_name") or "",
+            "district": "",
+            "detail": "",
+            "penalty_amount": "",
+        })
+    return hits
 
 
 def search_orders_by_promoter(name: str, fetcher=None) -> list:

@@ -23,7 +23,7 @@ Data coverage: `docs/RERA_Data_Coverage.xlsx` (regenerate with `python build_dat
 | Phase 3 | Fix Maharashtra CTS land-record extraction | **Done**, live-verified 2026-08-21. 15 fields + 3 mutation entries off the real card (was `{}` on every prior lookup) |
 | Phase 4a | Group entity graph (propose by name, confirm by hard link) | **Done** |
 | Phase 4b | Group-wide RERA sweep | **Done** — `group_sweep.py`, with per-authority coverage and confirm/refute |
-| Phase 4c | Litigation across the group | **Largely done** 2026-08-21 — `litigation_sweep.py`, opt-in `--group-litigation`: case law per entity and director, plus K-RERA's own order register. Other states' order registers remain |
+| Phase 4c | Litigation across the group | **Done** 2026-08-21 — case law per entity/director + all five K-RERA registers (incl. penalties). Every other authority probed and the reason it cannot be searched recorded |
 | Phase 4d | Finances (charges, ratings) | **Done** — MCA charges, `charge_watch.py`, CRISIL added, ratings across group entities |
 | Phase 4e | Statutory (GST) across the group | **Done** 2026-08-21 — `gst_group.py`, opt-in `--group-gst`. Coverage-first: GST is PAN-keyed, so most of a group is unreachable |
 | Phase 2 (rest) | ~24 remaining state portals | Not started — always a separate plan |
@@ -73,6 +73,31 @@ section names all of them, so an empty table is never read as a clean record.
 K-RERA also publishes five further order endpoints not yet read
 (`/viewAllInterimOrders`, `/viewAllProjectOrders`, `/viewAllAOorders`,
 `/viewAllComplaints`, `/viewAllComplaintDetails`).
+
+**The remaining registers, probed 2026-08-21 rather than assumed.**
+
+| Authority | Promoter-keyed order register? |
+|---|---|
+| **Karnataka** | **Yes — five of them.** Order-search index (11,732), authority orders, AO orders, interim orders, complaints under process. 15,600+ rows, including a **penalty table with violation, section and amount** (440 rows) |
+| **MahaRERA** | **Yes in principle** — the form DOES accept `order_respondent_name`, correcting an earlier note here. But the portal answered every attempt with its empty BigPipe shell, so no search could run |
+| **WBRERA** | No. 4,881 authority orders published, keyed only by complaint number; no party named in any column. Joinable via complaint numbers the adapter already reads per project |
+| **GujRERA / JHARERA** | No. Single-page apps; order pages not reachable without executing their JavaScript |
+| **TG-RERA** | No such register |
+
+> **Two silent-failure bugs found, both of the same species.**
+> 
+> **1. K-RERA pages truncate.** The 10.4 MB authority-orders page arrived once
+> with 2 of its 3 tables, dropping the penalty register entirely — a penalised
+> promoter would have shown none. The AO-orders page truncated mid-attribute on
+> another fetch. `_looks_complete` now refuses any body without a closing
+> `</html>`, and `order_register_coverage()` names registers that did not load.
+> 
+> **2. MahaRERA's orders search has been returning nothing for everything.**
+> `search_maharera_judgments` returned `[]` both for "no order published" and
+> for "every attempt hit the shell". Confirmed live: a search for a large,
+> certainly-litigated promoter hit the shell every time, so the pipeline was
+> reporting no orders for it. `search_maharera_judgments_status` now exposes
+> `{"searched": bool}`; **fixing the BigPipe follow-up itself remains open.**
 
 ### Phase 4e (group GST): the join key is the whole problem
 

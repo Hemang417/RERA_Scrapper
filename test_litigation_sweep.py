@@ -249,6 +249,64 @@ def test_the_karnataka_order_index_refuses_to_pair_mismatched_arrays():
     print("test_the_karnataka_order_index_refuses_to_pair_mismatched_arrays: PASS")
 
 
+def test_a_register_that_did_not_load_is_named_not_counted_as_empty():
+    """K-RERA's authority-orders page is 10.4 MB and HAS been seen to
+    arrive truncated, dropping its PENALTY table entirely -- 440 rows
+    naming the violation, the section and the amount. A promoter with
+    penalties would then have shown none. A register that did not load
+    must be named."""
+    result = ls.state_order_sweep(
+        _GRAPH, searcher=lambda name: [],
+        register_coverage={"loaded": ["Interim orders"], "missing": ["Authority orders"]})
+    joined = " ".join(result["limitations"])
+    assert "Authority orders" in joined, joined
+    assert "nothing was read, not that nothing is recorded" in joined, joined
+    print("test_a_register_that_did_not_load_is_named_not_counted_as_empty: PASS")
+
+
+def test_why_each_authority_is_unsearchable_is_stated_not_assumed():
+    """Each of these was PROBED on 2026-08-21, not assumed. MahaRERA does
+    accept a respondent (promoter) name -- an earlier note in this repo
+    said otherwise -- but its portal answered with an empty shell every
+    time. WBRERA publishes 4,881 orders keyed only by complaint number,
+    with no party named. Recording the reason is what stops the next
+    session re-deriving it, and stops a reader treating silence as a clean
+    record."""
+    joined = " ".join(ls.ORDERS_NOT_SEARCHABLE)
+    assert "respondent (promoter) name" in joined, joined
+    assert "BigPipe shell" in joined, joined
+    assert "4,881" in joined and "complaint number" in joined, joined
+    assert "single-page applications" in joined, joined
+    print("test_why_each_authority_is_unsearchable_is_stated_not_assumed: PASS")
+
+
+def test_a_maharera_shell_response_is_not_an_absence_of_orders():
+    """THE LIVE BUG THIS WORK FOUND. search_maharera_judgments returns []
+    both when a project genuinely has no published order and when every
+    attempt hit MahaRERA's empty BigPipe shell. On 2026-08-21 a search for
+    a large, certainly-litigated Maharashtra promoter hit the shell on
+    every attempt, so the pipeline would have reported no orders against
+    it -- a clean record manufactured from a search that never ran."""
+    import company_charter as charter
+
+    original = charter._maharera_orders_search_once
+    try:
+        charter._maharera_orders_search_once = lambda project, ctype: None
+        status = charter.search_maharera_judgments_status("Anything", max_attempts=1)
+        assert status["searched"] is False, status
+        assert status["results"] == [], status
+        assert "NOT an absence of orders" in status["note"], status
+
+        # ...and a genuine empty must still read as a real search.
+        charter._maharera_orders_search_once = lambda project, ctype: []
+        clean = charter.search_maharera_judgments_status("Anything", max_attempts=1)
+        assert clean["searched"] is True, clean
+        assert clean["note"] == "", clean
+    finally:
+        charter._maharera_orders_search_once = original
+    print("test_a_maharera_shell_response_is_not_an_absence_of_orders: PASS")
+
+
 def test_the_group_litigation_stage_is_opt_in_and_silent_when_off():
     """Off, the Charter carries no section -- different from carrying an
     empty one, which would assert that a search happened."""
@@ -274,5 +332,8 @@ if __name__ == "__main__":
     test_an_order_register_failure_does_not_silently_empty_the_table()
     test_only_entities_are_searched_in_order_registers()
     test_the_karnataka_order_index_refuses_to_pair_mismatched_arrays()
+    test_a_register_that_did_not_load_is_named_not_counted_as_empty()
+    test_why_each_authority_is_unsearchable_is_stated_not_assumed()
+    test_a_maharera_shell_response_is_not_an_absence_of_orders()
     test_the_group_litigation_stage_is_opt_in_and_silent_when_off()
     print("\nAll tests passed.")
