@@ -1,6 +1,6 @@
 # Pan-India RERA — progress and resumption notes
 
-**Updated 19 August 2026.** Working tree is green: `python -m pytest -q` → **543 passed**.
+**Updated 21 August 2026.** Working tree is green: `python -m pytest -q` -> **594 passed**.
 MahaRERA output is byte-identical to the pre-refactor baseline.
 
 Full plan: `~/.claude/plans/yes-make-the-plan-starry-neumann.md`
@@ -23,7 +23,7 @@ Data coverage: `docs/RERA_Data_Coverage.xlsx` (regenerate with `python build_dat
 | Phase 3 | Fix Maharashtra CTS land-record extraction | **Done**, live-verified 2026-08-21. 15 fields + 3 mutation entries off the real card (was `{}` on every prior lookup) |
 | Phase 4a | Group entity graph (propose by name, confirm by hard link) | **Done** |
 | Phase 4b | Group-wide RERA sweep | **Done** — `group_sweep.py`, with per-authority coverage and confirm/refute |
-| Phase 4c | Litigation across the group | **Done** 2026-08-21 — case law per entity/director + all five K-RERA registers (incl. penalties). Every other authority probed and the reason it cannot be searched recorded |
+| Phase 4c | Litigation across the group | **Done** 2026-08-21 — case law per entity/director, plus promoter-keyed orders from FOUR authorities (K-RERA x5 registers incl. penalties, MahaRERA, JHARERA, WBRERA via cause lists). GujRERA and TG-RERA probed; the reason each cannot be searched is recorded and rendered |
 | Phase 4d | Finances (charges, ratings) | **Done** — MCA charges, `charge_watch.py`, CRISIL added, ratings across group entities |
 | Phase 4e | Statutory (GST) across the group | **Done** 2026-08-21 — `gst_group.py`, opt-in `--group-gst`. Coverage-first: GST is PAN-keyed, so most of a group is unreachable |
 | Phase 2 (rest) | ~24 remaining state portals | Not started — always a separate plan |

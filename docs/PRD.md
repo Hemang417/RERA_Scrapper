@@ -1,12 +1,12 @@
 # Product Requirements Document (PRD)
-## RERA Scrapper — MahaRERA Due-Diligence & Company Charter Pipeline
+## RERA Scrapper — Pan-India RERA Due-Diligence & Company Charter Pipeline
 
 | Field | Value |
 |---|---|
 | **Document** | Product Requirements Document |
 | **Product** | RERA Scrapper |
-| **Version** | 1.1 |
-| **Date** | 13 August 2026 |
+| **Version** | 1.2 |
+| **Date** | 21 August 2026 |
 | **Status** | Baseline — documents the product as built, plus forward roadmap |
 | **Owner** | Integrow Asset Management |
 | **Companion documents** | `SAD.md` (architecture), `CLAUDE.md` (flow), `rules.md` (content rules), `guardrails.md` (guards) |
@@ -41,9 +41,9 @@
 
 ## 1. Executive summary
 
-**RERA Scrapper turns a single MahaRERA registration number into a defensible, source-cited due-diligence pack in one command.**
+**RERA Scrapper turns a single RERA registration number -- from any of six state authorities -- into a defensible, source-cited due-diligence pack in one command.**
 
-Real-estate underwriting in Maharashtra requires assembling a picture of three things — the **counterparty** (the promoter company), its **promoters** (the individuals behind it), and the **collateral** (the project and its land). That picture is scattered across a regulator's portal, three corporate-registry mirrors, two credit-rating agencies, an insolvency board, a GST portal, a Marathi-language land-records system, and the open web. Assembling it by hand takes an analyst days, produces inconsistent output, and — most importantly — leaves no audit trail of what was checked versus what was found.
+Real-estate underwriting requires assembling a picture of three things — the **counterparty** (the promoter company), its **promoters** (the individuals behind it), and the **collateral** (the project and its land). That picture is scattered across six state regulators' portals (each with its own vendor, format and gaps), three corporate-registry mirrors, three credit-rating agencies, an insolvency board, a GST portal, a Marathi-language land-records system, an open case-law index, and the open web. It is also rarely confined to one state: a promoter's real track record is usually held under OTHER companies, on OTHER states' registers. Assembling it by hand takes an analyst days, produces inconsistent output, and — most importantly — leaves no audit trail of what was checked versus what was found.
 
 This product automates that assembly and, critically, **governs what the resulting document is allowed to say**. It produces a paired **Company Charter** — an Internal variant that keeps every process failure and full bibliographic sourcing, and an External variant that is client-shareable with numbered citations — plus a RERA project summary PDF, a Developer Score, a Documentation Confidence Score, and a numbered, actionable gap list.
 
@@ -54,11 +54,13 @@ The product's distinguishing characteristic is not that it scrapes. It is that *
    -----------                                    --------
                                        +---> Company_Charter_..._Internal.pdf
    python main.py P51800012345         |     Company_Charter_..._External.pdf
-     [--gstin X | --pan Y]  ---------->+     Company_Charter_....facts.json
-                                       |     <REG_NO>_summary.pdf
-   1 human CAPTCHA solve               |     documents/ + complaint_orders/
-   (+1 per GST lookup)                 |     usage_summary.json (cost ledger)
+     [--state MH|GJ|KA|TG|JH|WB]       |     Company_Charter_....facts.json
+     [--group-sweep] [--group-gst]  -->+     <REG_NO>_summary.pdf
+     [--group-litigation]              |     documents/ + complaint_orders/
+     [--gstin X | --pan Y]             |     usage_summary.json (cost ledger)
                                        +---> a numbered, actionable gap list
+   1 human CAPTCHA solve                     ...each section stating its own
+   (+1 per GST lookup)                       COVERAGE, not just its findings
 ```
 
 ---
@@ -164,6 +166,11 @@ Producing two documents by hand from one analysis is where inconsistency creeps 
 | 2026-08-11 | Guardrails documentation and the blocking compliance review hardened; this PRD baselined |
 | 2026-08-12 | Deep research's own verify/gap-retry fan-out capped with a shared `_VerificationBudget`, after P51800077150's first-ever research pass (no prior research to reuse) ran past $10 before being killed by hand |
 | **2026-08-13** | **Hard pipeline-wide cost ceiling added** (`PIPELINE_COST_CAP_USD`, $6.00, refuses a call rather than starting it once a run's total spend across deep research **and** Charter generation reaches the cap). The verify and gap-retry fan-out itself was also **batched** — many sources, or every gap open in a retry round, are now checked/retried in one shared-budget call instead of one call each — and every Claude API call now marks its request cacheable (`cache_control`), with cache-write/cache-read tokens priced and reported separately from plain input tokens |
+| **2026-08-17** | **State seam landed.** `states/` package: `StateProfile` (data) + `StateAdapter` (one `acquire()` call), capability declaration, and state resolution from the registration number. `app.py`'s ~160 duplicated lines deleted |
+| 2026-08-18 | Gujarat, Karnataka and Telangana adapters |
+| 2026-08-19 | Jharkhand and West Bengal adapters, built subject-first rather than by register size. Karnataka run completed end-to-end |
+| **2026-08-20** | **Group-level diligence**: entity graph (propose by name, confirm by hard link), group-wide RERA sweep with per-authority coverage, promoter PAN read off the filed card, charge movement, state footprint, CRISIL added |
+| **2026-08-21** | **Land records fixed** -- `fields` had been `{}` on every CTS lookup ever made; now 15 fields plus mutation entries. **Group GST** (`gst_group.py`), **group case law** (`litigation_sweep.py`), and promoter-keyed **order registers from four authorities** (K-RERA's five registers including penalties, MahaRERA, JHARERA, WBRERA via its cause lists). MahaRERA's own orders search was found to have been returning nothing for every query, and repaired |
 
 ---
 
@@ -190,7 +197,7 @@ Producing two documents by hand from one analysis is where inconsistency creeps 
 |---|---|---|
 | NG1 | **Making the investment decision** | The product produces evidence and scores; a human underwrites |
 | NG2 | **Solving CAPTCHAs** | Hard ethical and ToS boundary, stated in three modules. A human solves every one |
-| NG3 | **Becoming a general-purpose Indian RERA tool** | Maharashtra only. Other states have different portals, schemas and land systems |
+| NG3 | **Covering all 36 states and UTs** | Six authorities are built (MH, GJ, KA, TG, JH, WB); roughly 24 live portals remain. Each is a separate vendor, schema, language and land system, and is scoped as its own plan -- a state is added when a subject operates there, not to complete a set |
 | NG4 | **Real-time monitoring** | Batch, on-demand, human-triggered. Change detection is run-to-run, not continuous |
 | NG5 | **Replacing legal title diligence** | The land-record check is corroborative. A Title Report is a lawyer's product |
 | NG6 | **A hosted multi-tenant service** | Single-operator, local filesystem, Windows-bound PDF conversion |
@@ -592,7 +599,7 @@ Requirements are numbered `FR-<area>-<n>`. **MUST / SHOULD / MAY** carry RFC-211
 
 | ID | Requirement | Priority |
 |---|---|---|
-| FR-ACQ-01 | The system **MUST** accept either a MahaRERA registration number matching `^P\d{11}$` or a free-text project name | P0 |
+| FR-ACQ-01 | The system **MUST** accept a registration number from any registered state profile, or a free-text project name, and **MUST** resolve which authority it belongs to from the number itself | P0 |
 | FR-ACQ-02 | On multiple name matches the system **MUST** present the candidates and let the operator pick; with no interactive terminal it **MUST** exit code 2 with instructions rather than guess | P0 |
 | FR-ACQ-03 | Project-id resolution **MUST NOT** require a login or a CAPTCHA, and **MUST NOT** click the "View Details" link (which fires a JS confirm and lands on the gated page) | P0 |
 | FR-ACQ-04 | The system **MUST** accept `--project-id N` to bypass search entirely, for projects the portal's own search index cannot find but whose API record still exists | P1 |
@@ -611,6 +618,11 @@ Requirements are numbered `FR-<area>-<n>`. **MUST / SHOULD / MAY** carry RFC-211
 | FR-ACQ-17 | The system **MUST** archive the previous run by **moving** it to `output/_history/<reg>/<timestamp>/`, resolving same-second collisions with a numeric suffix | P1 |
 | FR-ACQ-18 | The system **MUST** read prior research *before* archiving and prior manifests *after* archiving | P1 |
 | FR-ACQ-19 | The system **MUST** provide `--verify` mode that probes every endpoint and prints its configured trust level (`confirmed`/`observed`) alongside the empirical outcome | P2 |
+| FR-ACQ-20 | `--state` **MUST** always override detection. Where two authorities share a number format (MahaRERA and TG-RERA are both `P` + 11 digits) the system **MUST** probe both and let the one that actually holds the project win, **MUST NOT** decide on the district-code convention alone, and **MUST** say on stdout when a heuristic fired | P0 |
+| FR-ACQ-21 | Each state **MUST** declare what it HAS (`profile.capabilities`). A capability a state lacks **MUST** return the empty value plus an honest sentence in `notes` -- never a stub, and never a shape that reads as "checked, nothing found" | P0 |
+| FR-ACQ-22 | Acquisition **MUST** sit behind a single `acquire()` call covering resolve, auth, scrape, documents, orders and promoter portfolio, and `app.py` **MUST** call the same method as `main.py` (enforced by a test) | P0 |
+| FR-ACQ-23 | A state-specific code path **MUST NOT** run for another state. MahaRERA's orders search, the Maha Bhulekh land path and the MahaRERA-only document flow are each gated on a declared capability | P0 |
+| FR-ACQ-24 | A response that arrives TRUNCATED **MUST** be refused rather than parsed. Several registers are multi-megabyte single-request pages, and a short read yields fewer rows that are indistinguishable from a smaller register | P0 |
 
 ### 9.2 Corporate intelligence (FR-CORP)
 
@@ -649,7 +661,7 @@ Requirements are numbered `FR-<area>-<n>`. **MUST / SHOULD / MAY** carry RFC-211
 | ID | Requirement | Priority |
 |---|---|---|
 | FR-LAND-01 | The system **MUST** extract land identification (survey/CTS, village, taluka/district, pincode, gross/affected/net area), each with its source | P0 |
-| FR-LAND-02 | The system **MUST** support a Maha Bhulekh Property Card lookup, opt-in and never auto-run | P2 |
+| FR-LAND-02 | The system **MUST** support a Maha Bhulekh Property Card lookup, opt-in and never auto-run, and **MUST** extract the card's own labelled fields -- holder, area, tenure, encumbrance and the mutation table | P2 |
 | FR-LAND-03 | The system **MUST NOT** fuzzy-match Marathi office or village labels against RERA's English text; the operator **MUST** pick from the site's own option list | P0 |
 | FR-LAND-04 | The system **MUST** provide a four-step human-in-the-loop resolution chain (`offices` → `villages` → `candidates` → `finalize`), of which only the final fetch requires a CAPTCHA | P2 |
 | FR-LAND-05 | The system **MUST** re-emit the land-record reminder gap on **every** run until `cts_lookup_input.json` exists, so it cannot be forgotten after the first mention | P2 |
@@ -657,6 +669,9 @@ Requirements are numbered `FR-<area>-<n>`. **MUST / SHOULD / MAY** carry RFC-211
 | FR-LAND-07 | A composite key of district + village + CTS number **MUST** be used for pending land records, because a bare CTS number is not globally unique | P2 |
 | FR-LAND-08 | The system **MUST** merge `mortgage_area` and `mortgage_lender` into a single "Mortgage / charge on the land" field, preserving the finding that development agreements permit a mortgage even where none has been taken — **a live right is a finding** | P1 |
 | FR-LAND-09 | The system **MUST** extract text from downloaded documents, falling back to OCR, and **MUST** degrade to an `[OCR unavailable]` marker rather than failing when Tesseract is absent | P1 |
+| FR-LAND-10 | The Property Card **MUST** be requested in English and parsed from its HTML tables. In Marathi the portal serves the card as a single embedded JPEG, which no parser can read without a Marathi OCR pack; the language **MUST** be set by code, never left to whoever is at the CAPTCHA | P2 |
+| FR-LAND-11 | The Marathi card image **MUST** be saved alongside every capture as the authoritative artefact, because the portal's own disclaimer states the transliterated text is "prone to occasional inconsistencies" and that the Marathi content is sacrosanct | P2 |
+| FR-LAND-12 | A card that is present but unreadable **MUST** report NO READING TAKEN. The PU-ID is matched by regex over the whole page and so survives a card whose every labelled row failed to parse; a result carrying only a PU-ID **MUST NOT** be reported as a plot with no owner, no encumbrance and no mutation entries | P0 |
 
 ### 9.5 Compliance and litigation (FR-COMP)
 
@@ -674,8 +689,14 @@ Requirements are numbered `FR-<area>-<n>`. **MUST / SHOULD / MAY** carry RFC-211
 | FR-COMP-10 | A period whose frequency cannot be resolved **MUST** be counted as `unresolvable_frequency` and excluded from every other count, never assigned a guessed due date | P2 |
 | FR-COMP-11 | A period not yet due **MUST** be excluded from all counts — that is not a gap, it is simply not due yet | P2 |
 | FR-COMP-12 | GST failure **MUST** cost exactly one unscored sub-metric, never the run | P0 |
-| FR-COMP-13 | The system **MUST** search MahaRERA's orders/judgments and cross-reference the results against the project's appeals, saving the judgment PDFs | P1 |
+| FR-COMP-13 | The system **MUST** search the authority's orders/judgments and cross-reference the results against the project's appeals, saving the judgment PDFs. An orders search that could not run **MUST** be distinguishable from one that found nothing | P1 |
 | FR-COMP-14 | The system **SHOULD** triage the authenticity of any operator-supplied `reviews.json` (rating polarisation, bursts, near-duplicates, one-hit-wonder reviewers, claim cross-referencing) | P3 |
+| FR-COMP-15 | GST **MAY** be checked across the group (`--group-gst`). GST is keyed on PAN and no public MCA source publishes one, so the section **MUST** lead with how many entities were checked out of how many exist, and **MUST** name the ones that were not | P2 |
+| FR-COMP-16 | A PAN **MUST NOT** be guessed. Each **MUST** carry a provenance -- read off a filed PAN card, named in an authority's filing, extracted arithmetically from a known GSTIN, or supplied by hand -- and an unverified OCR candidate **MUST** be refused | P0 |
+| FR-COMP-17 | Case law **MAY** be searched across the group (`--group-litigation`), per entity and per director. Every hit is a NAME match on a full-text index and **MUST** be rendered as a candidate to confirm, never as this promoter's litigation | P2 |
+| FR-COMP-18 | The forums open case-law search does NOT reliably index -- consumer fora, most of NCLT/NCLAT, district courts, arbitration, and the RERA authorities' own orders -- **MUST** be named on the page, and a nil result **MUST NOT** be described as a clean record | P0 |
+| FR-COMP-19 | The system **SHOULD** search the RERA authorities' own order registers by promoter name where one is published, and **MUST** name every authority whose register was not searched, with the reason | P1 |
+| FR-COMP-20 | Where an order register names no party (WBRERA publishes 4,881 orders keyed only by complaint number), a join **MAY** be made through another published document. A join key recovered from OCR **MUST** be resolved against a closed set of real values and **MUST** be refused when it does not land on exactly one | P0 |
 
 ### 9.6 Market research (FR-RES)
 

@@ -1,13 +1,13 @@
 # Software Architecture Document (SAD)
-## RERA Scrapper — MahaRERA Due-Diligence & Company Charter Pipeline
+## RERA Scrapper — Pan-India RERA Due-Diligence & Company Charter Pipeline
 
 | Field | Value |
 |---|---|
 | **Document** | Software Architecture Document |
-| **System** | RERA Scrapper (MahaRERA project due-diligence and Company Charter generator) |
+| **System** | RERA Scrapper (pan-India RERA project due-diligence and Company Charter generator) |
 | **Repository root** | `RERA_Scrapper/` |
-| **Version** | 1.1 |
-| **Date** | 13 August 2026 |
+| **Version** | 1.2 |
+| **Date** | 21 August 2026 |
 | **Status** | Baseline — describes the system as implemented |
 | **Owner** | Integrow Asset Management |
 | **Companion documents** | `PRD.md` (product requirements), `CLAUDE.md` (flow), `rules.md` (content rules), `guardrails.md` (guards) |
@@ -59,14 +59,14 @@ In scope:
 
 - The full ingestion → enrichment → assembly → rendering → verification pipeline.
 - Both entry points: `main.py` (CLI) and `app.py` (Streamlit).
-- The three CAPTCHA-gated external portals and the redundancy chains built around them.
+- The CAPTCHA-gated external portals (MahaRERA, the GST portal, Maha Bhulekh) and the redundancy chains built around them, plus the un-gated state registers reached without one.
 - The rules/guardrail governance layer that decides whether a document may ship.
 - The two document families (RERA summary PDF; Company Charter family) and three renderers.
 
 Out of scope:
 
 - The commercial underwriting decision the documents feed into.
-- Any MahaRERA-side system internals (treated as an opaque, occasionally hostile third party).
+- Any RERA authority's own system internals (each treated as an opaque, occasionally hostile third party).
 - CI/CD infrastructure — none currently exists (see §25).
 
 ### 1.3 Audience
@@ -224,8 +224,10 @@ The punctuation constraint on B and C is not stylistic. `_verify_external_docume
                         |  Consumes: PDF + Charter Internal/External|
                         +====================+=====================+
                                              |
-                        CLI  python main.py <REG_NO> [--gstin|--pan]
-                        UI   streamlit run app.py
+             CLI  python main.py <REG_NO> [--state MH|GJ|KA|TG|JH|WB]
+                       [--group-sweep] [--group-gst] [--group-litigation]
+                       [--gstin|--pan]
+             UI   streamlit run app.py
                                              |
                                              v
    +=====================================================================+
@@ -236,8 +238,11 @@ The punctuation constraint on B and C is not stylistic. `_verify_external_docume
         |            |            |            |             |
         v            v            v            v             v
   +-----------+ +----------+ +----------+ +----------+ +-------------+
-  | MahaRERA  | | MCA      | | Credit / | | GST      | | Anthropic   |
-  | (2 hosts) | | mirrors  | | IBBI     | | Portal   | | Claude API  |
+  | SIX RERA  | | MCA      | | Credit / | | GST      | | Anthropic   |
+  | AUTHORITY | | mirrors  | | IBBI     | | Portal   | | Claude API  |
+  | PORTALS   | |          | |          | |          | |             |
+  | MH GJ KA  | |          | | CRISIL   | |          | |             |
+  | TG JH WB  | |          | |          | |          | |             |
   |           | |          | |          | |          | |             |
   | maharera. | | Zauba-   | | ICRA     | | services.| | claude-     |
   |  maha...  | |  Corp    | | Infomer- | |  gst.gov | |  sonnet-5   |
@@ -252,6 +257,16 @@ The punctuation constraint on B and C is not stylistic. `_verify_external_docume
                 +----------+
         |            |            |             |            |
         v            v            v             v            v
+  +-----------+ +----------+ +-----------+ +----------+ +-------------+
+  | Indian    | | (order   | |           | |          | |             |
+  | Kanoon    | |  regis-  | |           | |          | |             |
+  | (case law | |  ters:   | |           | |          | |             |
+  |  by name) | |  K-RERA  | |           | |          | |             |
+  |           | |  MahaRERA| |           | |          | |             |
+  |           | |  JHARERA | |           | |          | |             |
+  |           | |  WBRERA) | |           | |          | |             |
+  +-----------+ +----------+ +-----------+ +----------+ +-------------+
+
   +-----------+ +----------+ +-----------+ +----------+ +-------------+
   | Maha      | | Open     | | Google    | | xAI      | | Tesseract   |
   | Bhulekh   | | Street   | | Maps      | | Grok     | | OCR (local) |
@@ -269,7 +284,7 @@ The punctuation constraint on B and C is not stylistic. `_verify_external_docume
             -->  synchronous call     v   data flow direction
 ```
 
-**Trust tiering of the external world.** The system does not treat all sources equally. `_classify_source_tier` maps every source into one of 12 tiers with weights 20–100, feeding the Documentation Confidence score. MahaRERA, MCA mirrors, rating agencies, IBBI and Maps are *trusted by design* and excluded from the open-web trust registry; everything else (99acres, NoBroker, press, social, Wikipedia) accumulates hit counts in `source_trust_registry.json` across runs and is auto-promoted at the **5th distinct project**.
+**Trust tiering of the external world.** The system does not treat all sources equally. `_classify_source_tier` maps every source into one of 12 tiers with weights 20–100, feeding the Documentation Confidence score. The RERA authorities, MCA mirrors, rating agencies, IBBI, Indian Kanoon and Maps are *trusted by design* and excluded from the open-web trust registry; everything else (99acres, NoBroker, press, social, Wikipedia) accumulates hit counts in `source_trust_registry.json` across runs and is auto-promoted at the **5th distinct project**.
 
 ---
 
@@ -337,7 +352,7 @@ The punctuation constraint on B and C is not stylistic. `_verify_external_docume
 
 ## 6. Module inventory
 
-### 6.1 Application modules (29 files, all at repository root)
+### 6.1 Application modules (38 files at repository root, plus the `states/` package)
 
 | Module | LOC/size | Layer | Role |
 |---|---|---|---|
@@ -355,12 +370,12 @@ The punctuation constraint on B and C is not stylistic. `_verify_external_docume
 | `gst_intake.py` | 9.9 KB | L2 | PAN → all GSTINs → filing tables → `gst_filing_input.json` |
 | `gst_portal.py` | 18.5 KB | L2 | GST portal driver + filing-table parser; OCR-assisted |
 | `gst_compliance.py` | 12.2 KB | L3 | Pure offline GSTIN/PAN validation, QRMP frequency, statutory due dates, delays |
-| `mahabhumi.py` | 32.9 KB | L2 | Maha Bhulekh Property Card lookup; Marathi UI; district map; OCR `mar+eng` |
+| `mahabhumi.py` | 40.6 KB | L2 | Maha Bhulekh Property Card lookup; Marathi UI; district map. Requests the card in **English** and parses its HTML tables -- in Marathi the card is a single embedded JPEG -- and saves that image as the authoritative artefact |
 | `cts_intake.py` | 3.0 KB | Entry | Standalone CTS lookup with no RERA number |
 | `cts_resolve.py` | 6.7 KB | Entry | 4-step human-in-the-loop CTS office/village/number resolution |
 | `promoter_intake.py` | 3.0 KB | Entry | Standalone CIN-only promoter checks |
 | `attach_rera.py` | 2.3 KB | Entry | Link a pending CIN/CTS case to a RERA number |
-| **`company_charter.py`** | **591.9 KB / 10,182 lines** | L2–L6 | **The core.** Facts assembly, registry chains, editorial passes, scoring, dual-variant rendering, all three gates |
+| **`company_charter.py`** | **655.4 KB / 11,785 lines** | L2–L6 | **The core.** Facts assembly, registry chains, editorial passes, scoring, dual-variant rendering, all three gates |
 | `charter_report.py` | 70.8 KB | L6 | Second builder — "Counterparty + Collateral" document; own quality gate |
 | `charter_document.py` | 32.4 KB | Shared lib | Builder deleted 2026-08-10; **still a live shared library** (16 symbols) |
 | `charter_research_prep.py` | 24.6 KB | Shared lib | Roster building + agent prompt construction for the `charter_report` pipeline |
@@ -370,7 +385,26 @@ The punctuation constraint on B and C is not stylistic. `_verify_external_docume
 | `build_report.py` | 11.8 KB | One-off | Hand-curated research for one engagement; "delete or rewrite per engagement" |
 | `finalize_report.py` | 4.6 KB | Entry | Rebuild the summary PDF from disk with **zero network calls** |
 
-### 6.2 Test modules (28 files, `test_*.py` at root)
+**Added since v1.1 -- the state seam and group-level diligence:**
+
+| Module | LOC/size | Layer | Role |
+|---|---|---|---|
+| `states/base.py` | 20.2 KB | L1 | `StateProfile` (frozen dataclass, pure data) + `StateAdapter` (`typing.Protocol`, one `acquire()`), capability constants, `AcquisitionResult`, shared fetch/retry and filename helpers |
+| `states/__init__.py` | 7.7 KB | L1 | Profile registry and state resolution: `--state` wins, else match every registered reg-no pattern; the MH/TG collision is probed, not guessed |
+| `states/<state>.py` x6 | 2.8-4.9 KB | L0 | Per-state constants: endpoints, reg-no pattern, declared capabilities. MH, GJ, KA, TG, JH, WB |
+| `states/adapter_<state>.py` x6 | 12.5-34.3 KB | L1 | Per-state acquisition behind one `acquire()`. Karnataka and West Bengal also expose their order registers |
+| `ts_rera_client.py` | 11.5 KB | L1 | Telangana's pre-existing scraper, wrapped rather than rewritten |
+| `promoter_identity.py` | 25.7 KB | L2 | Reads the promoter's PAN off the PAN card in the document library; emits an explicit `status`, never prose to be sniffed |
+| `group_entities.py` | 25.0 KB | L2 | The entity graph: brand name PROPOSES, a hard link (shared director / registered office / filed relationship) CONFIRMS. Also state footprint from CIN codes and declared addresses |
+| `group_sweep.py` | 19.5 KB | L2 | Group-wide RERA sweep with per-authority coverage and confirm/probable/refute outcomes |
+| `charge_watch.py` | 10.3 KB | L2 | Secured borrowing movement between runs; a vanished charge is not a satisfied one |
+| `gst_group.py` | 11.5 KB | L2 | GST across the entity graph. Coverage-first: GST is PAN-keyed and no MCA source publishes a PAN |
+| `litigation_sweep.py` | 19.9 KB | L2 | Case law per entity and director, plus the authorities' own order registers; names the forums that are not indexed |
+| `wb_orders.py` | 8.9 KB | L3 | Pure logic for joining WBRERA's party-less order register to a promoter via its cause lists; OCR keys resolved against a closed set |
+| `run_cts_capture.py` | 5.3 KB | Entry | One live Property Card fetch, for a human at the keyboard |
+| `build_data_coverage.py` | 21.2 KB | One-off | Regenerates `docs/RERA_Data_Coverage.xlsx` |
+
+### 6.2 Test modules (50 files, `test_*.py` at root)
 
 Grouped by what they protect:
 
@@ -710,7 +744,26 @@ There is no `tests/` package, no `conftest.py`, no CI configuration.
 
 ## 8. Stage-by-stage specification
 
-### 8.1 Stage 1 — Resolve (`resolver.py`)
+> **Stages 1-6 now sit behind one call.** `states.get_adapter(code).acquire()`
+> covers resolve, auth, scrape, documents, complaint orders and promoter
+> portfolio, and `main.py` and `app.py` both call it -- which is what removed
+> `app.py`'s ~160 duplicated lines. **Sections 8.1-8.5 below describe
+> MahaRERA's adapter**, which is the reference implementation and still the
+> most capable; the other five are structured the same way but declare fewer
+> capabilities. See §8.0 for the seam itself.
+
+### 8.0 The state seam
+
+| Aspect | Detail |
+|---|---|
+| Two seams, not one | `StateProfile` is a frozen dataclass of pure data (name, acronym, regulator, reg-no pattern, capabilities) that travels into `facts["state"]` and `run_meta.json`. `StateAdapter` is a `typing.Protocol` with one method and never leaves acquisition. Separated so a Charter can be rendered from a hand-built facts dict with no adapter, no portal and no browser |
+| Why a Protocol | The repo has no classes outside underscore-prefixed test fakes. Structural typing let `ts_rera_client.py` be wrapped without being rewritten or inheriting anything |
+| Why `acquire()` is coarse | Telangana cannot split resolve from auth -- it CAPTCHA-gates the search itself -- and MahaRERA's 401/403 retry is MahaRERA-specific orchestration |
+| Capabilities | `CAP_LOOKUP_BY_REG_NO`, `CAP_CATEGORY_API`, `CAP_DOCUMENTS`, `CAP_SEPARATE_AUTH`, `CAP_PROMOTER_PORTFOLIO`, `CAP_ORDERS_SEARCH`, `CAP_LAND_RECORDS`. A state omits what it lacks **and** returns the empty value plus a sentence in `notes` -- never a stub |
+| Resolution | `--state` wins. Otherwise every registered pattern is matched. MahaRERA and TG-RERA share `P` + 11 digits, so **both are probed and whichever actually holds the project wins**; the district-code convention only orders the attempts, and a firing heuristic is announced on stdout |
+| Six states | MH (all seven capabilities), GJ, KA, TG, JH, WB |
+
+### 8.1 Stage 1 — Resolve (MahaRERA: `resolver.py`)
 
 | Aspect | Detail |
 |---|---|
@@ -731,7 +784,7 @@ There is no `tests/` package, no `conftest.py`, no CI configuration.
 5. **Positional parsing is brittle by admission** — reg-no line, project name on the next line, promoter on the line after.
 6. `search_promoters()` returns a promoter's entire registered portfolio in the same card format — this is what makes Stage 6 possible.
 
-### 8.2 Stage 2 — Auth (`session_auth.py`, `token_cache.py`)
+### 8.2 Stage 2 — Auth (MahaRERA: `session_auth.py`, `token_cache.py`)
 
 The four `auth_source` values are `explicit`, `cached`, `fresh_browser`, `none`, and **the pipeline runs to completion in all four** — the last simply fetches only `projects` and `complaints`.
 
@@ -790,7 +843,7 @@ Charters live *outside* `output/<reg>/`, in `output/company_charters/`, so they 
 
 Timestamp format `%Y%m%d_%H%M%S`, with `_2`, `_3`… suffixes on same-second collision. Not safe against two concurrent runs of the same `reg_no` — the collision check is not atomic.
 
-### 8.4 Stage 4 — Scrape (`api_client.py`)
+### 8.4 Stage 4 — Scrape (MahaRERA: `api_client.py`)
 
 The nine category endpoints, and their trust status as recorded in `config.CATEGORY_ENDPOINTS`:
 
@@ -824,6 +877,26 @@ Covered in the diagram in §7. Two asymmetries worth recording explicitly:
 
 - **Document download is parallel (8 workers); complaint-order download is serial.** Deliberate: complaint counts are small, document counts can exceed 100.
 - **GST intake sits between the portfolio build and deep research**, not after it, because deep research runs unattended for minutes while GST needs a human at the keyboard. All human-attended browser work is contiguous.
+
+### 8.7 Stage 2b — the code-computed group passes
+
+Six passes that are computed, never model-authored, each writing its own
+facts key and rendering its own Charter section. A stage must do **both**:
+`test_computed_facts_reach_the_page.py` exists because three capabilities
+were once built, tested, and consumed by nothing.
+
+| Pass | Opt-in | What it costs | What it must never do |
+|---|---|---|---|
+| `_safe_promoter_identity` | no | OCR over the filed PAN card | Treat an unverified candidate as a PAN |
+| `_safe_charge_movement` | no | One mirror fetch | Read a vanished charge as a satisfied one |
+| `_safe_state_footprint` | no | none (derived) | Imply a single-state group |
+| `_safe_group_rera_sweep` | `--group-sweep` | Several portals in sequence | Report "nothing found" for an authority that was never asked |
+| `_safe_group_gst` | `--group-gst` | **Two human CAPTCHA solves per entity** | Count an entity with no PAN as compliant |
+| `_safe_group_litigation` | `--group-litigation` | HTTP per name, plus register fetches | Render a name match as this promoter's litigation |
+
+Every one reports its own COVERAGE. The recurring failure this guards
+against, in every subsystem it has appeared in, is a check that could not
+run being read downstream as a check that found nothing.
 
 ### 8.6 Stage 10 — RERA summary PDF (`report.py`)
 
