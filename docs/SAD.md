@@ -428,316 +428,168 @@ There is no `tests/` package, no `conftest.py`, no CI configuration.
 ```
 ================================================================================
                  RERA SCRAPPER  --  END-TO-END PIPELINE
-                 entry: main.py::main()  |  11 stages
+              entry: main.py::main()  |  stages 0-11, six authorities
 ================================================================================
 
   [ENTRY]
-  +--------------------------+        +---------------------------+
-  |  main.py <REG_NO|name>   |        |  app.py  (Streamlit)      |
-  |  --gstin X | --pan Y     |        |  Run Scraper tab wraps    |
-  |  --headed --token T      |        |  the SAME functions       |
-  |  --no-auto-auth          |        |  (no duplicated logic)    |
-  |  --project-id N          |        +-------------+-------------+
-  |  --output-dir D --verify |                      |
-  +------------+-------------+                      |
-               +--------------------+---------------+
+  +----------------------------------+     +---------------------------+
+  |  main.py <REG_NO | project name> |     |  app.py  (Streamlit)      |
+  |  --state MH|GJ|KA|TG|JH|WB       |     |  Run Scraper tab calls    |
+  |  --group-sweep --group-gst       |     |  states...acquire(), the  |
+  |  --group-litigation              |     |  SAME method main.py does |
+  |  --gstin X | --pan Y             |     |  (~160 duplicated lines   |
+  |  --headed --token T              |     |   deleted; a test pins it)|
+  |  --no-auto-auth --project-id N   |     +-------------+-------------+
+  |  --output-dir D --verify         |                   |
+  +----------------+-----------------+                   |
+                   +------------------+------------------+
+                                      |
+                                      v
+     pipeline_start_time = time.time()      <-- fed to the Charter version log
+                                      |
+================================================================================
+  STAGE 0  --  WHICH AUTHORITY IS THIS?              states.candidate_profiles()
+================================================================================
+                                      v
+                        +-------------------------+
+                        |  --state given?         |--YES--> that profile wins,
+                        +------------+------------+         no detection at all
+                                     | NO
+                                     v
+                    match the query against EVERY registered
+                    profile's reg_no_pattern
+                                     |
+        +----------------------------+----------------------------+
+        | exactly one match          | TWO match                  | none
+        v                            v                            v
+   use that profile        MahaRERA and TG-RERA both        free-text name
+                           accept  ^P + 11 digits           -> default MH,
+                                     |                         announced
+                                     v
+                    *** PROBE BOTH. Whichever authority actually
+                        HOLDS the project wins. The district-code
+                        convention (P5.. vs P0..) only ORDERS the
+                        attempts -- it is an observed convention,
+                        not a published spec, and deciding on it
+                        alone would answer confidently and wrong.
+                        A firing heuristic is announced on stdout. ***
+                                     |
+                                     v
+                              StateProfile
+                    (name, acronym, regulator, reg-no
+                     pattern, CAPABILITIES)  --> facts["state"]
+                                              --> run_meta.json["state"]
+                                      |
+================================================================================
+  STAGES 1-6  --  ACQUIRE            states.get_adapter(code).acquire(query, ctx)
+                  ONE CALL: resolve, auth, scrape, documents,
+                  complaint orders, promoter portfolio
+================================================================================
+                                      v
+   +--------------------------------------------------------------------+
+   |  Why one coarse call rather than six seams:                        |
+   |    - Telangana cannot split resolve from auth; it CAPTCHA-gates    |
+   |      the search itself                                             |
+   |    - MahaRERA's 401/403 re-auth retry is MahaRERA's own            |
+   |      orchestration, not a shared stage                             |
+   |    - it is what let app.py stop duplicating the sequence           |
+   +--------------------------------+-----------------------------------+
                                     |
-                                    v
-  pipeline_start_time = time.time()   <-- fed to the Charter's version log
-                                    |
-================================================================================
-  STAGE 1  --  RESOLVE                                        resolver.py
-================================================================================
-                                    |
-             is query ^P\d{11}$ ?   |
-        +---------------------------+---------------------------+
-        | YES                                                   | NO
-        v                                                       v
-  --project-id given?                                   search_projects(name)
-     |          |                                               |
-   YES|        NO|                                        0 hits +--> exit(1)
-     |          v                                               |
-     |   resolve_project_id()                            1 hit  +--> use it
-     |   Playwright -> Drupal search                     N hits +--> interactive
-     |   read View Details href                                      pick
-     |   /public/project/view/(\d+)                       (no TTY -> exit(2))
-     |   *** never CLICKS the link:                              |
-     |       a click fires a JS confirm()                        |
-     |       and lands on the CAPTCHA page ***                   |
-     +----------------------+------------------------------------+
-                            v
-                (project_id, detail_url, reg_no)
-                            |
-================================================================================
-  STAGE 2  --  AUTH                     session_auth.py + token_cache.py
-================================================================================
-                            v
-              +-------------------------+
-              |  --token supplied?      |--YES--> auth_source = "explicit"
-              +------------+------------+
-                           | NO
-                           v
-              +-------------------------+
-              |  --no-auto-auth?        |--YES--> auth_source = "none"
-              +------------+------------+          (2 free categories only)
-                           | NO
-                           v
-              +-------------------------+
-              |  token_cache.load_valid |--HIT--> auth_source = "cached"
-              |  MAX_AGE_MINUTES = 90   |         (real TTL ~100 min;
-              |                         |          10 min safety margin)
-              +------------+------------+
-                           | MISS
-                           v
-              +-----------------------------------------------+
-              | acquire_token_via_browser()                   |
-              | headless=False  ALWAYS                        |
-              | goto /public/project/view/{id}                |
-              | fast path: read token once BEFORE prompting   |
-              | poll sessionStorage['tokens'].accessToken     |
-              |   every 2.0 s, up to 300 s                    |
-              |   status line every 30 s                      |
-              +--------------------+--------------------------+
-                    success        |          timeout / closed
-                       |           |                |
-                       v           |                v
-            auth_source =          |     CaptchaTimeoutError /
-            "fresh_browser"        |     BrowserClosedError
-            token_cache.save()     |     -> [WARN], continue
-                                   |     -> auth_source = "none"
+        +---------------+-----------+-----------+---------------+
+        v               v                       v               v
+   +---------+    +---------+             +---------+     +---------+
+   | MH      |    | GJ / KA |             | TG      |     | JH / WB |
+   | ALL 7   |    | no auth |             | name    |     | no auth |
+   | caps -- |    | no      |             | search  |     | no      |
+   | the     |    | CAPTCHA |             | only,   |     | CAPTCHA |
+   | ref.    |    |         |             | CAPTCHA |     |         |
+   | adapter |    |         |             | gated   |     |         |
+   +----+----+    +----+----+             +----+----+     +----+----+
+        |              |                       |               |
+        +--------------+-----------+-----------+---------------+
                                    v
-================================================================================
-  STAGE 3  --  ARCHIVE                                       run_archive.py
-================================================================================
-       *** ORDER IS LOAD-BEARING ***
-       1. load_prior_research()      <-- MUST be first: archiving moves
-                                          research/deep_research.json away
-       2. archive_previous_run()     <-- shutil.move (not copy) of the whole
-                                          output/<reg>/ tree into
-                                          output/_history/<reg>/<ts>/
-                                          collision -> _2, _3, ...
-       3. load_prior_manifest()      <-- MUST be after: reads FROM the archive
-          prior_documents_dir()
-          load_prior_complaint_orders_manifest()
-          prior_complaint_orders_dir()
-                                   |
-                       deep_research.reset_usage_log()
-                       (matters for app.py's long-lived process)
-                                   v
-================================================================================
-  STAGE 4  --  SCRAPE                                         api_client.py
-================================================================================
-   fetch_all_categories(project_id, raw_dir, token, errors_out=errors)
-
-        STEP A (serial, alone)          STEP B (parallel)
-   +------------------------+     +----------------------------------------+
-   | projects               |     | ThreadPoolExecutor(max_workers=8)      |
-   | getProjectGeneral      |---->| spocs . professionals . partners       |
-   |  DetailsByProjectId    |     | past_experiences . sro_details         |
-   | *** the ONLY endpoint  |     | documents . complaints . appeals       |
-   |     marked "confirmed" |     |                                        |
-   |     the other 8 are    |     | each worker: its OWN requests.Session  |
-   |     "observed"     *** |     | (Session thread-safety not guaranteed) |
-   |                        |     |                                        |
-   | carries userProfileId  |     | past_experiences needs userProfileId    |
-   | -> needed by           |     | from projects -> that is the ONE real  |
-   |    past_experiences    |     | ordering dependency                    |
-   +------------------------+     +----------------------------------------+
-                    |                              |
-                    +--------------+---------------+
-                                   v
-                    _unwrap_envelope(): responseObject / data /
-                    projects / content; a dict whose keys are a
-                    SUBSET of _ENVELOPE_ONLY_KEYS returns {}
-                    *** MahaRERA returns HTTP 200 with pure
-                        bookkeeping, e.g. {"message":"ERROR",
-                        "status":"0"} -- without this it renders
-                        as a fake data row ***
-                                   v
-                    write raw_dir/<category>.json
-                    (on failure writes {"_error":..,"status_code":..}
-                     so raw/ always has one file per category)
-                                   v
-              +----------------------------------------+
-              | gated categories that returned 401/403? |
-              +--------------+-------------------------+
-                             | YES and auth_source != "none"
-                             v
-              token_cache.invalidate() -> re-solve CAPTCHA
-              -> refetch ONLY the failed subset -> update
-              *** EXACTLY ONE RETRY. No backoff anywhere. ***
-                                   v
-================================================================================
-  STAGE 5  --  DOCUMENTS                            [complaint orders: NEVER FATAL]
-================================================================================
-   download_documents()                     download_complaint_orders()
-   +------------------------------+         +-----------------------------+
-   | ThreadPoolExecutor(8)        |         | SERIAL, one Session         |
-   | _MAX_DOCUMENT_DOWNLOAD_      |         | (complaint counts are small;|
-   |   WORKERS = 8                |         |  documents can be 100+)     |
-   |                              |         |                             |
-   | POST {"fileName","documentId"}         | reads orderDmsRefNo +       |
-   |   to the DMS path with bearer|         | orderFileName from BOTH     |
-   | *** NOT a static GET ***     |         | complaintDetails[] and      |
-   |                              |         | miscComplaintDetails[]      |
-   | Origin + Referer headers     |         |                             |
-   |   mimic the real detail page |         | "has always been present,   |
-   |                              |         |  it was simply never        |
-   | _sniff_and_save():           |         |  downloaded before"         |
-   |   Content-Type is a LIE --   |         +-----------------------------+
-   |   raw PDF bytes have been    |
-   |   observed labelled          |    manifest row schema:
-   |   application/json.          |    label . original_url . saved_filename
-   |   Trust JSON only if it      |    status . method . document_id
-   |   actually parses.           |    source_filename [+ complaint_id,
-   |                              |     complaint_registration_no]
-   | _dedupe_filename():          |
-   |   two DIFFERENT documents    |    status in {downloaded, reused, failed,
-   |   can share a filename       |    failed (HTTP n), failed (<exc>),
-   |   -> " (2)", " (3)" before   |    failed (couldn't resolve file bytes)}
-   |   the extension              |
-   |                              |    REUSE: prior manifest indexed by
-   | one threading.Lock guards    |    (document_id, source_filename) for
-   | seen_filenames + seen_urls   |    dms-post, by original_url for
-   +------------------------------+    direct-url -> shutil.copy2, status
-                                       "reused" (itself reusable -> chains)
-                                   v
-================================================================================
-  STAGE 6  --  PROMOTER PORTFOLIO                    [NEVER FATAL] own browser
-================================================================================
-   promoter name from partners.promoterDetails.promoterName
-   (projects.promoterName is null on every sample seen)
+   A CAPABILITY A STATE LACKS RETURNS THE EMPTY VALUE **PLUS A SENTENCE
+   IN notes** -- never a stub, never a shape that reads as
+   "checked, nothing found".  CAP_LOOKUP_BY_REG_NO / CAP_CATEGORY_API /
+   CAP_DOCUMENTS / CAP_SEPARATE_AUTH / CAP_PROMOTER_PORTFOLIO /
+   CAP_ORDERS_SEARCH / CAP_LAND_RECORDS
                                    |
                                    v
-   +-------------------------------------------------------------------+
-   | build_promoter_portfolio()                                        |
-   |  resolver.search_promoters()  -> promoter's whole RERA portfolio  |
-   |  cap: PROMOTER_PROJECT_LIMIT = 25  (never silent -> `truncated`)  |
-   |  per project: projects / complaints / appeals / past_experiences  |
-   |  geocode via OSM Nominatim, >= 1.1 s apart, per-run cache          |
-   |  5 km radius filter (haversine, r = 6371.0 km)                    |
-   |  a failed geocode is DROPPED, never treated as "0 km away"        |
-   |  self-exclusion by the ENTRY's own reg-no / exact name            |
-   |    (keying it on the fetch reg-no once destroyed real data        |
-   |     for single-project SPVs)                                      |
-   |  emits 7 standing limitations[] + an 8th when truncated           |
-   +-------------------------------------------------------------------+
-                                   v  -> output/<reg>/promoter/portfolio.json
+   AcquisitionResult { profile, reg_no, project_id, detail_url,
+                       category_data, documents_manifest, documents_dir,
+                       complaint_orders_manifest, promoter_name,
+                       promoter_portfolio, raw_record, auth_source,
+                       notes[] }
+                                   |
+        archiving stays with the CALLER via ctx.on_resolved, so the
+        adapter never owns the output tree
+                                   |
 ================================================================================
   STAGE 7  --  GST INTAKE                        [OPT-IN] [NEVER FATAL] [HUMAN]
 ================================================================================
-   only with --gstin or --pan (mutually exclusive)
-   placed HERE, not after deep research, because it is the LAST step
-   needing a human at the keyboard -- it sits beside the other browser work
+                                   v
+        needs --gstin or --pan.  PAN -> every GSTIN under it -> each
+        filing table -> gst_filing_input.json
+        ONE HUMAN CAPTCHA SOLVE PER LOOKUP, which is why it sits HERE,
+        beside the other browser work, and not after stage 8: deep
+        research runs unattended for minutes, so all human-attended
+        work is kept contiguous.
                                    |
-        format-validate BEFORE opening a browser (a typo must never
-        cost a human a CAPTCHA solve)
-                                   v
-   PAN --> search_gstins_by_pan()  [1 human CAPTCHA]
-        --> for each GSTIN: fetch_gstin_filing_table()  [1 human CAPTCHA each,
-            then ALL financial years walked in the same session]
-        --> parse_filing_table() -> GSTR-1 / GSTR-3B periods only
-            (CMP08, GSTR9/9C, GSTR1A deliberately NOT parsed: no statutory
-             due-date rule implemented, so scoring them would be a guess)
-        --> primary GSTIN = the one with the MOST periods
-            (schema is single-GSTIN; QRMP due dates are state-specific)
-        --> output/<reg>/gst_filing_input.json
-            *** an empty records:[] file is NEVER written -- the file's
-                existence means "GST data was supplied" ***
-                                   v
 ================================================================================
-  STAGE 8  --  DEEP RESEARCH                       [NEVER FATAL] unattended
+  STAGE 8  --  DEEP RESEARCH                        [NEVER FATAL] unattended
 ================================================================================
-   deep_research.run_deep_research(reg_no, category_data, out, prior_research)
-   +-------------------------------------------------------------------+
-   |  prior research < RESEARCH_REUSE_WINDOW_HOURS (24) ?              |
-   |     YES -> carry confirmed sources forward untouched (zero cost   |
-   |            for a block with no gaps); re-attempt ONLY open gaps   |
-   |     NO  -> full pass                                              |
-   +-------------------------------------------------------------------+
                                    v
-   _run_agentic_pass(label="research_generate")
-     client.beta.messages.tool_runner(model="claude-sonnet-5",
-       max_tokens=8000, tools=[{"type":"web_search_20260209",
-                                "name":"web_search"}])
-     runner is an ITERATOR -> one BetaMessage per turn -> list(runner)
-     usage recorded across ALL turns (each web_search round-trip is
-     separately billed; counting only the last would undercount)
-                                   v
-   three blocks: macro_market . micro_market . promoter_external
-   each: {summary, sections[{heading,body}], sources[{claim,url,
-          publisher,accessed_date}], gaps[str]}
-                                   v
-   _verify_block(): EVERY cited source re-checked, BATCHED --
-     _verify_claims_batch() checks up to BATCH_VERIFY_CHUNK_SIZE (10)
-     sources per call, sharing one BATCH_VERIFY_MAX_SEARCHES (10) search
-     budget, instead of one independent call per source
-     confirmed          -> keep
-     verification_error -> KEEP the source, append an honest gap
-                           "(NOT independently re-verified this pass ...)"
-     unsupported/stale  -> DROP the source into gaps
-                                   v
-   _resolve_gaps(): up to MAX_GAP_RETRY_ATTEMPTS = 2 rounds, each with a
-     DIFFERENT strategy (registry/official filing; related-party angle) --
-     _retry_gaps_batch() retries EVERY gap still open in a round in ONE
-     call sharing one BATCH_GAP_RETRY_MAX_SEARCHES (10) search budget,
-     instead of one call per gap per attempt
-     retry results are themselves re-verified (_verify_claims_batch) before
-     merging; a shared _VerificationBudget (MAX_RESEARCH_VERIFICATION_
-     CALLS = 15) still caps the total batched-call count across all three
-     blocks combined, as a backstop for an unusually large block/gap count
-     unresolved -> "(retried N alternate approach(es), not confirmed)"
-     *** never fabricated away just to make the list shorter ***
-                                   v
-   EVERY call in this stage funnels through _run_agentic_pass, which
-   refuses to even START a call once this run's total spend (across
-   deep research AND Charter generation) is >= PIPELINE_COST_CAP_USD
-   ($6.00) -- raises CostCapExceeded, never retried, degrades this
-   stage exactly like a missing ANTHROPIC_API_KEY would
-                                   v
-                 output/<reg>/research/deep_research.json
-                 stamped _generated_at + _reused_prior
-                                   v
-================================================================================
-  STAGE 9  --  COMPANY CHARTER                                 [NEVER FATAL]
-================================================================================
-                     see section 9 for the full internal view
-                     company_charter.run_company_charter(...)
+        deep_research.py -- the SINGLE transport for every Claude API
+        call.  Agentic web search, per-claim verification, bounded gap
+        retry, shared _VerificationBudget, PIPELINE_COST_CAP_USD ceiling
+        that REFUSES a call rather than starting it.
                                    |
+================================================================================
+  STAGE 9  --  COMPANY CHARTER                                  [NEVER FATAL]
+================================================================================
                                    v
-       output/company_charters/Company_Charter_<Name>_<REG>_Internal.pdf
-                                   ..._External.pdf
-                                   ....facts.json
-                                   Company_Charter_<REG>_claude_md_review.json
+   9.1  Assemble facts (registry chains, insolvency, doc grounding).
+        rules.md Section B is injected into every content call.
+                                   |
+   9.2  [OPT-IN] CTS land lookup     [OPT-IN] GST compliance check
+                                   |
+   9.2b CODE-COMPUTED GROUP PASSES -- never model-authored, each
+        writing its own facts key AND rendering its own section
+        (a test pins both halves: three capabilities were once built,
+         tested, and consumed by nothing)
+        +------------------------------------------------------------+
+        | _safe_promoter_identity   PAN off the filed card            |
+        | _safe_charge_movement     borrowing moved since last run    |
+        | _safe_state_footprint     registered vs actually built      |
+        | _safe_group_rera_sweep    [--group-sweep]                   |
+        | _safe_group_gst           [--group-gst]  2 CAPTCHAs/entity  |
+        | _safe_group_litigation    [--group-litigation]              |
+        +------------------------------------------------------------+
+        EVERY ONE REPORTS ITS OWN COVERAGE.  Absence of a finding
+        never means absence of a check -- the defect this pipeline
+        has met in every subsystem it has been built into.
+                                   |
+   9.3  Source-trust bookkeeping    9.4  Per-finding research
+                                   |
+   9.5  _fill_template  INTERNAL first (real facts, scores persisted),
+        then EXTERNAL (from _externalized_facts_copy)
+        each: preflight -> normalize -> scrub -> sanitize -> GATE
+                                   |
+   9.6  run_claude_md_document_review  -- STRICT: no PDF unless SHOWN
+        to comply. A review that could not run is a FAILURE.
+                                   |
+   9.7  _convert_docx_to_pdf on both.  *** THE PDF IS THE DELIVERABLE ***
+   9.8  restore scrubbed text, persist .facts.json
+                                   |
+================================================================================
+  STAGE 10  --  RERA SUMMARY PDF                                     report.py
+  STAGE 11  --  RUN SUMMARY + USAGE LOG                                main.py
+================================================================================
                                    v
-================================================================================
-  STAGE 10  --  RERA SUMMARY PDF                                    report.py
-================================================================================
-   build_pdf() -- ReportLab, no native deps
-   cover -> Project Details -> Company Charter Highlights -> Promoter Profile
-   -> Market Research -> remaining CATEGORY_ORDER categories
-   -> output/<reg>/<REG_NO>_summary.pdf
-   *** a DIFFERENT document from the Charter. Do not confuse them. ***
-                                   v
-================================================================================
-  STAGE 11  --  RUN SUMMARY + USAGE LOG                              main.py
-================================================================================
-   also persists documents_manifest.json + run_meta.json
-   write_usage_log() -> output/<reg>/usage_summary.json
-                     -> append one rollup line to output/usage_log.jsonl
-   prints: auth source, per-category counts, documents downloaded,
-           promoter_profile, market_research, gst_filing_intake,
-           company_charter, claude_api_usage (calls / tokens / $ by label)
-================================================================================
-
-  SIDE PATH  --  manual, opt-in, never auto-run
-  +----------------------------------------------------------------------+
-  | mahabhumi.py -- CTS -> Maha Bhulekh Property Card                     |
-  | Requires a human to drop output/<reg>/cts_lookup_input.json with the  |
-  | office/village pre-resolved (python cts_resolve.py offices/villages/  |
-  | candidates/finalize), because the site's CAPTCHA has NO reusable      |
-  | session -- solving it blocks on a human on EVERY call.                |
-  +----------------------------------------------------------------------+
+        report.build_pdf() -- the project report, NOT the Charter
+        summarise_category_health() -- a declared absence is reported
+        as an absence, never as a failed fetch
+        write_usage_log() -> usage_summary.json (per-label cost ledger)
 ```
 
 ---
