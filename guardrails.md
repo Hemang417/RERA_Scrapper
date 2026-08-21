@@ -153,6 +153,37 @@ it did not -- but its portal answered every attempt with an empty BigPipe shell;
 no party named in any column; **GujRERA and JHARERA** are single-page apps whose
 order pages need JavaScript; **TG-RERA** publishes no such register.
 
+**WBRERA's orders are joined through its cause lists** (`wb_orders.py`). Its
+register publishes 4,881 authority orders and names NO party in any column --
+only a complaint number. The promoter is inside each order PDF, and at ~900 KB
+each, 4,881 of them is over 4 GB. The cause lists DO name the parties against
+each complaint number, so they supply the join. Three guards, all necessary:
+
+- **`resolve_complaint_no` resolves against a CLOSED SET.** The cause-list PDFs
+  carry a poor OCR text layer that mangles exactly the join field --
+  `WBRERA/COMOO2117` for 002117, `WBRERAJCOMOOOTS4` for 000754. Correcting those
+  characters freely would be inventing a complaint number; resolving them against
+  the 1,157 real numbers the order register publishes picks an existing one
+  instead. **Two candidates means none** -- attaching an order to the wrong
+  promoter is worse than reporting one fewer. Measured live: six of seven
+  resolved uniquely, the seventh had no order at all (a pending hearing).
+- **No name is labelled "respondent".** The OCR does not preserve columns: names
+  wrap mid-title and hearing labels interleave, so "the last name in the run"
+  read PAPPU SINGH as the respondent of a complaint answered by SK BUILDERS AND
+  DEVELOPERS PVT. LIMITED. The block is kept whole and the promoter is matched by
+  PROXIMITY inside it, which makes every row a candidate -- a promoter appearing
+  as COMPLAINANT would match too.
+- **`coverage_note` says how few cause lists were read.** Reading all of them is
+  565 PDFs; the default reads the most recent slice. An unread cause list is a
+  silently missing order, and a short answer here looks exactly like a promoter
+  with a clean record.
+
+The cause-list PDFs are fetched with a PLAIN `requests` session, never the
+legacy-TLS pool -- the same reason `_download_documents` uses one. They sit on a
+different host over plain HTTP, and urllib3 rejects `assert_hostname` on a
+non-TLS connection, so through the pool every PDF failed and the join reported
+"0 of 565 cause lists read". The coverage line is what surfaced it.
+
 **JHARERA's order register** is `/Home/judgement_order` -- the whole state in one
 request, 228 entries. It names BOTH parties in a single column and writes the
 separator four ways ("Vs", "-Vs-", "V/s", "versus"); handling only the first

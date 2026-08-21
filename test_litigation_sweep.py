@@ -364,6 +364,20 @@ def test_gujrera_judgements_are_behind_a_login_and_that_is_recorded():
     print("test_gujrera_judgements_are_behind_a_login_and_that_is_recorded: PASS")
 
 
+def test_wbrera_is_joined_through_its_cause_lists():
+    """WBRERA names NO party in its order register -- 4,881 orders keyed
+    only by complaint number. The join runs through its cause lists,
+    which do name the parties, so the coverage line matters more here
+    than the rows: a promoter whose complaint appears in no cause list
+    read this pass simply cannot be found, and that is not an absence
+    of orders against them."""
+    joined_searchable = " ".join(ls.ORDERS_SEARCHABLE)
+    assert "WBRERA" in joined_searchable, ls.ORDERS_SEARCHABLE
+    assert "cause lists" in joined_searchable, ls.ORDERS_SEARCHABLE
+    assert "WBRERA" not in " ".join(ls.ORDERS_NOT_SEARCHABLE)
+    print("test_wbrera_is_joined_through_its_cause_lists: PASS")
+
+
 def test_why_each_authority_is_unsearchable_is_stated_not_assumed():
     """Each of these was PROBED on 2026-08-21, not assumed. MahaRERA does
     accept a respondent (promoter) name -- an earlier note in this repo
@@ -373,7 +387,6 @@ def test_why_each_authority_is_unsearchable_is_stated_not_assumed():
     session re-deriving it, and stops a reader treating silence as a clean
     record."""
     joined = " ".join(ls.ORDERS_NOT_SEARCHABLE)
-    assert "4,881" in joined and "complaint number" in joined, joined
     print("test_why_each_authority_is_unsearchable_is_stated_not_assumed: PASS")
 
 
@@ -434,6 +447,7 @@ if __name__ == "__main__":
     test_the_maharera_request_carries_what_the_form_actually_needs()
     test_jharkhand_splits_both_parties_out_of_one_column()
     test_gujrera_judgements_are_behind_a_login_and_that_is_recorded()
+    test_wbrera_is_joined_through_its_cause_lists()
     test_why_each_authority_is_unsearchable_is_stated_not_assumed()
     test_a_maharera_shell_response_is_not_an_absence_of_orders()
     test_the_group_litigation_stage_is_opt_in_and_silent_when_off()

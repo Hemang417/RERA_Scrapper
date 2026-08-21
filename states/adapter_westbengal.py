@@ -34,7 +34,15 @@ from .base import (
     safe_document_filename,
     storage_key,
 )
-from .westbengal import BASE_URL, PROFILE, PROJECT_DETAIL, STATE_INDEX
+from .westbengal import (
+    BASE_URL,
+    CAUSE_LIST,
+    DEFAULTERS,
+    ORDER_REGISTER,
+    PROFILE,
+    PROJECT_DETAIL,
+    STATE_INDEX,
+)
 
 urllib3.disable_warnings()
 
@@ -88,6 +96,131 @@ def _get(pool, url, ctx, what="page"):
             f"WBRERA {what} could not be fetched: {e}. The portal appears to be unreachable "
             f"right now; this is not a problem with the project or the registration number."
         ) from e
+
+
+# Reading every cause list is 565 PDFs of roughly 250 KB. The default is
+# the most recent slice; whatever is not read is reported, never implied.
+DEFAULT_CAUSE_LISTS = 25
+_WB_CACHE = {}
+
+
+def _fetch_text(url):
+    pool = _pool()
+    return fetch_with_retry(
+        lambda: pool.request("GET", url, timeout=_TIMEOUT, redirect=True).data.decode("utf-8", "replace"),
+        what="WBRERA page",
+    )
+
+
+def fetch_order_register(fetcher=None):
+    """WBRERA's 4,881 authority orders, keyed by complaint number."""
+    if "orders" in _WB_CACHE and fetcher is None:
+        return _WB_CACHE["orders"]
+    import wb_orders
+
+    html = fetcher() if fetcher else _fetch_text(ORDER_REGISTER)
+    parsed = wb_orders.parse_order_register(html)
+    if fetcher is None:
+        _WB_CACHE["orders"] = parsed
+    return parsed
+
+
+def cause_list_urls(fetcher=None):
+    """Every cause-list PDF link, newest first (the page is in that order)."""
+    from bs4 import BeautifulSoup
+
+    html = fetcher() if fetcher else _fetch_text(CAUSE_LIST)
+    table = BeautifulSoup(html or "", "html.parser").find("table")
+    if not table:
+        return []
+    return [a["href"] for row in table.find_all("tr")[1:]
+            for a in row.find_all("a", href=True)]
+
+
+def fetch_cause_list_texts(limit=DEFAULT_CAUSE_LISTS, urls=None, pdf_fetcher=None):
+    """Text of the most recent `limit` cause lists, and how many exist.
+
+    Returns (texts, total). The total is what makes the shortfall visible:
+    a promoter's orders are reachable only through the lists actually read.
+    A PDF that fails is skipped rather than aborting -- one bad document
+    must not cost the whole join -- and is simply absent from `texts`,
+    which the coverage note accounts for.
+    """
+    import fitz
+
+    urls = cause_list_urls() if urls is None else urls
+    total = len(urls)
+    # A PLAIN requests session, NOT the legacy-TLS pool -- the same reason
+    # _download_documents uses one. The cause lists live on a different
+    # host over plain HTTP, and urllib3 rejects assert_hostname on a
+    # non-TLS connection with a TypeError. Through the pool, every single
+    # PDF failed and the join reported "0 of 565 cause lists read".
+    session = None
+    if pdf_fetcher is None:
+        session = requests.Session()
+        session.verify = False
+        session.headers.update({"User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+        )})
+    texts = []
+    for url in urls[:max(0, int(limit or 0))]:
+        try:
+            if pdf_fetcher is not None:
+                raw = pdf_fetcher(url)
+            else:
+                raw = session.get(url, timeout=_TIMEOUT).content
+            with fitz.open(stream=raw, filetype="pdf") as document:
+                texts.append(chr(10).join(page.get_text() for page in document))
+        except Exception:
+            continue
+    return texts, total
+
+
+def search_orders_by_promoter(name, limit=DEFAULT_CAUSE_LISTS):
+    """WBRERA orders whose complaint names this promoter in a cause list.
+
+    Returns {"entries", "coverage"}. Every entry is a CANDIDATE: the OCR
+    text layer does not preserve the cause list's columns, so the promoter
+    is matched by proximity within its complaint's block and could in
+    principle be the complainant. See wb_orders for the whole argument.
+    """
+    import wb_orders
+
+    orders = fetch_order_register()
+    key = ("cause", int(limit or 0))
+    if key not in _WB_CACHE:
+        _WB_CACHE[key] = fetch_cause_list_texts(limit)
+    texts, total = _WB_CACHE[key]
+    index = wb_orders.build_complaint_index(texts)
+    return {
+        "entries": wb_orders.orders_for_promoter(name, orders, index),
+        "coverage": wb_orders.coverage_note(orders, len(texts), total, index),
+    }
+
+
+def fetch_defaulters(fetcher=None):
+    """WBRERA's rejected/defaulting applications, keyed by NAME.
+
+    Small, cheap and directly useful -- unlike the orders, this register
+    names the party outright.
+    """
+    from bs4 import BeautifulSoup
+
+    html = fetcher() if fetcher else _fetch_text(DEFAULTERS)
+    table = BeautifulSoup(html or "", "html.parser").find("table")
+    if not table:
+        return []
+    rows = table.find_all("tr")
+    headers = [" ".join(c.get_text(" ", strip=True).split()).lower()
+               for c in rows[0].find_all(["th", "td"])]
+    out = []
+    for row in rows[1:]:
+        cells = [" ".join(c.get_text(" ", strip=True).split()) for c in row.find_all("td")]
+        if not any(cells):
+            continue
+        out.append({headers[i]: cells[i] for i in range(min(len(headers), len(cells)))})
+    return out
 
 
 def _labelled_rows(table):

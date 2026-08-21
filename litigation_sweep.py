@@ -239,14 +239,13 @@ def sweep(graph, directors=None, known_places=None, searcher=None,
 # Which RERA authorities' own order registers this pipeline can search by
 # promoter name, and which it cannot. The second list is the important one:
 # a group with orders against it in Maharashtra would not show up here.
-ORDERS_SEARCHABLE = ("Karnataka (K-RERA)", "MahaRERA", "JHARERA")
+ORDERS_SEARCHABLE = ("Karnataka (K-RERA)", "MahaRERA", "JHARERA",
+                     "WBRERA (via its cause lists -- see below)")
 
 # Why each of the others is not, established by probing them on 2026-08-21
 # rather than assumed. These are source limits, not findings about any
 # promoter, and the section says so.
 ORDERS_NOT_SEARCHABLE = (
-    "WBRERA -- publishes 4,881 authority orders, but keyed only by complaint "
-    "number, with no promoter or party named in any column",
     "GujRERA -- its e-court judgement endpoint is complain/SECURE/complaint-"
     "judgments-Details and returns 'Invalid Request' without a login; only "
     "complaint COUNTS are public",
@@ -273,6 +272,7 @@ def state_order_sweep(graph, searcher=None, register_coverage=None):
     subjects = [s for s in _subjects(graph) if s["kind"] == SUBJECT_ENTITY]
     maharera = None
     jharkhand = None
+    westbengal = None
     if searcher is None:
         from states import adapter_karnataka
 
@@ -286,6 +286,9 @@ def state_order_sweep(graph, searcher=None, register_coverage=None):
         from states import adapter_jharkhand
 
         jharkhand = adapter_jharkhand.search_orders_by_promoter
+        from states import adapter_westbengal
+
+        westbengal = adapter_westbengal.search_orders_by_promoter
 
     entries, limitations = [], []
     searched = 0
@@ -318,6 +321,33 @@ def state_order_sweep(graph, searcher=None, register_coverage=None):
                     "detail": row.get("complaint_type") or "",
                     "penalty_amount": "",
                 })
+        if westbengal is not None:
+            # WBRERA names no party in its order register at all; the join
+            # runs through its cause lists, so the coverage line matters
+            # more here than the rows do.
+            try:
+                found = westbengal(subject["name"]) or {}
+                if found.get("coverage"):
+                    note = found["coverage"]
+                    if note not in limitations:
+                        limitations.append(note)
+                for row in found.get("entries") or []:
+                    entries.append({
+                        "authority": "WBRERA",
+                        "register": "Authority orders (joined via cause list)",
+                        "searched_name": subject["name"],
+                        "application_no": "WBRERA/COM " + (row.get("complaint_no") or ""),
+                        "order_date": row.get("dated") or "",
+                        "project_name": "",
+                        "promoter_name": row.get("matched_promoter") or "",
+                        "detail": row.get("description") or "",
+                        "penalty_amount": "",
+                    })
+            except Exception as e:
+                limitations.append(
+                    f"WBRERA's order register could not be joined for "
+                    f"{subject['name']} this pass: {type(e).__name__}: {e}"
+                )
         if jharkhand is not None:
             try:
                 for row in jharkhand(subject["name"]) or []:

@@ -51,6 +51,18 @@ BASE_URL = "https://rera.wb.gov.in"
 STATE_INDEX = BASE_URL + "/district_project.php?dcode=0"
 PROJECT_DETAIL = BASE_URL + "/project_details.php?procode={}"
 AGENT_LIST = BASE_URL + "/agent_list.php?dcode=0"
+# WBRERA's ORDER REGISTER: 4,881 orders in one request, but keyed ONLY by
+# complaint number -- no party is named in any column. The promoter is
+# inside the order PDF, and at ~900 KB each those are not sweepable.
+ORDER_REGISTER = BASE_URL + "/authority_order.php"
+AUTHORITY_DECISIONS = BASE_URL + "/authority_decisions.php"
+# The CAUSE LISTS are what make the register joinable: each PDF tabulates
+# Complaint No. / Complainant / Respondent, so they map a complaint number
+# to the promoter it was filed against.
+CAUSE_LIST = BASE_URL + "/cause_list.php"
+# 17 rejected/defaulting applications, keyed by NAME. Cheap and directly
+# useful, unlike the orders.
+DEFAULTERS = BASE_URL + "/defaulter.php"
 
 PROFILE = StateProfile(
     code="WB",
