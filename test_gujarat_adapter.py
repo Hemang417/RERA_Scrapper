@@ -204,7 +204,152 @@ def test_live_every_manifest_row_has_its_own_file():
     print("test_live_every_manifest_row_has_its_own_file: PASS")
 
 
+# --- opening one project -------------------------------------------------
+#
+# Gujarat cannot be SEARCHED by promoter -- that is settled and stated in
+# group_sweep._CANNOT_SEARCH. Being unable to OPEN a project was a separate
+# gap: a GujRERA registration arriving from any other source (a promoter's
+# declared past project, an address in a past-experience row, a human) had
+# nowhere to go. These guard the open.
+
+def _gj_restore(saved):
+    from states import adapter_gujarat as gj
+
+    gj.search, gj._get, gj._pool = saved
+
+
+def _gj_saved():
+    from states import adapter_gujarat as gj
+
+    return (gj.search, gj._get, gj._pool)
+
+
+_GJ_DETAILS = {
+    "projectDetail": {"projectName": "AALEKH BUNGALOWS - A", "distName": "Surat"},
+    "dev": [{"name": "AALEKH ENTERPRISE"}],
+    "acrchlist": [{"name": "SOME ARCHITECT"}],
+}
+_GJ_PREV = {"pervlist": [{"projectName": "EARLIER ONE"}], "gujrera": [{"projectName": "AND TWO"}]}
+
+
+def test_gujarat_opens_a_project_by_its_registration_number():
+    from states import adapter_gujarat as gj
+
+    saved = _gj_saved()
+    gj.search = lambda pool, q, size=100: [
+        {"entityType": "PROJECT", "entityId": "17020", "regNo": _SAMPLE_REG_NO},
+        {"entityType": "PROMOTER", "entityId": "999", "regNo": ""},
+    ]
+    gj._get = lambda pool, path: (
+        _GJ_DETAILS if "getproject-details" in path
+        else _GJ_PREV if "getprev-project-list" in path else {}
+    )
+    gj._pool = lambda: None
+    try:
+        summary = gj.fetch_project_summary(_SAMPLE_REG_NO)
+    finally:
+        _gj_restore(saved)
+
+    assert summary["opened"] is True, summary
+    assert summary["promoter_name"] == "AALEKH ENTERPRISE", summary
+    assert summary["project_name"] == "AALEKH BUNGALOWS - A", summary
+    assert summary["district"] == "Surat", summary
+    # A PROMOTER row in the same search result must not be mistaken for the
+    # project -- their entityId is an application id, not a promoter key.
+    assert summary["project_id"] == "17020", summary
+    print("test_gujarat_opens_a_project_by_its_registration_number: PASS")
+
+
+def test_gujarat_surfaces_the_past_projects_only_this_page_carries():
+    """The reason the open earns its place. Gujarat cannot be searched by
+    promoter, so `getprev-project-list` is the ONLY route to registrations
+    the promoter built before this one."""
+    from states import adapter_gujarat as gj
+
+    saved = _gj_saved()
+    gj.search = lambda pool, q, size=100: [
+        {"entityType": "PROJECT", "entityId": "17020", "regNo": _SAMPLE_REG_NO}]
+    gj._get = lambda pool, path: (
+        _GJ_DETAILS if "getproject-details" in path
+        else _GJ_PREV if "getprev-project-list" in path else {}
+    )
+    gj._pool = lambda: None
+    try:
+        summary = gj.fetch_project_summary(_SAMPLE_REG_NO)
+    finally:
+        _gj_restore(saved)
+
+    assert len(summary["declared_other_projects"]) == 2, summary["declared_other_projects"]
+    assert any("would not otherwise have been found" in n for n in summary["notes"]), \
+        summary["notes"]
+    print("test_gujarat_surfaces_the_past_projects_only_this_page_carries: PASS")
+
+
+def test_gujarat_never_guesses_between_several_matches():
+    """There is no reporter to ask inside a sweep, and picking the first row
+    would attribute another project's filings to this reference."""
+    from states import adapter_gujarat as gj
+
+    saved = _gj_saved()
+    gj.search = lambda pool, q, size=100: [
+        {"entityType": "PROJECT", "entityId": "1", "regNo": "PR/GJ/A"},
+        {"entityType": "PROJECT", "entityId": "2", "regNo": "PR/GJ/B"},
+    ]
+    gj._pool = lambda: None
+    try:
+        summary = gj.fetch_project_summary("AALEKH")
+    finally:
+        _gj_restore(saved)
+
+    assert summary["opened"] is False, summary
+    assert "NOT opened rather than guessed at" in summary["note"], summary["note"]
+    print("test_gujarat_never_guesses_between_several_matches: PASS")
+
+
+def test_gujarat_an_empty_record_is_not_a_project_with_nothing_filed():
+    from states import adapter_gujarat as gj
+
+    saved = _gj_saved()
+    gj.search = lambda pool, q, size=100: [
+        {"entityType": "PROJECT", "entityId": "17020", "regNo": _SAMPLE_REG_NO}]
+    gj._get = lambda pool, path: {}
+    gj._pool = lambda: None
+    try:
+        summary = gj.fetch_project_summary(_SAMPLE_REG_NO)
+    finally:
+        _gj_restore(saved)
+
+    assert summary["opened"] is False, summary
+    assert "no such record" in summary["note"], summary["note"]
+    print("test_gujarat_an_empty_record_is_not_a_project_with_nothing_filed: PASS")
+
+
+def test_gujarat_complaints_stay_unknown_when_a_project_is_opened():
+    """Opening the project must not quietly imply a clean complaint record:
+    GujRERA publishes no name-searchable complaint register at all."""
+    from states import adapter_gujarat as gj
+
+    saved = _gj_saved()
+    gj.search = lambda pool, q, size=100: [
+        {"entityType": "PROJECT", "entityId": "17020", "regNo": _SAMPLE_REG_NO}]
+    gj._get = lambda pool, path: (_GJ_DETAILS if "getproject-details" in path else {})
+    gj._pool = lambda: None
+    try:
+        summary = gj.fetch_project_summary(_SAMPLE_REG_NO)
+    finally:
+        _gj_restore(saved)
+
+    assert any("UNKNOWN" in n and "not be read as a clean record" in n
+               for n in summary["notes"]), summary["notes"]
+    print("test_gujarat_complaints_stay_unknown_when_a_project_is_opened: PASS")
+
+
 if __name__ == "__main__":
+    test_gujarat_opens_a_project_by_its_registration_number()
+    test_gujarat_surfaces_the_past_projects_only_this_page_carries()
+    test_gujarat_never_guesses_between_several_matches()
+    test_gujarat_an_empty_record_is_not_a_project_with_nothing_filed()
+    test_gujarat_complaints_stay_unknown_when_a_project_is_opened()
     test_the_registration_format_is_unambiguous()
     test_the_storage_key_is_flat_but_the_real_number_survives()
     test_document_entries_pair_uid_with_a_readable_label()

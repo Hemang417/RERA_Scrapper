@@ -55,7 +55,13 @@ import ssl
 
 import urllib3
 
-from .base import AcquisitionResult, StateResolutionError, fetch_with_retry, storage_key
+from .base import (
+    AcquisitionResult,
+    StateFetchError,
+    StateResolutionError,
+    fetch_with_retry,
+    storage_key,
+)
 from .gujarat import DMS_DOWNLOAD_URL, DMS_METADATA_URL, PROFILE, PROJECT_REG_API
 
 _TIMEOUT = 30
@@ -145,6 +151,110 @@ def _prettify(camel: str) -> str:
     better than showing the reader a raw camelCase key."""
     spaced = re.sub(r"(?<!^)(?=[A-Z])", " ", camel.rstrip("_")).replace("_", " ")
     return spaced[:1].upper() + spaced[1:].lower()
+
+
+class _NullReporter:
+    def info(self, *a, **k): pass
+    def warn(self, *a, **k): pass
+    def ok(self, *a, **k): pass
+    def choose(self, *a, **k): return None
+
+
+def fetch_project_summary(project_ref, reporter=None):
+    """Open ONE Gujarat project by its registration number or entity id.
+
+    GUJARAT IS NOT SEARCHABLE BY PROMOTER, AND THIS IS NOT THAT. GujRERA
+    publishes no promoter-to-projects link -- searching a known promoter
+    returns zero projects and `projectAllApplications/<id>` comes back
+    empty -- so `group_sweep` cannot produce Gujarat hits and says so
+    (`_CANNOT_SEARCH["GJ"]`). What this adds is the other half: a Gujarat
+    registration arriving from any OTHER source can now be opened and read
+    rather than listed and left unconfirmed.
+
+    The declared past-project list is the reason it earns its place here.
+    `getprev-project-list` is where a Gujarat promoter states the projects
+    they built before this one -- registrations this pipeline could not
+    otherwise discover in a state it cannot search.
+
+    Never raises: one unreachable project must not sink the pass.
+    """
+    reporter = reporter or _NullReporter()
+    needle = " ".join(str(project_ref or "").split())
+    if not needle:
+        return {"opened": False, "note": "No GujRERA project reference was carried."}
+
+    pool = _pool()
+    entity_id, registration_number = None, ""
+    # An entity id is a bare integer; anything else has to be searched for.
+    if needle.isdigit():
+        entity_id = needle
+    else:
+        try:
+            rows = fetch_with_retry(lambda: search(pool, needle), what="GujRERA search")
+        except StateFetchError as e:
+            return {"opened": False,
+                    "note": f"GujRERA could not be searched for '{project_ref}' "
+                            f"({type(e).__name__}), so this project was NOT opened."}
+        projects = [r for r in rows if r.get("entityType") == "PROJECT"]
+        if not projects:
+            return {"opened": False,
+                    "note": f"'{project_ref}' returned no project on GujRERA's search."}
+        if len(projects) > 1:
+            # No reporter to ask, and guessing would attribute another
+            # project's filings to this reference.
+            exact = [p for p in projects
+                     if (p.get("regNo") or "").strip().casefold() == needle.casefold()]
+            if len(exact) != 1:
+                return {"opened": False,
+                        "note": (f"'{project_ref}' matched {len(projects)} GujRERA projects "
+                                 f"and none of them exactly. It was NOT opened rather than "
+                                 f"guessed at.")}
+            projects = exact
+        entity_id = projects[0]["entityId"]
+        registration_number = (projects[0].get("regNo") or "").strip()
+
+    try:
+        details = fetch_with_retry(
+            lambda: _get(pool, f"public/getproject-details/{entity_id}"),
+            what="GujRERA project detail",
+        ) or {}
+        alldata = _get(pool, f"public/alldatabyprojectid/{entity_id}") or {}
+        prev = _get(pool, f"public/getprev-project-list/{entity_id}") or {}
+    except StateFetchError as e:
+        return {"opened": False,
+                "note": f"GujRERA's record for '{project_ref}' could not be read "
+                        f"({type(e).__name__})."}
+
+    project = details.get("projectDetail") or alldata or {}
+    if not project:
+        return {"opened": False,
+                "note": (f"GujRERA served no project record for '{project_ref}'. This is "
+                         f"'no such record', not a project with nothing filed.")}
+
+    declared_previous = (prev.get("pervlist") or []) + (prev.get("gujrera") or [])
+    notes = [
+        "GujRERA publishes no name-searchable complaint or appeal register, so complaints "
+        "and orders against this promoter are UNKNOWN from this authority. That must not be "
+        "read as a clean record.",
+    ]
+    if declared_previous:
+        notes.append(
+            f"The promoter declared {len(declared_previous)} earlier project(s) on this "
+            f"project's own GujRERA filing. Gujarat cannot be searched by promoter, so these "
+            f"are registrations that would not otherwise have been found."
+        )
+    return {
+        "opened": True,
+        "promoter_name": _promoter_name(alldata, details) or "",
+        "promoter_details": _promoter_details(alldata, details),
+        "project_name": (project.get("projectName") or project.get("entityName") or "").strip(),
+        "reg_no": registration_number or (project.get("regNo") or "").strip(),
+        "project_id": str(entity_id),
+        "district": project.get("distName") or project.get("districtName") or "",
+        "professionals": _professionals(details),
+        "declared_other_projects": declared_previous,
+        "notes": notes,
+    }
 
 
 class GujaratAdapter:

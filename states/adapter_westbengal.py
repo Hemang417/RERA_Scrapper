@@ -401,6 +401,104 @@ def document_entries(html):
     return entries
 
 
+class _NullReporter:
+    def info(self, *a, **k): pass
+    def warn(self, *a, **k): pass
+    def ok(self, *a, **k): pass
+    def choose(self, *a, **k): return None
+
+
+class _NullCtx:
+    """`_get` reports retries through ctx.reporter, and the sweep has no
+    reporter to give it."""
+    reporter = _NullReporter()
+
+
+_INDEX_CACHE = []
+
+
+def _index(ctx=None):
+    if not _INDEX_CACHE:
+        _INDEX_CACHE.extend(parse_state_index(
+            _get(_pool(), STATE_INDEX, ctx or _NullCtx(), what="state register")
+        ))
+    return _INDEX_CACHE
+
+
+def fetch_project_summary(project_ref, reporter=None):
+    """Open ONE West Bengal project by its registration number, project id
+    or procode.
+
+    WEST BENGAL IS NOT SEARCHABLE BY PROMOTER, AND THIS IS NOT THAT.
+    WBRERA's index does not name the promoter, so `group_sweep` cannot
+    produce WB hits at all and says so (`_CANNOT_SEARCH["WB"]`). What this
+    adds is the other half: a WB registration arriving from ANY other
+    source -- a promoter's declared past project, an address in a
+    past-experience row, a human -- can now be opened and read instead of
+    being listed and left unconfirmed.
+
+    That gap mattered here more than elsewhere, because the promoter's own
+    page is where WBRERA puts the promoter name. Opening the project is the
+    ONLY way to attach a West Bengal registration to a name.
+
+    Never raises: one unreachable project must not sink the pass.
+    """
+    reporter = reporter or _NullReporter()
+    needle = " ".join(str(project_ref or "").split()).casefold()
+    if not needle:
+        return {"opened": False, "note": "No WBRERA project reference was carried."}
+
+    try:
+        index = _index()
+    except StateFetchError as e:
+        return {"opened": False,
+                "note": f"WBRERA's register could not be read ({type(e).__name__}), so this "
+                        f"project was NOT opened and nothing was established about it."}
+    if not index:
+        return {"opened": False,
+                "note": "WBRERA's register returned no projects at all, which means it could "
+                        "not be read rather than that West Bengal has none."}
+
+    entry = next(
+        (e for e in index
+         if needle in (e["reg_no"].casefold(), e["project_id"].casefold(),
+                       str(e["procode"]).casefold())),
+        None,
+    )
+    if entry is None:
+        return {"opened": False,
+                "note": (f"'{project_ref}' is not in WBRERA's register of {len(index)} "
+                         f"projects. Note that West Bengal ran its own HIRA statute until the "
+                         f"Supreme Court struck it down in May 2021, so a genuine pre-2021 "
+                         f"West Bengal project may have no WBRERA record at all.")}
+
+    try:
+        parsed = parse_project_detail(
+            _get(_pool(), PROJECT_DETAIL.format(entry["procode"]), _NullCtx(),
+                 what="project detail")
+        )
+    except StateFetchError as e:
+        return {"opened": False,
+                "note": f"WBRERA's page for {entry['reg_no']} could not be read "
+                        f"({type(e).__name__})."}
+
+    return {
+        "opened": True,
+        # The whole point: the index does not carry this, the page does.
+        "promoter_name": parsed["promoter_name"],
+        "promoter_row": parsed["promoter_row"],
+        "project_name": entry["project_name"],
+        "reg_no": entry["reg_no"],
+        "project_id": entry["project_id"],
+        "registration_date": entry["registration_date"],
+        "completion_date": entry["completion_date"],
+        "professionals": parsed["professionals"],
+        "litigation": parsed["litigation"],
+        "declared_other_projects": parsed["other_projects"],
+        "notes": project_notes(parsed),
+    }
+
+
 class WestBengalAdapter:
     """StateAdapter for WBRERA."""
 

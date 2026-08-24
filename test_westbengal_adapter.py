@@ -228,7 +228,106 @@ def test_live_state_index_and_detail():
     print("test_live_state_index_and_detail: PASS")
 
 
+# --- opening one project -------------------------------------------------
+#
+# West Bengal cannot be SEARCHED by promoter: its index does not name the
+# promoter, which is exactly why opening the project matters more here than
+# anywhere else. The promoter's name is on the project page and NOWHERE
+# else, so the open is the only way to attach a WB registration to a name.
+
+_WB_INDEX = [{
+    "project_id": "WBRERA/NPR-003432",
+    "project_name": "Crown",
+    "completion_date": "31-12-2034",
+    "reg_no": "WBRERA/P/NOR/2025/002592",
+    "registration_date": "11-03-2025",
+    "procode": "16792000000025",
+}]
+
+_WB_DETAIL_HTML = """
+<table><tr><th>Promoter Name</th><th>Firm Name</th><th>Email ID</th></tr>
+       <tr><td>AARIKA CONSTRUCTION LLP</td><td>AARIKA CONSTRUCTION LLP</td>
+           <td>x@y.com</td></tr></table>
+<table><tr><th>Consultant Name</th><th>Consultant Type</th><th>Consultant Address</th></tr>
+       <tr><td>An Architect</td><td>Architect</td><td>Kolkata</td></tr></table>
+<table><tr><th>Litigations</th></tr><tr><td>NA</td></tr></table>
+"""
+
+
+def _wb_open(ref, index=None, detail_html=None):
+    from states import adapter_westbengal as wb
+
+    saved = (wb._get, wb._pool, list(wb._INDEX_CACHE))
+    wb._pool = lambda: None
+    wb._INDEX_CACHE[:] = _WB_INDEX if index is None else index
+    wb._get = lambda pool, url, ctx, what="page": (
+        _WB_DETAIL_HTML if detail_html is None else detail_html)
+    try:
+        return wb.fetch_project_summary(ref)
+    finally:
+        wb._get, wb._pool = saved[0], saved[1]
+        wb._INDEX_CACHE[:] = saved[2]
+
+
+def test_westbengal_opens_a_project_and_names_its_promoter():
+    """THE POINT OF THIS ONE. WBRERA's index carries no promoter, so before
+    this a West Bengal registration could be listed and never attached to a
+    name."""
+    summary = _wb_open("WBRERA/P/NOR/2025/002592")
+    assert summary["opened"] is True, summary
+    assert summary["promoter_name"] == "AARIKA CONSTRUCTION LLP", summary
+    assert summary["project_name"] == "Crown", summary
+    assert len(summary["professionals"]) == 1, summary["professionals"]
+    print("test_westbengal_opens_a_project_and_names_its_promoter: PASS")
+
+
+def test_westbengal_opens_by_any_of_the_three_identifiers_a_row_carries():
+    for ref in ("WBRERA/P/NOR/2025/002592", "WBRERA/NPR-003432", "16792000000025"):
+        assert _wb_open(ref)["opened"] is True, ref
+    print("test_westbengal_opens_by_any_of_the_three_identifiers_a_row_carries: PASS")
+
+
+def test_westbengal_a_stated_nil_litigation_is_not_a_missing_one():
+    """WBRERA writes the literal 'NA' for none, which is an ANSWER. A page
+    with no litigation table at all is not, and the two must never collapse
+    into the same output."""
+    summary = _wb_open("WBRERA/P/NOR/2025/002592")
+    assert summary["litigation"] == [], summary["litigation"]
+    assert any("stated nil return" in n for n in summary["notes"]), summary["notes"]
+
+    silent = _WB_DETAIL_HTML.replace(
+        "<table><tr><th>Litigations</th></tr><tr><td>NA</td></tr></table>", "")
+    summary = _wb_open("WBRERA/P/NOR/2025/002592", detail_html=silent)
+    assert any("UNKNOWN" in n for n in summary["notes"]), summary["notes"]
+    assert any("must not be read as a clean litigation record" in n
+               for n in summary["notes"]), summary["notes"]
+    print("test_westbengal_a_stated_nil_litigation_is_not_a_missing_one: PASS")
+
+
+def test_westbengal_an_absence_carries_the_2021_statute_caveat():
+    """West Bengal ran its own HIRA statute until the Supreme Court struck it
+    down in May 2021, so a genuine pre-2021 project may have no WBRERA record
+    at all. An absence here must never read as 'unregistered'."""
+    summary = _wb_open("WBRERA/P/NOR/1999/000001")
+    assert summary["opened"] is False, summary
+    assert "HIRA" in summary["note"], summary["note"]
+    print("test_westbengal_an_absence_carries_the_2021_statute_caveat: PASS")
+
+
+def test_westbengal_an_unreadable_register_is_not_an_absence():
+    summary = _wb_open("WBRERA/P/NOR/2025/002592", index=[])
+    assert summary["opened"] is False, summary
+    assert "could not be read rather than" in summary["note"], summary["note"]
+    assert _wb_open("")["note"].startswith("No WBRERA project reference")
+    print("test_westbengal_an_unreadable_register_is_not_an_absence: PASS")
+
+
 if __name__ == "__main__":
+    test_westbengal_opens_a_project_and_names_its_promoter()
+    test_westbengal_opens_by_any_of_the_three_identifiers_a_row_carries()
+    test_westbengal_a_stated_nil_litigation_is_not_a_missing_one()
+    test_westbengal_an_absence_carries_the_2021_statute_caveat()
+    test_westbengal_an_unreadable_register_is_not_an_absence()
     test_only_this_projects_own_filings_count_as_documents()
     test_the_classification_rule_is_explicit_about_each_case()
     test_backslashed_hrefs_are_normalised()

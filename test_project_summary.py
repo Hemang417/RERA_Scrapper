@@ -33,10 +33,13 @@ actually returns cannot pass unnoticed.
 Run directly: python test_project_summary.py
 """
 
+import importlib
 import json
 import os
 
 import api_client
+import group_sweep as gs
+import states
 from states import adapter_karnataka as ka
 from states import adapter_maharashtra as mh
 
@@ -266,7 +269,68 @@ def test_karnataka_a_project_outside_the_index_is_not_opened_silently():
     print("test_karnataka_a_project_outside_the_index_is_not_opened_silently: PASS")
 
 
+# --- the cross-state contract --------------------------------------------
+
+def test_every_state_can_be_opened_or_says_why_not():
+    """ANTI-DRIFT, and the guard this file was missing.
+
+    A state that can be SEARCHED but not OPENED produces candidates nobody
+    can confirm or refute, which is what inflates a group's apparent
+    footprint -- five of six hits on the first live Jharkhand run were false
+    brand matches, and opening them is what proved it. A state that can be
+    neither searched nor opened is a different thing, and both are fine as
+    long as the reader is told which.
+
+    So: every registered state either implements fetch_project_summary, or
+    has a written reason in group_sweep._CANNOT_OPEN. A new adapter arriving
+    with neither fails here, at the moment it is added.
+    """
+    missing = []
+    for code in sorted(states.PROFILES):
+        module = importlib.import_module(states._ADAPTER_MODULES[code])
+        if hasattr(module, "fetch_project_summary"):
+            continue
+        if code not in gs._CANNOT_OPEN:
+            missing.append(code)
+    assert not missing, (
+        f"{missing} can neither be opened nor explain why. Either implement "
+        f"fetch_project_summary or add a reader-facing reason to "
+        f"group_sweep._CANNOT_OPEN -- a silent absence reads as a project examined "
+        f"and found unremarkable."
+    )
+    print("test_every_state_can_be_opened_or_says_why_not: PASS")
+
+
+def test_telangana_is_the_only_state_that_cannot_be_opened_and_says_why():
+    """TG-RERA's public record does not carry its own registration number
+    and its search is CAPTCHA-gated by project name, so there is nothing to
+    hand a fetch. A stub that always failed would be worse than the absence
+    -- states/base.py forbids exactly that -- so the reason is written down
+    instead."""
+    assert set(gs._CANNOT_OPEN) == {"TG"}, sorted(gs._CANNOT_OPEN)
+    reason = gs._CANNOT_OPEN["TG"]
+    assert "CAPTCHA" in reason, reason
+    assert "does not display its own registration number" in reason, reason
+    # And it must not read as a finding about the project.
+    assert "nothing here was established about it" in reason, reason
+    print("test_telangana_is_the_only_state_that_cannot_be_opened_and_says_why: PASS")
+
+
+def test_an_unopenable_states_projects_carry_its_reason_not_a_generic_line():
+    """The reason has to reach the page, not just live in a dict."""
+    result = {"projects": [{"state": "TG", "project_id": "anything",
+                            "project_name": "CONSTELLA"}]}
+    gs.enrich_projects(result)
+    status = result["projects"][0]["detail_status"]
+    assert "CAPTCHA" in status, status
+    assert status.startswith("not opened"), status
+    print("test_an_unopenable_states_projects_carry_its_reason_not_a_generic_line: PASS")
+
+
 if __name__ == "__main__":
+    test_every_state_can_be_opened_or_says_why_not()
+    test_telangana_is_the_only_state_that_cannot_be_opened_and_says_why()
+    test_an_unopenable_states_projects_carry_its_reason_not_a_generic_line()
     test_maharera_reads_the_no_auth_fields_a_reader_needs()
     test_maharera_says_so_when_the_promoter_name_is_behind_the_captcha()
     test_maharera_uses_a_cached_session_but_never_mints_one()

@@ -70,6 +70,23 @@ _CANNOT_SEARCH = {
            "most of them would be -- can be drawn from this sweep."),
 }
 
+# Why a state's projects cannot be OPENED, as opposed to not being
+# searchable. Same discipline as _CANNOT_SEARCH above: a reader seeing an
+# unopened project is owed the reason, not a generic sentence.
+#
+# Telangana is the only entry and is expected to stay the only one. Every
+# other authority here can be handed an identifier and asked for a project;
+# TG-RERA cannot -- its public record does not carry its own registration
+# number, and its search is by project name behind a CAPTCHA that needs a
+# person at a browser. A fetch_project_summary for it would be a stub that
+# always fails, which is exactly what states/base.py forbids.
+_CANNOT_OPEN = {
+    "TG": ("TG-RERA's public record does not display its own registration number, and its "
+           "search is by project name behind a CAPTCHA that needs a person at a browser. So a "
+           "Telangana project cannot be opened unattended, and nothing here was established "
+           "about it either way."),
+}
+
 STATUS_SEARCHED = "searched"
 STATUS_NO_PROMOTER_SEARCH = "not searchable by promoter"
 STATUS_NO_ADAPTER = "no adapter"
@@ -310,7 +327,11 @@ def enrich_projects(result, fetcher=None, reporter=None, limit=DEFAULT_DETAIL_LI
         fn = fetcher if fetcher is not None else _detail_fetcher_for(project.get("state"))
         reference = project.get("project_id")
         if fn is None or not reference:
-            project["detail_status"] = "not opened (this authority has no per-project fetch)"
+            reason = _CANNOT_OPEN.get(project.get("state"))
+            project["detail_status"] = (
+                f"not opened -- {reason}" if reason and fn is None
+                else "not opened (this authority has no per-project fetch)"
+            )
             continue
         if opened >= limit:
             project["detail_status"] = "not opened (limit reached)"

@@ -337,15 +337,26 @@ def test_a_state_with_no_detail_fetch_says_so():
     """A project on an authority this pipeline cannot open per-project must be
     marked as not opened rather than silently appearing bare.
 
-    Gujarat is the case today. The result is built by hand rather than swept
-    because GujRERA has no promoter search either, and sweep() rightly
-    refuses to let an injected searcher invent coverage for it -- so there is
-    no way to get a Gujarat project into a swept result, which is correct.
-    Building the row directly is what isolates the enrichment behaviour."""
-    result = {"projects": [{"state": "GJ", "project_id": "17020",
-                            "matched_entity": "Aalekh Enterprise"}]}
+    TELANGANA IS THE CASE, AND IT IS EXPECTED TO STAY THE ONLY ONE. This
+    test used to use Gujarat, which gained a fetch_project_summary on
+    2026-08-24 -- and the moment it did, this test stopped exercising the
+    no-fetch path AND started making a live request to GujRERA from the
+    offline suite. TG-RERA cannot acquire one: its public record does not
+    display its own registration number and its search is CAPTCHA-gated by
+    project name, so there is nothing to hand a fetch. Nothing is imported
+    or requested for it, which is the point.
+
+    The result is built by hand rather than swept because none of these
+    authorities has a promoter search either, and sweep() rightly refuses to
+    let an injected searcher invent coverage for them."""
+    result = {"projects": [{"state": "TG", "project_id": "CONSTELLA",
+                            "matched_entity": "Constella"}]}
     gs.enrich_projects(result)
-    assert "no per-project fetch" in result["projects"][0]["detail_status"], result["projects"][0]
+    status = result["projects"][0]["detail_status"]
+    assert status.startswith("not opened"), result["projects"][0]
+    # And it carries THIS authority's reason, not a generic line -- a reader
+    # seeing an unopened project is owed the why.
+    assert "CAPTCHA" in status, status
     assert "detail" not in result["projects"][0], result["projects"][0]
     print("test_a_state_with_no_detail_fetch_says_so: PASS")
 
