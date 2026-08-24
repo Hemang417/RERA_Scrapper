@@ -13,7 +13,7 @@ not be skipped.
 
 ## Entry point
 
-`python main.py <REG_NO|project name> [--state MH|GJ|KA|TG|JH|WB] [--group-sweep] [--group-gst] [--group-litigation]
+`python main.py <REG_NO|project name> [--state MH|GJ|KA|TG|JH|WB|UP|TN|HR|DL] [--group-sweep] [--group-gst] [--group-litigation]
 [--gstin X | --pan Y] [--headed] [--token T] [--no-auto-auth] [--project-id N] [--output-dir D]`
 
 Everything below runs from `main.py::main()` in this order. Stages marked
@@ -27,8 +27,8 @@ the run continue. Nothing else may swallow an error.
    `P\d{11}`, so both are **probed and whichever actually has the project
    wins**; the district-code convention only orders the attempts.
 1-6. **Acquire** `states.get_adapter(code).acquire()` — resolve, auth, scrape,
-   documents, complaint orders, promoter portfolio, behind one call. Six states:
-   MH, GJ, KA, TG, JH, WB. A state declares what it HAS
+   documents, complaint orders, promoter portfolio, behind one call. Ten states:
+   MH, GJ, KA, TG, JH, WB, UP, TN, HR, DL. A state declares what it HAS
    (`profile.capabilities`); what it lacks returns empty plus an honest
    `notes` sentence, never a stub. Archiving stays with the caller via
    `ctx.on_resolved`. `app.py` calls the same method — enforced by a test.

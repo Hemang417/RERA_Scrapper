@@ -26,7 +26,8 @@ Data coverage: `docs/RERA_Data_Coverage.xlsx` (regenerate with `python build_dat
 | Phase 4c | Litigation across the group | **Done** 2026-08-21 — case law per entity/director, plus promoter-keyed orders from FOUR authorities (K-RERA x5 registers incl. penalties, MahaRERA, JHARERA, WBRERA via cause lists). GujRERA and TG-RERA probed; the reason each cannot be searched is recorded and rendered |
 | Phase 4d | Finances (charges, ratings) | **Done** — MCA charges, `charge_watch.py`, CRISIL added, ratings across group entities |
 | Phase 4e | Statutory (GST) across the group | **Done** 2026-08-21 — `gst_group.py`, opt-in `--group-gst`. Coverage-first: GST is PAN-keyed, so most of a group is unreachable |
-| Phase 2 (rest) | ~24 remaining state portals | Not started — always a separate plan |
+| Phase 2e | Uttar Pradesh (UP-RERA) + Tamil Nadu (TNRERA) adapters | **Done** 2026-08-24, both live-verified end-to-end |
+| Phase 2 (rest) | ~20 remaining state portals | Not started — always a separate plan |
 
 ### Phase 4c (group litigation): names propose, nothing here confirms
 
@@ -127,8 +128,156 @@ several states, so extending `promoter_identity`-style extraction across the
 group sweep's document libraries would convert unreachable entities into
 checkable ones. That is the natural next step and it needs no new source.
 
-Registered states: **MH**, **GJ**, **KA**, **TG**, **JH**, **WB** — all six have adapters.
-TG declares zero capabilities, which is a complete adapter, not a stub.
+Registered states: **MH**, **GJ**, **KA**, **TG**, **JH**, **WB**, **UP**, **TN**, **HR**,
+**DL** — all ten have adapters. TG declares zero capabilities, which is a complete
+adapter, not a stub.
+
+### Phase 2e (UP + TN): what the audit found that the profiles did not
+
+Both profiles were written from a portal audit before the adapters existed, and both
+were wrong about something that changed the design.
+
+**UP-RERA's search is CAPTCHA-gated, and nothing recorded that.** The profile said the
+promoter dropdown was merely paired with a mandatory district filter. `View_projects.aspx`
+in fact ships `function validate() { ... alert("Please Enter Captcha") }` against a
+`txtcap` field and a `CaptchaImage.axd` image, and a postback without a solved CAPTCHA
+returns the form with its results panel **empty** — indistinguishable from "this promoter
+has no projects". So the adapter never posts that form; `group_sweep._CANNOT_SEARCH["UP"]`
+now carries the reason, and `states/adapter_uttarpradesh.py` deliberately does NOT define
+`search_promoter_projects` (a test asserts the absence).
+
+> **A MISSING PROJECT ON UP-RERA IS HTTP 200.** `?id=378870`, `?id=30000` and every other
+> unissued id return a 48.7 KB page shell with a 200 — site chrome, no record, no error.
+> Parsed for fields it yields no promoter, no land, no bank account and no documents,
+> which on a Charter reads as a promoter who filed nothing. Resolution therefore checks
+> that the page **served the number that was asked for**, not that the fetch succeeded.
+> `ViewDocument` does the same thing for a file it does not hold, so downloads are judged
+> on the body rather than the status code.
+
+Resolving a LEGACY UP number still costs no search — the detail page's `?id=` is the
+number's own numeric suffix. The post-2024 scheme (`UPRERAPRJ378870/03/2025`) does not
+follow that and is **refused with the reason stated** rather than guessed at; a guessed id
+lands on another promoter's project. Documents need no VIEWSTATE round-trip: the download
+LinkButton answers with `window.open('ViewDocument?Param=<file name>')` and that file name
+is already in the grid's own column. Live: 24/24 documents on UPRERAPRJ2499, plus 7 slots
+carrying the promoter's own 'NA' — **not filed** is a third state, and among those seven
+are the CA, ARCHITECT and ENGINEERS certificates, which is a finding rather than a gap.
+
+**TNRERA's register is two applications whose volumes do not meet.** Counted live:
+
+```
+Building 2024, static per-year register:   96 rows, serials   1..96
+Building 2024, current application:       313 rows, serials 301..613
+overlap: ZERO.  On neither register: 204 numbers, serials 97..300.
+```
+
+Every other year 2017-2026 is whole. 2024 is the year the authority switched
+applications. An adapter reading one register reports "not registered" for projects the
+state has registered; one reading both still meets 204 numbers that are on neither, and
+`coverage_note()` distinguishes a serial **inside that hole** (a limit of what TNRERA
+publishes) from one **past the end** of the year's numbering (genuinely unissued). The
+registration number names its own page — type and year are in it — so a lookup costs two
+GETs and no search.
+
+TNRERA has **three** order registers, not the one the profile knew about:
+`tnrera_judgements` (Authority, 2018-), `smb_judgements` (single-member bench, 2022-) and
+`adjudicating_judgements` (Adjudicating Officer, 2018-). All three name complainant AND
+respondent in their own columns, so TNRERA is promoter-searchable for orders — 23
+register-years read per sweep, with the unread ones named. Reading one and calling it the
+litigation record is the K-RERA five-registers mistake.
+
+> **The PAN leak, refused on purpose.** TNRERA masks the PAN (`XXXXXX230D`) and the same
+> promoter view was observed carrying a full unmasked PAN in the adjacent `Company
+> Registration No` field, where somebody typed it into the wrong box. `parse_public_view`
+> refuses to return a PAN-shaped value from that field: harvesting it would key a group
+> entity on another portal's data-entry error. Watch the label test — `"pan" in label`
+> matches **Com-pan-y**, and the loose version blanked the withholding note itself.
+
+**Two bugs the live runs found that no unit test would have.** The carpet-area statement
+is served as `.xlsx` and was written to disk as `...View_File.pdf` — a ZIP archive named
+PDF, which anything opening it by type reads as empty; and the Form-C anchor carries no
+link text, so its document saved as `document.pdf` and a second one would have collided.
+Both now have guards. The pattern held again: **every real defect came from running it.**
+
+### The Haryana document downloader was dead on arrival
+
+Found while auditing the new adapters, fixed 2026-08-24, live-verified on
+RERA-GRG-741-2020 (102 EDEN ESTATE): **60/60 documents, 60 files on disk, all `%PDF`.**
+
+`_download_documents` called `safe_document_filename(label, used)` against a helper whose
+signature is `(documents_dir, label, used_names)`. TypeError on the FIRST document — and
+the call sat OUTSIDE the try/except wrapping the fetch, so it did not degrade into a
+per-document "failed" row: it propagated out of `acquire()` as a bare TypeError, which is
+not a `StateAcquisitionError`, so main.py did not catch it either. A real Gurugram record
+links sixty documents, so every Haryana run with a document died. Nothing caught it
+because Delhi and Haryana shipped without test files.
+
+The directory argument is not a formality: the length budget is measured against the
+caller's own output directory, and HARERA's labels are long ("AMSTORIA 26-2-2015.DWG
+STREET LIGHTING-MODEL"). The live run's longest path came to 251 characters — nine short
+of the Windows limit that reports itself as FileNotFoundError.
+
+> **And the same 200-OK trap, for the third portal in a row.** A document id HARERA does
+> not hold answers **HTTP 200 with 25 KB of HTML**. Proven against the pre-fix code: it
+> wrote that error page to disk as `JAMABANDI.pdf` and reported it "downloaded". A
+> Charter's document library would list a licence, a jamabandi and a demarcation plan
+> that are all the same web page. HARERA's document URLs are opaque hashes with no file
+> name, so the extension now comes from the served Content-Type.
+
+`test_haryana_adapter.py` guards both, and both guards were checked against the pre-fix
+code rather than assumed to fire.
+
+### Delhi and Haryana: covered by tests at last, and three more bugs fell out
+
+Both adapters shipped with **no test file at all**, which is how a hard crash on every
+Haryana document run went unnoticed. `test_delhi_adapter.py` (19 guards) and
+`test_haryana_adapter.py` (24) now cover them. Writing them found three further defects,
+every one by counting the live register rather than by reading the code.
+
+**1. One Delhi project was invisible.** The register appends a footnote marker INTO the
+cell -- `<label style="color:red" title="view disclaimer">*</label>` -- so the text reads
+`DLRERA2025P0003 *`. That string matches nothing: not the DL profile's own reg-no pattern,
+not a reader pasting the number as issued. Good Earth Capital Crest could not be resolved
+by its own registration number, could not appear in a portfolio, and could not be
+confirmed as a sweep hit. The register states the number twice and the second one is
+clean -- `data-diary-no="DLRERA2025P0003"` -- so the attribute is preferred now and the
+strip is the fallback. The marker survives as `has_disclaimer`, with a note saying the
+authority does not publish what it means (the only disclaimer text on the page is a
+site-wide data-migration notice) rather than inventing an interpretation.
+
+**2. Delhi's complaint count was counting orders.** The register publishes one row per
+ORDER: complaint 30/2020 -- one complainant, one respondent -- occupies **34 rows**
+differing only by decision date. Live on the Delhi Development Authority the run now
+reports *"2 matching complaint(s) against 20 published order(s)"* where it would have said
+20 complaints. The complaint NUMBER alone is not the key either: 624 rows carry 68
+distinct (number + parties) but only 51 distinct numbers, so numbers are reused between
+unrelated cases and collapsing on the number would merge different people's complaints and
+UNDER-report. The parties separate them. Each row's judgement PDF link was also being
+discarded and is now kept.
+
+**3. Fifty-two Haryana projects would have shared one output directory.** 52 of the 2,161
+rows across both benches print the literal string `NA` in the Project ID column -- BPTP
+NEST 83-A/B/C, NINEX RESIDENCY, several 2017 affordable-housing schemes, almost all older
+or lapsed. The Project ID is the primary key of `output/<reg_no>/`, so all 52 would have
+landed in `output/NA/` and overwritten each other: the Gujarat nested-path bug the other
+way round. All 52 carry a certificate number and all 52 of those are distinct, so
+`project_key()` falls back to it and the run says so. Verified live: HRERA-PKL-FBD-155-2019
+(BPTP NEST 83-A) now resolves and files under its certificate.
+
+> **The trap that was NOT fallen into, and the test that exists to answer it.** Every Delhi
+> register row carries a hidden `hdnPromoterID`, and it looks exactly like the promoter
+> identifier the adapter's notes say Delhi does not publish. It is issued per
+> REGISTRATION, not per promoter: the Delhi Development Authority appears under **22**
+> different ones, NBCC under eleven across two spellings of its name. Joining a portfolio
+> on it would split one promoter into 22 and report a developer with 24 Delhi projects as
+> having one. The name match is the weaker-looking option and the correct one; its own
+> limitation is stated in the portfolio notes instead.
+> `test_the_hidden_promoter_id_must_not_be_used_for_the_portfolio` is there for whoever
+> notices that field next.
+
+Every guard in both files was checked against the pre-fix code -- the Delhi parse really
+does yield `DLRERA2025P0003 *` and a 3-order complaint really is counted as 3 -- rather
+than assumed to fire.
 
 ---
 
