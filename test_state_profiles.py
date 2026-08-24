@@ -77,12 +77,23 @@ def test_no_unregistered_pattern_collision():
     Uses each profile's own sample-shaped strings, so this fires the moment
     a new state is added with a colliding pattern -- at the time the state
     is added, when someone can still choose a different discriminator."""
+    # EVERY ONE OF THESE IS AN ISSUED NUMBER, VERIFIED AGAINST ITS OWN
+    # AUTHORITY. The UP sample used to be UPRERAPRJ18905075, which nobody
+    # ever issued -- it was invented for a refusal test back when UP had no
+    # adapter, and its eight-digit suffix matches no real UP-RERA number.
+    # Once UP became a registered state the sample failed its own profile,
+    # and the failure looked like a broken pattern rather than a made-up
+    # number. A sample here is a claim about an authority's format; it has
+    # to come from a number that authority actually served.
     samples = {
         "MH": "P51800077150",
         "TG": "P02400003865",
         "KA": "PRM/KA/RERA/1251/446/PR/220422/004789",
         "GJ": "PR/GJ/SURAT/SURATCITY/SUDA/RAA05825/030819",
-        "UP": "UPRERAPRJ18905075",
+        "UP": "UPRERAPRJ14636",              # up-rera.in, ?id=14636
+        "TN": "TN/16/Building/0001/2024",    # rera.tn.gov.in 2024 register
+        "HR": "RERA-GRG-741-2020",
+        "DL": "DLRERA2018P0001",
     }
     for sample_code, sample in samples.items():
         if sample_code not in states.PROFILES:

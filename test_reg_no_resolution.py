@@ -134,32 +134,67 @@ def test_a_wrong_ordering_hint_is_self_correcting():
 
 
 def test_a_known_but_unsupported_authority_is_refused_by_name():
-    """THE BUG THIS FIXES. A Chennai or Noida registration number used to
-    fall through to the free-text branch and get searched against
-    MahaRERA, which then found nothing -- and "not found" reads as "this
-    project does not exist", not "that state has no adapter yet".
+    """THE BUG THIS FIXES. A registration number belonging to an authority
+    with no adapter used to fall through to the free-text branch and get
+    searched against MahaRERA, which then found nothing -- and "not found"
+    reads as "this project does not exist", not "that state has no adapter
+    yet". Worse, the fallback announced it as "not a recognised registration
+    number", which is the wrong diagnosis for a number the authority really
+    did issue.
 
-    Worse, the fallback announced it as "not a recognised registration
-    number", which is the wrong diagnosis: UPRERAPRJ18905075 is a
-    perfectly valid registration number. It belongs to an authority
-    this pipeline cannot serve."""
+    THIS TEST NOW INJECTS ITS OWN ENTRY, AND THAT IS THE POINT.
+    _UNSUPPORTED_AUTHORITIES is empty today: its two original entries were
+    UP-RERA and TNRERA, both of which now have adapters. An empty table with
+    no test would leave this refusal path unexercised until the next state
+    was added to it -- and the path is worth more than the table, because a
+    wrong entry in it is how the UP bug hid (`^UPRERAPRJ\\w+$`, where \\w
+    cannot match the slash in every post-2024 number).
+    """
     import states
 
-    for query, acronym in (("UPRERAPRJ18905075", "UP-RERA"),
-                           ("TN/29/Building/0000/2026", "TNRERA"),
-                           ("tn/29/layout/12/2025", "TNRERA")):
-        try:
-            states.candidate_profiles(query)
-        except states.StateResolutionError as e:
-            message = str(e)
-            assert acronym in message, message
-            # It must say it searched NOWHERE, so a reader cannot take
-            # the refusal as evidence about the project.
-            assert "NOT searched anywhere else" in message, message
-            assert "no adapter" in message, message
-        else:
-            raise AssertionError(query + " was routed somewhere instead of refused")
+    entry = {
+        "pattern": r"^ZZRERA/\d{4}/\d{2}$",
+        "acronym": "ZZ-RERA",
+        "authority": "Zzz Real Estate Regulatory Authority",
+        "covers": "a state this pipeline has no adapter for",
+        "evidence": "synthetic, for this test only",
+    }
+    original = states._UNSUPPORTED_AUTHORITIES
+    states._UNSUPPORTED_AUTHORITIES = (entry,)
+    try:
+        for query in ("ZZRERA/1234/56", "zzrera/1234/56"):
+            try:
+                states.candidate_profiles(query)
+            except states.StateResolutionError as e:
+                message = str(e)
+                assert "ZZ-RERA" in message, message
+                # It must say it searched NOWHERE, so a reader cannot take
+                # the refusal as evidence about the project.
+                assert "NOT searched anywhere else" in message, message
+                assert "no adapter" in message, message
+            else:
+                raise AssertionError(query + " was routed somewhere instead of refused")
+    finally:
+        states._UNSUPPORTED_AUTHORITIES = original
     print("test_a_known_but_unsupported_authority_is_refused_by_name: PASS")
+
+
+def test_the_authorities_that_were_refused_are_now_served():
+    """The other half of the same change, and the reason it is safe.
+
+    UP-RERA and TNRERA were both entries in _UNSUPPORTED_AUTHORITIES. They
+    must not merely have been deleted from it -- they must now RESOLVE, or
+    the refusal was removed and nothing put in its place.
+    """
+    import states
+
+    for query, code in (("UPRERAPRJ14636", "UP"),
+                        ("TN/16/Building/0001/2024", "TN"),
+                        ("TNRERA/29/BLG/0001/2026", "TN")):
+        profiles, _ = states.candidate_profiles(query)
+        assert [p.code for p in profiles] == [code], (query, [p.code for p in profiles])
+        assert states.get_adapter(code).profile.code == code
+    print("test_the_authorities_that_were_refused_are_now_served: PASS")
 
 
 def test_a_project_name_is_still_free_text_not_an_unsupported_state():
@@ -236,6 +271,7 @@ if __name__ == "__main__":
     test_the_ladder_skips_an_authority_that_cannot_be_searched_by_reg_no()
     test_a_wrong_ordering_hint_is_self_correcting()
     test_a_known_but_unsupported_authority_is_refused_by_name()
+    test_the_authorities_that_were_refused_are_now_served()
     test_a_project_name_is_still_free_text_not_an_unsupported_state()
     test_no_unsupported_pattern_collides_with_a_registered_one()
     test_every_unsupported_entry_carries_its_evidence()

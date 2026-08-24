@@ -50,17 +50,28 @@ def _broken(name, reporter=None):
 # --- the coverage rule ----------------------------------------------------
 
 def test_states_that_cannot_be_searched_say_so_and_are_not_counted():
-    """The central guard. Gujarat, West Bengal and Telangana must never be
-    reported as searched, and the reason must reach the reader."""
+    """The central guard. A state whose portal cannot be searched by promoter
+    must never be reported as searched, and the reason must reach the reader.
+
+    Uttar Pradesh joined this list when its adapter landed: UP-RERA's
+    register is CAPTCHA-gated AND demands a district before a promoter, and
+    a search that cannot run must not report a zero.
+
+    The count is derived rather than written down. It used to be a literal 3,
+    which meant every new adapter with a promoter search failed this test on
+    arrival -- a guard firing at the states it was built to accommodate.
+    """
     result = gs.sweep(["Pranami Builders"], searcher=_hit)
     by_state = {row["state"]: row for row in result["coverage"]}
 
-    for code in ("GJ", "WB", "TG"):
+    for code in ("GJ", "WB", "TG", "UP"):
         assert by_state[code]["status"] == gs.STATUS_NO_PROMOTER_SEARCH, by_state[code]
         assert by_state[code]["reason"], by_state[code]
         assert "not searched" in by_state[code]["reason"].lower(), by_state[code]["reason"]
 
-    assert result["states_searched"] == 3, result["states_searched"]
+    assert result["states_searched"] == len(gs.searchable_states()), (
+        result["states_searched"], gs.searchable_states())
+    assert not set(gs.searchable_states()) & {"GJ", "WB", "TG", "UP"}, gs.searchable_states()
     assert result["states_total"] == len(states.PROFILES), result
     print("test_states_that_cannot_be_searched_say_so_and_are_not_counted: PASS")
 
@@ -429,10 +440,15 @@ def test_searchable_states_match_the_adapters_that_implement_the_call():
         module = importlib.import_module(states._ADAPTER_MODULES[code])
         implements = hasattr(module, "search_promoter_projects")
         assert implements == (code in gs.searchable_states()), (code, implements)
-    # And the three that cannot be searched each have a reader-facing reason
-    # written for them, rather than falling back to generic wording.
-    for code in ("GJ", "WB", "TG"):
-        assert code in gs._CANNOT_SEARCH, code
+    # And every state that cannot be searched has a reader-facing reason
+    # written for it, rather than falling back to generic wording.
+    for code in states.PROFILES:
+        if code not in gs.searchable_states():
+            assert code in gs._CANNOT_SEARCH, (
+                f"{code} has no promoter search and no reason written for it, so the sweep "
+                f"would explain its absence in generic wording. Say why THIS authority "
+                f"cannot be searched."
+            )
     print("test_searchable_states_match_the_adapters_that_implement_the_call: PASS")
 
 

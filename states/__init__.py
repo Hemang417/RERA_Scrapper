@@ -14,7 +14,18 @@ layer, whose default is and remains Maharashtra.
 
 import re
 
-from . import gujarat, jharkhand, karnataka, maharashtra, telangana, westbengal
+from . import (
+    delhi,
+    gujarat,
+    haryana,
+    jharkhand,
+    karnataka,
+    maharashtra,
+    tamilnadu,
+    telangana,
+    uttarpradesh,
+    westbengal,
+)
 from .base import (  # noqa: F401  -- re-exported for callers
     ALL_CAPABILITIES,
     CAP_CATEGORY_API,
@@ -43,6 +54,10 @@ PROFILES = {
     karnataka.PROFILE.code: karnataka.PROFILE,
     jharkhand.PROFILE.code: jharkhand.PROFILE,
     westbengal.PROFILE.code: westbengal.PROFILE,
+    uttarpradesh.PROFILE.code: uttarpradesh.PROFILE,
+    tamilnadu.PROFILE.code: tamilnadu.PROFILE,
+    haryana.PROFILE.code: haryana.PROFILE,
+    delhi.PROFILE.code: delhi.PROFILE,
 }
 
 DEFAULT_STATE_CODE = "MH"
@@ -111,23 +126,28 @@ _LIKELIHOOD_ORDERS = {
 # Panchkula) is deliberately ABSENT: its portal published no registration
 # number this could be derived from on 2026-08-21, and a guessed pattern
 # would either miss real numbers or capture someone else's.
-_UNSUPPORTED_AUTHORITIES = (
-    {
-        "pattern": r"^UPRERAPRJ\w+$",
-        "acronym": "UP-RERA",
-        "authority": "Uttar Pradesh Real Estate Regulatory Authority",
-        "covers": "Noida, Greater Noida and Ghaziabad -- most of NCR by volume",
-        "evidence": "format recorded in this repo's verified reg-no table",
-    },
-    {
-        "pattern": r"^TN/\d{2}/(?:BUILDING|LAYOUT)/\d+/\d{4}$",
-        "acronym": "TNRERA",
-        "authority": "Tamil Nadu Real Estate Regulatory Authority",
-        "covers": "Chennai",
-        "evidence": "observed on rera.tn.gov.in, 2026-08-21 "
-                    "(e.g. TN/29/Building/0000/2026)",
-    },
-)
+#
+# EMPTY TODAY, AND THE MECHANISM IS KEPT ANYWAY. Both former entries --
+# UP-RERA and TNRERA -- are now REGISTERED authorities with adapters, so
+# refusing them would refuse projects this pipeline can actually fetch.
+#
+# Emptying it also retired two patterns that were WRONG, which is the
+# cautionary note for whoever adds the next one:
+#
+#   * `^UPRERAPRJ\w+$` -- `\w` does not match a slash, so every post-2024
+#     UP registration (UPRERAPRJ378870/03/2025) failed the pattern, fell
+#     through to the free-text branch and was searched against MahaRERA.
+#     The exact defect this table exists to prevent, hiding inside it.
+#   * `^TN/\d{2}/(?:BUILDING|LAYOUT)/\d+/\d{4}$` -- wrong in four ways at
+#     once, and its recorded evidence "TN/29/Building/0000/2026" was a
+#     search-box placeholder rather than an issued number. A serial of
+#     0000 should have been the tell.
+#
+# Both are documented in states/uttarpradesh.py and states/tamilnadu.py.
+# The lesson stands: a pattern here is a claim about another authority's
+# format, it must come from real issued numbers, and ONE example is not
+# enough to see which parts vary.
+_UNSUPPORTED_AUTHORITIES = ()
 
 
 def unsupported_authority(query: str):
@@ -236,6 +256,10 @@ _ADAPTER_MODULES = {
     "TG": "states.adapter_telangana",
     "JH": "states.adapter_jharkhand",
     "WB": "states.adapter_westbengal",
+    "UP": "states.adapter_uttarpradesh",
+    "TN": "states.adapter_tamilnadu",
+    "HR": "states.adapter_haryana",
+    "DL": "states.adapter_delhi",
 }
 
 

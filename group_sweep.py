@@ -63,6 +63,11 @@ _CANNOT_SEARCH = {
            "page in the state. West Bengal was not searched."),
     "TG": ("TG-RERA gates its own search behind a CAPTCHA that needs a person at a browser, so "
            "it cannot be searched unattended. Telangana was not searched."),
+    "UP": ("UP-RERA gates its project register behind a CAPTCHA and will not accept a promoter "
+           "without a district, so a promoter's projects would need a solved CAPTCHA and one "
+           "request per district across 75 districts. Uttar Pradesh was not searched, and no "
+           "conclusion about this group's UP projects -- which for an NCR promoter is where "
+           "most of them would be -- can be drawn from this sweep."),
 }
 
 STATUS_SEARCHED = "searched"
