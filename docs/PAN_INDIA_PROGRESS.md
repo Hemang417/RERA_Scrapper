@@ -683,7 +683,14 @@ so the MH/TG registration-format collision is real and testable.
   and covered by the differential-render test, but nobody has watched it produce a
   non-Maharashtra Charter.
 - `docs/PRD.md` and `docs/SAD.md` still describe the pre-refactor architecture.
-- `output/_history/P51800077150/20260818_185831/` is leftover from a test run.
+- ~~`output/_history/`~~ **cleared 2026-08-24.** It held three archived runs of
+  P51800077150 (257 MB, 226 files), all but a handful of them byte-for-byte
+  duplicates of the live `output/P51800077150/`. Two files were NOT duplicates and
+  were preserved into `output/P51800077150/research/` before the delete:
+  `pranami_bliss_charter_facts.py` (49 KB) and `run_pranami_charter.py` — the
+  hand-authored `pre_built_facts` recipe, which existed in exactly one place on disk
+  and had never been committed. They now sit where every other one-off script for a
+  project lives, beside `output/CONSTELLA_TS/research/patch_state_labels.py`.
 - 26 of ~30 state portals remain unaudited.
 - **Jharkhand and West Bengal have no adapter**, and for a Ranchi-origin
   promoter like Pranami that is where the real track record is. See the
