@@ -224,7 +224,7 @@ The punctuation constraint on B and C is not stylistic. `_verify_external_docume
                         |  Consumes: PDF + Charter Internal/External|
                         +====================+=====================+
                                              |
-             CLI  python main.py <REG_NO> [--state MH|GJ|KA|TG|JH|WB]
+             CLI  python main.py <REG_NO> [--state MH|GJ|KA|TG|JH|WB|UP|TN|HR|DL]
                        [--group-sweep] [--group-gst] [--group-litigation]
                        [--gstin|--pan]
              UI   streamlit run app.py
@@ -434,7 +434,8 @@ There is no `tests/` package, no `conftest.py`, no CI configuration.
   [ENTRY]
   +----------------------------------+     +---------------------------+
   |  main.py <REG_NO | project name> |     |  app.py  (Streamlit)      |
-  |  --state MH|GJ|KA|TG|JH|WB       |     |  Run Scraper tab calls    |
+  |  --state MH|GJ|KA|TG|JH|WB|      |     |  Run Scraper tab calls    |
+  |          UP|TN|HR|DL             |     |                           |
   |  --group-sweep --group-gst       |     |  states...acquire(), the  |
   |  --group-litigation              |     |  SAME method main.py does |
   |  --gstin X | --pan Y             |     |  (~160 duplicated lines   |
@@ -613,7 +614,9 @@ There is no `tests/` package, no `conftest.py`, no CI configuration.
 | Why `acquire()` is coarse | Telangana cannot split resolve from auth -- it CAPTCHA-gates the search itself -- and MahaRERA's 401/403 retry is MahaRERA-specific orchestration |
 | Capabilities | `CAP_LOOKUP_BY_REG_NO`, `CAP_CATEGORY_API`, `CAP_DOCUMENTS`, `CAP_SEPARATE_AUTH`, `CAP_PROMOTER_PORTFOLIO`, `CAP_ORDERS_SEARCH`, `CAP_LAND_RECORDS`. A state omits what it lacks **and** returns the empty value plus a sentence in `notes` -- never a stub |
 | Resolution | `--state` wins. Otherwise every registered pattern is matched. MahaRERA and TG-RERA share `P` + 11 digits, so **both are probed and whichever actually holds the project wins**; the district-code convention only orders the attempts, and a firing heuristic is announced on stdout |
-| Six states | MH (all seven capabilities), GJ, KA, TG, JH, WB |
+| Ten states | MH (all seven capabilities), GJ, KA, TG, JH, WB, UP, TN, HR, DL. TG declares ZERO capabilities, which is a complete adapter rather than a stub: its public record does not display its own registration number and its search is CAPTCHA-gated by project name |
+| Searchable by promoter | MH, KA, JH, TN, HR, DL. **GJ, WB, TG and UP are not**, each with a reader-facing reason in `group_sweep._CANNOT_SEARCH` -- a search that cannot run must never report a zero. UP-RERA is the sharpest case: its register is CAPTCHA-gated AND demands a district before a promoter, and an unsolved postback returns the form with an EMPTY results panel, indistinguishable from "this promoter has no projects" |
+| Openable per project | All ten except TG, which has no identifier to be handed. Pinned by `test_project_summary.py`: a state either implements `fetch_project_summary` or has a written reason in `group_sweep._CANNOT_OPEN` |
 
 ### 8.1 Stage 1 — Resolve (MahaRERA: `resolver.py`)
 

@@ -11,7 +11,7 @@ NOT to do -- the next run overwrites it.
 Every row records how the finding was established. "confirmed-live" means
 this pipeline actually fetched it; "observed" means it was seen on the
 portal but not yet fetched by code; "unaudited" means nobody has looked.
-That distinction matters because 24 of ~30 state portals are unaudited, and
+That distinction matters because ~20 of ~30 state portals are unaudited, and
 a coverage matrix that hides its own uncertainty is worse than none.
 
     python build_data_coverage.py
@@ -59,7 +59,103 @@ _EVIDENCE_FILL = {
 # WORKFLOW A -- RERA. What each authority publishes, per data item.
 # =========================================================================
 # Columns are authorities; the last two record where it lands in the Charter.
-RERA_STATES = ["MahaRERA", "TG-RERA", "GujRERA", "K-RERA", "JHARERA", "WBRERA"]
+RERA_STATES = ["MahaRERA", "TG-RERA", "GujRERA", "K-RERA", "JHARERA", "WBRERA",
+               "UP-RERA", "TNRERA", "HARERA", "Delhi-RERA"]
+
+# How many of those the RERA_FINDINGS tuples below carry inline.
+_INLINE_STATES = 6
+
+# The four authorities added on 2026-08-24, keyed by data item rather than
+# widened into the tuples below -- 21 carefully worded rows are not worth
+# rewriting to add four columns, and a lookup makes an unfilled row loudly
+# "Unaudited" instead of silently short.
+#
+# EVERY "Yes" HERE WAS SEEN ON A REAL RECORD, not inferred from a portal's
+# menu: UPRERAPRJ14636 and UPRERAPRJ2499, TNRERA/29/BLG/0001/2026 and
+# TN/16/Building/0001/2024, RERA-GRG-741-2020, and Delhi's whole register.
+# Where nobody has looked the cell says "Unaudited", which is the honest
+# answer and the one this sheet exists to keep visible.
+RERA_FINDINGS_LATER = {
+    # data item: (UP-RERA, TNRERA, HARERA, Delhi-RERA)
+    "Project identity (name, status, type, dates)":
+        ("Yes", "Yes", "Yes", "Partial"),
+    "Registration number retrievable from the portal":
+        ("Partial", "Yes", "Yes", "Yes"),
+    "Promoter / partner identity":
+        ("Yes", "Yes", "Yes", "Partial"),
+    "Professionals of record (architect/engineer/CA)":
+        ("Partial", "Partial", "Unaudited", "Not published"),
+    "Land details / survey numbers":
+        ("Yes", "Partial", "Partial", "Not published"),
+    "Bank accounts (escrow / collection)":
+        ("Yes", "Partial", "Yes", "Not published"),
+    "Document library (downloadable files)":
+        ("Yes", "Yes", "Yes", "Not published"),
+    "Complaints register":
+        ("No", "Yes", "No", "Yes"),
+    "Appeals register":
+        ("Unaudited", "Unaudited", "Unaudited", "Unaudited"),
+    "Orders / judgments search":
+        ("No", "Yes", "No", "Yes"),
+    "Promoter's other projects (track record)":
+        ("No", "Partial", "Yes", "Yes"),
+    "Past-experience declarations":
+        ("Unaudited", "Unaudited", "Unaudited", "Not published"),
+    "AUDITED BALANCE SHEET":
+        ("Unaudited", "Unaudited", "Yes", "Not published"),
+    "Audited profit & loss statement":
+        ("Unaudited", "Unaudited", "Unaudited", "Not published"),
+    "Income-tax returns":
+        ("Unaudited", "Unaudited", "Unaudited", "Not published"),
+    "Defaulters list":
+        ("Unaudited", "Unaudited", "Unaudited", "Unaudited"),
+    "Projects under investigation":
+        ("Unaudited", "Unaudited", "Unaudited", "Unaudited"),
+    "Cost incurred vs estimated cost":
+        ("Partial", "Partial", "Yes", "Not published"),
+    "Delay reasons (promoter-declared)":
+        ("Unaudited", "Unaudited", "Unaudited", "Not published"),
+    "NOC expiry and renewal tracking":
+        ("Unaudited", "Partial", "Unaudited", "Not published"),
+    "Construction progress / QPR":
+        ("Partial", "Yes", "Unaudited", "Partial"),
+}
+
+# Notes for the four new columns, appended to the row's existing note so the
+# reasoning travels with the cell rather than living only in a commit.
+RERA_NOTES_LATER = {
+    "Registration number retrievable from the portal":
+        "UP-RERA is Partial: a legacy UPRERAPRJ number resolves with no search at all (the "
+        "detail page id is the number's own numeric suffix), but the scheme used since ~2024 "
+        "(UPRERAPRJ378870/03/2025) does not follow that and cannot be resolved here.",
+    "Complaints register":
+        "TNRERA publishes THREE order registers (Authority, single-member bench, Adjudicating "
+        "Officer) and Delhi-RERA one, all naming complainant AND respondent in their own "
+        "columns -- which is what makes them promoter-searchable. UP-RERA and HARERA both "
+        "gate their case search behind a CAPTCHA keyed on a case number, so complaints there "
+        "are UNKNOWN rather than absent.",
+    "Promoter's other projects (track record)":
+        "UP-RERA's register is CAPTCHA-gated AND demands a district before a promoter, so a "
+        "portfolio would need a solved CAPTCHA and one request per district across 75 "
+        "districts. TNRERA is Partial: no promoter id and no promoter search, so a portfolio "
+        "is a NAME match across year tables and every row is a candidate.",
+    "Bank accounts (escrow / collection)":
+        "UP-RERA publishes the project account number in full with bank and branch. TNRERA "
+        "masks it (XXXXXXXXXX9995) while naming the bank, branch and the account holder.",
+    "Land details / survey numbers":
+        "UP-RERA publishes a KHASRA/PLOT grid with per-parcel areas and a registry/agreement "
+        "grid. HARERA carries DTCP licence numbers rather than khasra numbers. Note these are "
+        "the promoter's own declaration in every case, not an independent land record.",
+    "Document library (downloadable files)":
+        "UP-RERA's grid has a third state besides filed and missing: 7 of 31 rows on a real "
+        "record carry the promoter's own 'NA', including the CA, ARCHITECT and ENGINEERS "
+        "certificates -- not filed, which is a finding rather than a gap. HARERA links 60 "
+        "documents on one Gurugram record.",
+    "Project identity (name, status, type, dates)":
+        "Delhi-RERA is Partial because there is no per-project record at all: the register's "
+        "own View control is inert and every detail route probed returns nothing, so a Delhi "
+        "project's identity is its register row and nothing more.",
+}
 
 RERA_FINDINGS = [
     # (data item, MH, TG, GJ, KA, JH, WB, charter facts field, note)
@@ -286,15 +382,24 @@ def build_rera_sheet(wb):
     ncols = 3 + len(RERA_STATES)
     _title(ws, "Workflow A: RERA -- what each authority publishes",
            "Yes / Partial / No / Not published / Unaudited. 'Unaudited' means nobody has looked yet -- "
-           "24 of ~30 state portals are in that state.", ncols)
+           "~20 of ~30 state portals are in that state, and so are whole data items on the "
+           "four newest authorities.", ncols)
     header = ["Data item"] + RERA_STATES + ["Charter facts field", "Note"]
     ws.append([])
     ws.append(header)
     header_row = ws.max_row
     _style_header(ws, header_row, ncols)
+    unknown = set(RERA_FINDINGS_LATER) - {row[0] for row in RERA_FINDINGS}
+    assert not unknown, f"RERA_FINDINGS_LATER names rows that do not exist: {sorted(unknown)}"
     for item, *rest in RERA_FINDINGS:
-        states_vals = rest[:len(RERA_STATES)]
-        field, note = rest[len(RERA_STATES)], rest[len(RERA_STATES) + 1]
+        # A row with no entry in the later table is Unaudited for those four,
+        # never silently short -- the whole point of the sheet.
+        later = RERA_FINDINGS_LATER.get(item, ("Unaudited",) * 4)
+        states_vals = list(rest[:_INLINE_STATES]) + list(later)
+        field, note = rest[_INLINE_STATES], rest[_INLINE_STATES + 1]
+        extra = RERA_NOTES_LATER.get(item)
+        if extra:
+            note = f"{note} {extra}".strip()
         ws.append([item] + list(states_vals) + [field, note])
         for offset in range(len(RERA_STATES)):
             cell = ws.cell(row=ws.max_row, column=2 + offset)
@@ -373,7 +478,8 @@ def build_readme(wb):
         ("Evidence levels -- read these before trusting a row", Font(bold=True, size=12)),
         ("confirmed-live   this pipeline actually fetched it", None),
         ("observed         seen on the portal, not yet fetched by code", None),
-        ("unaudited        nobody has looked. 24 of ~30 state portals are here.", None),
+        ("unaudited        nobody has looked. ~20 of ~30 state portals are here, and so "
+         "are individual rows on UP-RERA, TNRERA, HARERA and Delhi-RERA.", None),
         ("", None),
         ("Biggest findings so far", Font(bold=True, size=12)),
         ("1. GujRERA publishes AUDITED BALANCE SHEETS, P&L and income-tax returns per project. "
@@ -397,9 +503,18 @@ def build_readme(wb):
          "confirm by shared director / registered office / filed relationship -- and treat a shared "
          "address as the weakest of the three (28 of 65 'group companies' were address-only).", None),
         ("9. Two more states are live: Jharkhand (JHARERA) and West Bengal (WBRERA), taking coverage to "
-         "six authorities. JHARERA is the only authority anywhere in this pipeline that files a "
+         "six authorities at the time. JHARERA is the only authority anywhere in this pipeline that files a "
          "professional's PAN as a plain readable field rather than a scanned card, and it also publishes "
          "a declared past-projects table and a genuine litigation disclosure per project.", None),
+        ("9b. FOUR more states are live as of 2026-08-24 -- Uttar Pradesh, Tamil Nadu, Haryana and "
+         "Delhi -- taking coverage to TEN authorities. Each brings something no other one here "
+         "does. HARERA states the promoter's CIN outright, which is the only hard RERA-to-MCA "
+         "join in this pipeline; every other authority forces a name match. UP-RERA publishes "
+         "the project bank account IN FULL and a khasra-level land grid. TNRERA publishes three "
+         "separate order registers, all naming both parties. Delhi-RERA publishes almost nothing "
+         "per project -- 130 projects for the whole NCT and no reachable detail record -- which "
+         "is itself the finding: an absence from Delhi's register is close to worthless as "
+         "evidence.", None),
         ("10. Karnataka's order/judgment coverage grew from one register to five (15,600+ rows across "
          "order search, authority orders, AO orders, interim orders and complaints-under-process), "
          "including a penalty table naming the violation, section and amount -- the single most "

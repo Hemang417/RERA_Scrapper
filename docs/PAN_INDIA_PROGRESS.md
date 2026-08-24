@@ -27,6 +27,7 @@ Data coverage: `docs/RERA_Data_Coverage.xlsx` (regenerate with `python build_dat
 | Phase 4d | Finances (charges, ratings) | **Done** — MCA charges, `charge_watch.py`, CRISIL added, ratings across group entities |
 | Phase 4e | Statutory (GST) across the group | **Done** 2026-08-21 — `gst_group.py`, opt-in `--group-gst`. Coverage-first: GST is PAN-keyed, so most of a group is unreachable |
 | Phase 2e | Uttar Pradesh (UP-RERA) + Tamil Nadu (TNRERA) adapters | **Done** 2026-08-24, both live-verified end-to-end |
+| Phase 2f | `fetch_project_summary` for Gujarat and West Bengal; coverage workbook and PRD/SAD brought to ten states | **Done** 2026-08-24 |
 | Phase 2 (rest) | ~20 remaining state portals | Not started — always a separate plan |
 
 ### Phase 4c (group litigation): names propose, nothing here confirms
@@ -226,6 +227,62 @@ of the Windows limit that reports itself as FileNotFoundError.
 
 `test_haryana_adapter.py` guards both, and both guards were checked against the pre-fix
 code rather than assumed to fire.
+
+### Every state can now be OPENED, or says why not
+
+`fetch_project_summary` existed on seven of ten adapters. Gujarat and West
+Bengal now have one; Telangana deliberately does not, and that is now written
+down rather than left as a silent absence.
+
+**Why this is not the same as being searchable.** GJ, WB, TG and UP cannot be
+searched by promoter, so `group_sweep` never produces hits for them — a
+`fetch_project_summary` is not there to serve the sweep. It is there for the
+other half: a registration arriving from ANY other source (a promoter's
+declared past project, a past-experience address, a human) can now be opened
+and read instead of listed and left unconfirmed.
+
+Each earns it for a specific reason:
+
+- **West Bengal** — WBRERA's index does not name the promoter. The project page
+  does. Opening the project is the ONLY way to attach a WB registration to a
+  name, which is exactly what a sweep candidate needs to be confirmed or
+  refuted. Live: `WBRERA/P/NOR/2025/002592` → AARIKA CONSTRUCTION LLP.
+- **Gujarat** — `getprev-project-list` is where a Gujarat promoter declares the
+  projects they built BEFORE this one. In a state that cannot be searched by
+  promoter, that is the only route to those registrations at all. Live on
+  `PR/GJ/SURAT/.../PAA12907/120224/311228`: AALEKH ENTERPRISE, plus 2 declared
+  earlier projects.
+- **Telangana** — cannot. Its public record does not display its own
+  registration number and its search is CAPTCHA-gated by project name, so
+  there is nothing to hand a fetch. A stub that always failed is precisely what
+  `states/base.py` forbids, so the reason lives in
+  `group_sweep._CANNOT_OPEN` and reaches the page: an unopened TG project now
+  carries that sentence instead of a generic "no per-project fetch".
+
+`test_project_summary.py` pins the contract — every state either implements the
+call or has a written reason — so a new adapter arriving with neither fails at
+the moment it is added.
+
+> **A test that had quietly stopped testing anything.**
+> `test_group_sweep.py::test_a_state_with_no_detail_fetch_says_so` used Gujarat
+> as its example of an unopenable state. The moment Gujarat gained a fetch, that
+> test stopped exercising the no-fetch path AND started making a live request to
+> GujRERA from the offline suite. It uses Telangana now, which imports and
+> requests nothing.
+
+### Docs and the coverage workbook, brought to ten states
+
+`docs/PRD.md` and `docs/SAD.md` had six-state `--state` lists in three ASCII
+diagrams and a "Six states" row; all now read ten, and the SAD gains rows for
+which states are searchable and which are openable. `build_data_coverage.py`
+listed six authorities, so `docs/RERA_Data_Coverage.xlsx` had no columns for
+UP, TN, HR or DL at all — it now has ten, 21 items each.
+
+**32 of those new cells say "Unaudited", and that is the point.** Every "Yes"
+was seen on a real record — UPRERAPRJ14636 and 2499, TNRERA/29/BLG/0001/2026,
+TN/16/Building/0001/2024, RERA-GRG-741-2020, Delhi's whole register — and
+nothing was inferred from a portal's menu. The sheet already had that
+vocabulary for exactly this.
 
 ### Delhi and Haryana: covered by tests at last, and three more bugs fell out
 

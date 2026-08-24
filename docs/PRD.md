@@ -54,7 +54,8 @@ The product's distinguishing characteristic is not that it scrapes. It is that *
    -----------                                    --------
                                        +---> Company_Charter_..._Internal.pdf
    python main.py P51800012345         |     Company_Charter_..._External.pdf
-     [--state MH|GJ|KA|TG|JH|WB]       |     Company_Charter_....facts.json
+     [--state MH|GJ|KA|TG|JH|WB|       |     Company_Charter_....facts.json
+             UP|TN|HR|DL]              |
      [--group-sweep] [--group-gst]  -->+     <REG_NO>_summary.pdf
      [--group-litigation]              |     documents/ + complaint_orders/
      [--gstin X | --pan Y]             |     usage_summary.json (cost ledger)
