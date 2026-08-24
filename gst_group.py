@@ -51,6 +51,7 @@ import re
 
 import gst_compliance
 import group_entities
+import promoter_identity
 
 STATUS_CHECKED = "checked"
 STATUS_NO_PAN = "no PAN on record"
@@ -143,6 +144,121 @@ def known_pans(identity_result=None, rera_pans=None, gstins=None, supplied=None)
         _add(name, pan, PAN_SOURCE_SUPPLIED)
 
     return found
+
+
+def pans_from_sweep(sweep_result, entity_names, reporter=None):
+    """PANs harvested off the group sweep's own opened project pages.
+
+    THE COVERAGE-WIDENING PATH, and it needs no new source. Two authorities
+    already print a PAN as a readable FIELD rather than filing it as a
+    scanned card: JHARERA states one for the contractor, architect and
+    structural engineer, and K-RERA states partner PANs. Every one of those
+    pages is already fetched by group_sweep.enrich_projects. Before this,
+    they were read, rendered and thrown away, while the entities they name
+    were reported as "no PAN on record".
+
+    THE RULE THAT MAKES THIS SAFE: A PAN IS ATTRIBUTED TO THE PARTY NAMED
+    BESIDE IT, NEVER TO THE PROJECT'S PROMOTER. A JHARERA project page
+    carries three or four PANs belonging to different companies, and taking
+    any of them as "this project's PAN" would key a GST lookup to the
+    architect's firm and then attribute its filing record to the developer.
+    That is the same misattribution promoter_identity.verify_pan was written
+    to stop, one level up.
+
+    Three filters, all of which must pass:
+
+      1. The PAN sits in a row that also names its holder. `pans_on_page`
+         -- JHARERA's bag of every PAN-shaped string on the record -- is
+         deliberately NOT used: those numbers have no owner attached, and
+         attributing one would be a guess.
+      2. promoter_identity.verify_pan confirms it against that holder's own
+         name (holder-type character, then the 5th character against the
+         name's initial).
+      3. The holder is a KNOWN GROUP ENTITY. This is both a correctness and
+         a privacy filter: an architect is often an individual, and
+         harvesting the personal PAN of someone who merely worked on a
+         group project is neither useful for group GST nor ours to collect.
+
+    Returns ({entity name: PAN}, [notes]). The notes say what was rejected
+    and why, so a thin harvest is legible rather than looking like an
+    absence of PANs.
+    """
+    known = {}
+    for name in (entity_names or []):
+        if str(name or "").strip():
+            known[group_entities.normalise(name)] = str(name).strip()
+
+    found, rejected_name, rejected_check, not_in_group = {}, 0, 0, 0
+    seen_pairs = set()
+
+    for project in ((sweep_result or {}).get("projects") or []):
+        detail = project.get("detail") or {}
+        holders = []
+        for professional in (detail.get("professionals") or []):
+            if not isinstance(professional, dict):
+                continue
+            holders.append((
+                professional.get("name") or professional.get("entityCompanyName") or "",
+                professional.get("panNumber") or "",
+                professional.get("professionalTypeName") or "professional",
+            ))
+        # K-RERA states partner PANs, keyed by whatever the table's own
+        # header calls them -- matched by content, never by position, for
+        # the same reason the adapter matches its tables that way.
+        for partner in (detail.get("partners") or []):
+            if not isinstance(partner, dict):
+                continue
+            name = next((v for k, v in partner.items() if "name" in k.lower()), "")
+            pan = next((v for k, v in partner.items()
+                        if "pan" in k.lower() and "company" not in k.lower()), "")
+            holders.append((name, pan, "partner"))
+
+        for holder_name, pan, role in holders:
+            holder_name = str(holder_name or "").strip()
+            pan = str(pan or "").strip().upper()
+            if not holder_name or not pan:
+                continue
+            if (group_entities.normalise(holder_name), pan) in seen_pairs:
+                continue
+            seen_pairs.add((group_entities.normalise(holder_name), pan))
+
+            if not gst_compliance.validate_pan(pan):
+                rejected_name += 1
+                continue
+            verdict = promoter_identity.verify_pan(pan, promoter_name=holder_name)
+            if not verdict.get("ok"):
+                rejected_check += 1
+                if reporter:
+                    reporter.warn(
+                        f"GST: discarded a PAN printed against {holder_name} ({role}) -- "
+                        f"{verdict.get('reason')}"
+                    )
+                continue
+            key = group_entities.normalise(holder_name)
+            if key not in known:
+                not_in_group += 1
+                continue
+            found.setdefault(known[key], pan)
+
+    notes = []
+    if found:
+        notes.append(
+            f"{len(found)} group entity/entities had a PAN read directly off a RERA filing, "
+            f"which is what made a GST lookup possible for them at all."
+        )
+    if rejected_check:
+        notes.append(
+            f"{rejected_check} PAN-shaped value(s) printed on those filings did not verify "
+            f"against the name they were printed against and were discarded rather than used. "
+            f"An unverified PAN would key a GST lookup to a different company."
+        )
+    if not_in_group:
+        notes.append(
+            f"{not_in_group} verified PAN(s) belonged to a contractor, architect or engineer "
+            f"who is not a group entity. They were not collected: they would not widen this "
+            f"group's GST coverage, and the individuals among them are not this report's subject."
+        )
+    return found, notes
 
 
 def _slug(name):

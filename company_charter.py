@@ -10966,7 +10966,8 @@ def _safe_group_rera_sweep(group_result: dict, subject_promoter: str = "",
 
 def _safe_group_gst(group_result: dict, subject_promoter: str = "",
                     identity_result: dict | None = None,
-                    enabled: bool | None = None, intake=None) -> dict:
+                    enabled: bool | None = None, intake=None,
+                    rera_sweep: dict | None = None) -> dict:
     """GST standing across the group, for every entity a PAN is held for.
 
     OPT-IN (CHARTER_GROUP_GST=1) for the same reason the RERA sweep is, only
@@ -10978,6 +10979,15 @@ def _safe_group_gst(group_result: dict, subject_promoter: str = "",
     so most of a group is structurally unreachable and the section's real
     content is its coverage line. An entity with no PAN is reported as
     unchecked; it is never counted as compliant. Never fatal.
+
+    `rera_sweep` WIDENS THAT COVERAGE AND IS THE MAIN WAY IT GROWS. Two
+    authorities print a PAN as a readable field -- JHARERA for the
+    contractor, architect and structural engineer, K-RERA for partners -- on
+    project pages the sweep has already fetched and opened. Harvesting them
+    turns structurally-unreachable entities into checkable ones without a
+    new source. gst_group.pans_from_sweep does the attribution safely: a PAN
+    belongs to the party NAMED BESIDE IT, verified on its own check
+    characters, and only kept for entities already in this group.
     """
     if enabled is None:
         enabled = os.environ.get("CHARTER_GROUP_GST") == "1"
@@ -10988,8 +10998,18 @@ def _safe_group_gst(group_result: dict, subject_promoter: str = "",
             subject_promoter, (group_result or {}).get("cin"), group_result,
             proposer=lambda b: [],
         )
-        pans = gst_group.known_pans(identity_result=identity_result)
-        return gst_group.sweep(graph, pans, intake=intake)
+        harvested, harvest_notes = gst_group.pans_from_sweep(
+            rera_sweep, [row["name"] for row in gst_group._entity_rows(graph)]
+        )
+        pans = gst_group.known_pans(identity_result=identity_result,
+                                    rera_pans=harvested)
+        result = gst_group.sweep(graph, pans, intake=intake)
+        # Where the reach came from is part of the coverage claim, not
+        # decoration: a reader judging "2 of 65" needs to know the 2 were
+        # obtained by reading another authority's filing.
+        if harvest_notes:
+            result.setdefault("limitations", []).extend(harvest_notes)
+        return result
     except Exception as e:
         return {"entities": [], "checked": 0, "total": 0, "without_pan": 0,
                 "limitations": [f"The group-wide GST check could not run this pass: {e}"]}
@@ -11541,6 +11561,11 @@ def run_company_charter(
             group_result, _portal_promoter_name(category_data),
             facts.get("promoter_identity_check"),
             enabled=group_gst or None,
+            # Computed just above. The sweep's opened project pages are
+            # where JHARERA's and K-RERA's readable PANs live, and those
+            # PANs are what make a GST lookup possible for entities the MCA
+            # side of the graph can never key.
+            rera_sweep=facts.get("group_rera_sweep"),
         )
         facts["group_litigation"] = _safe_group_litigation(
             group_result, _portal_promoter_name(category_data),

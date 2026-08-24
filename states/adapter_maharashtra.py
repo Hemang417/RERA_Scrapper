@@ -85,6 +85,151 @@ def search_promoter_projects(name, reporter=None):
     ]
 
 
+class _NullReporter:
+    """A reporter for callers that have none. The sweep runs across many
+    entities and states; per-request chatter from each would bury the
+    result."""
+
+    def info(self, *a, **k): pass
+    def warn(self, *a, **k): pass
+    def ok(self, *a, **k): pass
+    def choose(self, *a, **k): return None
+
+
+def _complaint_count(complaints):
+    """How many complaints the complaints payload records, or None.
+
+    None and 0 must stay distinguishable: one means the category could not
+    be read, the other that MahaRERA published none. Returning 0 for an
+    unread category is the false clean record this pipeline keeps guarding
+    against."""
+    if not isinstance(complaints, dict):
+        return None
+    details = complaints.get("complaintDetails")
+    if details is None:
+        # The key is present and null on a project with no complaints --
+        # confirmed on a real capture -- so this IS a published zero, not a
+        # failure to read. A missing payload never reaches here: the caller
+        # passes None only when the fetch itself failed.
+        return 0
+    if isinstance(details, list):
+        return len(details)
+    return None
+
+
+def fetch_project_summary(project_ref, reporter=None):
+    """The diligence-relevant fields of ONE MahaRERA project.
+
+    The sweep alone only proves a project EXISTS. This opens it, which is
+    where what a reader actually needs lives: how much of it is sold,
+    whether the registration has lapsed, its complaint count, and -- when a
+    session is already to hand -- its promoter of record.
+
+    IT WILL NEVER SOLVE A CAPTCHA, AND THAT SHAPES WHAT IT CAN RETURN.
+    MahaRERA serves only `projects` and `complaints` without a session
+    (config.NO_AUTH_CATEGORIES); everything else needs a guest token minted
+    by a human solving a CAPTCHA in a real browser. A sweep can touch a
+    dozen projects, so minting one per project would demand a dozen human
+    solves to answer a background question -- unacceptable, and it would
+    make the sweep unrunnable unattended. So this uses a token only if one
+    is ALREADY cached from this run's own acquire (free, no solve) and
+    otherwise reports the auth-gated fields as unread rather than absent.
+
+    THE PROMOTER NAME IS THE FIELD THAT SUFFERS. It lives on `partners`,
+    which is auth-gated -- the no-auth `projects` payload carries
+    `promoterName: null`, confirmed on a real capture. group_sweep
+    .enrich_projects confirms or refutes a candidate by comparing that name
+    against the entity that matched, so without a cached token a MahaRERA
+    hit stays UNCONFIRMED. `promoter_name_source` says which happened, so
+    "unconfirmed" is never mistaken for "refuted".
+
+    Never raises: one unreachable project must not sink a sweep.
+    """
+    reporter = reporter or _NullReporter()
+    if not project_ref:
+        return {"opened": False, "note": "No MahaRERA project id was carried on this row."}
+
+    def _category(name, token, session):
+        try:
+            return api_client.fetch_category(name, str(project_ref), session, token), None
+        except api_client.CategoryFetchError as e:
+            return None, e
+
+    with requests.Session() as session:
+        projects, error = _category("projects", None, session)
+        if projects is None:
+            return {"opened": False,
+                    "note": (f"This project's MahaRERA record could not be read "
+                             f"({error}).")}
+
+        complaints, complaints_error = _category("complaints", None, session)
+
+        # Opportunistic only. load_valid() returns a token only when one is
+        # already cached and unexpired -- it never mints one, so this cannot
+        # block on a human.
+        token = token_cache.load_valid()
+        partners = appeals = None
+        if token:
+            partners, _ = _category("partners", token, session)
+            appeals, _ = _category("appeals", token, session)
+
+    if not isinstance(projects, dict):
+        return {"opened": False,
+                "note": "MahaRERA returned no general-details payload for this project."}
+
+    promoter_name = ""
+    promoter_name_source = None
+    if partners is not None:
+        promoter_name = _extract_promoter_name({"partners": partners, "projects": projects}) or ""
+        promoter_name_source = "partners record (cached session)" if promoter_name else None
+
+    notes = []
+    if not promoter_name:
+        notes.append(
+            "This project's promoter of record could not be read: MahaRERA publishes it only on "
+            "the partners record, which sits behind its CAPTCHA-gated session, and no session was "
+            "already cached. The project is therefore neither confirmed nor refuted as this "
+            "group's -- it must not be read as either."
+        )
+    if complaints is None:
+        notes.append(
+            f"This project's MahaRERA complaint category could not be read "
+            f"({complaints_error}), so its complaint count is UNKNOWN. It must not be read as zero."
+        )
+    if projects.get("isProjectLapsed"):
+        notes.append("MahaRERA records this project's registration as LAPSED.")
+
+    total_units = projects.get("totalNumberOfUnits")
+    sold_units = projects.get("totalNumberOfSoldUnits")
+    return {
+        "opened": True,
+        "promoter_name": promoter_name,
+        "promoter_name_source": promoter_name_source,
+        # MahaRERA's own promoter key, and the one join this pipeline has
+        # that is not a name: it is stable across a promoter's projects, so
+        # two projects sharing it are the same promoter on the authority's
+        # own records. See docs/PAN_INDIA_PROGRESS.md's join-key table.
+        "user_profile_id": projects.get("userProfileId"),
+        "project_name": projects.get("projectName") or "",
+        "reg_no": projects.get("projectRegistartionNo") or "",
+        "status": projects.get("projectCurrentStatus") or projects.get("projectStatusName") or "",
+        "project_type": projects.get("projectTypeName") or "",
+        "registration_lapsed": bool(projects.get("isProjectLapsed")),
+        "rera_registration_date": projects.get("reraRegistrationDate"),
+        "proposed_completion_date": projects.get("projectProposeComplitionDate"),
+        "original_proposed_completion_date": projects.get("originalProjectProposeCompletionDate"),
+        "units_total": total_units,
+        "units_sold": sold_units,
+        "total_complaints_count": _complaint_count(complaints),
+        # None means the category was never asked for (no cached session);
+        # an empty list means MahaRERA published none. Kept distinct for the
+        # same reason the complaint count is.
+        "total_appeals_count": (len(appeals) if isinstance(appeals, list) else None),
+        "authenticated_fields_read": bool(token),
+        "notes": notes,
+    }
+
+
 class MaharashtraAdapter:
     """StateAdapter for MahaRERA.
 

@@ -212,6 +212,128 @@ def test_the_group_gst_stage_is_opt_in_and_silent_when_off():
     print("test_the_group_gst_stage_is_opt_in_and_silent_when_off: PASS")
 
 
+# --- widening coverage off RERA filings -----------------------------------
+#
+# THE POINT OF THESE. GST coverage is limited by the join key, not the
+# scraping: two of sixty-five entities were reachable on the real subject.
+# Two authorities already print a PAN as a readable FIELD -- JHARERA for the
+# contractor, architect and structural engineer, K-RERA for partners -- on
+# pages the sweep already fetches. Harvesting them is the one widening that
+# needs no new source. Doing it CARELESSLY, though, keys a GST lookup to the
+# architect's firm and files its record under the developer's name.
+
+def _sweep_with(*professionals, partners=()):
+    return {"projects": [{"state": "JH", "detail": {
+        "professionals": list(professionals), "partners": list(partners)}}]}
+
+
+def test_a_pan_printed_on_a_filing_widens_coverage():
+    """The real case: JHARERA names Pranami Builders' contractor PAN
+    outright, which is how AAECP0371L was obtained at all."""
+    found, notes = gg.pans_from_sweep(
+        _sweep_with({"professionalTypeName": "Contractor",
+                     "name": "PRANAMI BUILDERS PVT.LTD",
+                     "panNumber": "AAECP0371L"}),
+        ["Pranami Builders Pvt Ltd", "Bihar Carbons Ltd"],
+    )
+    assert found == {"Pranami Builders Pvt Ltd": "AAECP0371L"}, found
+    assert any("read directly off a RERA filing" in n for n in notes), notes
+
+    # And it flows through the existing provenance machinery unchanged.
+    pans = gg.known_pans(rera_pans=found)
+    key = gg.group_entities.normalise("Pranami Builders Pvt Ltd")
+    assert pans[key]["source"] == gg.PAN_SOURCE_RERA_FILING, pans
+    print("test_a_pan_printed_on_a_filing_widens_coverage: PASS")
+
+
+def test_a_pan_is_never_attributed_to_the_wrong_holder():
+    """THE LOAD-BEARING GUARD. A JHARERA page carries three or four PANs
+    belonging to DIFFERENT companies. Taking any of them as "this project's
+    PAN" would pull the architect's GST filings and report them as the
+    developer's -- the same misattribution verify_pan exists to stop, one
+    level up.
+
+    Here the identical number is printed against two different names. It
+    must be kept for the one whose initial it matches and discarded for the
+    other, on the PAN's own 5th character."""
+    found, notes = gg.pans_from_sweep(
+        _sweep_with(
+            {"professionalTypeName": "Contractor", "name": "PRANAMI BUILDERS PVT.LTD",
+             "panNumber": "AAECP0371L"},
+            {"professionalTypeName": "Architect", "name": "Bihar Carbons Ltd",
+             "panNumber": "AAECP0371L"},
+        ),
+        ["Pranami Builders Pvt Ltd", "Bihar Carbons Ltd"],
+    )
+    assert found == {"Pranami Builders Pvt Ltd": "AAECP0371L"}, found
+    assert "Bihar Carbons Ltd" not in found, (
+        "a PAN whose 5th character contradicts the name it was printed against was "
+        "attributed to that name anyway"
+    )
+    assert any("did not verify against the name" in n for n in notes), notes
+    print("test_a_pan_is_never_attributed_to_the_wrong_holder: PASS")
+
+
+def test_an_unattributed_pan_is_never_harvested():
+    """JHARERA's `pans_on_page` is every PAN-shaped string on the record,
+    with no owner attached. It is deliberately not read: attributing one
+    would be a guess, and this module's whole rule is that a PAN is only
+    ever as good as the name printed beside it."""
+    sweep = {"projects": [{"state": "JH", "detail": {
+        "pans_on_page": ["AAECP0371L", "AANCP0234D"], "professionals": []}}]}
+    found, _ = gg.pans_from_sweep(sweep, ["Pranami Builders Pvt Ltd"])
+    assert found == {}, found
+    print("test_an_unattributed_pan_is_never_harvested: PASS")
+
+
+def test_a_non_group_professionals_pan_is_not_collected():
+    """Correctness AND privacy. An architect is often an individual, and
+    their personal PAN neither widens this group's GST coverage nor is it
+    this report's business to hold."""
+    found, notes = gg.pans_from_sweep(
+        _sweep_with({"professionalTypeName": "Architect", "name": "Anil Associates",
+                     "panNumber": "AAACA1111A"}),
+        ["Pranami Builders Pvt Ltd"],
+    )
+    assert found == {}, found
+    assert any("not a group entity" in n for n in notes), notes
+    assert any("not this report's subject" in n for n in notes), notes
+    print("test_a_non_group_professionals_pan_is_not_collected: PASS")
+
+
+def test_karnataka_partner_pans_are_harvested_too():
+    """K-RERA states partner PANs, keyed by whatever its own table header
+    calls the column -- so the column is matched by content, never by
+    position, exactly as the adapter matches its tables."""
+    found, _ = gg.pans_from_sweep(
+        {"projects": [{"state": "KA", "detail": {"partners": [
+            {"Partner Name": "Bihar Carbons Ltd", "PAN No.": "AABCB2222B"},
+        ]}}]},
+        ["Bihar Carbons Ltd"],
+    )
+    assert found == {"Bihar Carbons Ltd": "AABCB2222B"}, found
+    print("test_karnataka_partner_pans_are_harvested_too: PASS")
+
+
+def test_a_malformed_harvested_pan_never_reaches_a_lookup():
+    found, _ = gg.pans_from_sweep(
+        _sweep_with({"professionalTypeName": "Contractor",
+                     "name": "Pranami Builders Pvt Ltd", "panNumber": "NOTAPAN123"}),
+        ["Pranami Builders Pvt Ltd"],
+    )
+    assert found == {}, found
+    print("test_a_malformed_harvested_pan_never_reaches_a_lookup: PASS")
+
+
+def test_an_unswept_or_unopened_project_yields_nothing_quietly():
+    """A project the sweep listed but never opened has no detail, and must
+    contribute no PANs rather than raising."""
+    assert gg.pans_from_sweep({}, ["X"]) == ({}, [])
+    assert gg.pans_from_sweep({"projects": [{"state": "JH"}]}, ["X"]) == ({}, [])
+    assert gg.pans_from_sweep(None, None) == ({}, [])
+    print("test_an_unswept_or_unopened_project_yields_nothing_quietly: PASS")
+
+
 if __name__ == "__main__":
     test_an_entity_with_no_pan_is_unchecked_never_compliant()
     test_the_coverage_sentence_leads_with_the_denominator()
@@ -225,4 +347,11 @@ if __name__ == "__main__":
     test_only_checked_entities_can_be_rendered_as_findings()
     test_proposed_entities_are_not_swept_only_confirmed_ones()
     test_the_group_gst_stage_is_opt_in_and_silent_when_off()
+    test_a_pan_printed_on_a_filing_widens_coverage()
+    test_a_pan_is_never_attributed_to_the_wrong_holder()
+    test_an_unattributed_pan_is_never_harvested()
+    test_a_non_group_professionals_pan_is_not_collected()
+    test_karnataka_partner_pans_are_harvested_too()
+    test_a_malformed_harvested_pan_never_reaches_a_lookup()
+    test_an_unswept_or_unopened_project_yields_nothing_quietly()
     print("\nAll tests passed.")

@@ -358,6 +358,20 @@ def enrich_projects(result, fetcher=None, reporter=None, limit=DEFAULT_DETAIL_LI
                 f"({', '.join(sorted(shared))}). Consistent with the one-vehicle-per-project "
                 f"structure, but the link is the shared name, not a filed relationship."
             )
+        elif not actual:
+            # THE CHECK COULD NOT RUN, WHICH IS NOT THE SAME AS FAILING IT.
+            # Without this branch the project fell through every arm above
+            # and carried NO confirmation key at all -- read alongside its
+            # `detail_status: "opened"` that looks like a project examined
+            # and found unremarkable. MahaRERA reaches here whenever no
+            # session is cached, because it publishes the promoter of record
+            # only on its auth-gated partners record.
+            project["confirmation"] = (
+                "unconfirmed: this project's own page published no promoter of record, so it "
+                "could not be checked against this group. That is a limit of what the authority "
+                "served, not evidence for or against the project belonging to this group."
+            )
+            project["unconfirmed"] = True
         elif agree is False:
             project["confirmation"] = (
                 f"refuted: this project's promoter of record is {actual}, which shares no name "
@@ -373,6 +387,10 @@ def enrich_projects(result, fetcher=None, reporter=None, limit=DEFAULT_DETAIL_LI
     result["projects_probable"] = len([p for p in projects
                                        if str(p.get("confirmation", "")).startswith("probable")])
     result["projects_refuted"] = len([p for p in projects if p.get("refuted")])
+    # Opened, but the authority published no promoter to check against. Counted
+    # separately from refuted because the two mean opposite things and a reader
+    # conflating them would either drop a real project or claim a false one.
+    result["projects_unconfirmed"] = len([p for p in projects if p.get("unconfirmed")])
     if opened < len([p for p in projects if p.get("project_id")]):
         result.setdefault("limitations", []).append(
             f"{opened} of {len(projects)} matched projects were opened and read; the rest are "

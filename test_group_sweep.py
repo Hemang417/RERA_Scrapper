@@ -323,12 +323,68 @@ def test_an_unopenable_project_is_recorded_not_dropped():
 
 
 def test_a_state_with_no_detail_fetch_says_so():
-    """MahaRERA and K-RERA have no fetch_project_summary yet. Their projects
-    must be marked as not opened rather than silently appearing bare."""
-    result = gs.sweep(["X"], state_codes=["KA"], searcher=_hit_with_id)
+    """A project on an authority this pipeline cannot open per-project must be
+    marked as not opened rather than silently appearing bare.
+
+    Gujarat is the case today. The result is built by hand rather than swept
+    because GujRERA has no promoter search either, and sweep() rightly
+    refuses to let an injected searcher invent coverage for it -- so there is
+    no way to get a Gujarat project into a swept result, which is correct.
+    Building the row directly is what isolates the enrichment behaviour."""
+    result = {"projects": [{"state": "GJ", "project_id": "17020",
+                            "matched_entity": "Aalekh Enterprise"}]}
     gs.enrich_projects(result)
     assert "no per-project fetch" in result["projects"][0]["detail_status"], result["projects"][0]
+    assert "detail" not in result["projects"][0], result["projects"][0]
     print("test_a_state_with_no_detail_fetch_says_so: PASS")
+
+
+def test_every_searchable_state_can_also_open_what_it_found():
+    """A sweep that can LIST a project but never OPEN it can neither confirm
+    nor refute it, and unconfirmed candidates are what inflate a group's
+    apparent footprint -- five of six on the first live run.
+
+    MahaRERA and K-RERA were exactly that gap for a while: both searchable,
+    neither openable, so every hit on the two largest registers in the
+    pipeline stayed a bare name. This pins the pairing rather than the two
+    states, so a seventh adapter cannot reintroduce it."""
+    missing = [code for code in gs.searchable_states()
+               if gs._detail_fetcher_for(code) is None]
+    assert not missing, (
+        f"these states can be searched by promoter but their hits can never be opened, "
+        f"so nothing found on them can be confirmed or refuted: {missing}"
+    )
+    print("test_every_searchable_state_can_also_open_what_it_found: PASS")
+
+
+def test_an_unreadable_promoter_name_is_unconfirmed_not_refuted():
+    """THE CHECK COULD NOT RUN IS NOT THE SAME AS THE CHECK FAILED, and
+    before this branch existed the project carried NO confirmation at all --
+    which alongside `detail_status: "opened"` reads as examined-and-fine.
+
+    MahaRERA reaches here whenever no session is cached: it publishes the
+    promoter of record only on its CAPTCHA-gated partners record, so an
+    unattended sweep opens the project and legitimately cannot name its
+    promoter. Refuting it would drop a real project; staying silent would
+    smuggle in an unverified one."""
+    def _nameless(ref, reporter=None):
+        return {"opened": True, "promoter_name": "", "units_total": 234}
+
+    result = gs.sweep(["Pranami Neev Realty Limited"], state_codes=["JH"],
+                      searcher=_hit_with_id)
+    gs.enrich_projects(result, fetcher=_nameless)
+    project = result["projects"][0]
+    assert project["detail_status"] == "opened", project
+    assert project.get("unconfirmed") is True, project
+    assert project["confirmation"].startswith("unconfirmed"), project["confirmation"]
+    # It must not read as either verdict.
+    assert not project.get("refuted"), project
+    assert result["projects_refuted"] == 0, result
+    assert result["projects_confirmed"] == 0, result
+    assert result["projects_unconfirmed"] == 1, result
+    # And it must say WHY, so a reader knows this is the authority's limit.
+    assert "not evidence" in project["confirmation"], project["confirmation"]
+    print("test_an_unreadable_promoter_name_is_unconfirmed_not_refuted: PASS")
 
 
 # --- bounds ---------------------------------------------------------------

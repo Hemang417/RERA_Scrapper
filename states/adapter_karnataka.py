@@ -367,6 +367,17 @@ def _find_table_by_header(tables: list, *needles) -> list:
 _INDEX_CACHE = []
 
 
+class _NullReporter:
+    """A reporter for callers that have none. The sweep runs across many
+    entities and states; per-request chatter from each would bury the
+    result."""
+
+    def info(self, *a, **k): pass
+    def warn(self, *a, **k): pass
+    def ok(self, *a, **k): pass
+    def choose(self, *a, **k): return None
+
+
 def search_promoter_projects(name, reporter=None):
     """Projects in the K-RERA state index under a promoter matching `name`.
 
@@ -388,10 +399,139 @@ def search_promoter_projects(name, reporter=None):
         return []
     return [
         {"reg_no": e["reg_no"], "project_name": e["project_name"],
-         "promoter_name": e["promoter_name"]}
+         "promoter_name": e["promoter_name"],
+         # Carried so a caller can OPEN the project -- group_sweep
+         # .enrich_projects skips any row without one, and without this
+         # every K-RERA hit was reported as "not opened (this authority has
+         # no per-project fetch)" even once fetch_project_summary existed.
+         # The reg no is the handle: fetch_project_summary looks it back up
+         # in this same index to recover the ack no that /projectViewDetails
+         # also wants.
+         "project_id": e["reg_no"] or e["ack_no"]}
         for e in index
         if needle in " ".join((e["promoter_name"] or "").split()).casefold()
     ]
+
+
+def _index_entry(ref):
+    """The state-index row for a reg no or ack no, or None.
+
+    Reuses `_INDEX_CACHE`, so in a sweep -- where search_promoter_projects
+    has already loaded it -- this costs nothing. K-RERA's detail view wants
+    BOTH identifiers and the search row only carries one, so the index is
+    what recovers the other.
+    """
+    needle = (ref or "").strip().casefold()
+    if not needle:
+        return None
+    if not _INDEX_CACHE:
+        try:
+            session = _session()
+            _INDEX_CACHE.extend(parse_search_index(session.get(SEARCH_PAGE, timeout=_TIMEOUT).text))
+        except Exception:
+            return None
+    for entry in _INDEX_CACHE:
+        if needle in ((entry["reg_no"] or "").casefold(), (entry["ack_no"] or "").casefold()):
+            return entry
+    return None
+
+
+def fetch_project_summary(project_ref, reporter=None):
+    """The diligence-relevant fields of ONE K-RERA project.
+
+    The sweep alone only proves a project EXISTS. This opens it, which is
+    where what a reader actually needs lives: the partners and land owners,
+    the professionals of record, cost incurred against cost estimated, and
+    the complaint count.
+
+    Deliberately a SUMMARY and not a full acquire(): it does not download
+    the project's ~120 documents. A group sweep can touch a dozen projects,
+    and pulling several hundred megabytes of scanned filings to answer
+    "does this promoter have projects in Karnataka" would be the wrong
+    trade. The document COUNT is reported so a reader knows what is there.
+
+    THE PROMOTER NAME COMES FROM THE STATE INDEX, NOT THE DETAIL PAGE.
+    K-RERA's detail tables carry partners and land owners but not the
+    promoter of record -- acquire() takes it from the index too. That is
+    load-bearing for the caller: group_sweep.enrich_projects confirms or
+    refutes a candidate by comparing this name against the entity that
+    matched, and a summary that returned no name would leave every hit
+    unconfirmed.
+
+    Never raises: one unreachable project must not sink a sweep.
+    """
+    reporter = reporter or _NullReporter()
+    entry = _index_entry(project_ref)
+    if entry is None:
+        return {"opened": False,
+                "note": (f"'{project_ref}' is not in the K-RERA state index, so its project "
+                         f"page could not be located.")}
+
+    session = _session()
+    try:
+        summary_html = session.post(
+            SEARCH_POST,
+            data={"regNo": entry["reg_no"], "appNo": entry["ack_no"], "btn1": "Search"},
+            timeout=_TIMEOUT,
+        ).text
+    except Exception as e:
+        return {"opened": False,
+                "note": f"K-RERA did not return this project's summary row ({type(e).__name__})."}
+
+    adapter = ADAPTER
+    summary, action_id = adapter._parse_summary(summary_html)
+    if not action_id:
+        return {"opened": False,
+                "note": ("K-RERA returned no detail handle for this project, so its record "
+                         "could not be opened.")}
+
+    try:
+        detail_html = session.post(DETAIL_POST, data={"action": action_id}, timeout=_TIMEOUT).text
+    except Exception as e:
+        return {"opened": False,
+                "note": f"K-RERA did not return this project's detail page ({type(e).__name__})."}
+
+    tables = [_table_to_rows(t) for t in BeautifulSoup(detail_html, "html.parser").find_all("table")]
+    parsed = adapter._parse_detail(tables, summary)
+
+    # The state-wide register, never the per-project page -- see
+    # KarnatakaAdapter._complaint_count for the false clean record that
+    # taught this. A count of None means the register could not be read and
+    # must not be shown as zero.
+    class _Ctx:
+        pass
+
+    ctx = _Ctx()
+    ctx.reporter = reporter
+    complaint_count, complaint_row = adapter._complaint_count(session, entry["project_name"], ctx)
+
+    notes = []
+    if complaint_count is None:
+        notes.append(
+            "K-RERA's state-wide complaint register could not be read for this project, so its "
+            "complaint count is UNKNOWN. It must not be read as zero."
+        )
+    documents = (parsed.get("documents") or {}).get("tables") or []
+    document_rows = sum(max(0, len(t) - 1) for t in documents)
+
+    return {
+        "opened": True,
+        "promoter_name": entry["promoter_name"] or "",
+        "project_name": entry["project_name"] or "",
+        "reg_no": entry["reg_no"] or "",
+        "status": summary.get("Project Status") or summary.get("Status") or "",
+        "partners": parsed.get("partners") or [],
+        "land_owners": parsed.get("land_owners") or [],
+        "professionals": parsed.get("professionals") or [],
+        # K-RERA is the only built authority publishing both, and the pair is
+        # a direct input to financial strength -- see the coverage workbook.
+        "costs": parsed.get("costs") or {},
+        "extensions": parsed.get("extensions") or [],
+        "total_complaints_count": complaint_count,
+        "complaint_register_row": complaint_row,
+        "documents_on_page": document_rows,
+        "notes": notes,
+    }
 
 
 class KarnatakaAdapter:
