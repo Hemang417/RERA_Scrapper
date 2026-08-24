@@ -469,6 +469,45 @@ hardcoded state literal. `test_state_labels.py` renders the same facts under two
 profiles and asserts the difference is exactly the state-bearing paragraphs —
 proving parameterisation is both complete and contained.
 
+## 8. `output/` is gitignored, and it holds work that is not reproducible
+
+**This is the one guard in this file that is not code.** Nothing enforces it;
+`.gitignore:1` ignores `output/` wholesale, so everything below has no git
+history and no remote copy. A clear-out is unrecoverable, and it has already
+gone wrong twice.
+
+Two classes of file live in there that are NOT run output:
+
+| What | Where | Why it cannot be regenerated |
+|---|---|---|
+| The Charter seed template | `company_charter.TEMPLATE_PATH` — `output/company_charters/Company_Charter_TEMPLATE_Integrow_Branded.docx` | A static hand-built asset. `_fill_template` copies it on every run and fills the copy; nothing has ever regenerated the seed |
+| ~13 one-off scripts, ~280 KB | `output/<REG_NO>/research/*.py` | Hand-written `pre_built_facts` recipes and post-render patch scripts, up to 60 KB each. They are the ONLY route to a Charter when no API key works |
+
+The scripts are not incidental. `constella_charter_facts.py`,
+`karmashine_charter_facts.py`, `pranami_bliss_charter_facts.py` and
+`build_facts.py` are the hand-assembled facts dicts behind four delivered
+Charters, and `patch_state_labels.py` / `patch_rules_compliance.py` are the
+post-render fixes that made them compliant.
+
+**Both near-misses.** The template was deleted during a routine `output/`
+clear and broke `run_company_charter()` with `FileNotFoundError`; it survived
+only because a stale pre-migration copy happened to exist on the Desktop. On
+2026-08-24 `output/_history/` was cleared as "a test-run leftover" — 257 MB
+across three archived runs, and genuinely almost all of it duplicated the live
+directory — but two of its files were the Pranami recipe, in one place on
+disk, never committed.
+
+**Before deleting anything under `output/`:**
+
+```bash
+find output -path '*/research/*.py' -not -path '*__pycache__*'
+```
+
+and check for the template. **Diff an archive against the live directory
+first** — most of what looks like history is byte-for-byte duplicate, and the
+few files that are not are exactly the ones worth keeping. Say what you found
+before you delete, rather than after.
+
 ## Adding a guardrail
 
 Put it in code, add its symbol to the right table above, and let
