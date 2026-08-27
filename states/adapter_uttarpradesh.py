@@ -460,6 +460,79 @@ def fetch_project_summary(project_ref, reporter=None):
     }
 
 
+# --- the de-registered / defaulter register --------------------------------
+#
+# DELIBERATELY NOT WIRED INTO acquire(). Written and verified live on
+# 2026-08-26 -- mirrors the westbengal.fetch_defaulters() precedent: a small,
+# directly useful register that names the party outright, kept as a standalone
+# module-level function until something actually calls it.
+#
+# NOT A FETCHABLE URL ON ITS OWN. The homepage's 'DE-REGISTERED PROJECTS' menu
+# item is not a link -- it is `javascript:__doPostBack('...$lnkDefaulter','')`,
+# an ASP.NET WebForms postback. A plain GET on the page it redirects to
+# (`/DefaulterList`) serves the same 48.7 KB chrome-only shell as an unissued
+# project id: the grid is populated server-side during the postback itself and
+# is not there for a fresh request to read. So this fetches the homepage first
+# for a live __VIEWSTATE/__EVENTVALIDATION pair, then POSTs the postback that
+# names `lnkDefaulter`, and parses the grid out of THAT response.
+#
+# ONE REGISTER, TWO STATUSES. Confirmed live: 72 rows under
+# `ctl00_ContentPlaceHolder1_grd_black`, each a project registration number,
+# project name, district and promoter name -- with the project name itself
+# carrying the suffix `(De-Registered Project)` or `(Defaulter Project)`.
+# UP-RERA does not split these into two registers or a separate status
+# column, so neither does this parser.
+
+
+def fetch_defaulters(session=None):
+    """UP-RERA's de-registered/defaulter project register, by promoter NAME.
+
+    [{'sno', 'project_registration_no', 'project_name', 'project_district',
+      'promoter_name', 'promoter_photo', 'rera_order', 'view_details'}, ...],
+    keyed by the grid's own header row (lower-cased, spaces to underscores) so
+    a header UP-RERA reorders or renames does not silently misalign the
+    values -- the same defensive shape as westbengal.fetch_defaulters().
+    """
+    session = session or _session()
+    home_url = BASE_URL + "/index.aspx"
+    home_html = _get(session, home_url, what="UP-RERA homepage")
+    soup = BeautifulSoup(home_html, "html.parser")
+
+    def _field(name):
+        node = soup.find(id=name) or soup.find(attrs={"name": name})
+        return node.get("value", "") if node else ""
+
+    payload = {
+        "__EVENTTARGET": "ctl00$ContentPlaceHolder1$lnkDefaulter",
+        "__EVENTARGUMENT": "",
+        "__VIEWSTATE": _field("__VIEWSTATE"),
+        "__VIEWSTATEGENERATOR": _field("__VIEWSTATEGENERATOR"),
+        "__EVENTVALIDATION": _field("__EVENTVALIDATION"),
+    }
+
+    def _post():
+        response = session.post(home_url, data=payload, timeout=_TIMEOUT, verify=False)
+        response.raise_for_status()
+        return response.text
+
+    result_html = fetch_with_retry(_post, what="UP-RERA de-registered/defaulter list")
+    table = BeautifulSoup(result_html, "html.parser").find(id=_CONTROL_PREFIX + "grd_black")
+    if table is None:
+        return []
+    trs = table.find_all("tr")
+    if not trs:
+        return []
+    headers = [" ".join(c.get_text(" ", strip=True).split()).lower().replace(" ", "_")
+               for c in trs[0].find_all(["th", "td"])]
+    out = []
+    for tr in trs[1:]:
+        cells = [" ".join(c.get_text(" ", strip=True).split()) for c in tr.find_all("td")]
+        if not any(cells):
+            continue
+        out.append({headers[i]: cells[i] for i in range(min(len(headers), len(cells)))})
+    return out
+
+
 # --- the adapter ----------------------------------------------------------
 
 

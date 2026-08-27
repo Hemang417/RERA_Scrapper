@@ -53,6 +53,7 @@ from .base import (
 )
 from .haryana import (
     BENCHES,
+    CANCELLED_PROJECTS,
     LAPSED_PROJECTS,
     PROFILE,
     PROJECT_DETAIL,
@@ -374,6 +375,103 @@ def parse_project_detail(html):
         "litigation_declared": litigation,
         "documents": documents,
     }
+
+
+def parse_lapsed_or_defaulter_register(html):
+    """Rows off EITHER `/admincontrol/lapsed_projects/{bench}` or
+    `/admincontrol/cancelled_projects/{bench}` -- same shape, same three
+    header needles as `parse_register`, verified live 2026-08-26.
+
+    THESE ARE TWO DIFFERENT FINDINGS, NOT ONE. Lapsed = the registration
+    certificate's own validity window (Approval From/To) has ended -- 320
+    Panchkula + 235 Gurugram rows. Cancelled = the menu itself labels this
+    "Defaulter/ Cancelled/ Suspended/ Abeyance Projects", HARERA's own
+    action against the promoter -- 23 Panchkula + 5 Gurugram rows, far
+    fewer, and the two lists barely overlap. A caller must not read a
+    lapsed listing as a defaulter finding or vice versa.
+
+    Pure: HTML in, dicts out, no network -- like `parse_register`. NOT
+    wired into `acquire()`; nothing here calls `fetch_lapsed_projects` or
+    `fetch_defaulter_projects` below.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    for table in soup.find_all("table"):
+        rows = _rows_of(table)
+        if len(rows) < 2:
+            continue
+        header = [h.casefold() for h in rows[0][0]]
+        joined = " | ".join(header)
+        if not ("registration certificate number" in joined
+                and "project id" in joined and "builder" in joined):
+            continue
+
+        def _column(*needles):
+            for index, name in enumerate(header):
+                if all(n in name for n in needles):
+                    return index
+            return None
+
+        idx = {
+            "certificate_no": _column("registration certificate number"),
+            "project_id": _column("project id"),
+            "project_name": _column("project name"),
+            "builder": _column("builder"),
+            "location": _column("project location"),
+            "district": _column("project district"),
+            # Present on the lapsed register only; absent (None) on the
+            # cancelled/defaulter one, where _cell() below just yields "".
+            "approval_from": _column("approval from"),
+            "approval_to": _column("approval to"),
+        }
+
+        out = []
+        for texts, cells in rows[1:]:
+            def _cell(key):
+                index = idx.get(key)
+                if index is None or index >= len(texts):
+                    return ""
+                return texts[index]
+
+            builder = _cell("builder").strip()
+            project_name = _cell("project_name").strip()
+            if not builder and not project_name:
+                continue
+            out.append({
+                "certificate_no": _cell("certificate_no"),
+                "project_id": _cell("project_id"),
+                "project_name": project_name,
+                "builder": builder,
+                "location": _cell("location"),
+                "district": _cell("district"),
+                "approval_from": _cell("approval_from"),
+                "approval_to": _cell("approval_to"),
+            })
+        if out:
+            return out
+    return []
+
+
+def fetch_lapsed_projects(bench, session=None):
+    """One bench's list of registrations whose validity window has ended.
+
+    NOT a defaulter list -- see `parse_lapsed_or_defaulter_register`.
+    Unwired: `acquire()` never calls this.
+    """
+    html = _get(session or _session(), LAPSED_PROJECTS.format(bench),
+                what=f"HARERA {BENCHES.get(bench, bench)} lapsed-projects register")
+    return parse_lapsed_or_defaulter_register(html)
+
+
+def fetch_defaulter_projects(bench, session=None):
+    """One bench's "Defaulter/ Cancelled/ Suspended/ Abeyance Projects"
+    list -- HARERA's own action against the promoter, and a much smaller,
+    different set of rows than `fetch_lapsed_projects`.
+
+    Unwired: `acquire()` never calls this.
+    """
+    html = _get(session or _session(), CANCELLED_PROJECTS.format(bench),
+                what=f"HARERA {BENCHES.get(bench, bench)} defaulter/cancelled-projects register")
+    return parse_lapsed_or_defaulter_register(html)
 
 
 _REGISTER_CACHE = {}

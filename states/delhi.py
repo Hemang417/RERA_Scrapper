@@ -69,6 +69,31 @@ AGENTS_INDEX = BASE_URL + "/PublicView/RegisteredAgentsDetail"
 # Complaint Number / Complainant Name / Respondent Name / Date of Decision.
 # The misspelling `Compalaint` is in the real URL; it is not a typo here.
 ORDER_REGISTER = BASE_URL + "/CourtView/OrderJudgementsAuthorityInfo?type=GC_Compalaint_M"
+# Delhi DOES have a separate Real Estate Appellate Tribunal (REAT) -- it is
+# NOT linked from any register page and was found only via web search, then
+# confirmed live. REAT Delhi is shared with the UT of Chandigarh (one
+# Chairperson appointed for both, per the Land & Building Department's own
+# order), but this register carries only Delhi's appeals. Confirmed live
+# 2026-08-26: 505 data rows, columns Sr.No / Appeal Number / Date of
+# Decision / judgement PDF. UNLIKE ORDER_REGISTER it names NO PARTY -- a row
+# is a free-text bundle of appeal/CM numbers, so it is browsable but not
+# promoter-searchable the way the complaint register is.
+APPEAL_REGISTER = BASE_URL + "/courtREAT/REATcourtOrderJudgementsAppellateTribunalInfo"
+# The authority's OWN-MOTION (suo moto) notices and orders -- proceedings it
+# opened itself rather than ones a complainant filed. This is the closest
+# thing this portal publishes to "projects under investigation". Confirmed
+# live 2026-08-26: 1,797 data rows naming a Respondent/Promoter and project
+# details per row, so it IS promoter-searchable like ORDER_REGISTER.
+SUOMOTO_REGISTER = BASE_URL + "/courtview/SuoMotoCases"
+# Orders referred for EXECUTION because the respondent never complied -- the
+# closest thing this portal publishes to a "defaulters list", though the
+# authority never uses that word. Confirmed live 2026-08-26: 7,493 data rows
+# naming a Complainant/Decree Holder and a Respondent/Judgement Debtor (the
+# defaulting promoter) per row. The equivalent Adjudicating-Officer register,
+# `.../courtview/ExecutionInOrderJudgementsAOInfo`, returned a header only
+# (0 rows) on the same day -- a live page with nothing pending, not a dead
+# route.
+EXECUTION_REGISTER = BASE_URL + "/courtview/ExecutionInOrderJudgementsAuthorityInfo"
 
 PROFILE = StateProfile(
     code="DL",

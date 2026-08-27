@@ -69,6 +69,12 @@ BASE_URL = "https://haryanarera.gov.in"
 BENCHES = {"1": "Panchkula", "2": "Gurugram"}
 REGISTERED_PROJECTS = BASE_URL + "/admincontrol/registered_projects/{}"
 LAPSED_PROJECTS = BASE_URL + "/admincontrol/lapsed_projects/{}"
+# NOT the same list as LAPSED_PROJECTS -- verified live 2026-08-24 audit.
+# Lapsed = the registration's own Approval-To validity date has passed.
+# Cancelled = HARERA's menu labels this "Defaulter/ Cancelled/ Suspended/
+# Abeyance Projects", an authority action against the promoter. 320+235
+# rows lapsed across both benches vs 23+5 cancelled/defaulter.
+CANCELLED_PROJECTS = BASE_URL + "/admincontrol/cancelled_projects/{}"
 # The detail view takes a plain integer, and that integer is carried in the
 # register row itself -- so opening a project needs no search step.
 PROJECT_DETAIL = BASE_URL + "/view_project/project_preview_open/{}"

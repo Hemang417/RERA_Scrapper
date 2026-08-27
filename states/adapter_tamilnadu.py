@@ -53,10 +53,12 @@ actively REFUSES to return a PAN-shaped value from that field and records
 `pan_masked` instead. gst_group must never see one from Tamil Nadu.
 """
 
+import io
 import json
 import os
 import re
 
+import pdfplumber
 import requests
 from bs4 import BeautifulSoup
 
@@ -773,6 +775,200 @@ def search_orders_by_promoter(name, fetcher=None):
     hits = [r for r in rows
             if needle in " ".join((r.get("respondent") or "").split()).casefold()]
     return hits, coverage
+
+
+# --- the penalty register (unwired) ---------------------------------------
+#
+# NOT called from acquire() or any test -- written and verified against a
+# live page (2026-08-26), same precedent as adapter_westbengal.fetch_defaulters().
+#
+# This is the closest thing TNRERA publishes to a "defaulters list": one live
+# page per project type, no year selector and no search box, naming the
+# promoter, their address, the project and the penalty levied. Confirmed live
+# with real rows -- 1 on the Building page (TNRERA/PBF/0092/2025, M/S. VIKAS
+# MANTRA PROPERTIES & INFRASTRUCTURE PRIVATE LIMITED, Rs 20,10,940) and 146 on
+# the Layout page (TNRERA/PLI/2288/2024 among them). It is titled "Penalty",
+# not "Defaulters" or "Black List" -- the authority publishes no register
+# under either of those names, and no separate revoked/cancelled-registration
+# list was found anywhere on the site.
+PENALTY_URLS = {
+    "building": BASE_URL + "/building/online/penalty",
+    "layout": BASE_URL + "/layout/online/penalty",
+}
+
+
+def parse_penalty_register(html):
+    """One penalty page as [{application_no, promoter_block, project_block,
+    penalty_notice_date, penalty_amount}].
+
+    Same header-by-content approach as `_columns` -- this page has no year
+    selector so there is exactly one table to find, but matching by header
+    text rather than position costs nothing and survives a column reorder.
+
+    `promoter_block` is left whole, deliberately NOT run through
+    `promoter_name()`: that helper assumes a comma before the address starts
+    ('M/s. X, No.7, ... Road'), and this register's cells instead run the
+    firm name straight into 'Door No.' with a period ('LIMITED. Door No.
+    NO.27, ...'). Applying it here truncated a real promoter's name at
+    'Door No.' on the first live row checked -- a bug in reuse, not a
+    pre-existing one in `promoter_name()` itself.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    for table in soup.find_all("table"):
+        rows = _rows_of(table)
+        if len(rows) < 2:
+            continue
+        header = [h.casefold() for h in rows[0][0]]
+
+        def find(*needles):
+            for index, name in enumerate(header):
+                if all(n in name for n in needles):
+                    return index
+            return None
+
+        idx = {
+            "application_no": find("application"),
+            "promoter_block": find("promoter"),
+            "project_block": find("project"),
+            "penalty_notice_date": find("penalty", "issued"),
+            "penalty_amount": find("penalty", "amount"),
+        }
+        if idx["application_no"] is None or idx["promoter_block"] is None:
+            continue
+        out = []
+        for texts, _cells in rows[1:]:
+            def cell(key):
+                index = idx.get(key)
+                if index is None or index >= len(texts):
+                    return ""
+                return texts[index]
+
+            application_no = cell("application_no")
+            if not application_no:
+                continue
+            out.append({
+                "application_no": application_no,
+                "promoter_block": cell("promoter_block"),
+                "project_block": cell("project_block"),
+                "penalty_notice_date": cell("penalty_notice_date"),
+                "penalty_amount": cell("penalty_amount"),
+            })
+        if out:
+            return out
+    return []
+
+
+def fetch_penalty_notices(kind="building", fetcher=None, session=None):
+    """TNRERA's live penalty register for one project type ('building' or
+    'layout'). Returns a plain list, never raises -- a caller that wires this
+    in decides what "could not be read" should mean for its own use."""
+    url = PENALTY_URLS[kind]
+    html = fetcher(url) if fetcher is not None else _get(
+        session or _session(), url, what=f"TNRERA {kind} penalty register"
+    )
+    return parse_penalty_register(html)
+
+
+# --- unregistered-project enforcement PDFs ---------------------------------
+#
+# NOT WIRED INTO acquire(). "Projects under investigation" was Partial in the
+# 2026-08-26 coverage audit -- two static PDFs, linked from the homepage,
+# enumerate projects TNRERA is enforcing against for never having registered
+# at all. Confirmed live these are NATIVE-TEXT PDFs (real tables, not scans)
+# -- no OCR needed, unlike Delhi-RERA's REAT orders. pdfplumber's own table
+# extraction reads the grid cleanly; a raw text dump does not reliably keep
+# a row's three columns apart.
+#
+# THE CEILING IS REAL, NOT A SCRAPING GAP. Both lists are project-level
+# enforcement for UNREGISTERED sites -- "Show Cause Notice issued for levy
+# of penalty for non registration" and a caution list of promoters selling
+# without registering at all. Neither is a "projects under investigation"
+# register for something already REGISTERED, and TNRERA publishes no such
+# register found this session. So this closes the "static, non-searchable"
+# half of the earlier Partial verdict, not the "doesn't cover registered
+# projects" half -- that would need a different finding, not better code.
+
+SCN_PENALTY_PDF = BASE_URL + "/homePageFiles/SCN_issued_levy_of_penalty.pdf"
+PERSONAL_USE_CAUTION_PDF = BASE_URL + "/homePageFiles/Personal_Use_Not_For_Sale.pdf"
+
+
+def parse_enforcement_pdf(pdf_bytes):
+    """Either enforcement PDF's table, across every page, as
+    [{sl_no, party_detail, site_address, extra}]. `extra` is whichever
+    fourth column that PDF has (an approval-letter number and date on the
+    SCN list; nothing on the caution list, an empty string there).
+
+    Both PDFs share the same three-column skeleton (serial / party+address /
+    site address) with a title row and a repeated header row per page, which
+    `_looks_like_header` filters out rather than counting as data.
+    """
+
+    def _looks_like_header(row):
+        first = (row[0] or "").strip().casefold()
+        return first in ("sl.no.", "sl.no", "s.no.", "s.no") or first == ""
+
+    out = []
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            for table in page.extract_tables():
+                for row in table:
+                    cells = [(" ".join((c or "").split())) for c in row]
+                    if not cells or not cells[0] or not cells[0][:1].isdigit():
+                        continue
+                    if _looks_like_header(cells):
+                        continue
+                    out.append({
+                        "sl_no": cells[0],
+                        "party_detail": cells[1] if len(cells) > 1 else "",
+                        "site_address": cells[2] if len(cells) > 2 else "",
+                        "extra": cells[3] if len(cells) > 3 else "",
+                    })
+    return out
+
+
+def fetch_enforcement_pdf_rows(url, session=None):
+    """Downloads and parses one of the two enforcement PDFs. Returns a plain
+    list; never raises -- these are large (up to 118 pages) and a caller
+    sweeping both should not have one failure sink the other.
+
+    NOT `_get()`: that helper returns `response.text`, which decodes a
+    binary PDF as if it were text and corrupts it. This fetches bytes
+    directly, with the same retry-on-transient-failure discipline.
+    """
+    session = session or _session()
+
+    def _fetch():
+        response = session.get(url, timeout=_TIMEOUT, verify=False)
+        response.raise_for_status()
+        return response.content
+
+    try:
+        content = fetch_with_retry(_fetch, what="TNRERA enforcement PDF")
+    except StateFetchError:
+        return []
+    return parse_enforcement_pdf(content)
+
+
+def search_enforcement_lists_by_name(name, session=None):
+    """Rows from BOTH enforcement PDFs whose party detail matches `name`.
+    A normalised substring match over OCR-free native text, so hits are
+    still candidates rather than confirmed matches -- these are promoter
+    names embedded in prose ('Thiru. X ... Managing Partner, M/s. Y...'),
+    not a clean single-column name field.
+    """
+    needle = " ".join(str(name or "").split()).casefold()
+    if not needle:
+        return []
+    session = session or _session()
+    hits = []
+    for url, source in (
+        (SCN_PENALTY_PDF, "TNRERA show-cause (non-registration penalty) list"),
+        (PERSONAL_USE_CAUTION_PDF, "TNRERA personal-use / not-for-sale caution list"),
+    ):
+        for row in fetch_enforcement_pdf_rows(url, session=session):
+            if needle in row["party_detail"].casefold():
+                hits.append({**row, "source": source})
+    return hits
 
 
 # --- the group-sweep seam -------------------------------------------------

@@ -94,29 +94,29 @@ RERA_FINDINGS_LATER = {
     "Complaints register":
         ("No", "Yes", "No", "Yes"),
     "Appeals register":
-        ("Unaudited", "Unaudited", "Unaudited", "Unaudited"),
+        ("Partial", "No", "Yes", "Yes"),
     "Orders / judgments search":
         ("No", "Yes", "No", "Yes"),
     "Promoter's other projects (track record)":
-        ("No", "Partial", "Yes", "Yes"),
+        ("Partial", "Partial", "Yes", "Yes"),
     "Past-experience declarations":
         ("Unaudited", "Unaudited", "Unaudited", "Not published"),
     "AUDITED BALANCE SHEET":
-        ("Unaudited", "Unaudited", "Yes", "Not published"),
+        ("No", "No", "Yes", "Not published"),
     "Audited profit & loss statement":
-        ("Unaudited", "Unaudited", "Unaudited", "Not published"),
+        ("No", "No", "No", "Not published"),
     "Income-tax returns":
-        ("Unaudited", "Unaudited", "Unaudited", "Not published"),
+        ("No", "No", "No", "Not published"),
     "Defaulters list":
-        ("Unaudited", "Unaudited", "Unaudited", "Unaudited"),
+        ("Yes", "Yes", "Yes", "Partial"),
     "Projects under investigation":
-        ("Unaudited", "Unaudited", "Unaudited", "Unaudited"),
+        ("Partial", "Partial", "No", "Yes"),
     "Cost incurred vs estimated cost":
         ("Partial", "Partial", "Yes", "Not published"),
     "Delay reasons (promoter-declared)":
-        ("Unaudited", "Unaudited", "Unaudited", "Not published"),
+        ("No", "No", "Partial", "Not published"),
     "NOC expiry and renewal tracking":
-        ("Unaudited", "Partial", "Unaudited", "Not published"),
+        ("No", "No", "No", "Not published"),
     "Construction progress / QPR":
         ("Partial", "Yes", "Unaudited", "Partial"),
 }
@@ -135,10 +135,15 @@ RERA_NOTES_LATER = {
         "gate their case search behind a CAPTCHA keyed on a case number, so complaints there "
         "are UNKNOWN rather than absent.",
     "Promoter's other projects (track record)":
-        "UP-RERA's register is CAPTCHA-gated AND demands a district before a promoter, so a "
-        "portfolio would need a solved CAPTCHA and one request per district across 75 "
-        "districts. TNRERA is Partial: no promoter id and no promoter search, so a portfolio "
-        "is a NAME match across year tables and every row is a candidate.",
+        "UP-RERA is now Partial rather than No: CONFIRMED LIVE 2026-08-26 via a human-solved "
+        "CAPTCHA (up_captcha_search.py) that the search genuinely works, correctly returning "
+        "UPRERAPRJ14636 (BALAJI GREENS) for BALAJIMAHIMA INFRATECH PRIVATE LIMITED in "
+        "Barabanki district. It stays Partial, not Yes, because it demands a district before a "
+        "promoter, so a full portfolio would need a solved CAPTCHA per district across 75 "
+        "districts -- unattended automation is still refused (group_sweep._CANNOT_SEARCH), but "
+        "a human-in-the-loop lookup is a real, working path now, not merely a theoretical one. "
+        "TNRERA is Partial for a different reason: no promoter id and no promoter search, so a "
+        "portfolio is a NAME match across year tables and every row is a candidate.",
     "Bank accounts (escrow / collection)":
         "UP-RERA publishes the project account number in full with bank and branch. TNRERA "
         "masks it (XXXXXXXXXX9995) while naming the bank, branch and the account holder.",
@@ -155,6 +160,139 @@ RERA_NOTES_LATER = {
         "Delhi-RERA is Partial because there is no per-project record at all: the register's "
         "own View control is inert and every detail route probed returns nothing, so a Delhi "
         "project's identity is its register row and nothing more.",
+    "Appeals register":
+        "TNRERA is No, audited live 2026-08-26: a Tamil Nadu Real Estate Appellate Tribunal "
+        "(TNREAT) DOES exist, distinct from the authority -- it has its own domain, "
+        "tnreat.tn.gov.in, linked from TNRERA's own homepage -- but its public page carries no "
+        "case search, cause list or judgment register at all, only a sign-in and a virtual-"
+        "meeting-report link. Not a stub of the authority's own order registers: a genuinely "
+        "separate body that simply publishes nothing searchable to the public. UP-RERA is "
+        "Partial: its own Appellate Tribunal (UP-REAT) runs a live judgement search at "
+        "efilingreat.up.gov.in/upreat/judgement.php with a free-text party-name field, "
+        "CAPTCHA-gated. CONFIRMED LIVE 2026-08-26 the gate is passable, not just present: "
+        "up_captcha_search.py opens a real browser, a human reads and solves the CAPTCHA, and "
+        "the search genuinely runs -- tested against BALAJIMAHIMA INFRATECH PRIVATE LIMITED, "
+        "which returned a clean 'No Data Found' in a real results table (Sr.No/Filing No./Case "
+        "No./Case Title/Registration Date/Action), not an error or an empty page. Stays "
+        "Partial rather than Yes because every search still costs one human CAPTCHA solve -- "
+        "real and working, but not unattended. HARERA is Yes: the "
+        "Haryana Real Estate Appellate Tribunal is served off HARERA's own domain "
+        "(haryanarera.gov.in/admincontrol/judgements/3), a plain GET with no CAPTCHA -- 2,779 "
+        "rows of Appeal No. / Appellant Name / Respondent Name / Date of Decision, confirmed "
+        "promoter-searchable. Delhi-RERA is now Yes, upgraded from Partial 2026-08-26: REAT "
+        "Delhi (shared with the UT of Chandigarh, not linked from any Delhi-RERA page, found "
+        "only by web search) publishes a live 505-row register that names no party in its own "
+        "columns -- but every row links a scanned judgement PDF, and REAT's own case captions "
+        "name the Appellant and Respondent on the PDF's first page. "
+        "states/adapter_delhi.py's build_appeal_party_index() downloads and OCRs (PyMuPDF "
+        "native text first, Tesseract fallback -- confirmed live that every PDF sampled is a "
+        "scan, zero native text) just that first page across all 481 distinct order PDFs behind "
+        "the 505 rows, extracting both party names by the caption's own structure rather than "
+        "guessing at fixed columns. Confirmed live 2026-08-26: 437/505 rows (87%) now carry a "
+        "real party name -- searching 'Parsvnath' returns 27 real hits, e.g. 'Bimal Kumar & Ors. "
+        "vs M/s Parsvnath Landmark Developers Pvt. Ltd.' Of the 68 rows that don't, 63 are the "
+        "AUTHORITY'S OWN register linking a PDF that 404s (a genuine broken link on their side, "
+        "confirmed directly), and only 5 PDFs (12 rows, all 2021-2022 vintage) use a caption "
+        "shape the parser doesn't recognise. search_appeals_by_party() is the promoter-facing "
+        "search this unlocks, still unwired into acquire().",
+    "AUDITED BALANCE SHEET":
+        "TNRERA is No, audited live 2026-08-26 against TNRERA/29/BLG/0001/2026, /0004/2026 and "
+        "/0005/2026: the promoter view carries a 'Financial Indicators (Rs. in Lakhs)' block "
+        "with a bare self-declared Net Worth NUMBER (populated on one of three: Rs "
+        "2,00,00,000) but no uploaded balance-sheet document anywhere in the documents list on "
+        "any of the three projects checked. UP-RERA is No: the document grid was read on three "
+        "real projects (51 rows, 20 distinct labels) and none resembles a balance sheet -- the "
+        "closest is the Form REG-3 CA certificate, which certifies compliance rather than filing "
+        "the statement itself. HARERA's Yes is real but softer than GujRERA's or JHARERA's actual "
+        "uploaded statements: it rests on a Part-D compliance declaration ('Annex copy of the "
+        "balance sheet of last 3 years: Yes') and a CA-certificate document referencing 'BOOKS OF "
+        "ACCOUNTS/ BALANCE SHEET' -- no document in the 60-row library checked is itself labelled "
+        "'balance sheet'.",
+    "Audited profit & loss statement":
+        "TNRERA is No, same 'Financial Indicators' block and same three projects: 'Net Profit / "
+        "Loss' is a bare self-declared number (Rs 72,16,670 on the one populated record), never "
+        "a filed P&L statement. UP-RERA is No, same three-project document-grid read as above. "
+        "HARERA is No: 'profit and loss'/'profit & loss' occurs zero times across four project "
+        "detail pages checked (1444, 681, 3723, 431), against a single 'balance sheet' mention "
+        "each -- the two are not filed together.",
+    "Income-tax returns":
+        "TNRERA is No, same block: 'Taxes Paid - IT (GST/ST)' is a single number that conflates "
+        "income tax with GST/service tax (Rs 27,92,915 on the populated record) and no ITR "
+        "document is filed anywhere in the three document sets checked. UP-RERA is No, same "
+        "document-grid read. HARERA is No: 'income tax'/'ITR' occurs zero times across the same "
+        "four pages.",
+    "Defaulters list":
+        "TNRERA is Yes, audited live 2026-08-26: https://rera.tn.gov.in/building/online/penalty "
+        "and .../layout/online/penalty are live, unpaginated pages naming the promoter, address, "
+        "project and penalty levied -- 1 row on Building (TNRERA/PBF/0092/2025, M/S. VIKAS "
+        "MANTRA PROPERTIES & INFRASTRUCTURE PRIVATE LIMITED, Rs 20,10,940, 13-02-2025) and 146 "
+        "on Layout. Titled 'Penalty', not 'Defaulters' or 'Black List' -- no register under "
+        "either of those names was found, and no separate revoked/cancelled-registration list "
+        "exists. An unwired parser (parse_penalty_register / fetch_penalty_notices) was added "
+        "to states/adapter_tamilnadu.py, mirroring adapter_westbengal.fetch_defaulters(). UP-RERA "
+        "is Yes: https://www.up-rera.in/DefaulterList (reachable only via the homepage's "
+        "DE-REGISTERED PROJECTS postback, not a plain link) serves a live 72-row register -- reg. "
+        "no., project name suffixed '(De-Registered Project)' or '(Defaulter Project)', district, "
+        "promoter -- e.g. UPRERAPRJ7090, ANSAL PROPERTIES & INFRASTRUCTURE LIMITED. An unwired "
+        "fetch_defaulters() was added to states/adapter_uttarpradesh.py. HARERA is Yes: "
+        "/admincontrol/cancelled_projects/{bench} (menu label 'Defaulter/ Cancelled/ Suspended/ "
+        "Abeyance Projects') is a distinct, live register -- 23 Panchkula + 5 Gurugram rows -- "
+        "confirmed DIFFERENT from /admincontrol/lapsed_projects/{bench} (319 + 234 rows), which "
+        "is only registrations whose validity date has passed, not a defaulter finding; both got "
+        "unwired parsers in states/adapter_haryana.py. Delhi-RERA is Partial: the authority never "
+        "uses the word 'defaulter', but courtview/ExecutionInOrderJudgementsAuthorityInfo -- "
+        "7,493 live rows of orders referred for enforcement because the promoter ('Judgement "
+        "Debtor') did not comply -- is the closest real equivalent; got an unwired parser in "
+        "states/adapter_delhi.py.",
+    "Projects under investigation":
+        "TNRERA stays Partial, but 'static (non-searchable)' is fixed as of 2026-08-26: both "
+        "PDFs are NATIVE TEXT (confirmed live, zero OCR needed, unlike Delhi-RERA's REAT scans) "
+        "and adapter_tamilnadu.py's parse_enforcement_pdf()/search_enforcement_lists_by_name() "
+        "reads them with pdfplumber's table extraction -- 35 rows off the 5-page SCN list, 1,502 "
+        "off the 118-page caution list, confirmed live end-to-end (searching 'Sivakaminathan' "
+        "returns the real row). What did NOT change, because it is a finding about the "
+        "authority's publication rather than a scraping gap: neither list covers a REGISTERED "
+        "project under suo-moto scrutiny, only the unregistered-building enforcement pipeline -- "
+        "'Show Cause Notice issued for levy of penalty for non registration' and a 'Public "
+        "Caution Notice' of buildings claimed as personal-use and therefore left unregistered. "
+        "UP-RERA stays Partial for the opposite reason: the three adjacent registers (Abeyance, "
+        "NCLT, Withdrawn Registration) named in the earlier audit are REAL pages, but their data "
+        "loads via a WebService1.asmx POST that returned HTTP 500 on every parameter tried, "
+        "including a real browser driving the page's own default (empty-parameter) call -- "
+        "confirmed live 2026-08-26 this is the AUTHORITY'S OWN backend failing, not a request-"
+        "shaping problem on this end, so nothing was built against a data source that cannot "
+        "currently be read at all. HARERA is No: the only relevant menu item, 'Suo Motu "
+        "(Projects) Cause List', is a hearing-schedule generator requiring a specific date and a "
+        "CAPTCHA, not a browsable register; the only visible trace of suo-moto outcomes is "
+        "inside HREAT's judgement text (case numbers containing 'MT' for Motu). Delhi-RERA is "
+        "Yes: courtview/SuoMotoCases is a live, promoter-named, 1,797-row register of the "
+        "authority's own-motion notices and orders -- the clearest 'projects under "
+        "investigation' register found on any of the four new states; got an unwired parser in "
+        "states/adapter_delhi.py.",
+    "Delay reasons (promoter-declared)":
+        "TNRERA is No, audited live against TN/29/Building/0328/2024 whose register row reads "
+        "'Extension given upto 31.07.2026 Completed': its detail view (public-view2) has no "
+        "delay-reason, extension-reason or revised-completion-date field across any of its 20 "
+        "sections -- the extension text lives only as free text in the register's own Current "
+        "Status column, never as a structured field, and never states WHY. UP-RERA is No: "
+        "'delay'/'reason'/'extension'/'revised' were grepped across three project pages with "
+        "zero hits for 'delay' or 'reason'; the only adjacent field is a bare revised valid-upto "
+        "date with no promoter-declared justification. HARERA is Partial: the project detail "
+        "page carries structured 'Initial date of completion' and 'Likely date of completion' "
+        "fields -- a computable delay signal -- but 'reason'/'justification' occurs zero times "
+        "anywhere on the page, so there is no promoter-declared free-text reason, only the two "
+        "dates.",
+    "NOC expiry and renewal tracking":
+        "TNRERA is revised from Partial to No, audited live 2026-08-26: the detail view does "
+        "carry a 'Clearance / NOC Details' section, but its only fields are 'Clearance Type' "
+        "(e.g. 'PWD & RS') and 'Uploaded Document' -- confirmed on both a fresh 2026 "
+        "registration and an already-extended 2024 one -- with no expiry date or renewal-status "
+        "field anywhere in either. UP-RERA is No: zero genuine 'NOC' occurrences across three "
+        "project pages and up-rera.in's full 153-link menu (the only raw-HTML hits were inside "
+        "the base64 __VIEWSTATE blob). HARERA is No: the 'Statutory Approvals Status' table "
+        "lists licence/clearance/NOC numbers each marked 'ALREADY BEEN OBTAINED' with a date -- "
+        "but that date is when it was obtained, not an expiry or validity-end date, and no "
+        "separate NOC-validity register exists.",
 }
 
 RERA_FINDINGS = [
@@ -345,6 +483,44 @@ UNMAPPED = [
      "West Bengal projects",
      "17 rejected/defaulting applications keyed by name -- a cheap, direct red-flag input. The parser "
      "exists but is called from nowhere in acquire() or the litigation sweep.", "Medium"),
+    ("UP-RERA de-registered/defaulter list", "adapter_uttarpradesh.fetch_defaulters() -- written, unwired, "
+     "live-verified 2026-08-26 (72 rows)", "Uttar Pradesh projects",
+     "Named by promoter outright -- ANSAL PROPERTIES & INFRASTRUCTURE LIMITED is on it. Reachable only "
+     "via an ASP.NET postback, not a plain URL, which is why nothing had fetched it before.", "High"),
+    ("HARERA cancelled/defaulter projects", "adapter_haryana.fetch_defaulter_projects() -- written, unwired, "
+     "live-verified 2026-08-26 (23 Panchkula + 5 Gurugram)", "Haryana projects",
+     "Distinct from the already-imported LAPSED_PROJECTS URL, which is validity expiry, not an "
+     "authority action -- conflating the two would understate lapsed rows as defaults or vice versa.",
+     "Medium"),
+    ("TNRERA penalty register", "adapter_tamilnadu.fetch_penalty_notices() -- written, unwired, "
+     "live-verified 2026-08-26 (147 rows across Building + Layout)", "Tamil Nadu projects",
+     "Names promoter, project and the penalty amount levied -- TNRERA's own closest equivalent to a "
+     "defaulters list, titled 'Penalty' rather than that.", "Medium"),
+    ("TNRERA unregistered-project enforcement PDFs", "adapter_tamilnadu.search_enforcement_lists_by_name() "
+     "-- written, unwired, live-verified 2026-08-26 (35 + 1,502 rows, native-text PDFs, no OCR needed)",
+     "Tamil Nadu projects/promoters",
+     "The show-cause and personal-use-caution lists, now actually searchable by name rather than merely "
+     "linked as static PDFs. Ceiling is real, not fixable in code: both cover UNREGISTERED sites, never a "
+     "registered project under suo-moto scrutiny.", "Medium"),
+    ("Delhi-RERA suo-moto register", "adapter_delhi.parse_suo_moto_register() -- written, unwired, "
+     "live-verified 2026-08-26 (1,797 rows)", "Delhi projects",
+     "Names a Respondent/Promoter and project per row -- the clearest 'projects under investigation' "
+     "signal found on any of the four newest states, and Delhi otherwise has no per-project record at "
+     "all.", "High"),
+    ("Delhi-RERA execution register", "adapter_delhi.parse_execution_register() -- written, unwired, "
+     "live-verified 2026-08-26 (7,493 rows)", "Delhi projects",
+     "Orders referred for enforcement because the promoter (named as Judgement Debtor) did not comply "
+     "-- the authority's own closest equivalent to a defaulters list.", "Medium"),
+    ("Delhi-RERA Appellate Tribunal (REAT) register, WITH party names",
+     "adapter_delhi.build_appeal_party_index() / search_appeals_by_party() -- written, unwired, "
+     "live-verified 2026-08-26 (437/505 rows named, 481 PDFs OCR'd)", "Delhi projects",
+     "The register itself names no party -- not linked from any Delhi-RERA page either, found "
+     "only by web search -- but every row links a scanned judgement PDF whose own case caption "
+     "does. OCRing just the PDFs' first pages (PyMuPDF native text, confirmed zero on every "
+     "sample -- Tesseract fallback) turned an unsearchable register into one where "
+     "search_appeals_by_party('Parsvnath') returns 27 real hits. The only gaps are the "
+     "authority's own 63 broken PDF links and 5 older (2021-2022) PDFs in a caption shape not "
+     "yet recognised.", "High"),
 ]
 
 
@@ -521,6 +697,25 @@ def build_readme(wb):
          "consequential regulatory-history record any authority here publishes. JHARERA and WBRERA "
          "orders are now searchable by promoter too; WBRERA's join runs through its cause lists, "
          "since its own order register names no party directly.", None),
+        ("11. The 32 'Unaudited' cells UP-RERA/TNRERA/HARERA/Delhi-RERA picked up on 2026-08-24 were "
+         "actually audited live on 2026-08-26, one portal at a time, rather than left to sit. Each of "
+         "the four states turned out to have a real Appellate Tribunal separate from the RERA authority "
+         "itself -- HARERA's (HREAT) is plainly browsable and promoter-searchable, UP's (UP-REAT) is "
+         "CAPTCHA-gated, Delhi's (REAT) is browsable but names no party, and Tamil Nadu's exists but "
+         "publishes nothing searchable at all. Every one of the four also turned out to publish SOME "
+         "form of defaulter/enforcement register the earlier audit had not found -- UP-RERA's "
+         "DefaulterList (72 rows, reachable only via an ASP.NET postback, not a link), HARERA's "
+         "cancelled/defaulter register (confirmed DISTINCT from its already-known lapsed-projects "
+         "register, which is validity expiry rather than an authority action), TNRERA's penalty "
+         "register (147 rows), and Delhi's execution register (7,493 rows) plus its suo-moto register "
+         "(1,797 rows, the clearest 'projects under investigation' signal of the four). None of these "
+         "seven new registers is wired into acquire() yet -- each earned an unwired, live-verified "
+         "parser function instead, the same precedent WBRERA's fetch_defaulters() set, and each is its "
+         "own row on Sheet D. What stayed genuinely negative also got a real reason instead of a shrug: "
+         "none of the four publishes a P&L statement or an income-tax return anywhere, UP-RERA and "
+         "Delhi-RERA publish no balance sheet either, and none but K-RERA states an NOC EXPIRY date "
+         "(HARERA's 'Statutory Approvals' table gives the date obtained, not the date it lapses).",
+         None),
     ]
     for i, (text, font) in enumerate(lines, start=1):
         ws.cell(row=i, column=1, value=text)

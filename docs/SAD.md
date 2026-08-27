@@ -428,7 +428,7 @@ There is no `tests/` package, no `conftest.py`, no CI configuration.
 ```
 ================================================================================
                  RERA SCRAPPER  --  END-TO-END PIPELINE
-              entry: main.py::main()  |  stages 0-11, six authorities
+              entry: main.py::main()  |  stages 0-11, ten authorities
 ================================================================================
 
   [ENTRY]

@@ -10,3 +10,6 @@ venv/
 # Tesseract language packs -- vendored binary assets (~3MB each), not source.
 # See mahabhumi.py's _ocr_image docstring for how to fetch mar.traineddata.
 tessdata/
+
+# up_captcha_search.py's own result dumps -- diagnostic output, not source.
+_up_captcha_*_result.txt

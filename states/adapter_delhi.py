@@ -31,12 +31,17 @@ does not serve them. Any of those appearing blank in a Charter is the
 authority's limit, never a finding about the promoter.
 """
 
+import hashlib
 import json
 import os
 import re
+import shutil
 
+import fitz  # PyMuPDF
+import pytesseract
 import requests
 from bs4 import BeautifulSoup
+from PIL import Image
 
 from .base import (
     AcquisitionResult,
@@ -45,10 +50,31 @@ from .base import (
     fetch_with_retry,
     storage_key,
 )
-from .delhi import ORDER_REGISTER, PROFILE, STATE_INDEX
+from .delhi import (
+    APPEAL_REGISTER,
+    EXECUTION_REGISTER,
+    ORDER_REGISTER,
+    PROFILE,
+    STATE_INDEX,
+    SUOMOTO_REGISTER,
+)
 
 _TIMEOUT = 90
 _UA = "RERA-Scrapper-DueDiligence/1.0 (research tool, low-volume)"
+
+# Same Tesseract-path bootstrap as mahabhumi.py/gst_portal.py/company_charter.py,
+# for the same reason: pytesseract shells out to the binary by name, and on a
+# machine where it's installed but not on PATH this would otherwise fail
+# silently rather than fall back cleanly.
+if not shutil.which("tesseract"):
+    for _candidate in (
+        os.environ.get("TESSERACT_CMD"),
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+    ):
+        if _candidate and os.path.exists(_candidate):
+            pytesseract.pytesseract.tesseract_cmd = _candidate
+            break
 
 # "RR TEXKNIT LLP (Other than Individual)" -- the parenthetical is the
 # authority's own applicant classification, not part of the name. Worth
@@ -340,6 +366,440 @@ def search_orders_by_promoter(name, fetcher=None):
         return []
     return [row for row in fetch_order_register(fetcher)
             if needle in " ".join((row.get("respondent") or "").split()).casefold()]
+
+
+def parse_appeal_register(html):
+    """Delhi-RERA's Appellate Tribunal (REAT) order register, as
+    [{appeal_no, decided_on, order_url}].
+
+    NOT WIRED INTO acquire() -- observed and confirmed live 2026-08-26
+    (505 data rows), not yet a Charter input. Kept separate from
+    `parse_order_register` because the shape genuinely differs: THIS TABLE
+    NAMES NO PARTY. A row is a free-text bundle of one or more appeal/CM
+    numbers sharing one decision date and one judgement PDF -- e.g.
+    "(CM No.73/2026 in Appeal No.108/REAT/2022) (Appeal No.197/REAT/2025)
+    (Appeal No.193/REAT/2025)" is ONE row. So this register can be browsed
+    and its PDFs opened, but -- unlike the complaint register -- it cannot
+    be matched against a promoter's name; there is no respondent column.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    for table in soup.find_all("table"):
+        rows = _rows_of(table)
+        if not rows:
+            continue
+        header = [h.casefold() for h in rows[0][0]]
+        joined = " | ".join(header)
+        if "appeal number" not in joined:
+            continue
+
+        def _column(*needles):
+            for index, name in enumerate(header):
+                if all(n in name for n in needles):
+                    return index
+            return None
+
+        idx = {
+            "appeal_no": _column("appeal", "number"),
+            "decided_on": _column("date") or _column("decision"),
+        }
+        out = []
+        for texts, cells, row_element in rows[1:]:
+            def _cell(key):
+                index = idx.get(key)
+                if index is None or index >= len(texts):
+                    return ""
+                return texts[index]
+
+            appeal_no = _cell("appeal_no")
+            if not appeal_no:
+                continue
+            order_url = ""
+            for anchor in row_element.find_all("a", href=True):
+                order_url = anchor["href"]
+                break
+            out.append({
+                "appeal_no": appeal_no,
+                "decided_on": _cell("decided_on"),
+                "order_url": order_url,
+            })
+        if out:
+            return out
+    return []
+
+
+# --- REAT appeal register: the party names its own table doesn't carry -----
+#
+# NOT WIRED INTO acquire(). parse_appeal_register() above is real and
+# live-verified, but it hands back exactly what the register's own columns
+# state, and the register names NO party -- confirmed 2026-08-26. What it
+# DOES do is link one judgement PDF per row, and REAT's own order PDFs open
+# with a standard case caption naming the Appellant and Respondent, e.g.:
+#
+#   M/s Hiptage Infrastructure Pvt. Ltd. ..... Appellant
+#   V/s
+#   RERA for NCT of Delhi & Anr Respondents
+#
+# Confirmed live on three real orders, promoter on either side depending on
+# who filed: a developer appealing an Authority order is the Appellant
+# against "Real Estate Regulatory Authority" as Respondent; a homebuyer
+# appealing IS the Appellant, with the developer as Respondent. So a
+# promoter search must check BOTH sides.
+#
+# THE PDFS ARE SCANNED IMAGES, NOT TEXT -- confirmed on all three samples
+# checked (0 characters of native text on every page). OCR is required, but
+# only the FIRST page: the caption is always there, and a real order can run
+# 20-25 pages, so OCRing the rest would cost time for nothing this needs.
+
+# A role LABEL line, once the OCR's dotted leader is stripped, can be
+# genuinely empty -- confirmed live on a real caption where the party name
+# sat on its OWN line, a blank line followed, and "Appellant"/"Respondent"
+# landed on a separate line preceded only by leader-dot noise. A
+# same-line-only regex read that noise itself as the party NAME -- wrong,
+# and worse, silent: it looked like a match, not a miss.
+#
+# THE NOISE IS NOT JUST DOTS. Tesseract renders a run of leader dots as a
+# SINGLE ellipsis character, U+2026 ("…") -- confirmed live: a respondent
+# line OCR'd as "...….Respondent" (three literal dots, THEN the
+# ellipsis, then one more dot). A first version of this noise class only
+# excluded U+FFFD (the replacement character, seen on a different sample)
+# and left U+2026 untouched, so the strip removed one trailing "." and
+# called "...…" a real name.
+#
+# THE LABEL CAN BE A COMPOUND ROLE, TOO. Confirmed live: an application
+# WITHIN an appeal (a request to release deposited money, say) is captioned
+# "Applicant/Respondent" -- the same person is the applicant on the
+# application and the respondent on the underlying appeal. A pattern for
+# bare "Respondent" alone matched inside that compound word, so `same_line`
+# kept "Applicant/" and reported IT as the party name. `(?:\w+/)*` in front
+# absorbs any such prefix into the match, so it gets excluded from
+# `same_line` along with the role word itself.
+_ROLE_WORD_RE = {
+    "appellant": re.compile(r"(?:\w+/)*\bappellants?\b", re.I),
+    "respondent": re.compile(r"(?:\w+/)*\brespondents?\b", re.I),
+}
+_NOISE_CHARS = r".…�\s"  # dots, ellipsis, replacement char, whitespace
+# What "just leader noise, no real name" looks like on a line by itself.
+_LEADER_NOISE_RE = re.compile(r"^[" + _NOISE_CHARS + r"]*$")
+
+
+def _party_before_role(lines, role):
+    """The party name for `role` ('appellant' or 'respondent'): the text
+    before the role word on ITS OWN line if that text is more than leader
+    noise, else the nearest preceding non-blank, non-noise line. Handles
+    both caption shapes confirmed live: 'Name ..... Appellant' on one line,
+    and 'Name' / (blank) / '�.. Appellant' split across three.
+    """
+    role_re = _ROLE_WORD_RE[role]
+    for i, line in enumerate(lines):
+        match = role_re.search(line)
+        if not match:
+            continue
+        same_line = line[:match.start()]
+        same_line = re.sub(r"[" + _NOISE_CHARS + r"]+$", "", same_line).strip()
+        if len(same_line) >= 3:
+            return same_line
+        for j in range(i - 1, -1, -1):
+            candidate = lines[j].strip()
+            if candidate and not _LEADER_NOISE_RE.match(candidate):
+                return candidate
+        return ""
+    return ""
+
+
+def extract_appeal_parties(caption_text):
+    """{'appellant': str, 'respondent': str} off ONE order's opening-page
+    OCR text, or '' for either side no role word was found at all.
+
+    Pure function over already-extracted text, so it's testable against a
+    saved OCR capture without a network call or a Tesseract install. The
+    FIRST line naming each role word wins -- the caption sits at the top of
+    the page, and neither role word tends to recur in that shape later in
+    an order's own prose.
+    """
+    lines = (caption_text or "").split("\n")
+    return {
+        "appellant": " ".join(_party_before_role(lines, "appellant").split()),
+        "respondent": " ".join(_party_before_role(lines, "respondent").split()),
+    }
+
+
+def _ocr_first_page(pdf_bytes):
+    """The first page's text -- native first, Tesseract OCR fallback --
+    same fallback order as company_charter.py's _extract_document_text,
+    scoped to one page because that is all a caption ever needs and these
+    orders run up to 25 pages. Never raises: an unreadable PDF or a missing
+    Tesseract install yields '', which the caller reports as unparseable
+    rather than crashing a batch of hundreds.
+    """
+    try:
+        with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+            if doc.page_count == 0:
+                return ""
+            page = doc[0]
+            text = page.get_text().strip()
+            if text:
+                return text
+            pix = page.get_pixmap(dpi=300)
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            return pytesseract.image_to_string(img)
+    except Exception:
+        return ""
+
+
+def _cache_key(order_url):
+    return hashlib.sha1(order_url.encode("utf-8")).hexdigest()[:20]
+
+
+def fetch_appeal_order_parties(order_url, session=None, cache_dir=None):
+    """Parties for ONE order PDF, as {'appellant', 'respondent', 'caption_text',
+    'note'}. Caches the extracted TEXT (not the PDF itself -- these orders run
+    several MB each and 481 of them is not worth keeping on disk) to
+    `cache_dir`, keyed by a hash of the URL, so a re-run after an interrupted
+    batch does not re-download and re-OCR everything it already read.
+    """
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_path = os.path.join(cache_dir, _cache_key(order_url) + ".txt")
+        if os.path.exists(cache_path):
+            with open(cache_path, "r", encoding="utf-8") as f:
+                cached = f.read()
+            parties = extract_appeal_parties(cached)
+            return {**parties, "caption_text": cached, "note": "cached"}
+
+    session = session or requests.Session()
+    try:
+        response = fetch_with_retry(
+            lambda: session.get(order_url, timeout=180, headers={"User-Agent": _UA}),
+            what="Delhi-RERA/REAT order PDF",
+        )
+        response.raise_for_status()
+    except Exception as e:  # noqa: BLE001 -- recorded, one bad PDF must not sink the batch
+        return {"appellant": "", "respondent": "", "caption_text": "",
+                "note": f"download failed: {type(e).__name__}"}
+
+    caption_text = _ocr_first_page(response.content)
+    if cache_dir:
+        with open(cache_path, "w", encoding="utf-8") as f:
+            f.write(caption_text)
+    parties = extract_appeal_parties(caption_text)
+    note = "" if (parties["appellant"] or parties["respondent"]) else (
+        "OCR ran but no Appellant/Respondent caption pattern matched"
+        if caption_text else "no text recovered (native or OCR)"
+    )
+    return {**parties, "caption_text": caption_text, "note": note}
+
+
+def build_appeal_party_index(session=None, cache_dir=None, reporter=None, limit=None):
+    """Every REAT appeal register row, enriched with the parties its own PDF
+    names. Returns {"rows": [...], "coverage": {...}}.
+
+    ONE PDF CAN COVER SEVERAL APPEAL NUMBERS (a batch order deciding
+    multiple appeals together) -- 481 distinct order_urls across 505 rows,
+    confirmed live. Fetched once per URL, not once per row, and every row
+    sharing that URL gets the same parties. A row whose PDF's caption named
+    a DIFFERENT combination of appellants (some multi-appeal orders do) is
+    not distinguished -- the parties recorded are whichever pair sits first
+    in that PDF's opening page, so a multi-appellant order's later
+    appellants are a known gap, not a silent one (see 'coverage').
+    """
+    reporter = reporter or _NullReporter()
+    session = session or requests.Session()
+    session.headers.update({"User-Agent": _UA})
+
+    html = fetch_with_retry(
+        lambda: requests.get(APPEAL_REGISTER, timeout=_TIMEOUT).text,
+        what="Delhi-RERA/REAT appeal register",
+    )
+    register_rows = parse_appeal_register(html)
+    urls = []
+    seen = set()
+    for row in register_rows:
+        url = row.get("order_url")
+        if url and url not in seen:
+            seen.add(url)
+            urls.append(url)
+    if limit:
+        urls = urls[:limit]
+
+    by_url = {}
+    failed = 0
+    for i, url in enumerate(urls, start=1):
+        result = fetch_appeal_order_parties(url, session=session, cache_dir=cache_dir)
+        by_url[url] = result
+        if result["note"] and result["note"] != "cached":
+            failed += 1
+        reporter.info(
+            f"REAT order {i}/{len(urls)}: "
+            + (f"appellant={result['appellant']!r} respondent={result['respondent']!r}"
+               if (result["appellant"] or result["respondent"])
+               else f"unparsed ({result['note']})")
+        )
+
+    enriched = []
+    for row in register_rows:
+        url = row.get("order_url")
+        parties = by_url.get(url, {"appellant": "", "respondent": "", "note": "not processed (limit reached)"})
+        enriched.append({**row, "appellant": parties["appellant"], "respondent": parties["respondent"],
+                          "parties_note": parties["note"]})
+
+    named = sum(1 for r in enriched if r["appellant"] or r["respondent"])
+    reporter.ok(f"REAT appeal party index: {named}/{len(enriched)} rows carry a party name "
+                f"({len(urls)} PDFs read, {failed} unparseable).")
+    return {
+        "rows": enriched,
+        "coverage": {
+            "total_rows": len(enriched), "distinct_pdfs": len(urls),
+            "rows_with_a_party_name": named, "pdfs_unparseable": failed,
+        },
+    }
+
+
+def search_appeals_by_party(name, rows):
+    """Rows from build_appeal_party_index()['rows'] whose appellant OR
+    respondent matches `name`. A normalised substring match, so every hit
+    is a CANDIDATE -- same exposure as every other name-keyed register in
+    this pipeline: these are OCR'd from a scanned document, and a promoter's
+    name may be spelled differently between filings.
+    """
+    needle = " ".join(str(name or "").split()).casefold()
+    if not needle:
+        return []
+    return [
+        row for row in rows
+        if needle in row.get("appellant", "").casefold()
+        or needle in row.get("respondent", "").casefold()
+    ]
+
+
+def parse_suo_moto_register(html):
+    """Delhi-RERA's own-motion (suo moto) notices and orders, as
+    [{case_no, respondent_name, project_details, hearing_type, last_hearing,
+    next_hearing, copy_url}].
+
+    NOT WIRED INTO acquire(). The closest thing this portal publishes to
+    "projects under investigation": proceedings the AUTHORITY opened on its
+    own motion rather than ones a complainant filed. Confirmed live
+    2026-08-26 with 1,797 data rows -- it DOES name a respondent/promoter
+    per row, so unlike the appeal register above it is promoter-searchable
+    the same way `search_orders_by_promoter` reads the complaint register.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    for table in soup.find_all("table"):
+        rows = _rows_of(table)
+        if not rows:
+            continue
+        header = [h.casefold() for h in rows[0][0]]
+        joined = " | ".join(header)
+        if "respondent" not in joined and "promoter" not in joined:
+            continue
+
+        def _column(*needles):
+            for index, name in enumerate(header):
+                if all(n in name for n in needles):
+                    return index
+            return None
+
+        idx = {
+            "case_no": _column("case") or _column("complaint", "number"),
+            "respondent_name": _column("respondent") or _column("promoter"),
+            "project_details": _column("project"),
+            "hearing_type": _column("type"),
+            "last_hearing": _column("last", "hearing"),
+            "next_hearing": _column("next", "hearing"),
+        }
+        out = []
+        for texts, cells, row_element in rows[1:]:
+            def _cell(key):
+                index = idx.get(key)
+                if index is None or index >= len(texts):
+                    return ""
+                return texts[index]
+
+            if not _cell("respondent_name"):
+                continue
+            copy_url = ""
+            for anchor in row_element.find_all("a", href=True):
+                copy_url = anchor["href"]
+                break
+            out.append({
+                "case_no": _cell("case_no"),
+                "respondent_name": _cell("respondent_name"),
+                "project_details": _cell("project_details"),
+                "hearing_type": _cell("hearing_type"),
+                "last_hearing": _cell("last_hearing"),
+                "next_hearing": _cell("next_hearing"),
+                "copy_url": copy_url,
+            })
+        if out:
+            return out
+    return []
+
+
+def parse_execution_register(html):
+    """Delhi-RERA's orders referred for EXECUTION -- non-compliance
+    enforcement -- as [{execution_no, complaint_no, decree_holder,
+    judgement_debtor, decided_on, next_hearing, notice_url, judgement_url}].
+
+    NOT WIRED INTO acquire(). The closest thing this portal publishes to a
+    "defaulters list", though the authority never uses that word: every row
+    is an order the promoter (the Judgement Debtor) has not complied with,
+    now pending enforcement. Confirmed live 2026-08-26 with 7,493 data rows.
+    The Adjudicating-Officer equivalent
+    (`.../courtview/ExecutionInOrderJudgementsAOInfo`) shares this exact
+    column shape but returned zero data rows the same day -- a live,
+    currently-empty register, not a broken route, so it is not given its
+    own parser here.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    for table in soup.find_all("table"):
+        rows = _rows_of(table)
+        if not rows:
+            continue
+        header = [h.casefold() for h in rows[0][0]]
+        joined = " | ".join(header)
+        if "execution" not in joined or "judgement debtor" not in joined:
+            continue
+
+        def _column(*needles):
+            for index, name in enumerate(header):
+                if all(n in name for n in needles):
+                    return index
+            return None
+
+        idx = {
+            "execution_no": _column("execution", "number"),
+            "complaint_no": _column("complaint", "number"),
+            "decree_holder": _column("decree", "holder"),
+            "judgement_debtor": _column("judgement", "debtor"),
+            "decided_on": _column("date", "decision"),
+            "next_hearing": _column("next", "hearing"),
+        }
+        out = []
+        for texts, cells, row_element in rows[1:]:
+            def _cell(key):
+                index = idx.get(key)
+                if index is None or index >= len(texts):
+                    return ""
+                return texts[index]
+
+            if not _cell("judgement_debtor"):
+                continue
+            anchors = row_element.find_all("a", href=True)
+            notice_url = anchors[0]["href"] if len(anchors) > 0 else ""
+            judgement_url = anchors[1]["href"] if len(anchors) > 1 else ""
+            out.append({
+                "execution_no": _cell("execution_no"),
+                "complaint_no": _cell("complaint_no"),
+                "decree_holder": _cell("decree_holder"),
+                "judgement_debtor": _cell("judgement_debtor"),
+                "decided_on": _cell("decided_on"),
+                "next_hearing": _cell("next_hearing"),
+                "notice_url": notice_url,
+                "judgement_url": judgement_url,
+            })
+        if out:
+            return out
+    return []
 
 
 class _NullReporter:

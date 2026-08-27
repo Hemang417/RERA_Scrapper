@@ -1,10 +1,227 @@
 # Pan-India RERA — progress and resumption notes
 
-**Updated 21 August 2026.** Working tree is green: `python -m pytest -q` -> **594 passed**.
+**Updated 26 August 2026.** Working tree is green: `python -m pytest -q` -> **708 passed**.
 MahaRERA output is byte-identical to the pre-refactor baseline.
 
 Full plan: `~/.claude/plans/yes-make-the-plan-starry-neumann.md`
 Data coverage: `docs/RERA_Data_Coverage.xlsx` (regenerate with `python build_data_coverage.py`)
+
+---
+
+## 2026-08-26 (later) — UP-RERA's CAPTCHA gate is now passable, human-in-the-loop
+
+Two of UP's coverage cells were "Partial" and "No" specifically because its
+search is CAPTCHA-gated -- confirmed to EXIST, never confirmed to actually
+WORK once solved. `up_captcha_search.py` closes that gap the same way
+`gst_portal.py` and `mahabhumi.py` already do for GST and land records: a
+real, VISIBLE Playwright browser opens, a human reads the CAPTCHA and types
+it in themselves, and the script only reads the result after they submit.
+Nothing in it reads or solves a CAPTCHA image.
+
+**Both searches are now confirmed live, not just confirmed present.**
+`search_projects_by_promoter("BALAJIMAHIMA INFRATECH PRIVATE LIMITED",
+"Barabanki")` correctly returned UPRERAPRJ14636 (BALAJI GREENS) -- the exact
+project already known from the adapter's own live-verified examples.
+`search_appeals("BALAJIMAHIMA INFRATECH PRIVATE LIMITED")` against UP-REAT
+returned a clean "No Data Found" in a real results table. `RERA_FINDINGS_LATER`
+in `build_data_coverage.py` records both: "Promoter's other projects (track
+record)" UP-RERA moved from No to Partial, "Appeals register" UP-RERA's note
+was strengthened from "CAPTCHA-gated, unconfirmed" to "confirmed passable."
+Both stay Partial rather than Yes -- every search still costs one human
+CAPTCHA solve, and the projects search additionally demands a district before
+a promoter, so an unattended sweep is still refused
+(`group_sweep._CANNOT_SEARCH["UP"]` is unchanged on purpose).
+
+**Three bugs fell out of getting the automation itself right, each found by
+actually running it against a real human, not by reasoning about it:**
+1. **"Did the page change" is not "did the human submit."** The first
+   attempt polled for a jump in rendered body text (the same heuristic
+   `gst_portal.py` uses) -- and closed the browser before the human had
+   touched the CAPTCHA, because the promoter dropdown alone renders ~2,300
+   option strings into that text, trivially tripping a length threshold on
+   its own.
+2. **"Did a navigation happen" is not "did the human submit," either.**
+   Waiting for any page navigation was still too broad: clicking "refresh
+   CAPTCHA" is ALSO a full ASP.NET postback (a fresh guid needs a server
+   round trip), so a human who read an unclear CAPTCHA and refreshed it once
+   closed the browser on themselves before ever reaching Search. Fixed by
+   waiting for the SPECIFIC POST that names the Search control -- confirmed
+   empirically (a headless diagnostic, no CAPTCHA needed) that
+   `btnSearch` appears only in the real Search submit's POST body and never
+   in the refresh button's.
+3. **A "successful" read can still be a blank, mid-navigation page.**
+   Even after catching the right request, reading `page.content()` a moment
+   too early either raised Playwright's own "page is navigating" error or
+   worse -- silently succeeded against a blank interim document. Fixed with
+   a retry-on-short-read wrapper and a wait for a marker element that exists
+   on the resulting page regardless of outcome.
+
+None of this changes `states/adapter_uttarpradesh.py` or `group_sweep.py` --
+`up_captcha_search.py` is a separate, opt-in, human-in-the-loop tool, the
+same category as `gst_intake.py` and `cts_resolve.py`, not a silent
+capability upgrade to the unattended pipeline.
+
+---
+
+## 2026-08-26 (later still) — Delhi-RERA's Appeals register: Partial to Yes, no CAPTCHA needed
+
+The other "Partial" this session went after was Delhi-RERA's REAT appeal
+register: real, live, 505 rows -- but it names no party in its own columns,
+so it was browsable, never promoter-searchable. Unlike UP-RERA's gate, this
+one needed no CAPTCHA and no human at all: every row links a scanned
+judgement PDF, and REAT's own case captions state the Appellant and
+Respondent on the PDF's first page (e.g. "M/s Hiptage Infrastructure Pvt.
+Ltd. ..... Appellant" / "V/s" / "RERA for NCT of Delhi & Anr Respondent").
+
+`states/adapter_delhi.py` gained `build_appeal_party_index()` and
+`search_appeals_by_party()`: download each of the 481 distinct order PDFs
+behind the 505 rows, OCR just the FIRST page (PyMuPDF native text first --
+confirmed zero characters of native text on every sample checked, these are
+scans, not text PDFs -- Tesseract fallback otherwise; a 20-25-page order
+does not need OCRing in full for a caption that only ever sits on page 1),
+and extract both party names from the caption's own structure. Cost:
+~5 minutes for the whole register (304s live), one download+OCR per PDF,
+cached to `output/delhi_reat_appeal_cache/` (text only, not the PDFs
+themselves -- 481 of those at several MB each was not worth keeping) so a
+re-run only fetches what changed.
+
+**Result, confirmed live: 437/505 rows (87%) now carry a real party name.**
+`search_appeals_by_party("Parsvnath", rows)` returns 27 genuine hits --
+"Bimal Kumar & Ors. vs M/s Parsvnath Landmark Developers Pvt. Ltd." among
+them. Of the 68 that don't: 63 are the AUTHORITY'S OWN register linking a
+PDF that 404s (confirmed directly, not a scraping artifact -- their own
+links are broken), and only 5 PDFs (12 rows, all 2021-2022) use an older
+caption shape the parser doesn't yet recognise. `build_data_coverage.py`
+moved Delhi-RERA's "Appeals register" Partial to Yes.
+
+**Getting the caption parser right took three real bugs, each an OCR
+artifact reading as a wrong PARSE rather than a wrong CHARACTER:**
+1. A first cut required a dotted leader ("..... Appellant") immediately
+   before the role word on the SAME line. One real caption's Respondent
+   line OCR'd with no dots at all ("RERA forNCT of Delhi & Ant
+   Respondents") -- a document that genuinely has no dots there, not a
+   scraping failure, so the fix loosened dots to optional.
+2. Loosening that surfaced a worse failure: some captions split the party
+   name onto its OWN line, with a blank line, then a THIRD line carrying
+   only leader noise before the role word. A same-line-only regex read
+   that noise as the party's NAME -- confirmed live, the "name" came back
+   as a single garbled character. Fixed with a line-walker that falls back
+   to the nearest preceding non-blank, non-noise line.
+3. The noise itself was under-specified: Tesseract renders a run of leader
+   dots as ONE ellipsis character (U+2026), not literal dots, and a
+   different sample produced a replacement character (U+FFFD) instead --
+   two different renderings of the same "there were dots here" fact,
+   requiring both in the noise class, not just the one first observed.
+   A fourth, smaller fix: a compound label like "Applicant/Respondent"
+   (an application decided within an appeal) matched the bare
+   "Respondent" pattern midword, so "Applicant/" leaked into the captured
+   name until the role regex was widened to swallow any `word/` prefix
+   immediately before the target role word too.
+
+Same lesson as UP-RERA's CAPTCHA automation two sections up: the actual
+CAPTCHA/OCR step was never the hard part. Telling a real answer apart from
+something that only LOOKS like one -- an empty string, a garbled character,
+a stray "Applicant/" -- was.
+
+---
+
+## 2026-08-26 (final) — "Projects under investigation": one real ceiling, one closed gap
+
+Attempted both remaining Partials. Different outcomes.
+
+**UP-RERA: a dead end, confirmed rather than assumed.** The three registers
+named in the earlier audit (Abeyance Projects, NCLT Projects, Withdrawn
+Registration) are real pages, but their data loads via a
+`WebService1.asmx` POST (`loadAbeyanceprojectWithParameter`,
+`loadNCLTprojectWithParameter`, `loadwithdrawnproject`) that returned HTTP
+500 on every parameter tried -- empty string, a real registration number,
+junk text -- via both `requests` and a REAL HEADLESS BROWSER driving the
+page's own default load call. That rules out a request-shaping problem on
+this end: the authority's own backend is failing right now, for its own
+page, loaded the way a human would load it. Nothing was built against a
+source that cannot currently be read at all; `build_data_coverage.py`'s
+note now says so with the confirming detail instead of leaving the three
+registers as an unexplained "none wired in yet."
+
+**TNRERA: closed the fixable half.** The two enforcement PDFs (Show Cause
+Notices for non-registration, and the Personal-Use/Not-For-Sale caution
+list) turned out to be NATIVE-TEXT, not scans -- confirmed live, no OCR
+needed, unlike every other PDF-parsing gotcha this session ran into.
+`adapter_tamilnadu.py` gained `parse_enforcement_pdf()` (pdfplumber's own
+table extraction, not a raw text dump -- a row's three columns don't
+reliably stay apart in a text stream) and
+`search_enforcement_lists_by_name()`. Confirmed live: 35 rows off the
+5-page SCN list, 1,502 off the 118-page caution list, and searching
+"Sivakaminathan" returns the real row. The verdict stays Partial on
+purpose: neither list was ever going to cover a REGISTERED project under
+suo-moto scrutiny, only the unregistered-building enforcement pipeline --
+that is a fact about what TNRERA publishes, not something more code fixes.
+
+Both sessions' worth of "Partial to Full" attempts land on the same
+distinction: some ceilings are a missing parser (fixable, and now fixed
+three times over -- Delhi's REAT parties, UP's project sweep, TNRERA's
+enforcement PDFs), and some are the authority genuinely not publishing the
+thing at all, or its own systems being down. Telling the two apart, live,
+is the actual work.
+
+---
+
+## 2026-08-26 — the 32 "Unaudited" cells got audited
+
+The four states added 2026-08-24 (UP-RERA, TNRERA, HARERA, Delhi-RERA) left 32
+coverage-workbook cells marked "Unaudited" -- appeals registers on all four,
+financial disclosure on UP/TN/HR, defaulters and projects-under-investigation
+on all four, delay reasons and NOC expiry on most. Each was resolved by an
+actual live portal check (four parallel sessions, one per state, all HTTP
+against the real authority), not by inference from a menu label. Full detail
+lives in `build_data_coverage.py`'s `RERA_NOTES_LATER`; the shape of it:
+
+**Every one of the four states has a separate Real Estate Appellate
+Tribunal**, distinct from the RERA authority itself -- none of this pipeline
+had looked for one before. Coverage varies wildly: HARERA's (HREAT) is a
+plain GET, no CAPTCHA, 2,779 rows, genuinely promoter-searchable
+(`haryanarera.gov.in/admincontrol/judgements/3`). Delhi's (REAT, shared with
+the UT of Chandigarh) is a live 505-row register **not linked from any
+Delhi-RERA page** -- found only by web search -- but names no party, so it's
+browsable, not searchable. UP's (UP-REAT) has a real judgement search with a
+party-name field, CAPTCHA-gated. Tamil Nadu's (TNREAT) exists as a body but
+its site publishes nothing searchable at all -- a sign-in page and a
+virtual-meeting report, nothing else.
+
+**All four turned out to publish some real defaulter/enforcement register the
+2026-08-24 audit never found**, each reached by a different mechanism: UP-RERA's
+`DefaulterList` (72 rows) is reachable ONLY via an ASP.NET `__doPostBack`, not
+a plain link -- a GET on the URL itself serves the same 48.7 KB empty shell as
+an unissued project id, which is presumably why it was missed the first time.
+HARERA's `cancelled_projects` register (23 Panchkula + 5 Gurugram rows) is
+confirmed **distinct** from the already-imported-but-unused `lapsed_projects`
+register (320 + 235 rows) -- lapsed is validity expiry, cancelled is an
+authority action against the promoter, and they are not the same finding.
+TNRERA's penalty register (147 rows across Building + Layout) names the
+promoter and the amount levied. Delhi's execution register (7,493 rows) names
+the non-complying promoter as "Judgement Debtor," and its suo-moto register
+(1,797 rows) is the single clearest "projects under investigation" signal
+found on any of the four -- ironic, given Delhi otherwise has no reachable
+per-project record at all.
+
+**Each of those seven new registers got a small, pure, live-verified parser
+function**, added to the relevant `states/adapter_*.py`, following the
+precedent `adapter_westbengal.fetch_defaulters()` set: written and correct,
+**not wired into `acquire()`**, because turning a coverage finding into a
+Charter input is a separate decision from confirming the finding is real.
+They are catalogued on Sheet D of the coverage workbook. `acquire()` was not
+touched on any of the four adapters, and all 98 of their tests plus the full
+708-test suite pass unchanged.
+
+**What stayed a real "No" got a reason instead of staying "Unaudited":** none
+of the four publishes a profit & loss statement or an income-tax return
+anywhere (checked against real document grids/field blocks, not assumed);
+UP-RERA and Delhi-RERA publish no balance sheet either (HARERA's "Yes" is
+worth a second look -- it rests on a compliance-declaration checkbox and a CA
+certificate that *references* a balance sheet, not a document literally
+labelled one); and none of the four states an NOC *expiry* date -- HARERA's
+"Statutory Approvals Status" table gives the date a clearance was obtained,
+never when it lapses.
 
 ---
 
@@ -678,11 +895,13 @@ so the MH/TG registration-format collision is real and testable.
 
 ## Known gaps, deliberately left
 
-- **Charter rendering for GJ/KA projects is unverified** — it needs an Anthropic API call
-  and the account is over its limit until 2026-09-01. The render path is state-parameterised
-  and covered by the differential-render test, but nobody has watched it produce a
-  non-Maharashtra Charter.
-- `docs/PRD.md` and `docs/SAD.md` still describe the pre-refactor architecture.
+- **Charter rendering for any non-Maharashtra project is unverified** — it needs an
+  Anthropic API call and the account is over its limit until 2026-09-01. The render path
+  is state-parameterised and covered by the differential-render test, but nobody has
+  watched it produce a non-Maharashtra Charter, for any of the nine non-MH states.
+- ~~`docs/PRD.md` and `docs/SAD.md` still describe the pre-refactor architecture.~~
+  **Fixed 2026-08-24** — both now describe the ten-state `StateAdapter` architecture; see
+  "Docs and the coverage workbook, brought to ten states" below.
 - ~~`output/_history/`~~ **cleared 2026-08-24.** It held three archived runs of
   P51800077150 (257 MB, 226 files), all but a handful of them byte-for-byte
   duplicates of the live `output/P51800077150/`. Two files were NOT duplicates and
@@ -691,10 +910,21 @@ so the MH/TG registration-format collision is real and testable.
   hand-authored `pre_built_facts` recipe, which existed in exactly one place on disk
   and had never been committed. They now sit where every other one-off script for a
   project lives, beside `output/CONSTELLA_TS/research/patch_state_labels.py`.
-- 26 of ~30 state portals remain unaudited.
-- **Jharkhand and West Bengal have no adapter**, and for a Ranchi-origin
-  promoter like Pranami that is where the real track record is. See the
-  join-key notes below.
+- ~20 of ~30 state portals remain unaudited — the ten built are the ones actually looked
+  at; the rest are still an unopened list, always a separate plan (see "Phase 2 (rest)"
+  in the status table above).
+- **Four states cannot be swept by promoter UNATTENDED — GJ, TG, UP, WB — each with a
+  written reason in `group_sweep._CANNOT_SEARCH` rather than a silent zero.** GujRERA and
+  WBRERA publish no promoter-to-projects link at all; TG-RERA's search is CAPTCHA-gated by
+  project name and its record does not even show its own registration number. **UP-RERA was
+  the one worth revisiting, and it has now been** — `up_captcha_search.py` (2026-08-26)
+  proved live that a human-solved CAPTCHA really does unlock `View_projects.aspx`'s
+  promoter+district search (correctly returned UPRERAPRJ14636 for a known promoter in
+  Barabanki). That is a real, working, human-in-the-loop lookup for ONE promoter in ONE
+  district at a time -- it does not change `group_sweep._CANNOT_SEARCH["UP"]`, because a
+  full statewide sweep would still cost one CAPTCHA solve per district across 75 of them,
+  which is not something to run unattended. See the "UP-RERA's CAPTCHA gate is now passable"
+  section above for what was actually proven and the three bugs fixed getting there.
 
 ---
 

@@ -41,9 +41,9 @@
 
 ## 1. Executive summary
 
-**RERA Scrapper turns a single RERA registration number -- from any of six state authorities -- into a defensible, source-cited due-diligence pack in one command.**
+**RERA Scrapper turns a single RERA registration number -- from any of ten state authorities -- into a defensible, source-cited due-diligence pack in one command.**
 
-Real-estate underwriting requires assembling a picture of three things — the **counterparty** (the promoter company), its **promoters** (the individuals behind it), and the **collateral** (the project and its land). That picture is scattered across six state regulators' portals (each with its own vendor, format and gaps), three corporate-registry mirrors, three credit-rating agencies, an insolvency board, a GST portal, a Marathi-language land-records system, an open case-law index, and the open web. It is also rarely confined to one state: a promoter's real track record is usually held under OTHER companies, on OTHER states' registers. Assembling it by hand takes an analyst days, produces inconsistent output, and — most importantly — leaves no audit trail of what was checked versus what was found.
+Real-estate underwriting requires assembling a picture of three things — the **counterparty** (the promoter company), its **promoters** (the individuals behind it), and the **collateral** (the project and its land). That picture is scattered across ten state regulators' portals (each with its own vendor, format and gaps), three corporate-registry mirrors, three credit-rating agencies, an insolvency board, a GST portal, a Marathi-language land-records system, an open case-law index, and the open web. It is also rarely confined to one state: a promoter's real track record is usually held under OTHER companies, on OTHER states' registers. Assembling it by hand takes an analyst days, produces inconsistent output, and — most importantly — leaves no audit trail of what was checked versus what was found.
 
 This product automates that assembly and, critically, **governs what the resulting document is allowed to say**. It produces a paired **Company Charter** — an Internal variant that keeps every process failure and full bibliographic sourcing, and an External variant that is client-shareable with numbered citations — plus a RERA project summary PDF, a Developer Score, a Documentation Confidence Score, and a numbered, actionable gap list.
 
@@ -198,7 +198,7 @@ Producing two documents by hand from one analysis is where inconsistency creeps 
 |---|---|---|
 | NG1 | **Making the investment decision** | The product produces evidence and scores; a human underwrites |
 | NG2 | **Solving CAPTCHAs** | Hard ethical and ToS boundary, stated in three modules. A human solves every one |
-| NG3 | **Covering all 36 states and UTs** | Six authorities are built (MH, GJ, KA, TG, JH, WB); roughly 24 live portals remain. Each is a separate vendor, schema, language and land system, and is scoped as its own plan -- a state is added when a subject operates there, not to complete a set |
+| NG3 | **Covering all 36 states and UTs** | Ten authorities are built (MH, GJ, KA, TG, JH, WB, UP, TN, HR, DL); roughly 20 live portals remain. Each is a separate vendor, schema, language and land system, and is scoped as its own plan -- a state is added when a subject operates there, not to complete a set |
 | NG4 | **Real-time monitoring** | Batch, on-demand, human-triggered. Change detection is run-to-run, not continuous |
 | NG5 | **Replacing legal title diligence** | The land-record check is corroborative. A Title Report is a lawyer's product |
 | NG6 | **A hosted multi-tenant service** | Single-operator, local filesystem, Windows-bound PDF conversion |
