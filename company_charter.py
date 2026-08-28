@@ -7997,8 +7997,10 @@ def verify_cross_corroboration(facts: dict) -> dict:
 # underlying project's quality, safety, or investment merit. A project with a
 # genuinely bad track record whose problems are thoroughly documented can
 # score HIGH here; a genuinely fine project with little public paper trail to
-# verify against can score LOW. Six criteria, each computed directly from
-# data already in `facts`, none of them a model self-assessment. CRISIL's own
+# verify against can score LOW. Eight criteria (see _DOC_CONFIDENCE_WEIGHTS),
+# each computed directly from data already in `facts`, none of them a model
+# self-assessment; a pass with too few of them applicable is itself flagged
+# (see _MIN_CRITERIA_FOR_HIGH_BAND below). CRISIL's own
 # real-estate methodology (researched, not guessed -- see project notes) does
 # NOT publish a numeric weighting formula for any of its three products
 # (project grading, developer grading, or credit rating); it relies on a
@@ -8038,16 +8040,63 @@ _DOC_CONFIDENCE_WEIGHTS = {
     "financial_figures_confirmed": 0.10,  # was 0.00/TBD -- implemented in Step 5
 }
 
+# Module-level (not a local inside _append_authenticity_page, where it used
+# to live) specifically so its key set can be asserted against
+# _DOC_CONFIDENCE_WEIGHTS's directly -- a local copy silently went stale
+# after the Step 5 rebalance (a leftover singular "recency" key, no
+# "financial_figures_confirmed" row at all), and nothing caught it because
+# nothing could import it to check. See test_documentation_confidence_score
+# .test_criterion_labels_cover_every_real_key.
+_DOC_CONFIDENCE_CRITERION_LABELS = {
+    "source_tier_quality": "Weighted Source-Tier Quality",
+    "primary_tier_density": "Primary-Tier Density",
+    "completeness_rate": "Completeness Rate",
+    "cross_corroboration": "Cross-Corroboration",
+    "recency_legal": "Recency (Legal/Litigation Sources)",
+    "recency_other": "Recency (Other Sources)",
+    "verification_rate": "Independent Verification Rate",
+    "financial_figures_confirmed": "Financial Figures Confirmed",
+}
+
 _RECENCY_WINDOW_MONTHS = 18  # this project's own calibration, not a disclosed CRISIL threshold
 _RECENCY_WINDOW_MONTHS_LEGAL = 3  # legal/litigation sources are held to a much tighter freshness bar
 
 # The four core investment-case figures financial_figures_confirmed checks
 # for, and the gap-text markers used to detect each is still an open,
 # unconfirmed gap rather than something read from a primary document.
+#
+# Widened 2026-08-28 after auditing every real gap sentence across this
+# repo's own past Charter runs (facts.json, gitignored, not test fixtures)
+# for phrasing this marker set would miss. Two genuine misses found, both
+# real scoring bugs (a figure silently counted "confirmed" -- i.e. no
+# unresolved gap -- when the Charter's own prose says the opposite):
+#   - Bellagio Courtyards: "The authority's record states 47 units and 3
+#     sold, while the promoter's own inventory disclosure ... lists 87
+#     apartments" -- a live unit-count DISCREPANCY, but phrased as "units"/
+#     "apartments" rather than "unit count/mix/breakdown". unit_counts is
+#     now broadened to the bare noun -- audited against every real gap
+#     sentence in this repo's captured runs with zero false-positive hits
+#     (in a real-estate DD document, "unit"/"apartment" is never anything
+#     but a dwelling unit).
+#   - Karma Shine: "Plot area, buildable area, floor space entitlement,
+#     unit mix, unit count ... are all undetermined" -- an FSI/BUA gap
+#     phrased as "buildable area"/"floor space entitlement", neither of
+#     which matched fsi or land_built_up_area, so both showed "confirmed"
+#     for a project whose own gap text says its development potential is
+#     entirely unknown. Deliberately NOT adding a bare "\bfar\b" for
+#     Floor Area Ratio -- "far" is an ordinary English word and would
+#     false-positive on unrelated prose; "floor area ratio" and "f.a.r."
+#     are unambiguous instead.
+#
+# Broadening a keyword list only ever narrows the false-negative gap, never
+# closes it -- a differently-worded future gap can still slip through. This
+# is a mitigation, not a structural fix (that would mean reading a
+# structured value field per figure instead of grepping prose), tracked as
+# a known limitation rather than silently assumed fixed.
 _FINANCIAL_FIGURE_MARKERS = {
-    "fsi": (r"\bfsi\b",),
-    "land_built_up_area": (r"built-up area", r"built up area", r"\bbua\b"),
-    "unit_counts": (r"unit breakdown", r"unit count", r"unit mix", r"number of units"),
+    "fsi": (r"\bfsi\b", r"floor space (index|entitlement)", r"floor area ratio", r"\bf\.a\.r\.?\b"),
+    "land_built_up_area": (r"built-up area", r"built up area", r"\bbua\b", r"buildable area", r"\bplot area\b"),
+    "unit_counts": (r"unit breakdown", r"unit count", r"unit mix", r"number of units", r"\bunits?\b", r"\bapartments?\b"),
     "pricing": (r"\bpricing\b", r"per-sq\.?ft", r"per sq\.?ft", r"\bprice\b"),
 }
 
@@ -8085,6 +8134,17 @@ _DEVELOPER_SCORE_TIER_SCORES = {"AAA": 100.0, "AA": 83.3, "A": 66.7, "B": 50.0, 
 # criteria are averaged) back onto a single overall letter grade.
 _DEVELOPER_SCORE_TIER_THRESHOLDS = (("AAA", 91.65), ("AA", 75.0), ("A", 58.35), ("B", 41.65), ("C", 25.0))  # D below C
 _DATA_AUTHENTICITY_BANDS = {"High": 70, "Moderate": 45}  # Limited below Moderate
+
+# Thin-coverage safeguard for the Documentation Confidence Score: below this
+# many APPLICABLE criteria (out of len(_DOC_CONFIDENCE_WEIGHTS) == 8),
+# renormalization is doing most of the work, not the evidence -- see
+# _compute_documentation_confidence_score's own note on why this needs the
+# same "restrain a High, never worsen anything else" cap already used for
+# zero-verification. 4 is a bare majority of the 8 criteria: a "High" earned
+# by fewer than half of them is a materially weaker claim than the same raw
+# number would be with most criteria weighing in, even though renormalized
+# math makes their `overall` figures land identically.
+_MIN_CRITERIA_FOR_HIGH_BAND = 4
 
 
 def _band_label(score: float) -> str:
@@ -8292,7 +8352,24 @@ def _compute_documentation_confidence_score(facts: dict, authenticity_summary: d
     # the Developer Score's imminent-flag override).
     if total_attempted == 0:
         result["verification_warning"] = "0 claims were independently re-checked this pass."
-        if band == "High":
+        if result["band"] == "High":
+            result["band"] = "Moderate"
+
+    # Thin-coverage safeguard: renormalization means a project with data for
+    # only 1-2 of the 8 criteria can post the exact same `overall` number as
+    # one with all 8 -- that's the point of renormalizing rather than
+    # scoring N/A as 0, but it also means "High" from a near-empty criteria
+    # set is a much thinner claim than "High" from a full one, and nothing
+    # before this said so. Same restrain-only shape as the verification cap
+    # above (independent of it -- both can fire on the same result), and
+    # deliberately checks the ALREADY-capped result["band"] so the two
+    # safeguards compose instead of one undoing the other.
+    if len(criteria) < _MIN_CRITERIA_FOR_HIGH_BAND:
+        result["coverage_warning"] = (
+            f"Only {len(criteria)} of {len(_DOC_CONFIDENCE_WEIGHTS)} scoring criteria had applicable data "
+            f"this pass -- the overall score is renormalized across just those, not a full assessment."
+        )
+        if result["band"] == "High":
             result["band"] = "Moderate"
 
     return result
@@ -10945,7 +11022,7 @@ def _append_authenticity_page(doc, facts: dict) -> None:
             "rating of the underlying project's quality, safety, or investment merit. A project with a "
             "genuinely poor track record whose problems are thoroughly documented can score HIGH here; a "
             "genuinely sound project with little public paper trail to verify against can score LOW. It "
-            "is a weighted average of six criteria computed below from this document's own sources and "
+            "is a weighted average of up to eight criteria computed below from this document's own sources and "
             "gaps -- informed by the structure of CRISIL's real-estate methodology (a small number of "
             "named factors rather than one flat checklist) but NOT a replica of any CRISIL formula: CRISIL "
             "does not publish a numeric weighting scheme for any of its three real-estate products, and "
@@ -10958,6 +11035,19 @@ def _append_authenticity_page(doc, facts: dict) -> None:
         ),
     )
 
+    # Both safeguards below only ever RESTRAIN this score (a computed High
+    # capped to Moderate), never worsen an already-lower band -- see
+    # _compute_documentation_confidence_score. Surfaced here as plain text
+    # rather than through _variant_paragraph: this is a factual statement
+    # about the score's own basis, not narrative prose needing an
+    # Internal/External phrasing split.
+    score_warnings = [w for w in (confidence.get("verification_warning"), confidence.get("coverage_warning")) if w]
+    if score_warnings:
+        warning_para = doc.add_paragraph()
+        warning_run = warning_para.add_run(_externalize_prose(facts, " ".join(score_warnings)))
+        warning_run.italic = True
+        _color_run(warning_run, _TEXT_AMBER)
+
     score_table = doc.add_table(rows=1, cols=4)
     _set_table_borders(score_table)
     score_headers = score_table.rows[0].cells
@@ -10968,15 +11058,7 @@ def _append_authenticity_page(doc, facts: dict) -> None:
             for run in p.runs:
                 run.bold = True
 
-    _CRITERION_LABELS = {
-        "source_tier_quality": "Weighted Source-Tier Quality",
-        "primary_tier_density": "Primary-Tier Density",
-        "completeness_rate": "Completeness Rate",
-        "cross_corroboration": "Cross-Corroboration",
-        "recency": "Recency",
-        "verification_rate": "Independent Verification Rate",
-    }
-    for key, label in _CRITERION_LABELS.items():
+    for key, label in _DOC_CONFIDENCE_CRITERION_LABELS.items():
         row = score_table.add_row()
         if key in confidence["criteria"]:
             c = confidence["criteria"][key]
