@@ -5,72 +5,34 @@ API. No external sources, no LLM; this is the deterministic half of the
 promoter deep-research feature (see report.py for the agentic half).
 """
 
-import math
 import re
-import time
 from datetime import datetime
 
 import requests
 
 import api_client
 import config
+import geo_lookup
 import resolver
 
-# OpenStreetMap's public Nominatim API -- free, no API key, used only to
-# resolve a free-text address/locality into (lat, lon) for the "area within
-# 5km" Developer Score criterion. Its usage policy caps this at ~1 request/
-# second and requires a descriptive User-Agent identifying the app, not a
-# generic library default -- both are honored below (_GEOCODE_MIN_INTERVAL_S,
-# _GEOCODE_USER_AGENT). Never treat a failed/empty geocode as "0km away" --
-# it must just drop that entry from the 5km sum, not include or exclude it
-# by a guess.
-_GEOCODE_URL = "https://nominatim.openstreetmap.org/search"
-_GEOCODE_USER_AGENT = "MahaRERA-Scrapper-DueDiligence/1.0 (personal research tool, low-volume)"
-_GEOCODE_MIN_INTERVAL_S = 1.1
+# Geocoding (OpenStreetMap Nominatim, free-text address/locality -> lat/lon)
+# used to filter past_experiences entries by whether they're within 5km of
+# the subject project, for the Developer Score's "promoter influence in the
+# micro-market" criterion. The rate-limited HTTP call and the distance math
+# live in geo_lookup.py, shared with company_charter.py's Distances-table
+# refinement -- see that module's docstring for why the rate limiter must be
+# process-wide rather than per-module. Never treat a failed/empty geocode as
+# "0km away" -- it must just drop that entry from the 5km sum, not include or
+# exclude it by a guess.
 _FIVE_KM_RADIUS = 5.0
-_last_geocode_at = 0.0
 
 
 def _geocode(query: str) -> tuple | None:
-    """Resolves a free-text address/locality string to (lat, lon) via
-    Nominatim, rate-limited to Nominatim's own usage policy. Returns None
-    -- never a guessed coordinate -- if the query is empty, the request
-    fails, or nothing matches."""
-    global _last_geocode_at
-    query = (query or "").strip()
-    if not query:
-        return None
-
-    elapsed = time.monotonic() - _last_geocode_at
-    if elapsed < _GEOCODE_MIN_INTERVAL_S:
-        time.sleep(_GEOCODE_MIN_INTERVAL_S - elapsed)
-    _last_geocode_at = time.monotonic()
-
-    try:
-        resp = requests.get(
-            _GEOCODE_URL,
-            params={"q": query, "format": "json", "limit": 1, "countrycodes": "in"},
-            headers={"User-Agent": _GEOCODE_USER_AGENT},
-            timeout=config.REQUEST_TIMEOUT,
-        )
-        resp.raise_for_status()
-        results = resp.json()
-        if not results:
-            return None
-        return float(results[0]["lat"]), float(results[0]["lon"])
-    except (requests.RequestException, ValueError, KeyError, IndexError, TypeError):
-        return None
+    return geo_lookup.geocode(query)
 
 
 def _haversine_km(a: tuple, b: tuple) -> float:
-    lat1, lon1 = a
-    lat2, lon2 = b
-    r_km = 6371.0
-    p1, p2 = math.radians(lat1), math.radians(lat2)
-    dp = math.radians(lat2 - lat1)
-    dl = math.radians(lon2 - lon1)
-    x = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
-    return 2 * r_km * math.asin(math.sqrt(x))
+    return geo_lookup.haversine_km(a, b)
 
 
 def _geocode_query_for(address: str | None, district: str | None, state_name: str = "Maharashtra") -> str:

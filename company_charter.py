@@ -18,24 +18,35 @@ Guardrails, same philosophy as deep_research.py:
     re-verified (reusing deep_research._verify_claim) before being trusted.
   - Anything that can't be confirmed goes in `gaps`, verbatim, never
     silently filled in or approximated as fact.
-  - Distances are estimated via web_search (no live browser/Maps API here)
-    -- the template's own Methodology Note says so explicitly, matching its
-    existing "state plainly what's confirmed vs approximated" philosophy.
+  - Distances start as a web_search estimate (no live browser/Maps API
+    here) -- the template's own Methodology Note says so explicitly,
+    matching its existing "state plainly what's confirmed vs approximated"
+    philosophy -- then get a precision upgrade per the two passes below.
 
 Requires: ANTHROPIC_API_KEY (same as deep_research.py), and a local
 Tesseract OCR install for scanned/no-text PDFs (falls back to a plain
 "[OCR unavailable]" marker per-document if Tesseract isn't found, rather
 than failing the whole run).
 
-Optional precision upgrade for the Distances table: set
-COMPANY_CHARTER_USE_MAPS_SCRAPE=1 to have _refine_distances_with_maps()
-launch a headless Playwright browser per landmark and read the real
-driving route off Google Maps, replacing the model's web_search estimate.
-Off by default -- verified against the live site, but it scrapes Google's
-consumer UI rather than their paid Distance Matrix/Routes API, so it may
-not comply with Google's Terms of Service and can break without warning
-if Google changes their page. Always falls back to the existing estimate
-on any failure.
+Two precision upgrades for the Distances table, tried in order, each
+falling back to the next on failure -- never to a blank field:
+
+1. _refine_distances_with_nominatim() -- ON by default. Geocodes the
+   subject project's own locality and each landmark the model's
+   web_search already named via OpenStreetMap's free Nominatim API (see
+   geo_lookup.py), and replaces the estimate with a computed straight-line
+   (haversine) distance, labelled as such. No ToS risk, no scraping -- but
+   it's straight-line, not driving, distance, and only resolves a landmark
+   Nominatim can actually geocode by name.
+2. _refine_distances_with_maps() -- opt-in (COMPANY_CHARTER_USE_MAPS_SCRAPE=1),
+   tried only for whatever landmarks step 1 couldn't resolve. Launches a
+   headless Playwright browser per landmark and reads the real driving
+   route off Google Maps. Verified against the live site, but it scrapes
+   Google's consumer UI rather than their paid Distance Matrix/Routes API,
+   so it may not comply with Google's Terms of Service and can break
+   without warning if Google changes their page.
+
+Either failing leaves the model's own web_search estimate untouched.
 
     python company_charter.py <REG_NO>
     COMPANY_CHARTER_USE_MAPS_SCRAPE=1 python company_charter.py <REG_NO>
@@ -60,6 +71,7 @@ from PIL import Image
 import config
 import deep_research
 import finalize_report
+import geo_lookup
 import group_enforcement
 import group_entities
 import group_sweep
@@ -806,19 +818,63 @@ def _lookup_maps_distance(origin: str, destination: str) -> dict | None:
         return None
 
 
-def _refine_distances_with_maps(facts: dict, origin: str) -> dict:
+def _refine_distances_with_nominatim(facts: dict, origin: str) -> set:
+    """PRIORITY precision upgrade for the Distances table, on by default
+    (no env gate, unlike the Maps scrape below) -- geocodes the subject
+    project's own locality once via OpenStreetMap's free Nominatim API
+    (geo_lookup.py, shared with promoter_portfolio.py's 5km filter, which
+    also owns the rate limiter), then each distance entry's landmark name
+    -- the model's own web_search already found -- and replaces its
+    estimated distance_time with a computed straight-line (haversine)
+    distance. Free, no scraping, no Terms-of-Service ambiguity -- but it is
+    a STRAIGHT-LINE distance, not a driving route, and it only resolves
+    landmarks specific/well-formed enough for Nominatim's free-form search
+    to find; both are stated plainly in route_note rather than presented as
+    a driving distance. An entry left untouched here (bad origin geocode,
+    or a landmark Nominatim can't resolve) keeps the model's own estimate
+    unless _refine_distances_with_maps, called next, resolves it instead.
+
+    Returns the set of landmark names this pass DID resolve, so that next
+    call knows to skip them -- there is no reason to also pay for (and
+    risk) a Maps scrape on a distance already computed for free."""
+    resolved = set()
+    origin_coords = geo_lookup.geocode(origin) if origin else None
+    if not origin_coords:
+        return resolved
+
+    for entry in facts.get("distances", []):
+        landmark = entry.get("landmark")
+        if not landmark:
+            continue
+        landmark_coords = geo_lookup.geocode(landmark)
+        if not landmark_coords:
+            continue
+        km = geo_lookup.haversine_km(origin_coords, landmark_coords)
+        entry["distance_time"] = f"{km:.1f} km (straight-line)"
+        entry["route_note"] = (
+            "Straight-line distance, computed via OpenStreetMap Nominatim geocoding this run "
+            "-- not a driving route."
+        )
+        resolved.add(landmark)
+    return resolved
+
+
+def _refine_distances_with_maps(facts: dict, origin: str, skip: set = frozenset()) -> dict:
     """Opt-in (COMPANY_CHARTER_USE_MAPS_SCRAPE=1) precision upgrade: replaces
     each distance entry's web_search-estimated distance_time/route_note with
     a live-scraped Google Maps driving route when the lookup succeeds,
     leaving the model's own estimate untouched (not silently dropped) when
     it doesn't -- so a scrape failure degrades to exactly today's behavior
-    rather than blanking the field."""
+    rather than blanking the field. `skip` names landmarks
+    _refine_distances_with_nominatim already resolved -- tried first,
+    unconditionally -- so this pass (the one carrying ToS risk) only runs
+    against what that one couldn't."""
     if os.environ.get(_MAPS_SCRAPE_ENV_VAR) != "1":
         return facts
 
     for entry in facts.get("distances", []):
         landmark = entry.get("landmark")
-        if not landmark:
+        if not landmark or landmark in skip:
             continue
         result = _lookup_maps_distance(origin, landmark)
         if result:
@@ -11988,7 +12044,8 @@ def run_company_charter(
     if origin_locality:
         _state_name = _profile_for_run.state_name
         origin = f"{origin_locality}, {origin_district}, {_state_name}" if origin_district else f"{origin_locality}, {_state_name}"
-        facts = _refine_distances_with_maps(facts, origin)
+        _resolved_via_nominatim = _refine_distances_with_nominatim(facts, origin)
+        facts = _refine_distances_with_maps(facts, origin, skip=_resolved_via_nominatim)
 
     # Runs last, after every other step above has had its chance to add a
     # source -- otherwise a topic that only looks single-sourced mid-assembly

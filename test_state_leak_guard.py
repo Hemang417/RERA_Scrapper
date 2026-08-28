@@ -133,8 +133,6 @@ _ALLOWED = {
         ),
     },
     "promoter_portfolio.py": {
-        # Nominatim requires a identifying User-Agent. Not reader-facing.
-        "_GEOCODE_USER_AGENT": ("MahaRERA-Scrapper-DueDiligence/1.0 (personal research tool, low-volume)",),
         # Default argument values, so an unqualified call behaves exactly as
         # it did before the state parameter existed.
         "_geocode_query_for": ("Maharashtra",),
