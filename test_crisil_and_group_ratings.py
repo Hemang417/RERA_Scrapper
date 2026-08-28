@@ -30,6 +30,12 @@ through carbon and logistics entities while the two rated companies sat at
 positions 28 and 29. The pass reported "0 rated" and disclosed the bound
 honestly -- honest and useless at the same time.
 
+CARE and India Ratings were added later still (both confirmed reverse-
+engineerable the same way ICRA/Infomerics were: a plain, unauthenticated
+search endpoint plus a plain detail endpoint, no browser/JS needed), closing
+the gap between what the file's own doc comments already claimed the tool
+checked ("CRISIL/ICRA/CARE/India Ratings") and what it actually queried.
+
 Network tests are opt-in: CRISIL_LIVE=1.
 
 Run directly: python test_crisil_and_group_ratings.py
@@ -83,10 +89,89 @@ def test_crisil_is_actually_in_the_agency_list():
     agencies = [name for name, _ in cc._CREDIT_RATING_AGENCIES]
     assert "CRISIL" in agencies, agencies
     assert "ICRA" in agencies and "Infomerics" in agencies, agencies
+    assert "CARE" in agencies and "India Ratings" in agencies, agencies
     source = inspect.getsource(cc._append_credit_rating_section)
     assert "CRISIL" in source, \
         "the section still tells the reader only ICRA and Infomerics were checked"
     print("test_crisil_is_actually_in_the_agency_list: PASS")
+
+
+# --- CARE and India Ratings ------------------------------------------------
+
+def test_care_matches_only_the_exact_entity_not_a_securitisation_tranche():
+    """CARE's own search returns "Godrej Finance Limited-Securitisation" as
+    a SEPARATE company alongside "Godrej Finance Limited" itself (a real,
+    live search result, not a hypothetical) -- exact matching must not
+    confuse the tranche entity with the parent, the same discipline already
+    proven for CRISIL/ICRA/Infomerics."""
+    original_search, original_detail = cc._care_search_companies, cc._care_fetch_rating_detail
+    cc._care_search_companies = lambda name: [
+        {"CompanyID": "abc==", "CompanyName": "Godrej Finance Limited"},
+        {"CompanyID": "xyz==", "CompanyName": "Godrej Finance Limited-Securitisation"},
+    ]
+    cc._care_fetch_rating_detail = lambda company_id: {
+        "instruments": [{"instrument": "Long Term", "rating": "CARE AA+; Stable"}],
+        "url": f"https://www.careratings.com/search?Id={company_id}",
+    }
+    try:
+        result = cc._lookup_care_rating("Godrej Finance Limited")
+    finally:
+        cc._care_search_companies, cc._care_fetch_rating_detail = original_search, original_detail
+    assert result["found"] is True, result
+    assert result["company_name"] == "Godrej Finance Limited", result
+    assert result["url"].endswith("abc=="), result
+    print("test_care_matches_only_the_exact_entity_not_a_securitisation_tranche: PASS")
+
+
+def test_care_reports_not_found_honestly():
+    original = cc._care_search_companies
+    cc._care_search_companies = lambda name: []
+    try:
+        result = cc._lookup_care_rating("Nonexistent Company Ltd")
+    finally:
+        cc._care_search_companies = original
+    assert result["found"] is False, result
+    assert "CARE" in result["note"], result
+    print("test_care_reports_not_found_honestly: PASS")
+
+
+def test_india_ratings_reports_not_found_honestly():
+    original = cc._india_ratings_search_companies
+    cc._india_ratings_search_companies = lambda name: []
+    try:
+        result = cc._lookup_india_ratings_rating("Nonexistent Company Ltd")
+    finally:
+        cc._india_ratings_search_companies = original
+    assert result["found"] is False, result
+    assert "India Ratings" in result["note"], result
+    print("test_india_ratings_reports_not_found_honestly: PASS")
+
+
+def test_india_ratings_matches_the_exact_issuer_by_name():
+    """India Ratings' own search returns multiple issuers sharing a brand
+    word (e.g. "Godrej Agrovet Limited" alongside "Godrej Properties
+    Limited") -- exact matching must pick the right one, not the first."""
+    original_search, original_detail = (
+        cc._india_ratings_search_companies, cc._india_ratings_fetch_rating_detail,
+    )
+    cc._india_ratings_search_companies = lambda name: [
+        {"issuerID": "14086", "name": "Godrej Agrovet Limited"},
+        {"issuerID": "12230", "name": "Godrej Properties Limited"},
+    ]
+    cc._india_ratings_fetch_rating_detail = lambda issuer_id: {
+        "instruments": [{"instrument": "Non-convertible debentures", "rating": "IND AA+ / Stable"}],
+        "url": f"https://www.indiaratings.co.in/search/issuerid/{issuer_id}",
+    }
+    try:
+        result = cc._lookup_india_ratings_rating("Godrej Properties Limited")
+    finally:
+        (cc._india_ratings_search_companies, cc._india_ratings_fetch_rating_detail) = (
+            original_search, original_detail,
+        )
+    assert result["found"] is True, result
+    assert result["company_name"] == "Godrej Properties Limited", result
+    assert result["url"].endswith("/12230"), result
+    print("test_india_ratings_matches_the_exact_issuer_by_name: PASS")
 
 
 # --- the group check ------------------------------------------------------
@@ -216,14 +301,44 @@ def test_live_crisil_returns_the_current_rating_not_a_stale_one():
     print("test_live_crisil_returns_the_current_rating_not_a_stale_one: PASS")
 
 
+def test_live_care_returns_a_real_rating():
+    if not _LIVE:
+        print("test_live_care_returns_a_real_rating: SKIPPED (set CRISIL_LIVE=1)")
+        return
+    result = cc._lookup_care_rating("Godrej Finance Limited")
+    assert result["found"] is True, result
+    assert result["agency"] == "CARE", result
+    ratings = " ".join(i["rating"] for i in result["instruments"])
+    assert "CARE" in ratings, ratings
+    print("test_live_care_returns_a_real_rating: PASS")
+
+
+def test_live_india_ratings_returns_a_real_rating():
+    if not _LIVE:
+        print("test_live_india_ratings_returns_a_real_rating: SKIPPED (set CRISIL_LIVE=1)")
+        return
+    result = cc._lookup_india_ratings_rating("Godrej Properties Limited")
+    assert result["found"] is True, result
+    assert result["agency"] == "India Ratings", result
+    ratings = " ".join(i["rating"] for i in result["instruments"])
+    assert "IND" in ratings, ratings
+    print("test_live_india_ratings_returns_a_real_rating: PASS")
+
+
 if __name__ == "__main__":
     test_a_legal_form_abbreviation_does_not_hide_a_rating()
     test_canonicalising_never_merges_two_different_companies()
     test_crisil_is_actually_in_the_agency_list()
+    test_care_matches_only_the_exact_entity_not_a_securitisation_tranche()
+    test_care_reports_not_found_honestly()
+    test_india_ratings_reports_not_found_honestly()
+    test_india_ratings_matches_the_exact_issuer_by_name()
     test_the_group_check_covers_entities_the_subject_check_cannot()
     test_a_bounded_check_looks_at_the_likeliest_parent_first()
     test_entities_past_the_limit_are_not_reported_as_unrated()
     test_unrated_is_explained_rather_than_left_looking_adverse()
     test_a_failing_agency_never_sinks_the_group_pass()
     test_live_crisil_returns_the_current_rating_not_a_stale_one()
+    test_live_care_returns_a_real_rating()
+    test_live_india_ratings_returns_a_real_rating()
     print("\nAll tests passed.")

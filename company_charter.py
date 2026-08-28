@@ -1126,13 +1126,11 @@ def _check_document_grounding(facts: dict, extracted_docs: dict, category_data: 
 # As of this pass, ICRA is no longer the only agency checked -- see
 # _lookup_infomerics_rating below, added after ICRA-only coverage produced
 # a real, misleading "not found" for a promoter's sister entity that was
-# actually rated (by Infomerics, not ICRA). CRISIL's equivalent
-# company-rating search still wasn't confirmed reverse-engineerable in the
-# time spent on it (its site exposes an SME-specific autocomplete on a
-# different product, not the main corporate-rating search) -- rather than
-# build against an unconfirmed mechanism, coverage stays scoped to what
-# actually works. CRISIL/CARE/India Ratings coverage can be added later if
-# a working search endpoint is found for any of them.
+# actually rated (by Infomerics, not ICRA). CRISIL, CARE and India Ratings
+# were added later still, once each one's own search/detail endpoints were
+# separately confirmed reverse-engineerable (see each function's own
+# comment block below for how) -- coverage now spans all five SEBI-
+# registered agencies with a workable public search mechanism.
 #
 # Matches ONLY on an exact (case-insensitive) name match against each
 # agency's own company list -- never a fuzzy "probably the same company"
@@ -1441,26 +1439,173 @@ def _lookup_crisil_rating(company_name: str) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# CARE Ratings (CareEdge Ratings) credit-rating lookup -- confirmed live
+# against CARE's real public rating database (careratings.com). Its header
+# search box calls a plain, unauthenticated JSON endpoint -- GET
+# /header/searchlistinsights?cinput=<name> -- returning company matches
+# keyed by an opaque CompanyID; the matching company's current instrument
+# ratings come from a second plain GET -- /getSearchprintrating?companyName
+# =<CompanyID> (the ID, not the name, despite the parameter's name). Both
+# confirmed with a bare requests.get(), no browser/JS needed, even though
+# the company's own human-facing page (careratings.com/search?Id=
+# <CompanyID>) is itself client-rendered from this same endpoint -- a plain
+# GET of that page returns an empty shell. Live-tested against "Godrej
+# Finance Limited" -- returned CARE AA+; Stable across its long-term, NCD
+# and subordinate-debt instruments.
+# ---------------------------------------------------------------------------
+
+_CARE_SEARCH_URL = "https://www.careratings.com/header/searchlistinsights"
+_CARE_DETAIL_URL = "https://www.careratings.com/getSearchprintrating"
+_CARE_PAGE_URL = "https://www.careratings.com/search"
+
+
+def _care_search_companies(name: str) -> list:
+    resp = requests.get(_CARE_SEARCH_URL, params={"cinput": name}, timeout=config.REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    return resp.json().get("data") or []
+
+
+def _care_fetch_rating_detail(company_id: str) -> dict:
+    resp = requests.get(_CARE_DETAIL_URL, params={"companyName": company_id}, timeout=config.REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    rows = resp.json().get("data") or []
+    instruments = []
+    if rows:
+        for inst in rows[0].get("CompanyInstrument") or []:
+            if inst.get("Instrument") and inst.get("Rating"):
+                instruments.append({"instrument": inst["Instrument"], "rating": inst["Rating"]})
+    return {"instruments": instruments, "url": f"{_CARE_PAGE_URL}?Id={company_id}"}
+
+
+def _lookup_care_rating(company_name: str) -> dict:
+    try:
+        matches = _care_search_companies(company_name)
+    except (requests.RequestException, ValueError) as e:
+        return {"found": False, "note": f"CARE lookup could not run this pass: {e}"}
+
+    exact = next(
+        (m for m in matches if str(m.get("CompanyName", "")).strip().lower() == company_name.strip().lower()),
+        None,
+    )
+    if not exact:
+        return {"found": False, "note": "No public CARE rating found for this exact legal entity name."}
+
+    try:
+        detail = _care_fetch_rating_detail(exact["CompanyID"])
+    except requests.RequestException as e:
+        return {"found": False,
+                "note": f"Found a matching CARE entity ({exact['CompanyName']}) but could not fetch its "
+                        f"rating detail this pass: {e}"}
+
+    return {
+        "found": True,
+        "agency": "CARE",
+        "company_name": exact["CompanyName"],
+        "instruments": detail["instruments"],
+        "url": detail["url"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# India Ratings (Ind-Ra, a Fitch Group company) credit-rating lookup --
+# confirmed live against India Ratings' real public database
+# (indiaratings.co.in). Its header search modal calls a plain,
+# unauthenticated JSON endpoint -- GET /home/GetSearch?searchKey=<name> --
+# returning an "issuerList" of {issuerID, name}; the matching issuer's
+# current instrument ratings come from a second plain GET -- GET
+# /home/GetIssuerDetails?issuerId=<issuerID>&noOfShowEntry=10. Both
+# confirmed with a bare requests.get(), no browser/JS needed, even though
+# the issuer's own human-facing page (indiaratings.co.in/search/issuerid/
+# <issuerID>) is itself client-rendered from this same endpoint. Live-tested
+# against "Godrej Properties Limited" -- returned IND AA+ / Stable on its
+# NCDs and IND A1+ on its commercial paper.
+# ---------------------------------------------------------------------------
+
+_INDIA_RATINGS_SEARCH_URL = "https://www.indiaratings.co.in/home/GetSearch"
+_INDIA_RATINGS_DETAIL_URL = "https://www.indiaratings.co.in/home/GetIssuerDetails"
+_INDIA_RATINGS_PAGE_URL = "https://www.indiaratings.co.in/search/issuerid"
+
+
+def _india_ratings_search_companies(name: str) -> list:
+    resp = requests.get(_INDIA_RATINGS_SEARCH_URL, params={"searchKey": name}, timeout=config.REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    return resp.json().get("issuerList") or []
+
+
+def _india_ratings_fetch_rating_detail(issuer_id: str) -> dict:
+    resp = requests.get(
+        _INDIA_RATINGS_DETAIL_URL,
+        params={"issuerId": issuer_id, "noOfShowEntry": 10},
+        timeout=config.REQUEST_TIMEOUT,
+    )
+    resp.raise_for_status()
+    rows = resp.json() or []
+    instruments = []
+    if rows:
+        for inst in rows[0].get("ratingsList") or []:
+            instrument_name, rating = inst.get("instrumentName"), inst.get("rating")
+            if not (instrument_name and rating):
+                continue
+            if inst.get("outlook"):
+                rating = f"{rating} (Outlook: {inst['outlook']})"
+            instruments.append({"instrument": instrument_name, "rating": rating})
+    return {"instruments": instruments, "url": f"{_INDIA_RATINGS_PAGE_URL}/{issuer_id}"}
+
+
+def _lookup_india_ratings_rating(company_name: str) -> dict:
+    try:
+        matches = _india_ratings_search_companies(company_name)
+    except (requests.RequestException, ValueError) as e:
+        return {"found": False, "note": f"India Ratings lookup could not run this pass: {e}"}
+
+    exact = next(
+        (m for m in matches if str(m.get("name", "")).strip().lower() == company_name.strip().lower()),
+        None,
+    )
+    if not exact:
+        return {"found": False, "note": "No public India Ratings rating found for this exact legal entity name."}
+
+    try:
+        detail = _india_ratings_fetch_rating_detail(exact["issuerID"])
+    except requests.RequestException as e:
+        return {"found": False,
+                "note": f"Found a matching India Ratings entity ({exact['name']}) but could not fetch its "
+                        f"rating detail this pass: {e}"}
+
+    return {
+        "found": True,
+        "agency": "India Ratings",
+        "company_name": exact["name"],
+        "instruments": detail["instruments"],
+        "url": detail["url"],
+    }
+
+
 _CREDIT_RATING_AGENCIES = (
     ("CRISIL", _lookup_crisil_rating),
     ("ICRA", _lookup_icra_rating),
+    ("CARE", _lookup_care_rating),
+    ("India Ratings", _lookup_india_ratings_rating),
     ("Infomerics", _lookup_infomerics_rating),
 )
 
 
 def lookup_credit_rating(company_name: str) -> dict:
-    """Checks EVERY agency above (currently CRISIL, ICRA and Infomerics) for a
-    public rating under an EXACT (case-insensitive) match on
-    `company_name` -- never a fuzzy "probably the same company" guess,
-    since misattributing a rating to the wrong legal entity would be a
-    serious factual error in a due-diligence document. Always checks all
-    agencies, even after an earlier one already found something -- so that
-    if two agencies rate the same entity, BOTH ratings surface side by
-    side for comparison, rather than silently showing only the first
-    match. (This costs one extra request per additional agency versus a
-    first-match-wins design, which is negligible next to the value of
-    catching a real disagreement between agencies.) Returns:
-      {"found": True, "ratings": [{"agency": "ICRA" | "Infomerics",
+    """Checks EVERY agency above (currently CRISIL, ICRA, CARE, India
+    Ratings and Infomerics) for a public rating under an EXACT
+    (case-insensitive) match on `company_name` -- never a fuzzy "probably
+    the same company" guess, since misattributing a rating to the wrong
+    legal entity would be a serious factual error in a due-diligence
+    document. Always checks all agencies, even after an earlier one
+    already found something -- so that if two agencies rate the same
+    entity, BOTH ratings surface side by side for comparison, rather than
+    silently showing only the first match. (This costs one extra request
+    per additional agency versus a first-match-wins design, which is
+    negligible next to the value of catching a real disagreement between
+    agencies.) Returns:
+      {"found": True, "ratings": [{"agency": "CRISIL" | "ICRA" | "CARE" |
+       "India Ratings" | "Infomerics",
        "company_name": <matched label>, "instruments": [{"instrument":
        ..., "rating": ...}, ...], "url": ...}, ...], "not_found_agencies":
        [<agency names with no match>]}
@@ -9716,16 +9861,19 @@ def _append_credit_rating_section(doc, facts: dict) -> None:
     _variant_paragraph(
         doc, facts,
         internal_text=(
-            "Checked directly against every rating agency's public database (currently CRISIL, ICRA and Infomerics) "
-            "for an exact match on the promoter's own legal name -- not a fuzzy or \"probably the same "
-            "company\" guess, since attributing a rating to the wrong legal entity would itself be a serious "
-            "error. Every agency is checked regardless of whether an earlier one already found something, so "
-            "that if two agencies rate the same entity, both ratings are shown here for comparison rather "
-            "than silently reporting only one. A promoter having no public rating anywhere is the ordinary "
-            "case, not a red flag: these agencies only rate developers that sought a public rating (typically "
-            "larger, listed, or NCD-issuing entities)."
+            "Checked directly against every rating agency's public database (currently CRISIL, ICRA, CARE, "
+            "India Ratings and Infomerics) for an exact match on the promoter's own legal name -- not a fuzzy "
+            "or \"probably the same company\" guess, since attributing a rating to the wrong legal entity "
+            "would itself be a serious error. Every agency is checked regardless of whether an earlier one "
+            "already found something, so that if two agencies rate the same entity, both ratings are shown "
+            "here for comparison rather than silently reporting only one. A promoter having no public rating "
+            "anywhere is the ordinary case, not a red flag: these agencies only rate developers that sought a "
+            "public rating (typically larger, listed, or NCD-issuing entities)."
         ),
-        external_text="Checked against ICRA and Infomerics for a rating under the promoter's exact legal name.",
+        external_text=(
+            "Checked against CRISIL, ICRA, CARE, India Ratings and Infomerics for a rating under the "
+            "promoter's exact legal name."
+        ),
     )
 
     promoter_result = check.get("promoter", {})
