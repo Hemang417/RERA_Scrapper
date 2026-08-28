@@ -465,6 +465,43 @@ def test_a_lapsed_registration_is_counted_not_dropped():
     print("test_a_lapsed_registration_is_counted_not_dropped: PASS")
 
 
+def test_the_defaulter_register_shares_the_lapsed_registers_parser():
+    """Same three header needles, same table -- fetch_defaulter_projects and
+    fetch_lapsed_projects are two different URLs through one parser, and
+    the two findings must never be conflated (see the module docstring's
+    'these are two different findings, not one')."""
+    from states.adapter_haryana import parse_lapsed_or_defaulter_register
+
+    rows = parse_lapsed_or_defaulter_register(_REGISTER_HTML)
+    assert len(rows) == 3, rows
+    assert rows[0]["builder"] == "COUNTRYWIDE PROMOTERS PRIVATE LIMITED", rows[0]
+    print("test_the_defaulter_register_shares_the_lapsed_registers_parser: PASS")
+
+
+def test_fetch_defaulter_projects_reads_the_bench_named_url():
+    """Confirms the URL each bench actually resolves to, and that the fetch
+    wrapper is a thin pass-through to the shared parser -- injected via
+    monkeypatched _get rather than a live network call."""
+    from states.adapter_haryana import CANCELLED_PROJECTS, fetch_defaulter_projects
+
+    original = hr._get
+    seen_urls = []
+
+    def fake_get(session, url, what="page"):
+        seen_urls.append(url)
+        return _REGISTER_HTML
+
+    hr._get = fake_get
+    try:
+        rows = fetch_defaulter_projects("2", session=object())
+    finally:
+        hr._get = original
+
+    assert seen_urls == [CANCELLED_PROJECTS.format("2")], seen_urls
+    assert len(rows) == 3, rows
+    print("test_fetch_defaulter_projects_reads_the_bench_named_url: PASS")
+
+
 def test_haryana_is_searchable_and_openable():
     assert hasattr(hr, "search_promoter_projects")
     assert "HR" in gs.searchable_states(), gs.searchable_states()
@@ -552,6 +589,8 @@ if __name__ == "__main__":
     test_directors_are_read_with_their_roles()
     test_a_promoter_filing_under_two_spellings_stays_apart_and_says_so()
     test_a_lapsed_registration_is_counted_not_dropped()
+    test_the_defaulter_register_shares_the_lapsed_registers_parser()
+    test_fetch_defaulter_projects_reads_the_bench_named_url()
     test_haryana_is_searchable_and_openable()
     test_complaints_are_unknown_rather_than_zero()
     test_downloading_a_document_does_not_crash_the_run()

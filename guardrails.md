@@ -266,6 +266,29 @@ satisfied charge stays listed with a closure date); a CHG-1 modification is not
 a release. `charge_watch` never claims the mirror proves the money is still
 owed, only that no satisfaction has reached it.
 
+`group_enforcement.sweep` searches UP-RERA, HARERA, TNRERA and Delhi-RERA's own
+defaulter, cancellation, penalty and enforcement registers by NAME, across
+seven sources written and live-verified 2026-08-26 but left unwired until this
+pass. A different source from `litigation_sweep` (the regulator's own rows, not
+a full-text index) with the same discipline: every hit is a CANDIDATE, tagged
+with a caution naming which register produced it and why a name match is not
+identity -- TNRERA's penalty register is matched against a raw, unparsed text
+block rather than a clean field, and its own comment on `promoter_name()`
+explains why that helper is not reused here. `NOT_ENFORCEMENT_SEARCHABLE` names
+every authority this pass does not reach (MahaRERA, GujRERA, WBRERA, JHARERA,
+TG-RERA, and K-RERA's own penalty register, already covered by
+`litigation_sweep.state_order_sweep`) -- an empty candidates table says nothing
+about any of them, and `coverage_sentence` may not use the word "clean".
+
+**The Delhi REAT appeal index is the expensive source, and it is bounded by a
+cache, not a query limit.** `states.adapter_delhi.build_appeal_party_index`
+OCRs up to 481 order PDFs to recover the party names its own register columns
+do not carry -- a real cost (~5 minutes for the whole register), paid once and
+cached to disk (`cache_dir`) so a second promoter's sweep does not re-OCR PDFs
+a prior run already read. The section's limitations name how many of the 481
+were actually read and how many could not be parsed, so a PDF outside that
+count is reported as unread, never as confirmed clean.
+
 ## 2b. Identity — a wrong PAN is worse than no PAN
 
 `promoter_identity.verify_pan` is the gate on every PAN read off a filed card.

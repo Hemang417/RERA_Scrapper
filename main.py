@@ -154,6 +154,18 @@ def parse_args() -> argparse.Namespace:
             "does not reliably cover, so an empty table is never read as a clean record."
         ),
     )
+    parser.add_argument(
+        "--group-enforcement",
+        action="store_true",
+        help=(
+            "Search UP-RERA, HARERA, TNRERA and Delhi-RERA's own defaulter, cancellation, "
+            "penalty and enforcement registers for every group entity and director. Off by "
+            "default: one of the seven sources (Delhi's REAT appeal register) costs a real "
+            "OCR pass, cached across runs, and every hit is a NAME match that must be "
+            "confirmed. The Charter section names the authorities this pass does not reach, "
+            "so an empty table is never read as a clean national record."
+        ),
+    )
     gst = parser.add_mutually_exclusive_group()
     gst.add_argument(
         "--gstin",
@@ -511,6 +523,7 @@ def main() -> int:
             reviews=reviews, promoter_portfolio=portfolio, pipeline_start_time=pipeline_start_time,
             state_profile=profile, group_sweep=args.group_sweep,
             group_gst=args.group_gst, group_litigation=args.group_litigation,
+            group_enforcement=args.group_enforcement,
         )
         external_charter_path = charter_path.replace("_Internal.docx", "_External.docx")
         print(f"[OK] Company Charter (Internal) written to {charter_path}")

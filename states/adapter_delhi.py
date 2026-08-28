@@ -802,6 +802,39 @@ def parse_execution_register(html):
     return []
 
 
+_SUOMOTO_CACHE = []
+_EXECUTION_CACHE = []
+
+
+def fetch_suo_moto_register(fetcher=None):
+    """The whole suo-moto register, cached for the process. Same mirror as
+    fetch_order_register() -- a national register, fetched whole and
+    filtered locally by callers, never re-queried per name."""
+    if _SUOMOTO_CACHE and fetcher is None:
+        return _SUOMOTO_CACHE
+    html = fetcher() if fetcher is not None else _get(
+        _session(), SUOMOTO_REGISTER, what="Delhi-RERA suo-moto register"
+    )
+    parsed = parse_suo_moto_register(html)
+    if fetcher is None:
+        _SUOMOTO_CACHE.extend(parsed)
+    return parsed
+
+
+def fetch_execution_register(fetcher=None):
+    """The whole execution register, cached for the process. Same mirror as
+    fetch_order_register()."""
+    if _EXECUTION_CACHE and fetcher is None:
+        return _EXECUTION_CACHE
+    html = fetcher() if fetcher is not None else _get(
+        _session(), EXECUTION_REGISTER, what="Delhi-RERA execution register"
+    )
+    parsed = parse_execution_register(html)
+    if fetcher is None:
+        _EXECUTION_CACHE.extend(parsed)
+    return parsed
+
+
 class _NullReporter:
     def info(self, *a, **k): pass
     def warn(self, *a, **k): pass

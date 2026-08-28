@@ -42,14 +42,17 @@ import group_sweep as gs
 from states.adapter_tamilnadu import (
     coverage_note,
     document_extension,
+    fetch_penalty_notices,
     field_value,
     looks_like_a_document,
     parse_order_register,
+    parse_penalty_register,
     parse_public_view,
     parse_register,
     parse_registration_number,
     project_name,
     promoter_name,
+    search_enforcement_lists_by_name,
     search_orders_by_promoter,
 )
 
@@ -368,6 +371,71 @@ def test_all_three_registers_are_read_and_an_unread_one_is_named():
     print("test_all_three_registers_are_read_and_an_unread_one_is_named: PASS")
 
 
+# --- penalty register and enforcement PDFs (group_enforcement's join keys) -
+
+_PENALTY_HTML = """
+<table>
+ <tr><th>Sl.No</th><th>Application Number</th><th>Promoter Details</th>
+     <th>Project Details</th><th>Date of Penalty Notice Issued</th>
+     <th>Penalty Amount</th></tr>
+ <tr><td>1</td><td>TNRERA/PLI/2288/2024</td>
+     <td>M/s. CASA GRANDE LIMITED. Door No. 27, Some Road</td>
+     <td>Green Avenue Homes & Gardens</td><td>12-Mar-2025</td><td>50000</td></tr>
+ <tr><td>2</td><td></td><td>No application number</td>
+     <td>Some Project</td><td>01-Jan-2026</td><td>10000</td></tr>
+</table>
+"""
+
+
+def test_the_penalty_register_is_found_by_header_and_keeps_the_promoter_block_whole():
+    """promoter_block is deliberately NOT run through promoter_name(): that
+    helper truncates at 'Door No.', which this register's cells run
+    straight into with a period rather than a comma."""
+    rows = parse_penalty_register(_PENALTY_HTML)
+    assert len(rows) == 1, rows
+    assert rows[0]["application_no"] == "TNRERA/PLI/2288/2024", rows[0]
+    assert "Door No." in rows[0]["promoter_block"], rows[0]
+    assert rows[0]["penalty_amount"] == "50000", rows[0]
+    print("test_the_penalty_register_is_found_by_header_and_keeps_the_promoter_block_whole: PASS")
+
+
+def test_fetch_penalty_notices_reads_both_kinds_through_one_parser():
+    rows = fetch_penalty_notices(kind="building", fetcher=lambda url: _PENALTY_HTML)
+    assert len(rows) == 1 and rows[0]["application_no"] == "TNRERA/PLI/2288/2024", rows
+    print("test_fetch_penalty_notices_reads_both_kinds_through_one_parser: PASS")
+
+
+def test_enforcement_lists_are_searched_by_name_across_both_pdfs():
+    """search_enforcement_lists_by_name reads two PDFs via
+    fetch_enforcement_pdf_rows -- injected here rather than fabricating real
+    PDF bytes, to pin the search/match logic (normalised substring over
+    prose, both lists walked, a miss on one list does not short-circuit the
+    other) independent of pdfplumber's own extraction."""
+    import states.adapter_tamilnadu as tn
+
+    original = tn.fetch_enforcement_pdf_rows
+    calls = []
+
+    def fake_fetch(url, session=None):
+        calls.append(url)
+        if url == tn.SCN_PENALTY_PDF:
+            return [{"sl_no": "1", "party_detail": "Thiru. Casa Grande, Managing Partner",
+                      "site_address": "Chennai", "extra": ""}]
+        return [{"sl_no": "1", "party_detail": "Someone Unrelated",
+                  "site_address": "Coimbatore", "extra": ""}]
+
+    tn.fetch_enforcement_pdf_rows = fake_fetch
+    try:
+        hits = search_enforcement_lists_by_name("Casa Grande")
+    finally:
+        tn.fetch_enforcement_pdf_rows = original
+
+    assert len(calls) == 2, "both enforcement PDFs must be checked, not just one"
+    assert len(hits) == 1, hits
+    assert "Casa Grande" in hits[0]["party_detail"], hits[0]
+    print("test_enforcement_lists_are_searched_by_name_across_both_pdfs: PASS")
+
+
 # --- documents ------------------------------------------------------------
 
 def test_a_missing_file_answers_200_and_is_not_saved():
@@ -478,6 +546,9 @@ if __name__ == "__main__":
     test_only_filed_documents_are_collected_not_the_menu()
     test_orders_are_matched_on_the_respondent()
     test_all_three_registers_are_read_and_an_unread_one_is_named()
+    test_the_penalty_register_is_found_by_header_and_keeps_the_promoter_block_whole()
+    test_fetch_penalty_notices_reads_both_kinds_through_one_parser()
+    test_enforcement_lists_are_searched_by_name_across_both_pdfs()
     test_a_missing_file_answers_200_and_is_not_saved()
     test_a_spreadsheet_is_not_saved_under_a_pdf_name()
     test_the_form_c_link_has_no_text_and_still_gets_a_name()

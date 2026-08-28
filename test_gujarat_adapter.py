@@ -85,6 +85,42 @@ def test_a_null_uid_is_skipped_not_downloaded():
     print("test_a_null_uid_is_skipped_not_downloaded: PASS")
 
 
+def test_financial_document_labels_are_marked_high_priority_for_extraction():
+    """GujRERA's audited balance sheet, P&L and income-tax filings were never
+    text-extracted for the model at all -- excluded from the OCR keyword
+    list entirely, so they never even reached the prompt. This pins that the
+    keyword list actually matches GujRERA's real label strings, and that
+    doing so does not sweep up something unrelated."""
+    import company_charter as cc
+
+    payload = {"findoc": {
+        "auditedBalSheetDoc1UId": "UID-A",
+        "auditedProfitLossSheetDoc1UId": "UID-B",
+        "incomeTaxReturn1UId": "UID-C",
+    }}
+    entries = _document_entries(payload)
+    labels = {e["label"] for e in entries}
+    assert labels == {"Audited balance sheet (1)", "Audited profit & loss statement (1)",
+                       "Income-tax return (1)"}, labels
+
+    def is_priority(label):
+        return any(k in label.lower() for k in cc._HIGH_PRIORITY_DOC_KEYWORDS)
+
+    for label in labels:
+        assert is_priority(label), f"{label!r} did not match the high-priority keyword list"
+
+    # Jharkhand's own document grid produces the non-hyphenated spelling --
+    # both forms must match, not just GujRERA's hyphenated one.
+    assert is_priority("Company Pan Card | Balance Sheet | Income Tax Preceeding Year 1")
+
+    # A representative sample of unrelated, already-priority and already-
+    # deprioritised labels must be unaffected by the new keywords.
+    assert is_priority("Sanctioned layout plan")            # pre-existing, still matches
+    assert not is_priority("Architect's completion certificate")
+    assert not is_priority("Sold Unsold statement")
+    print("test_financial_document_labels_are_marked_high_priority_for_extraction: PASS")
+
+
 def test_professionals_are_normalised_to_maharera_shape():
     """company_charter.summarize_professionals expects ONE list of dicts
     carrying professionalTypeName. Gujarat splits them across four lists, so
@@ -354,6 +390,7 @@ if __name__ == "__main__":
     test_the_storage_key_is_flat_but_the_real_number_survives()
     test_document_entries_pair_uid_with_a_readable_label()
     test_a_null_uid_is_skipped_not_downloaded()
+    test_financial_document_labels_are_marked_high_priority_for_extraction()
     test_professionals_are_normalised_to_maharera_shape()
     test_prettify_never_shows_a_raw_camelcase_key()
     test_capabilities_are_declared_honestly()

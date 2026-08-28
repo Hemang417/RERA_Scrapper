@@ -322,6 +322,72 @@ def test_a_document_keeps_the_extension_the_portal_gave_it():
     print("test_a_document_keeps_the_extension_the_portal_gave_it: PASS")
 
 
+class _FakeResponse:
+    def __init__(self, text):
+        self.text = text
+
+    def raise_for_status(self):
+        pass
+
+
+class _FakeDefaulterSession:
+    """UP-RERA's defaulter register is not a fetchable URL on its own -- it
+    is an ASP.NET postback fired from the homepage. This stands in for both
+    legs: a GET for the __VIEWSTATE pair, then the POST naming lnkDefaulter."""
+
+    _HOME_HTML = """
+    <html><body>
+    <input id="__VIEWSTATE" value="VS123" />
+    <input id="__VIEWSTATEGENERATOR" value="GEN1" />
+    <input id="__EVENTVALIDATION" value="EV456" />
+    </body></html>
+    """
+
+    _RESULT_HTML = """
+    <html><body>
+    <table id="ctl00_ContentPlaceHolder1_grd_black">
+     <tr><th>S.No.</th><th>Project Registration No.</th><th>Project Name</th>
+         <th>Project District</th><th>Promoter Name</th></tr>
+     <tr><td>1</td><td>UPRERAPRJ99999</td>
+         <td>SOME SCHEME (De-Registered Project)</td>
+         <td>Lucknow</td><td>ACME BUILDERS PVT LTD</td></tr>
+    </table>
+    </body></html>
+    """
+
+    def __init__(self):
+        self.posted = []
+
+    def get(self, url, timeout=None, verify=None):
+        return _FakeResponse(self._HOME_HTML)
+
+    def post(self, url, data=None, timeout=None, verify=None):
+        self.posted.append(data)
+        return _FakeResponse(self._RESULT_HTML)
+
+
+def test_the_defaulter_register_is_reached_by_postback_not_a_plain_get():
+    """The homepage menu item is a __doPostBack, not a link -- a plain GET on
+    /DefaulterList serves the same chrome-only shell an unissued project id
+    does. This pins that fetch_defaulters actually fires the postback naming
+    lnkDefaulter, carrying the VIEWSTATE pair read off the homepage, and
+    parses the grid by its own header row rather than by position."""
+    from states.adapter_uttarpradesh import fetch_defaulters
+
+    session = _FakeDefaulterSession()
+    rows = fetch_defaulters(session=session)
+
+    assert len(session.posted) == 1, "the postback must fire exactly once"
+    posted = session.posted[0]
+    assert posted["__EVENTTARGET"] == "ctl00$ContentPlaceHolder1$lnkDefaulter", posted
+    assert posted["__VIEWSTATE"] == "VS123", posted
+
+    assert len(rows) == 1, rows
+    assert rows[0]["project_registration_no."] == "UPRERAPRJ99999", rows[0]
+    assert rows[0]["promoter_name"] == "ACME BUILDERS PVT LTD", rows[0]
+    print("test_the_defaulter_register_is_reached_by_postback_not_a_plain_get: PASS")
+
+
 def test_uttar_pradesh_is_not_searchable_and_says_why():
     """UP-RERA's register is CAPTCHA-gated AND wants a district before a
     promoter. A searcher posting that form would get back the form with an
@@ -420,6 +486,7 @@ if __name__ == "__main__":
     test_a_document_the_promoter_declared_NA_is_neither_filed_nor_failed()
     test_the_unfiled_certificates_reach_the_reader()
     test_a_document_keeps_the_extension_the_portal_gave_it()
+    test_the_defaulter_register_is_reached_by_postback_not_a_plain_get()
     test_uttar_pradesh_is_not_searchable_and_says_why()
     test_a_project_can_still_be_opened_even_though_the_state_is_not_searchable()
     test_live_the_id_route_serves_the_number_it_was_asked_for()

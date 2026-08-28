@@ -60,6 +60,7 @@ from PIL import Image
 import config
 import deep_research
 import finalize_report
+import group_enforcement
 import group_entities
 import group_sweep
 import gst_group
@@ -161,9 +162,15 @@ def _charter_system_blocks(*, external: bool, extra: str = "") -> list:
 # is listed in the Document Library table by name only, with an explicit
 # "not opened this pass" reason, matching the template's own allowance for
 # that (see paragraph 63/64 in the template).
+# Financial disclosure keywords: GujRERA files audited balance sheets, P&L
+# statements and income-tax returns per project as "Income-tax return (1)"
+# etc. (states/adapter_gujarat.py's own _DOC_LABELS); Jharkhand's document
+# grid produces the non-hyphenated "Income Tax" header instead, hence both
+# spellings below.
 _HIGH_PRIORITY_DOC_KEYWORDS = (
     "title", "legal", "encumbrance", "form b", "declaration", "ioa", "iod",
     "sanction", "approval", "layout", "plan", "allotment", "agreement",
+    "balance sheet", "profit", "loss", "audited", "income tax", "income-tax",
 )
 _MAX_CHARS_PER_DOC = 6000
 _MAX_TOTAL_DOC_CHARS = 30000
@@ -6448,9 +6455,11 @@ def _fill_template_inner(
         lambda: _append_secured_borrowing_section(doc, facts),
         lambda: _append_group_companies_section(doc, facts),
         lambda: _append_state_footprint_section(doc, facts),
+        lambda: _append_project_cost_extension_section(doc, facts),
         lambda: _append_group_rera_sweep_section(doc, facts),
         lambda: _append_group_gst_section(doc, facts),
         lambda: _append_group_litigation_section(doc, facts),
+        lambda: _append_group_enforcement_section(doc, facts),
         lambda: _append_developer_score_section(doc, facts),
     ):
         batch = _capture_batch(append_fn)
@@ -9352,6 +9361,66 @@ def _append_group_litigation_section(doc, facts: dict) -> None:
         doc.add_paragraph(limitation)
 
 
+def _append_group_enforcement_section(doc, facts: dict) -> None:
+    """Appends defaulter/cancellation/penalty/enforcement candidates from
+    UP-RERA, HARERA, TNRERA and Delhi-RERA's own published registers.
+
+    A DIFFERENT SOURCE FROM GROUP CASE-LAW SEARCH. These are the regulator's
+    own rows, not a full-text index, but the same discipline applies: a name
+    match on a public register is not confirmed identity, and every
+    authority this pass does not reach is named so an empty table is never
+    read as a clean record across all ten states.
+    """
+    sweep = facts.get("group_enforcement_check") or {}
+    subjects = sweep.get("subjects") or []
+    if not subjects:
+        return
+
+    heading_style = doc.paragraphs[4].style
+    doc.add_page_break()
+    heading_para = doc.add_paragraph(_external_heading(
+        facts, "Group Enforcement & Defaulter Search (Code-Computed)"
+    ))
+    heading_para.style = heading_style
+
+    doc.add_paragraph(group_enforcement.coverage_sentence(sweep))
+
+    candidates = sweep.get("candidates") or []
+    if candidates:
+        table = doc.add_table(rows=1, cols=5)
+        _set_table_borders(table)
+        for idx, label in enumerate(("Name searched", "Authority / register", "Matched text",
+                                     "Reference", "Caution")):
+            cell = table.rows[0].cells[idx]
+            cell.text = label
+            _shade_cell(cell, "D9E2F3")
+            for para in cell.paragraphs:
+                for run in para.runs:
+                    run.bold = True
+        for row_data in candidates:
+            row = table.add_row()
+            _set_row_cell(row, 0, row_data.get("searched_name") or "")
+            _set_row_cell(row, 1, "%s -- %s" % (row_data.get("authority") or "",
+                                                row_data.get("register") or ""))
+            _set_row_cell(row, 2, row_data.get("matched_text") or "")
+            _set_row_cell(row, 3, row_data.get("detail") or "")
+            _set_row_cell(row, 4, row_data.get("caution") or "")
+        doc.add_paragraph(
+            "Each row above is a name match on the authority's own published register. "
+            "None of them is established to involve this group: they are matters to "
+            "confirm against the promoter's own records before being treated as this "
+            "promoter's enforcement history."
+        )
+    else:
+        doc.add_paragraph(
+            "No candidate matches were returned for the names searched. See the "
+            "limitations below before reading that as an absence of enforcement action."
+        )
+
+    for limitation in sweep.get("limitations") or []:
+        doc.add_paragraph(limitation)
+
+
 def _append_developer_score_section(doc, facts: dict) -> None:
     """Renders facts["developer_score"] (see _compute_developer_score) as a
     per-sub-metric table against the 3-bucket / 9-sub-metric AAA-D
@@ -10046,6 +10115,84 @@ def _append_state_footprint_section(doc, facts: dict) -> None:
 
     for limitation in footprint.get("limitations") or []:
         doc.add_paragraph(limitation)
+
+
+def _cost_extension_table(doc, rows: list) -> None:
+    """Renders a list of dicts as a table whose columns are whatever keys the
+    portal's own header row actually produced -- these are K-RERA's raw
+    table headers (e.g. "Registration/Extensions", "Estimated Cost (in
+    INR)"), not a fixed internal schema, so hardcoding column names would
+    silently drop a field the moment the portal orders or renames one."""
+    if not rows:
+        return
+    columns = list(rows[0].keys())
+    table = doc.add_table(rows=1, cols=len(columns))
+    _set_table_borders(table)
+    for idx, label in enumerate(columns):
+        cell = table.rows[0].cells[idx]
+        cell.text = label
+        _shade_cell(cell, "D9E2F3")
+        for para in cell.paragraphs:
+            for run in para.runs:
+                run.bold = True
+    for row_data in rows:
+        row = table.add_row()
+        for idx, label in enumerate(columns):
+            value = row_data.get(label, "")
+            if label.lower().startswith(("estimated cost", "actual cost")) and value:
+                value = f"Rs {value}"
+            _set_row_cell(row, idx, str(value))
+
+
+def _append_project_cost_extension_section(doc, facts: dict) -> None:
+    """Appends K-RERA's own cost-incurred-vs-estimated and registration/
+    extension history, already fetched on every K-RERA run and unread until
+    now. Silent for every other state, purely because the key is absent
+    there -- never a state check in this function.
+    """
+    check = facts.get("project_cost_extension_check") or {}
+    incurred = check.get("incurred") or []
+    estimated = check.get("estimated") or []
+    extensions = check.get("extensions") or []
+    if not incurred and not estimated and not extensions:
+        return
+
+    heading_style = doc.paragraphs[4].style
+    doc.add_page_break()
+    heading_para = doc.add_paragraph(_external_heading(
+        facts, "Project Cost & Extension History (Code-Computed)"
+    ))
+    heading_para.style = heading_style
+    _variant_paragraph(
+        doc, facts,
+        internal_text=(
+            "Read directly off the authority's own project detail page -- estimated versus "
+            "actual construction cost, and the history of registration extensions granted -- "
+            "rather than paraphrased, so it cannot disagree with what the regulator itself shows."
+        ),
+        external_text=(
+            "Read directly off the authority's own project detail page: estimated versus actual "
+            "construction cost, and the history of registration extensions granted."
+        ),
+    )
+
+    if extensions:
+        sub = doc.add_paragraph("Registration extension history")
+        for run in sub.runs:
+            run.bold = True
+        _cost_extension_table(doc, extensions)
+
+    if estimated:
+        sub = doc.add_paragraph("Estimated cost of construction")
+        for run in sub.runs:
+            run.bold = True
+        _cost_extension_table(doc, estimated)
+
+    if incurred:
+        sub = doc.add_paragraph("Cost incurred")
+        for run in sub.runs:
+            run.bold = True
+        _cost_extension_table(doc, incurred)
 
 
 def _clean_scraped_address(address: str) -> str:
@@ -11064,6 +11211,38 @@ def _safe_group_litigation(group_result: dict, subject_promoter: str = "",
                 "limitations": [f"The group case-law sweep could not run this pass: {e}"]}
 
 
+def _safe_group_enforcement(group_result: dict, subject_promoter: str = "",
+                            enabled: bool | None = None) -> dict:
+    """UP-RERA, HARERA, TNRERA and Delhi-RERA's own defaulter, cancellation,
+    penalty and enforcement registers, searched by name across the group.
+
+    OPT-IN (CHARTER_GROUP_ENFORCEMENT=1), separate from --group-litigation:
+    these are the regulator's own published rows, not a full-text case-law
+    index, and one of the seven sources (Delhi's REAT appeal register) costs
+    a real OCR pass. Every hit is a CANDIDATE for the same reason
+    litigation_sweep's are -- a name match on a public register is not
+    confirmed identity. Never fatal.
+    """
+    if enabled is None:
+        enabled = os.environ.get("CHARTER_GROUP_ENFORCEMENT") == "1"
+    if not enabled:
+        return {}
+    try:
+        graph = group_entities.build_entity_graph(
+            subject_promoter, (group_result or {}).get("cin"), group_result,
+            proposer=lambda b: [],
+        )
+        directors = []
+        for person in (group_result or {}).get("current_directors") or []:
+            name = (person or {}).get("name") if isinstance(person, dict) else person
+            if name:
+                directors.append(name)
+        return group_enforcement.sweep(graph, directors=directors)
+    except Exception as e:
+        return {"subjects": [], "candidates": [], "searched": 0, "total": 0,
+                "limitations": [f"The group enforcement sweep could not run this pass: {e}"]}
+
+
 def _safe_state_footprint(group_result: dict, category_data: dict) -> dict:
     """Never fatal: a footprint that cannot be derived costs one section."""
     try:
@@ -11077,6 +11256,30 @@ def _safe_state_footprint(group_result: dict, category_data: dict) -> dict:
         return {"incorporated_in": [], "built_in": [], "unmapped_entities": 0,
                 "unrecognised_codes": [],
                 "limitations": [f"State footprint could not be derived this pass: {e}"]}
+
+
+def _safe_project_cost_extension(category_data: dict) -> dict:
+    """K-RERA's own project detail page publishes cost-incurred-vs-estimated
+    and a registration/extension history, already fetched into category_data
+    on every K-RERA run (states/adapter_karnataka.py's primary acquire(),
+    not the group-sweep-only fetch_project_summary) and left unread until
+    now. No other state adapter populates these keys, so the section this
+    feeds is silent everywhere else purely because the data is absent --
+    never because of a state check.
+
+    Never fatal: a shape this never expects (a portal redesign changing the
+    table's own header text) costs one section, not the run.
+    """
+    try:
+        cost_details = (category_data or {}).get("cost_details") or {}
+        incurred = cost_details.get("incurred") or []
+        estimated = cost_details.get("estimated") or []
+        extensions = (category_data or {}).get("extensions") or []
+        if not incurred and not estimated and not extensions:
+            return {}
+        return {"incurred": incurred, "estimated": estimated, "extensions": extensions}
+    except Exception:
+        return {}
 
 
 def _portal_promoter_name(category_data: dict) -> str:
@@ -11335,6 +11538,7 @@ def run_company_charter(
     group_sweep: bool = False,
     group_gst: bool = False,
     group_litigation: bool = False,
+    group_enforcement: bool = False,
 ) -> tuple[str, dict]:
     """Returns (out_path, facts) -- facts is the complete, code-and-model
     -assembled Charter data (same content as the .facts.json written
@@ -11415,6 +11619,12 @@ def run_company_charter(
         documents_manifest, documents_dir, category_data
     )
     _record_promoter_identity_gap(facts)
+
+    # Code-computed, unconditional (not gated on any --group-* flag or on
+    # state): K-RERA's own detail page already carries this on every run, and
+    # the render section stays silent when the key is absent, which is every
+    # non-K-RERA state.
+    facts["project_cost_extension_check"] = _safe_project_cost_extension(category_data)
 
     # Also code-computed, never model-authored (see summarize_professionals'
     # own note for the real mis-reporting this replaces): MahaRERA's
@@ -11571,6 +11781,10 @@ def run_company_charter(
             group_result, _portal_promoter_name(category_data),
             state_footprint=facts.get("state_footprint"),
             enabled=group_litigation or None,
+        )
+        facts["group_enforcement_check"] = _safe_group_enforcement(
+            group_result, _portal_promoter_name(category_data),
+            enabled=group_enforcement or None,
         )
         if group_result.get("found") and group_result.get("companies"):
             facts.setdefault("sources", []).append({

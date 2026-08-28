@@ -22,6 +22,7 @@ import re
 import charter_report
 import company_charter
 import charge_watch
+import group_enforcement
 import group_sweep
 import gst_group
 import litigation_sweep
@@ -49,6 +50,10 @@ _MODULES = {
     # And the case-law sweep, whose every hit is a name match that must
     # never be rendered as an established proceeding.
     "litigation_sweep": litigation_sweep,
+    # And the group enforcement/defaulter sweep -- a different source from
+    # case law, same discipline: a hit is a name match, an authority it
+    # cannot reach is named, not silently absent.
+    "group_enforcement": group_enforcement,
     # The group sweep and the charge watch are the two passes that report
     # COVERAGE as well as findings -- their guards are what stop "we did not
     # look" being read as "there is nothing there".

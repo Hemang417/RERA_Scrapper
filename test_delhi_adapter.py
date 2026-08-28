@@ -55,9 +55,13 @@ import states
 from states.adapter_delhi import (
     DelhiAdapter,
     distinct_complaints,
+    fetch_execution_register,
     fetch_project_summary,
+    fetch_suo_moto_register,
+    parse_execution_register,
     parse_order_register,
     parse_state_index,
+    parse_suo_moto_register,
     search_orders_by_promoter,
     search_promoter_projects,
     split_applicant_kind,
@@ -420,6 +424,78 @@ def test_an_unreadable_register_is_not_an_empty_one():
     print("test_an_unreadable_register_is_not_an_empty_one: PASS")
 
 
+# --- suo-moto and execution registers (group_enforcement's join keys) ----
+
+_SUOMOTO_HTML = """
+<table>
+ <tr><th>Sr.No.</th><th>Case No.</th><th>Respondent Name</th><th>Project Details</th>
+     <th>Hearing Type</th><th>Last Hearing</th><th>Next Hearing</th></tr>
+ <tr><td>1</td><td>SM/12/2024</td><td>M/s Skylark Multistate CGHS Ltd</td>
+     <td>Some Project</td><td>Suo Moto</td><td>10-Jan-2026</td><td>10-Feb-2026</td></tr>
+ <tr><td>2</td><td>SM/13/2024</td><td></td>
+     <td>No respondent named</td><td>Suo Moto</td><td></td><td></td></tr>
+</table>
+"""
+
+_EXECUTION_HTML = """
+<table>
+ <tr><th>Sr.No.</th><th>Execution Number</th><th>Complaint Number</th>
+     <th>Decree Holder</th><th>Judgement Debtor</th><th>Date Of Decision</th>
+     <th>Next Hearing</th></tr>
+ <tr><td>1</td><td>EX/45/2024</td><td>30/2020</td><td>Pradeep Gupta</td>
+     <td>M/s Skylark Multistate CGHS Ltd</td><td>28-Jul-2026</td><td>15-Sep-2026</td></tr>
+ <tr><td>2</td><td>EX/46/2024</td><td>31/2020</td><td>Someone Else</td>
+     <td></td><td>01-Aug-2026</td><td></td></tr>
+</table>
+"""
+
+
+def test_the_suo_moto_register_is_found_by_header_and_names_the_respondent():
+    """The closest thing this portal publishes to "projects under
+    investigation" -- confirmed a row with no respondent named is dropped,
+    since an unsearchable row can never become a hit."""
+    rows = parse_suo_moto_register(_SUOMOTO_HTML)
+    assert len(rows) == 1, rows
+    assert rows[0]["case_no"] == "SM/12/2024", rows[0]
+    assert rows[0]["respondent_name"] == "M/s Skylark Multistate CGHS Ltd", rows[0]
+    print("test_the_suo_moto_register_is_found_by_header_and_names_the_respondent: PASS")
+
+
+def test_the_execution_register_names_the_judgement_debtor_and_keeps_both_links():
+    """Every row is an order the promoter (the Judgement Debtor) has not
+    complied with. A row with no debtor named is dropped."""
+    rows = parse_execution_register(_EXECUTION_HTML)
+    assert len(rows) == 1, rows
+    assert rows[0]["judgement_debtor"] == "M/s Skylark Multistate CGHS Ltd", rows[0]
+    assert rows[0]["execution_no"] == "EX/45/2024", rows[0]
+    print("test_the_execution_register_names_the_judgement_debtor_and_keeps_both_links: PASS")
+
+
+def test_fetch_suo_moto_and_execution_registers_mirror_fetch_order_register():
+    """The two new fetch wrappers must fetch once, parse, and cache -- same
+    shape as fetch_order_register(), confirmed by injecting a fetcher rather
+    than hitting the network."""
+    import states.adapter_delhi as dl
+
+    dl._SUOMOTO_CACHE.clear()
+    dl._EXECUTION_CACHE.clear()
+    calls = {"suomoto": 0, "execution": 0}
+
+    def suomoto_fetcher():
+        calls["suomoto"] += 1
+        return _SUOMOTO_HTML
+
+    def execution_fetcher():
+        calls["execution"] += 1
+        return _EXECUTION_HTML
+
+    rows = fetch_suo_moto_register(fetcher=suomoto_fetcher)
+    assert len(rows) == 1 and calls["suomoto"] == 1, (rows, calls)
+    rows2 = fetch_execution_register(fetcher=execution_fetcher)
+    assert len(rows2) == 1 and calls["execution"] == 1, (rows2, calls)
+    print("test_fetch_suo_moto_and_execution_registers_mirror_fetch_order_register: PASS")
+
+
 # --- the sweep seam ------------------------------------------------------
 
 def test_delhi_is_searchable_and_openable():
@@ -502,6 +578,9 @@ if __name__ == "__main__":
     test_what_delhi_does_not_publish_is_declared_not_left_empty()
     test_an_absence_from_a_130_project_register_is_weak_evidence()
     test_an_unreadable_register_is_not_an_empty_one()
+    test_the_suo_moto_register_is_found_by_header_and_names_the_respondent()
+    test_the_execution_register_names_the_judgement_debtor_and_keeps_both_links()
+    test_fetch_suo_moto_and_execution_registers_mirror_fetch_order_register()
     test_delhi_is_searchable_and_openable()
     test_live_the_whole_register_is_one_get_and_every_number_resolves()
     test_live_the_order_register_publishes_more_orders_than_complaints()

@@ -622,6 +622,89 @@ def test_a_penalty_order_reaches_the_page_with_its_amount():
     print("test_a_penalty_order_reaches_the_page_with_its_amount: PASS")
 
 
+def test_krera_cost_and_extension_history_reaches_the_page():
+    """K-RERA's own detail page already carries this on every run
+    (adapter_karnataka.py's primary acquire(), not the group-sweep-only
+    fetch_project_summary) and it sat unread. Real shape captured live from
+    PRM/KA/RERA/1251/309/PR/201001/003607."""
+    facts = _base_facts()
+    facts["project_cost_extension_check"] = {
+        "incurred": [],
+        "estimated": [{
+            "Sl No.": "1",
+            "Particulars": "Estimated Cost of Construction as certified by Engineer",
+            "Estimated Cost (in INR)": "2264231280",
+            "Actual Cost (in INR)": "2020000000",
+        }],
+        "extensions": [
+            {"Registration/Extensions": "At the time of Registration",
+             "Start Date": "14-10-2020", "Proposed Completion Date": "31-10-2024",
+             "Certificate/Order": ""},
+            {"Registration/Extensions": "Section 6 Extension",
+             "Start Date": "31-10-2024", "Proposed Completion Date": "31-10-2025",
+             "Certificate/Order": ""},
+        ],
+    }
+    text = _all_text(_render(facts, "internal", "krerocosts"))
+    assert "2264231280" in text, "the estimated cost never reached the page"
+    assert "Rs 2264231280" in text, "the money value was not marked as Rs"
+    assert "Section 6 Extension" in text, "the extension history was dropped"
+    print("test_krera_cost_and_extension_history_reaches_the_page: PASS")
+
+
+def test_krera_cost_and_extension_section_is_silent_when_absent():
+    """Nine of ten states never populate this key -- the section must render
+    nothing for them, gated on data presence, never on a state check."""
+    facts = _base_facts()
+    facts.pop("project_cost_extension_check", None)
+    text = _all_text(_render(facts, "internal", "krerocostsabsent"))
+    assert "Project Cost & Extension History" not in text, \
+        "the section rendered with no data behind it"
+    print("test_krera_cost_and_extension_section_is_silent_when_absent: PASS")
+
+
+def test_a_group_enforcement_candidate_reaches_the_page_with_its_caution():
+    """UP-RERA, HARERA, TNRERA and Delhi-RERA's own registers are a
+    different source from case law, but the same discipline applies: a
+    name match is not confirmed identity, and the caution must survive
+    onto the page alongside it."""
+    facts = _base_facts()
+    facts["group_enforcement_check"] = {
+        "subjects": [{"name": "Pranami Builders Pvt Ltd", "status": "searched", "hit_count": 1}],
+        "candidates": [{
+            "authority": "Uttar Pradesh (UP-RERA)",
+            "register": "De-registered / defaulter project register",
+            "searched_name": "Pranami Builders Pvt Ltd",
+            "matched_text": "Pranami Builders Pvt Ltd",
+            "detail": "UPRERAPRJ99999",
+            "caution": "This is a name match on the authority's own published register, "
+                       "not confirmed proof of identity.",
+        }],
+        "searched": 1, "total": 1,
+        "limitations": ["Registers NOT searched by this pass: MahaRERA; GujRERA."],
+    }
+    text = _all_text(_render(facts, "internal", "groupenforce"))
+    assert "UPRERAPRJ99999" in text, "the reference never reached the page"
+    assert "not confirmed proof of identity" in text, "the caution was dropped"
+    assert "matters to confirm" in text, "the page asserted this as this promoter's enforcement history"
+    print("test_a_group_enforcement_candidate_reaches_the_page_with_its_caution: PASS")
+
+
+def test_an_empty_group_enforcement_result_still_warns_against_reading_it_as_clean():
+    facts = _base_facts()
+    facts["group_enforcement_check"] = {
+        "subjects": [{"name": "Quiet Entity Ltd", "status": "searched", "hit_count": 0}],
+        "candidates": [], "searched": 1, "total": 1,
+        "limitations": ["Registers NOT searched by this pass: MahaRERA; GujRERA; WBRERA. "
+                        "An empty result above says nothing about any authority named here."],
+    }
+    text = _all_text(_render(facts, "internal", "groupenforceempty"))
+    assert "says nothing about any authority named here" in text, text[-700:]
+    assert "clean" not in text.lower().split("group enforcement")[-1][:400], \
+        "an empty search read as clean"
+    print("test_an_empty_group_enforcement_result_still_warns_against_reading_it_as_clean: PASS")
+
+
 def test_every_stage_this_session_added_is_reachable_from_the_pipeline():
     """Anti-drift guard, and the reason this file exists: each of these was
     at some point computed correctly and rendered nowhere. A stage must be
@@ -639,6 +722,8 @@ def test_every_stage_this_session_added_is_reachable_from_the_pipeline():
         ("group_rera_sweep", "_append_group_rera_sweep_section"),
         ("group_gst_check", "_append_group_gst_section"),
         ("group_litigation", "_append_group_litigation_section"),
+        ("group_enforcement_check", "_append_group_enforcement_section"),
+        ("project_cost_extension_check", "_append_project_cost_extension_section"),
     ):
         assert f'facts["{key}"] =' in source, f"{key} is never written into facts"
         assert f'facts.get("{key}")' in source, f"{key} is written but never read back"
@@ -646,7 +731,8 @@ def test_every_stage_this_session_added_is_reachable_from_the_pipeline():
     # ...and each render section is actually registered to run.
     for section in ("_append_secured_borrowing_section", "_append_state_footprint_section",
                     "_append_group_rera_sweep_section", "_append_group_gst_section",
-                    "_append_group_litigation_section"):
+                    "_append_group_litigation_section", "_append_group_enforcement_section",
+                    "_append_project_cost_extension_section"):
         assert f"lambda: {section}(doc, facts)" in source,             f"{section} exists but is never called during a render"
     print("test_every_stage_this_session_added_is_reachable_from_the_pipeline: PASS")
 
@@ -684,6 +770,10 @@ if __name__ == "__main__":
         test_a_case_law_candidate_reaches_the_page_carrying_its_caution()
         test_an_empty_case_law_result_still_warns_against_reading_it_as_clean()
         test_a_penalty_order_reaches_the_page_with_its_amount()
+        test_krera_cost_and_extension_history_reaches_the_page()
+        test_krera_cost_and_extension_section_is_silent_when_absent()
+        test_a_group_enforcement_candidate_reaches_the_page_with_its_caution()
+        test_an_empty_group_enforcement_result_still_warns_against_reading_it_as_clean()
         test_every_stage_this_session_added_is_reachable_from_the_pipeline()
         print("\nAll tests passed.")
     finally:

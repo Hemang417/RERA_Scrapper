@@ -1,10 +1,88 @@
 # Pan-India RERA — progress and resumption notes
 
-**Updated 26 August 2026.** Working tree is green: `python -m pytest -q` -> **708 passed**.
+**Updated 28 August 2026.** Working tree is green: `python -m pytest -q` -> **734 passed**.
 MahaRERA output is byte-identical to the pre-refactor baseline.
 
 Full plan: `~/.claude/plans/yes-make-the-plan-starry-neumann.md`
 Data coverage: `docs/RERA_Data_Coverage.xlsx` (regenerate with `python build_data_coverage.py`)
+
+---
+
+## 2026-08-28 — the seven unwired registers and two unused financial sources: closed
+
+Two open gaps this doc named — the seven registers' "not wired into
+`acquire()`... that's a separate decision" note further down, and "Biggest
+unused findings" below (GujRERA financials, K-RERA cost/extension data) — are
+now closed, code-reviewed against a fresh test run, and pass the full suite:
+
+1. **All seven previously-unwired registers are now searched**, via a new
+   `group_enforcement.py` module, opt-in behind `--group-enforcement` (parallel
+   to `--group-litigation`, not folded into it — the two are different sources
+   with different failure modes). UP-RERA's defaulter register, both HARERA
+   benches' cancelled-projects list, both TNRERA penalty registers plus its two
+   enforcement PDFs, and Delhi-RERA's suo-moto and execution registers are each
+   fetched once per sweep and filtered locally against every group entity and
+   director; the REAT appeal register (party-enriched via OCR) is searched per
+   subject through the existing `search_appeals_by_party`. Two new adapter
+   functions were needed — `adapter_delhi.fetch_suo_moto_register` and
+   `fetch_execution_register` — mirroring `fetch_order_register`'s cache
+   pattern exactly, since the parsers existed but nothing fetched their HTML.
+   The Delhi REAT OCR cost (up to 481 PDFs) is bounded by a **shared** cache
+   directory (`output/_cache/delhi_reat_ocr/`, deliberately outside any single
+   promoter's output folder) rather than an arbitrary per-run PDF cap, since
+   caching already amortizes the cost across every future run. Every register
+   this pass cannot reach (MahaRERA, GujRERA, WBRERA, JHARERA, TG-RERA, and
+   K-RERA's own penalty register — already covered by
+   `litigation_sweep.state_order_sweep`) is named in
+   `group_enforcement.NOT_ENFORCEMENT_SEARCHABLE`, rendered whenever the table
+   is empty, so a nil result is never read as a clean sweep across all ten
+   states. The seven parser functions had **zero test coverage** before this —
+   validated only by "confirmed live" doc-comment claims — so fixture tests
+   were added to `test_uttarpradesh_adapter.py`, `test_haryana_adapter.py`,
+   `test_tamilnadu_adapter.py` and `test_delhi_adapter.py` first, locking down
+   the parsing behavior before `group_enforcement.py` was built on top of it.
+   `test_group_enforcement.py` (12 tests) covers the sweep itself, offline via
+   an injectable `fetchers` dict.
+
+   **One real bug found by the render test, not by inspection**: the "no
+   candidates" fallback sentence in `_append_group_enforcement_section`
+   originally read "...before reading that as a clean enforcement record" —
+   using the exact word (`"clean"`) the section exists to warn a reader away
+   from. `test_an_empty_group_enforcement_result_still_warns_against_reading_it_as_clean`
+   caught it; fixed to "an absence of enforcement action."
+
+2. **GujRERA's financial documents now reach the model's OCR/analysis pass.**
+   `company_charter._HIGH_PRIORITY_DOC_KEYWORDS` gained `"balance sheet"`,
+   `"profit"`, `"loss"`, `"audited"`, and — deliberately both spellings —
+   `"income tax"` and `"income-tax"`, since GujRERA's own label is hyphenated
+   (`"Income-tax return (1)"`) while Jharkhand's document grid already
+   produces the non-hyphenated form. Confirmed against every state's document
+   labels that this introduces no false positive; the visible side effect is
+   that Jharkhand's and Haryana's already-filed audited financials are now
+   also extracted, not just Gujarat's. No new facts key or render section —
+   there is no dedicated "Financial Disclosure" field in
+   `_CHARTER_FACTS_SCHEMA`, so this makes the figures *available* to the
+   model's existing free-text narration, not *guaranteed* to surface in a
+   structured place. A follow-up schema field is the natural next step if
+   reliable surfacing turns out to matter more than availability.
+
+3. **K-RERA's cost-incurred/estimated and extension history now has its own
+   Charter section**, unconditional (no flag) since `adapter_karnataka.py`'s
+   primary `acquire()` already writes `category_data["cost_details"]` and
+   `["extensions"]` on every K-RERA run — this was sitting in `raw/` unread,
+   not gated behind `--group-sweep` the way the doc's original note implied.
+   `_safe_project_cost_extension` + `_append_project_cost_extension_section`
+   render the portal's own raw header text as table columns (never a
+   hardcoded field name, since K-RERA's own headers are the only schema this
+   has), silent for all nine other states purely because the data key is
+   absent there — gated on data presence, never a state check, per the
+   existing state-leak-guard convention.
+
+**Two of the doc's original four "unused findings" were already stale before
+this pass started**: MCA charge filings (`company_charter.summarise_charges`)
+and the Maha Bhulekh CTS land record check are both fully wired and live
+already, contrary to an older note here — narrowing the real scope to the two
+items above.
 
 ---
 
@@ -207,11 +285,17 @@ per-project record at all.
 **Each of those seven new registers got a small, pure, live-verified parser
 function**, added to the relevant `states/adapter_*.py`, following the
 precedent `adapter_westbengal.fetch_defaulters()` set: written and correct,
-**not wired into `acquire()`**, because turning a coverage finding into a
-Charter input is a separate decision from confirming the finding is real.
-They are catalogued on Sheet D of the coverage workbook. `acquire()` was not
-touched on any of the four adapters, and all 98 of their tests plus the full
-708-test suite pass unchanged.
+originally **not wired into `acquire()`**, because turning a coverage finding
+into a Charter input was a separate decision from confirming the finding was
+real. They are catalogued on Sheet D of the coverage workbook. `acquire()` was
+not touched on any of the four adapters, and all 98 of their tests plus the
+full 708-test suite passed unchanged at the time.
+
+**Closed 2026-08-28** — see "the seven unwired registers and two unused
+financial sources" above. All seven are now searched by name via the new
+`group_enforcement.py`, opt-in behind `--group-enforcement`; `acquire()` is
+still untouched, since the sweep fetches each register directly rather than
+through the per-project acquisition path.
 
 **What stayed a real "No" got a reason instead of staying "Unaudited":** none
 of the four publishes a profit & loss statement or an income-tax return
@@ -883,13 +967,26 @@ so the MH/TG registration-format collision is real and testable.
 
 ## Biggest unused findings (see Sheet D of the coverage workbook)
 
-- **GujRERA publishes audited balance sheets, P&L and income-tax returns** per project.
-  Already downloaded by the adapter; no Charter field consumes them.
-- **K-RERA publishes cost incurred vs estimated, delay reasons, NOC expiry.** Same.
+- ~~**GujRERA publishes audited balance sheets, P&L and income-tax returns** per
+  project. Already downloaded by the adapter; no Charter field consumes them.~~
+  **Closed 2026-08-28** — added to `company_charter._HIGH_PRIORITY_DOC_KEYWORDS`,
+  so these now reach the model's OCR/analysis pass like any other high-priority
+  document (no dedicated schema field yet — see the 2026-08-28 section above).
+- ~~**K-RERA publishes cost incurred vs estimated, delay reasons, NOC expiry.**
+  Same.~~ **Partly closed 2026-08-28** — cost incurred/estimated and extension
+  history now render in their own Charter section
+  (`_append_project_cost_extension_section`), unconditional for K-RERA projects.
+  NOC expiry was never actually implemented in the adapter (the module
+  docstring's claim was aspirational, not built) and delay reasons remain
+  unconsumed.
 - **MCA charge filings** are on the ZaubaCorp page the pipeline already fetches, and are
-  the only independent check on a promoter's declared mortgage. Not parsed.
+  the only independent check on a promoter's declared mortgage. **Already fully wired**
+  as of this audit (`company_charter.summarise_charges` -> `_append_secured_borrowing_section`)
+  — this bullet was stale before 2026-08-28 as well; kept for the historical record.
 - **Maha Bhulekh** land-record card already carries owner, area, tenure, encumbrance and
-  mutation — none reaches the document, because the parser looks for the wrong HTML shape.
+  mutation. **Already fully wired** as of this audit (`run_cts_land_lookup` ->
+  `_append_cts_land_record_section`, opt-in) — this bullet was stale before
+  2026-08-28 too.
 
 ---
 
