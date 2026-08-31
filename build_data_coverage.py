@@ -480,11 +480,43 @@ CTS_FINDINGS = [
      "Partial", "Free", "confirmed-live", "Present as a labelled row."),
     ("Mutation entries", "Maha Bhulekh Property Card (फेरफार table)",
      "Partial", "Free", "confirmed-live", "Full dated table with mutation numbers, present on the card."),
-    ("Registered deeds / parties / consideration", "IGR Maharashtra e-Search (Index II)",
-     "Yes", "Free + CAPTCHA", "observed", "Mumbai from 1985; other districts digitised from 2002."),
-    ("Equitable mortgages", "IGR Notice of Intimation",
-     "Yes", "Free + CAPTCHA", "observed",
-     "Compulsory in MAHARASHTRA AND GUJARAT ONLY. This is why CERSAI is not needed for those two states."),
+    ("Registered deeds / parties / consideration", "IGR Maharashtra e-Search (freesearchigrservice.maharashtra.gov.in)",
+     "Yes", "Free + CAPTCHA", "confirmed-live",
+     "Audited live 2026-09-01 with a REAL result, not just a reachable form. Two search modes, both "
+     "free and CAPTCHA-gated (confirmed via DOM inspection, not just a page-text guess): 'Property "
+     "Details' (Year -> District -> Village/Area, an autocomplete text field paired with a dropdown "
+     "-> Survey/CTS/Milkat/Gat/Plot No.; a name-based search is also offered once a property number "
+     "is entered) and 'Document Number' (Registration Type [eFiling/eRegistration/Regular/iSarita "
+     "2.0] -> District, all 37 -- this mode is genuinely statewide, not Mumbai-only -> SRO -> Year -> "
+     "Doc No.). Document Number/SRO Mumbai 9 (Andheri)/2024/#100 returned a real registered Leave & "
+     "License agreement dated 03/01/2024 -- Seller/Lessor 'Ramesh Babulal Shah', Purchaser/Lessee "
+     "'M/s Matushri Impex' (through partner Ramesh T. Bhalani), full property description (Bandra "
+     "Kurla Complex premises, CTS No. 4207) AND consideration (monthly rent Rs 44,100 plus Rs "
+     "5,29,200 advance for the first 12 months) -- all present in the RESULT LIST ROW ITSELF, no "
+     "further click needed. Each row also carries an 'IndexII' button (a further postback, "
+     "__doPostBack('RegistrationGrid','indexII$0')) documented in the site's own User Guide as "
+     "opening a fuller Index II view in a separate window -- present and clickable, but its own "
+     "content was NOT captured this pass (the popup did not materialize in this environment), so "
+     "that specific view stays unconfirmed rather than assumed. A real, stated limitation from the "
+     "site's own FAQ: Power of Attorney and Will deeds are NOT available in search results. Mumbai "
+     "city and Suburban districts go back to 1985; 'selected offices' elsewhere now reach back before "
+     "the earlier 2002 baseline too, per the site's own notice."),
+    ("Equitable mortgages", "IGR Notice of Intimation (freesearchigrservice.maharashtra.gov.in)",
+     "Yes", "Free + CAPTCHA", "confirmed-live",
+     "The MECHANISM is confirmed live, sharing the exact same interface, schema and evidence as the "
+     "row above -- 'Registration Type' (eFiling/eRegistration/Regular/iSarita 2.0) is a filing-"
+     "channel category, not a deed-type filter, so a Notice of Intimation is just one of many "
+     "possible 'DName' (deed name) values a search can return, discoverable the same way any other "
+     "deed is: by its own document number, or by opening a property's full document list. No live "
+     "example of an actual Notice of Intimation was captured this pass -- the one real result pulled "
+     "was a Leave & License agreement -- so this confirms the CHANNEL, not a specific mortgage "
+     "instance. Separately confirmed: the 'CERSAI Search' button on this same page is an INTEGRATED "
+     "postback on igr's own portal (__doPostBack with a distinct 'aa' validation group), not an "
+     "external redirect to cersai.org.in -- worth knowing before assuming a CERSAI cross-check means "
+     "leaving this site. 'Compulsory in MAHARASHTRA AND GUJARAT ONLY, which is why CERSAI is not "
+     "needed for those two states' is the pre-existing legal claim this row already carried; it was "
+     "not independently re-verified this pass, since the portal itself doesn't state its own legal "
+     "basis anywhere in the UI."),
     ("Lender, amount, satisfaction status", "MCA charge filings via ZaubaCorp",
      "Yes", "Free -- page already fetched", "confirmed-live",
      "STALE ROW, RECONCILED 2026-09-01: this said 'observed'/'NOT currently parsed' months after it "
@@ -607,6 +639,15 @@ UNMAPPED = [
      "Promoter-declared delay reasons and lapsed-NOC tracking; no equivalent elsewhere.", "Medium"),
     ("Maha Bhulekh card fields", "Free portal, extraction broken", "Maharashtra projects",
      "Owner, area, tenure, encumbrance and mutation are all ON the card and none reach the document.",
+     "High"),
+    ("IGR Maharashtra registered-deed search", "freesearchigrservice.maharashtra.gov.in, confirmed "
+     "live 2026-09-01 (not built)", "Maharashtra projects",
+     "An independent, free, party-named check on registrations against a property/CTS number or a "
+     "specific document number -- CAPTCHA-gated but otherwise unauthenticated. A real result already "
+     "pulled carries seller/purchaser names, full property description and the ACTUAL CONSIDERATION "
+     "AMOUNT in one row, no further click needed -- a direct corroboration (or contradiction) of a "
+     "promoter's declared land dealings that nothing else in this pipeline checks independently. Also "
+     "carries an integrated CERSAI cross-search on the same page. Nothing calls this portal yet.",
      "High"),
     ("JHARERA audited balance sheet + 3 years ITR", "adapter_jharkhand.py document library (labelled, downloaded)",
      "Jharkhand projects",
@@ -925,6 +966,22 @@ def build_readme(wb):
          "resolving which Id belongs to which company needs more work); CRISIL is unchanged, since its "
          "own short inline excerpt predates this pass. This closes Sheet D's 'Credit-rating rationale "
          "documents' row -- removed from there since it is no longer unused.", None),
+        ("18. IGR Maharashtra e-Search -- Sheet B's last two 'observed' rows, closed live 2026-09-01 "
+         "with a REAL pulled result, not just a reachable form. freesearchigrservice.maharashtra.gov.in "
+         "offers two free, CAPTCHA-gated search modes (Property Details: Year/District/Village-or-Area/"
+         "Survey-CTS-Milkat-Gat-Plot No.; Document Number: Registration Type/District, all 37, genuinely "
+         "statewide/SRO/Year/Doc No.). Document Number/SRO Mumbai 9 (Andheri)/2024/#100 returned a real "
+         "registered Leave & License agreement -- seller and purchaser named, full property description, "
+         "AND the actual consideration (Rs 44,100/month plus Rs 5,29,200 advance) -- all in the result "
+         "row itself, no extra click. Genuine limitation found along the way, from the site's own FAQ: "
+         "Power of Attorney and Will deeds are excluded from search entirely. Equitable mortgages share "
+         "the identical mechanism and evidence -- a Notice of Intimation is just one more possible deed-"
+         "name value, not a separately filterable category -- but no live mortgage example was actually "
+         "pulled this pass, so that row confirms the channel, not a specific instance. Also found: the "
+         "page's own 'CERSAI Search' button is an integrated postback on this same portal, not an "
+         "external redirect. Added to Sheet D as a new high-value, unbuilt finding -- nothing in this "
+         "pipeline calls this portal yet, and it is the only independent, party-named check on a "
+         "promoter's registered dealings this pipeline has found for Maharashtra.", None),
     ]
     for i, (text, font) in enumerate(lines, start=1):
         ws.cell(row=i, column=1, value=text)
