@@ -566,9 +566,24 @@ CIN_FINDINGS = [
     ("Balance sheet / P&L", "MCA (paid) / Tofler / InstaFinancials (paywalled)",
      "No", "Paid", "confirmed-live", "n/a",
      "NOT freely available for a private SPV -- EXCEPT in Gujarat, where GujRERA publishes audited statements per project."),
-    ("Credit-rating rationale (revenue, debt, net worth)", "ICRA / Infomerics press releases",
-     "Partial", "Free", "observed", "(unmapped -- Phase 4d)",
-     "Only the CURRENT rating is fetched today; the rationale endpoint is noted in code as not-yet-identified."),
+    ("Credit-rating rationale (revenue, debt, net worth)", "CARE / India Ratings / Infomerics",
+     "Yes", "Free", "confirmed-live", "credit_rating_check.promoter.ratings[].rationale_url",
+     "WIRED IN 2026-09-01, not just found: CARE, India Ratings and Infomerics all embed a path to their "
+     "own rationale document in a response this pipeline already fetches for the bare rating -- "
+     "Infomerics nests a PDF url four levels into a current instrument's own JSON; CARE's search "
+     "response carries a CommonContent list of PDF filenames (date-sorted and Title-filtered here, "
+     "since it mixes in group affiliates' filings under one shared CompanyID, unsorted); India Ratings "
+     "renders its rationale as rich HTML, not a PDF, on its own page. All three confirmed by actually "
+     "downloading/opening a real document -- Infomerics' carried a full 'Financials (Standalone)' "
+     "table (Total Debt, Tangible Net Worth, EBITDA, PAT across two fiscal years); CARE's carried "
+     "real Total Income/Net Worth/Gearing figures; India Ratings' page went further still -- bookings, "
+     "collections, cash-flow-from-operations, forecast leverage ratios, a Strengths/Weaknesses key-"
+     "rating-drivers section. company_charter.py's rating-comparison table now cites the rationale "
+     "URL alongside the rating itself, and it is registered as its own sources[] entry. ICRA is the "
+     "one gap left: a real per-entity rationale mechanism exists (/Rationale/ShowRationaleReport?Id=) "
+     "but resolving which numeric Id belongs to a given company needs more reverse-engineering than "
+     "this pass did. CRISIL is unchanged -- its own factsheet page already carried a short inline "
+     "excerpt (the `rationale` key), not a document link, before this pass."),
 ]
 
 # =========================================================================
@@ -586,8 +601,6 @@ UNMAPPED = [
      "High"),
     ("K-RERA projects under investigation", "K-RERA, observed", "Karnataka projects",
      "Same -- a regulator-declared adverse signal.", "Medium"),
-    ("Credit-rating rationale documents", "ICRA / Infomerics", "Rated promoters only",
-     "Free route to revenue/debt/net-worth figures the MCA charges for.", "Medium"),
     ("K-RERA cost incurred vs estimated", "K-RERA detail page", "Karnataka projects",
      "Financial-strength scores None everywhere today. This is a direct, free input.", "High"),
     ("K-RERA delay reasons + NOC expiry", "K-RERA detail page", "Karnataka projects",
@@ -893,6 +906,25 @@ def build_readme(wb):
          "path found anywhere, unlike the other three states' CAPTCHA-only public search. The two "
          "stale 'Dharani' comments this finding traces to (states/telangana.py, charter_document.py) "
          "were corrected in the same pass.", None),
+        ("16. Sheet B's 'Lender, amount, satisfaction status' row said observed/'NOT currently parsed' "
+         "months after it actually was -- Sheet C's own MCA-charge-filings row for the same underlying "
+         "fact was confirmed live back in commit d0536e6, this one just never got updated to match. "
+         "Reconciled 2026-09-01.", None),
+        ("17. Credit-rating rationale documents -- WIRED IN 2026-09-01, not just found. CARE, India "
+         "Ratings and Infomerics each embed a path to their own rationale document in a response this "
+         "pipeline already fetches for the bare rating; none of the three were being extracted. "
+         "Confirmed real by downloading/opening an actual document for each: Infomerics' carried a "
+         "full 'Financials (Standalone)' table (Total Debt, Tangible Net Worth, EBITDA, PAT); CARE's "
+         "carried real Total Income/Net Worth/Gearing figures; India Ratings renders its rationale as "
+         "rich HTML rather than a PDF and went further still -- bookings, collections, cash flow from "
+         "operations, forecast leverage ratios, a Strengths/Weaknesses key-rating-drivers section. Now "
+         "wired into lookup_credit_rating's own return shape (rationale_url per agency), cited in the "
+         "Charter's rating-comparison table, and registered as its own sources[] entry -- not left as "
+         "an unused finding the way the WBRERA ITR gap was before it, too. ICRA stays a real, "
+         "identified gap (a per-entity /Rationale/ShowRationaleReport?Id= mechanism exists, but "
+         "resolving which Id belongs to which company needs more work); CRISIL is unchanged, since its "
+         "own short inline excerpt predates this pass. This closes Sheet D's 'Credit-rating rationale "
+         "documents' row -- removed from there since it is no longer unused.", None),
     ]
     for i, (text, font) in enumerate(lines, start=1):
         ws.cell(row=i, column=1, value=text)

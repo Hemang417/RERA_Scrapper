@@ -151,8 +151,9 @@ def test_india_ratings_matches_the_exact_issuer_by_name():
     """India Ratings' own search returns multiple issuers sharing a brand
     word (e.g. "Godrej Agrovet Limited" alongside "Godrej Properties
     Limited") -- exact matching must pick the right one, not the first."""
-    original_search, original_detail = (
+    original_search, original_detail, original_pr = (
         cc._india_ratings_search_companies, cc._india_ratings_fetch_rating_detail,
+        cc._india_ratings_search_press_releases,
     )
     cc._india_ratings_search_companies = lambda name: [
         {"issuerID": "14086", "name": "Godrej Agrovet Limited"},
@@ -162,16 +163,138 @@ def test_india_ratings_matches_the_exact_issuer_by_name():
         "instruments": [{"instrument": "Non-convertible debentures", "rating": "IND AA+ / Stable"}],
         "url": f"https://www.indiaratings.co.in/search/issuerid/{issuer_id}",
     }
+    # Stubbed to an empty list, not left unpatched -- without this, the
+    # rationale lookup added alongside this test would reach the real
+    # network on every run of this otherwise fully offline test.
+    cc._india_ratings_search_press_releases = lambda name: []
     try:
         result = cc._lookup_india_ratings_rating("Godrej Properties Limited")
     finally:
-        (cc._india_ratings_search_companies, cc._india_ratings_fetch_rating_detail) = (
-            original_search, original_detail,
-        )
+        (cc._india_ratings_search_companies, cc._india_ratings_fetch_rating_detail,
+         cc._india_ratings_search_press_releases) = (original_search, original_detail, original_pr)
     assert result["found"] is True, result
     assert result["company_name"] == "Godrej Properties Limited", result
     assert result["url"].endswith("/12230"), result
     print("test_india_ratings_matches_the_exact_issuer_by_name: PASS")
+
+
+# --- rating rationale documents ---------------------------------------------
+#
+# The rating itself is a letter grade; the rationale document behind it is
+# where the revenue/debt/net-worth detail actually lives. Confirmed live
+# 2026-09-01 that CARE, India Ratings and Infomerics all embed a path to
+# that document in a response this pipeline already fetches for the rating
+# alone -- these pin the extraction logic against the real shapes observed.
+
+def test_infomerics_rationale_pdf_is_pulled_from_the_current_instrument():
+    """Infomerics nests the rationale PDF four levels deep inside a CURRENT
+    instrument entry (companyInstrument[].PressRelease.Document.DocumentFile
+    .url) -- confirmed live against Pranami Estates Private Limited, whose
+    press-release PDF carries a full "Financials (Standalone)" table (Total
+    Debt, Tangible Net Worth, EBITDA, PAT). A PAST instrument's PressRelease
+    must never be preferred over a current one's."""
+    current = {
+        "isPast": False,
+        "PressRelease": {"Document": {"DocumentFile": {
+            "url": "https://infomericstorage.blob.core.windows.net/uploads/PR_current.pdf"
+        }}},
+    }
+    assert cc._infomerics_rationale_pdf_url(current).endswith("PR_current.pdf")
+    print("test_infomerics_rationale_pdf_is_pulled_from_the_current_instrument: PASS")
+
+
+def test_infomerics_rationale_pdf_is_empty_not_a_crash_when_the_shape_is_missing():
+    """A real Infomerics entry can omit PressRelease/Document/DocumentFile
+    entirely -- this must degrade to "" at any of the four levels, never
+    raise, since a KeyError here would take down the whole rating lookup
+    over a single missing nested field."""
+    for inst in ({}, {"PressRelease": None}, {"PressRelease": {"Document": None}},
+                 {"PressRelease": {"Document": {"DocumentFile": None}}}):
+        assert cc._infomerics_rationale_pdf_url(inst) == "", inst
+    print("test_infomerics_rationale_pdf_is_empty_not_a_crash_when_the_shape_is_missing: PASS")
+
+
+def test_care_rationale_picks_the_newest_pdf_for_the_exact_company_only():
+    """CARE's CommonContent list, confirmed live, is NOT reliably newest-
+    first and mixes a group affiliate's PDFs into one shared CompanyID's
+    results (searching "Godrej" returns "Godrej Housing Finance Limited"
+    filings inside "Godrej Finance Limited"'s own CommonContent) -- both
+    the date-based sort and the Title filter are load-bearing, not
+    decorative."""
+    match = {
+        "CompanyName": "Godrej Finance Limited",
+        "CommonContent": [
+            {"Title": "Godrej Finance Limited", "PDf": "202507120723_Godrej_Finance_Limited.pdf"},
+            # Newest by filename date, but listed first is NOT what makes
+            # it win -- the sort must, since real CommonContent isn't
+            # ordered newest-first.
+            {"Title": "Godrej Finance Limited", "PDf": "202606140613_Godrej_Finance_Limited.pdf"},
+            # An affiliate sharing the CompanyID -- must never be picked,
+            # even though its own filename date is the newest of all three.
+            {"Title": "Godrej Housing Finance Limited", "PDf": "202609010000_Godrej_Housing_Finance_Limited.pdf"},
+        ],
+    }
+    url = cc._care_rationale_pdf_url(match)
+    assert url.endswith("202606140613_Godrej_Finance_Limited.pdf"), url
+    print("test_care_rationale_picks_the_newest_pdf_for_the_exact_company_only: PASS")
+
+
+def test_care_rationale_is_empty_when_common_content_is_absent_or_unmatched():
+    assert cc._care_rationale_pdf_url({"CompanyName": "X", "CommonContent": []}) == ""
+    assert cc._care_rationale_pdf_url({"CompanyName": "X"}) == ""
+    # Only an affiliate's PDF is present -- no PDF for the matched company
+    # itself, which must not fall back to the affiliate's.
+    mismatched = {
+        "CompanyName": "Godrej Finance Limited",
+        "CommonContent": [{"Title": "Godrej Housing Finance Limited", "PDf": "202601010000_x.pdf"}],
+    }
+    assert cc._care_rationale_pdf_url(mismatched) == ""
+    print("test_care_rationale_is_empty_when_common_content_is_absent_or_unmatched: PASS")
+
+
+def test_india_ratings_rationale_matches_issuer_and_picks_the_latest_date():
+    """India Ratings' pressreleaseList (a sibling of issuerList in the SAME
+    search response) can carry several releases for the matched issuer and
+    releases for other issuers in the same result set -- both the issuer
+    filter and the prDate-based "latest" pick are load-bearing."""
+    releases = [
+        {"issuerName": "Godrej Agrovet Limited", "urlKey": "wrong-issuer", "prDate": "01 Jan 2027"},
+        {"issuerName": "Godrej Properties Limited", "urlKey": "older", "prDate": "22 Jul 2026"},
+        {"issuerName": "Godrej Properties Limited", "urlKey": "newest", "prDate": "26 Aug 2026"},
+    ]
+    url = cc._india_ratings_pick_rationale_url("Godrej Properties Limited", releases)
+    assert url.endswith("/newest"), url
+    print("test_india_ratings_rationale_matches_issuer_and_picks_the_latest_date: PASS")
+
+
+def test_india_ratings_rationale_is_empty_when_nothing_matches():
+    assert cc._india_ratings_pick_rationale_url("Nobody Rated Ltd", []) == ""
+    assert cc._india_ratings_pick_rationale_url(
+        "Nobody Rated Ltd", [{"issuerName": "Someone Else Ltd", "urlKey": "x", "prDate": "01 Jan 2026"}]
+    ) == ""
+    print("test_india_ratings_rationale_is_empty_when_nothing_matches: PASS")
+
+
+def test_rating_lookups_expose_rationale_url_end_to_end():
+    """The full path a Charter pass actually reads: _lookup_*_rating's own
+    return dict must carry rationale_url when one exists, not just the
+    lower-level helpers tested above."""
+    original_care_search = cc._care_search_companies
+    original_care_detail = cc._care_fetch_rating_detail
+    cc._care_search_companies = lambda name: [{
+        "CompanyID": "abc==", "CompanyName": "Godrej Finance Limited",
+        "CommonContent": [{"Title": "Godrej Finance Limited", "PDf": "202606140613_Godrej_Finance_Limited.pdf"}],
+    }]
+    cc._care_fetch_rating_detail = lambda company_id: {
+        "instruments": [{"instrument": "Long Term", "rating": "CARE AA+; Stable"}],
+        "url": f"https://www.careratings.com/search?Id={company_id}",
+    }
+    try:
+        result = cc._lookup_care_rating("Godrej Finance Limited")
+    finally:
+        cc._care_search_companies, cc._care_fetch_rating_detail = original_care_search, original_care_detail
+    assert result["rationale_url"].endswith("202606140613_Godrej_Finance_Limited.pdf"), result
+    print("test_rating_lookups_expose_rationale_url_end_to_end: PASS")
 
 
 # --- the group check ------------------------------------------------------
@@ -333,6 +456,13 @@ if __name__ == "__main__":
     test_care_reports_not_found_honestly()
     test_india_ratings_reports_not_found_honestly()
     test_india_ratings_matches_the_exact_issuer_by_name()
+    test_infomerics_rationale_pdf_is_pulled_from_the_current_instrument()
+    test_infomerics_rationale_pdf_is_empty_not_a_crash_when_the_shape_is_missing()
+    test_care_rationale_picks_the_newest_pdf_for_the_exact_company_only()
+    test_care_rationale_is_empty_when_common_content_is_absent_or_unmatched()
+    test_india_ratings_rationale_matches_issuer_and_picks_the_latest_date()
+    test_india_ratings_rationale_is_empty_when_nothing_matches()
+    test_rating_lookups_expose_rationale_url_end_to_end()
     test_the_group_check_covers_entities_the_subject_check_cannot()
     test_a_bounded_check_looks_at_the_likeliest_parent_first()
     test_entities_past_the_limit_are_not_reported_as_unrated()

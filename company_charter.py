@@ -1318,6 +1318,23 @@ def _infomerics_search_companies(name: str) -> list:
     return resp.json()
 
 
+def _infomerics_rationale_pdf_url(inst: dict) -> str:
+    """The rationale/press-release PDF URL Infomerics already embeds inside a
+    current instrument entry -- data.companyInstrument[].PressRelease.
+    Document.DocumentFile.url, a direct blob-storage link, confirmed live to
+    carry the FULL rationale (a "Financials (Standalone)" table with Total
+    Debt, Tangible Net Worth, EBITDA, PAT across two fiscal years) that the
+    plain instrument/rating pair above never surfaces. Returns "" rather
+    than None on any missing key, since this walks four levels of a
+    third-party JSON shape that has no guaranteed structure."""
+    try:
+        return (
+            ((inst.get("PressRelease") or {}).get("Document") or {}).get("DocumentFile") or {}
+        ).get("url") or ""
+    except AttributeError:
+        return ""
+
+
 def _infomerics_fetch_rating_detail(slug: str) -> dict:
     url = _INFOMERICS_COMPANY_URL.format(slug=slug)
     resp = requests.get(url, timeout=config.REQUEST_TIMEOUT)
@@ -1325,6 +1342,7 @@ def _infomerics_fetch_rating_detail(slug: str) -> dict:
     data = resp.json()
 
     instruments = []
+    rationale_url = ""
     for inst in data.get("companyInstrument", []):
         if inst.get("isPast"):
             continue
@@ -1336,8 +1354,14 @@ def _infomerics_fetch_rating_detail(slug: str) -> dict:
             "instrument": f"{inst.get('InstrumentTitle', '')} ({inst.get('InstrumentAmount', '')})".strip(),
             "rating": rating,
         })
+        if not rationale_url:
+            rationale_url = _infomerics_rationale_pdf_url(inst)
 
-    return {"instruments": instruments, "url": f"https://www.infomerics.com/pressrelease/{slug}"}
+    return {
+        "instruments": instruments,
+        "url": f"https://www.infomerics.com/pressrelease/{slug}",
+        "rationale_url": rationale_url,
+    }
 
 
 def _lookup_infomerics_rating(company_name: str) -> dict:
@@ -1363,6 +1387,7 @@ def _lookup_infomerics_rating(company_name: str) -> dict:
         "agency": "Infomerics",
         "company_name": exact["CompanyName"],
         "instruments": detail["instruments"],
+        "rationale_url": detail.get("rationale_url") or "",
         "url": detail["url"],
     }
 
@@ -1530,12 +1555,41 @@ def _lookup_crisil_rating(company_name: str) -> dict:
 _CARE_SEARCH_URL = "https://www.careratings.com/header/searchlistinsights"
 _CARE_DETAIL_URL = "https://www.careratings.com/getSearchprintrating"
 _CARE_PAGE_URL = "https://www.careratings.com/search"
+_CARE_PDF_BASE = "https://www.careratings.com/upload/CompanyFiles/PR/"
+_CARE_PDF_DATE_RE = re.compile(r"^(\d{12})_")
 
 
 def _care_search_companies(name: str) -> list:
     resp = requests.get(_CARE_SEARCH_URL, params={"cinput": name}, timeout=config.REQUEST_TIMEOUT)
     resp.raise_for_status()
     return resp.json().get("data") or []
+
+
+def _care_rationale_pdf_url(match: dict) -> str:
+    """The most recent rationale/press-release PDF for this exact company,
+    from the CommonContent list the search response already carries.
+
+    Filenames are 'YYYYMMDDHHMM_Company_Name.pdf'; sorting on that numeric
+    prefix, not on list order, is what picks the LATEST one -- CommonContent
+    was observed live NOT reliably newest-first. CommonContent also mixes in
+    a group affiliate's PDFs under one shared CompanyID (searching "Godrej"
+    returns "Godrej Housing Finance Limited" filings inside "Godrej Finance
+    Limited"'s own CommonContent) -- filtering each entry's own Title against
+    this exact company name is what keeps this from attributing an
+    affiliate's rationale to the wrong entity."""
+    wanted = str(match.get("CompanyName", "")).strip().casefold()
+    dated = []
+    for entry in match.get("CommonContent") or []:
+        filename = entry.get("PDf") or ""
+        title = str(entry.get("Title", "")).strip().casefold()
+        date_match = _CARE_PDF_DATE_RE.match(filename)
+        if not (filename and date_match and title == wanted):
+            continue
+        dated.append((date_match.group(1), filename))
+    if not dated:
+        return ""
+    dated.sort(reverse=True)
+    return _CARE_PDF_BASE + dated[0][1]
 
 
 def _care_fetch_rating_detail(company_id: str) -> dict:
@@ -1575,6 +1629,7 @@ def _lookup_care_rating(company_name: str) -> dict:
         "agency": "CARE",
         "company_name": exact["CompanyName"],
         "instruments": detail["instruments"],
+        "rationale_url": _care_rationale_pdf_url(exact),
         "url": detail["url"],
     }
 
@@ -1603,6 +1658,59 @@ def _india_ratings_search_companies(name: str) -> list:
     resp = requests.get(_INDIA_RATINGS_SEARCH_URL, params={"searchKey": name}, timeout=config.REQUEST_TIMEOUT)
     resp.raise_for_status()
     return resp.json().get("issuerList") or []
+
+
+_INDIA_RATINGS_PR_PAGE_URL = "https://www.indiaratings.co.in/pressrelease"
+
+
+def _india_ratings_search_press_releases(name: str) -> list:
+    """A SEPARATE call to the same search endpoint _india_ratings_search_companies
+    already hits -- its response carries a full pressreleaseList alongside
+    issuerList, confirmed live, but a second request is simpler and less
+    fragile than threading that list through the issuer-search call's
+    return shape, which test_crisil_and_group_ratings.py already monkey-
+    patches as a plain list of issuers. Split out as its own function (like
+    every other agency's _*_search_companies above) so a test can stub this
+    one call without also needing to fake the issuer search -- and, just as
+    importantly, so a test that does NOT stub it never silently reaches the
+    real network."""
+    resp = requests.get(_INDIA_RATINGS_SEARCH_URL, params={"searchKey": name}, timeout=config.REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    return resp.json().get("pressreleaseList") or []
+
+
+def _india_ratings_pick_rationale_url(company_name: str, releases: list) -> str:
+    """Pure selection logic, pulled out of the network call above so it is
+    directly testable: the most recent rationale press-release URL for this
+    exact issuer, matched by issuerName and picked by prDate.
+
+    Unlike India Ratings' PDF-based peers, the rationale here is rendered as
+    rich HTML on its own page -- live-tested against Godrej Properties
+    Limited: bookings, collections, cash-flow-from-operations figures,
+    forecast leverage ratios, and a Strengths/Weaknesses key-rating-drivers
+    section, not just a rating number."""
+    wanted = company_name.strip().casefold()
+    matching = [r for r in releases if str(r.get("issuerName", "")).strip().casefold() == wanted]
+    if not matching:
+        return ""
+
+    def _pr_date(entry):
+        try:
+            return datetime.strptime(entry.get("prDate", ""), "%d %b %Y")
+        except ValueError:
+            return datetime.min
+
+    latest = max(matching, key=_pr_date)
+    url_key = latest.get("urlKey")
+    return f"{_INDIA_RATINGS_PR_PAGE_URL}/{url_key}" if url_key else ""
+
+
+def _india_ratings_rationale_url(company_name: str) -> str:
+    try:
+        releases = _india_ratings_search_press_releases(company_name)
+    except (requests.RequestException, ValueError):
+        return ""
+    return _india_ratings_pick_rationale_url(company_name, releases)
 
 
 def _india_ratings_fetch_rating_detail(issuer_id: str) -> dict:
@@ -1650,6 +1758,7 @@ def _lookup_india_ratings_rating(company_name: str) -> dict:
         "agency": "India Ratings",
         "company_name": exact["name"],
         "instruments": detail["instruments"],
+        "rationale_url": _india_ratings_rationale_url(exact["name"]),
         "url": detail["url"],
     }
 
@@ -1679,11 +1788,19 @@ def lookup_credit_rating(company_name: str) -> dict:
       {"found": True, "ratings": [{"agency": "CRISIL" | "ICRA" | "CARE" |
        "India Ratings" | "Infomerics",
        "company_name": <matched label>, "instruments": [{"instrument":
-       ..., "rating": ...}, ...], "url": ...}, ...], "not_found_agencies":
-       [<agency names with no match>]}
+       ..., "rating": ...}, ...], "url": ..., "rationale_url": ...},
+       ...], "not_found_agencies": [<agency names with no match>]}
         -- `ratings` holds one entry per agency that found something (in
         agency-check order); `not_found_agencies` names the rest so a
-        reader knows they were checked, not skipped.
+        reader knows they were checked, not skipped. `rationale_url`
+        (CARE, India Ratings, Infomerics only, confirmed live) points at
+        the agency's own rationale document, which carries the revenue/
+        debt/net-worth detail a bare rating never does -- confirmed by
+        downloading a real one for each of the three agencies live, not
+        merely by finding the URL. ICRA's own per-entity rationale needs
+        an id this pass doesn't resolve; CRISIL's own agency dict instead
+        carries a `rationale` key (a short inline excerpt off its
+        factsheet page, not a document link).
       {"found": False, "note": "..."} -- an honest explanation naming
       every agency actually checked, not an error, when nothing matches
       anywhere or every request failed. A promoter/SPV having no public
@@ -9965,6 +10082,15 @@ def _add_rating_comparison_table(doc, rating_result: dict, facts: dict) -> None:
     for r in ratings:
         citation = _citation_text(facts, _clean_source_label(r["url"]) or r["url"])
         doc.add_paragraph(f"Match found ({r['agency']}): {r['company_name']} {citation}")
+        # The bare rating alone carries none of the analysis behind it. Where
+        # the agency's own rationale document is reachable -- confirmed live
+        # for CARE, India Ratings and Infomerics, each of which embeds it in
+        # a response this lookup already fetches -- point the reader at it
+        # directly rather than leaving them with only a letter grade.
+        rationale_url = r.get("rationale_url")
+        if rationale_url:
+            rationale_citation = _citation_text(facts, _clean_source_label(rationale_url) or rationale_url)
+            doc.add_paragraph(f"Full rating rationale ({r['agency']}, revenue/debt/net-worth detail): {rationale_citation}")
 
     table = doc.add_table(rows=1, cols=3)
     _set_table_borders(table)
@@ -11727,6 +11853,14 @@ def run_promoter_intake(cin: str, company_name: str = "", output_dir: str = conf
                 "published_date": "unknown",
                 "accessed_date": accessed_date,
             })
+            if agency_rating.get("rationale_url"):
+                record["sources"].append({
+                    "label": f"{agency_rating['agency']} rating rationale",
+                    "ref": f"{agency_rating['company_name']} -- {agency_rating['rationale_url']}",
+                    "topic": "credit_rating",
+                    "published_date": "unknown",
+                    "accessed_date": accessed_date,
+                })
 
     out_dir = os.path.join(output_dir, "_pending", cin)
     os.makedirs(out_dir, exist_ok=True)
@@ -12015,6 +12149,14 @@ def run_company_charter(
                 "published_date": "unknown",
                 "accessed_date": datetime.now().strftime("%Y-%m-%d"),
             })
+            if agency_rating.get("rationale_url"):
+                facts.setdefault("sources", []).append({
+                    "label": f"{agency_rating['agency']} rating rationale",
+                    "ref": f"{agency_rating['company_name']} -- {agency_rating['rationale_url']}",
+                    "topic": "credit_rating",
+                    "published_date": "unknown",
+                    "accessed_date": datetime.now().strftime("%Y-%m-%d"),
+                })
 
     if "ibbi" in results:
         ibbi_result = results["ibbi"]
