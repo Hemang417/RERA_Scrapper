@@ -13,3 +13,6 @@ tessdata/
 
 # up_captcha_search.py's own result dumps -- diagnostic output, not source.
 _up_captcha_*_result.txt
+
+# igr_maharashtra_search.py's own result dumps -- same, diagnostic output.
+_igr_maharashtra_*_result.txt

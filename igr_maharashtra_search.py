@@ -204,6 +204,41 @@ def _wait_for_human_submit(page, timeout_seconds, request_predicate, post_submit
     time.sleep(1.0)
 
 
+def _wait_for_search_to_finish(page, timeout_seconds=120):
+    """After a human submits, THIS PORTAL CAN GENUINELY TAKE MINUTES to
+    render the real result -- its own FAQ says so outright ("Search result
+    will take few minutes to show result"). _wait_for_human_submit only
+    proves the Search POST fired and the page began reloading; it does
+    NOT prove the result has actually rendered by the time it returns.
+
+    CONFIRMED LIVE 2026-09-01, a real human CAPTCHA solve against
+    region=urban/Pune/Gulatekadi/3223: reading raw_text right after
+    _wait_for_human_submit returned captured the page BACK AT THE BLANK
+    SEARCH FORM with the portal's own 'Please Wait.....' marker still in
+    it -- a fully-formed, correct-length page that looks like an ordinary
+    result to any check based on response size or exception-freedom alone.
+    `found` was reported as unknown and the real result, whatever it was,
+    was never actually seen.
+
+    Polls for that literal marker to DISAPPEAR from the body text rather
+    than trusting a fixed wait -- the loading text as this portal writes
+    it (checked case-insensitively since capitalisation was not itself
+    confirmed stable). Returns whether it actually cleared within
+    `timeout_seconds`; a caller should still treat a raw_text capture
+    taken after a False return as possibly incomplete, not as "no
+    results" -- the two must not be conflated."""
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        try:
+            text = page.inner_text("body")
+        except Exception:
+            text = ""
+        if "please wait" not in text.casefold():
+            return True
+        page.wait_for_timeout(2000)
+    return False
+
+
 def _safe_read(read_fn, attempts=6, delay=1.0, min_length=0):
     """Retries `read_fn()` against Playwright's "page is navigating" race
     (the resulting page can still be in flight a moment after the search
@@ -350,16 +385,28 @@ def search_by_document_number(
         except (CaptchaTimeoutError, BrowserClosedError) as e:
             return {"found": False, "rows": [], "raw_text": "", "url": page.url, "note": str(e)}
 
+        finished = _wait_for_search_to_finish(page)
         html = _safe_read(page.content, min_length=5000)
         body_text = _safe_read(lambda: page.inner_text("body"), min_length=200)
         if screenshot_path:
             _safe_read(lambda: page.screenshot(path=screenshot_path, full_page=True))
         rows = _parse_document_results(html)
-        note = "" if rows else (
-            "No results table naming DocNo/Seller/Purchaser rendered after submit -- either the "
-            "search did not actually land, or it landed and this document number does not exist "
-            "for this SRO/year. Check raw_text/screenshot to tell which."
-        )
+        if rows:
+            note = ""
+        elif not finished:
+            note = (
+                "The portal's own 'Please Wait.....' marker was still present when this was read -- "
+                "the site's own FAQ warns results can take minutes, and this capture may be "
+                "incomplete rather than a genuine empty result. Re-check raw_text/screenshot, or "
+                "re-run with a longer wait, before concluding this document number doesn't exist."
+            )
+        else:
+            note = (
+                "No results table naming DocNo/Seller/Purchaser rendered after submit, and the "
+                "'Please Wait.....' marker had cleared -- either the search did not actually land, "
+                "or it landed and this document number does not exist for this SRO/year. Check "
+                "raw_text/screenshot to tell which."
+            )
         return {"found": bool(rows), "rows": rows, "raw_text": body_text, "url": page.url, "note": note}
     finally:
         try:
@@ -583,15 +630,24 @@ def search_by_property(
         except (CaptchaTimeoutError, BrowserClosedError) as e:
             return {"found": False, "rows": [], "raw_text": "", "url": page.url, "note": str(e)}
 
+        finished = _wait_for_search_to_finish(page)
         body_text = _safe_read(lambda: page.inner_text("body"), min_length=200)
         if screenshot_path:
             _safe_read(lambda: page.screenshot(path=screenshot_path, full_page=True))
-        return {
-            "found": None, "rows": [], "raw_text": body_text, "url": page.url,
-            "note": "Result table shape not confirmed live for this search mode -- see raw_text/"
-                    "screenshot for what actually came back, and use search_by_document_number "
-                    "instead where the document number is already known.",
-        }
+        note = (
+            "Result table shape not confirmed live for this search mode -- see raw_text/screenshot "
+            "for what actually came back, and use search_by_document_number instead where the "
+            "document number is already known."
+        )
+        if not finished:
+            note = (
+                "The portal's own 'Please Wait.....' marker was STILL PRESENT when this was read -- "
+                "confirmed live 2026-09-01 that reading too early here captures the page back at "
+                "the blank search form, not a real result. This raw_text is likely incomplete; "
+                "re-run with a longer wait or check the screenshot before drawing any conclusion "
+                "from it. " + note
+            )
+        return {"found": None, "rows": [], "raw_text": body_text, "url": page.url, "note": note}
     finally:
         try:
             browser.close()

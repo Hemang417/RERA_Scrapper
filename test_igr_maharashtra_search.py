@@ -146,6 +146,49 @@ def test_every_region_has_a_distinct_search_control_name():
     print("test_every_region_has_a_distinct_search_control_name: PASS")
 
 
+# --- the "Please Wait....." race --------------------------------------------
+#
+# Confirmed live 2026-09-01: a real human solved the CAPTCHA for region=
+# urban/Pune/Gulatekadi/3223, and the raw_text this pipeline captured right
+# after was the search form BACK AT BLANK with the portal's own
+# "Please Wait....." marker still in it -- the site's own FAQ says results
+# can take minutes. A fixed short wait after submit is not enough; this
+# tests the polling fix against a stand-in `page` rather than a live one.
+
+class _FakePage:
+    """Returns each string in `texts` in turn on successive inner_text()
+    calls, repeating the last one once exhausted -- enough to simulate a
+    page whose "Please Wait....." clears after N polls without an actual
+    browser or actual waiting."""
+    def __init__(self, texts):
+        self._texts = list(texts)
+        self._i = 0
+
+    def inner_text(self, _selector):
+        text = self._texts[min(self._i, len(self._texts) - 1)]
+        self._i += 1
+        return text
+
+    def wait_for_timeout(self, _ms):
+        pass  # no real sleep -- this is what makes the test fast
+
+
+def test_wait_for_search_to_finish_clears_once_please_wait_is_gone():
+    page = _FakePage(["...Please Wait.....", "...Please Wait.....", "Real Result Table Here"])
+    assert igr._wait_for_search_to_finish(page, timeout_seconds=30) is True
+    print("test_wait_for_search_to_finish_clears_once_please_wait_is_gone: PASS")
+
+
+def test_wait_for_search_to_finish_times_out_honestly_rather_than_lying():
+    """If "Please Wait....." never clears within the budget, this must say
+    so (False) rather than silently returning as if the result were
+    ready -- a caller uses this to decide whether to trust what it reads
+    next."""
+    page = _FakePage(["...Please Wait....."])
+    assert igr._wait_for_search_to_finish(page, timeout_seconds=0) is False
+    print("test_wait_for_search_to_finish_times_out_honestly_rather_than_lying: PASS")
+
+
 if __name__ == "__main__":
     test_the_real_captured_row_parses_with_party_names_and_consideration()
     test_a_table_without_the_expected_headers_is_ignored()
@@ -156,4 +199,6 @@ if __name__ == "__main__":
     test_rest_of_maharashtra_requires_a_taluka()
     test_the_taluka_requirement_is_specific_to_rest_of_maharashtra()
     test_every_region_has_a_distinct_search_control_name()
+    test_wait_for_search_to_finish_clears_once_please_wait_is_gone()
+    test_wait_for_search_to_finish_times_out_honestly_rather_than_lying()
     print("\nAll tests passed.")
