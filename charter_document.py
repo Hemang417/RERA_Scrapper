@@ -592,9 +592,10 @@ def _recommended_steps(facts: dict, flags: dict) -> list:
     if not (facts.get("cts_land_record_check") or {}).get("found"):
         # Maha Bhulekh is Maharashtra's land-records portal and holds nothing
         # for any other state, so recommending it elsewhere would send the
-        # reader to a dead end. Other states have their own systems (Dharani,
-        # Bhoomi, AnyROR...) which this pipeline does not yet query, so the
-        # honest step there is the generic one.
+        # reader to a dead end. Other states have their own systems (Bhu
+        # Bharati -- Telangana's Dharani, retired 2025 -- Bhoomi, AnyROR...)
+        # which this pipeline does not yet query, so the honest step there
+        # is the generic one.
         if cc._state_profile().can(cc.states.CAP_LAND_RECORDS):
             steps.append("Retrieve the Maha Bhulekh Property Card for the project's CTS number to confirm land ownership independently.")
         else:

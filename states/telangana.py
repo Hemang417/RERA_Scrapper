@@ -33,8 +33,16 @@ limitation rather than a placeholder:
   * No CAP_ORDERS_SEARCH. Telangana publishes no name-searchable
     complaint/appeal register.
 
-  * No CAP_LAND_RECORDS. Telangana's land system is Dharani, which this
-    pipeline does not query.
+  * No CAP_LAND_RECORDS. Telangana's land system was Dharani, retired and
+    replaced by Bhu Bharati (bhubharati.telangana.gov.in) under the
+    Telangana Bhu Bharati (Record of Rights in Land) Act, 2025 -- confirmed
+    live 2026-09-01 that the old dharani.telangana.gov.in domain refuses
+    every connection. This pipeline does not query either one: Bhu Bharati's
+    own public homepage routes every service through a mobile-OTP citizen
+    login (Mobile No. + Password/OTP, self-registration), with no anonymous
+    district/survey-number lookup found, unlike Karnataka's or Gujarat's
+    equivalents -- see build_data_coverage.py's CTS sheet for the fuller
+    finding.
 
   * No CAP_PROMOTER_PORTFOLIO. No promoter-name search returning that
     promoter's other projects.

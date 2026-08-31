@@ -488,8 +488,48 @@ CTS_FINDINGS = [
     ("Lender, amount, satisfaction status", "MCA charge filings via ZaubaCorp",
      "Yes", "Free -- page already fetched", "observed",
      "NOT currently parsed. The only independent check on the promoter's declared mortgage. National, so it belongs in the CIN workflow."),
-    ("Land records for other states", "Dharani (TG) / Bhoomi (KA) / AnyROR (GJ) / Bhulekh (UP)",
-     "Not built", "n/a", "unaudited", "Each is a separate system with its own identifier scheme, language and CAPTCHA."),
+    ("Karnataka land records (Bhoomi)", "landrecords.karnataka.gov.in, RTC and Mutation Copy view",
+     "Yes", "Free + CAPTCHA", "confirmed-live",
+     "Audited live 2026-09-01. District -> Taluk -> Hobli -> Village drill-down, then survey number, "
+     "then 'Fetch Survey Details' -- no login. A CAPTCHA text field (id=captchatextbox) IS present, "
+     "confirmed by inspecting the live DOM directly rather than trusting a text summary of the page: "
+     "an earlier automated read of this same portal claimed 'no explicit CAPTCHA mentioned', which was "
+     "wrong -- the CAPTCHA is rendered by client-side JS and invisible to a fetch that doesn't run it."),
+    ("Gujarat land records (AnyROR)", "anyror.gujarat.gov.in, Rural Land Record",
+     "Yes", "Free + CAPTCHA", "confirmed-live",
+     "Audited live 2026-09-01. One page, one District -> Taluka -> Village form, but a 15-option record-"
+     "type dropdown behind it: VF-7 (survey details), VF-8A (khata/account), VF-6 (hakka patrak -- "
+     "rights/mutation entries), 135-D mutation notice, revenue case details, and 'KNOW KHATA BY OWNER "
+     "NAME' -- an owner-NAME search, confirmed present as a dropdown option though not opened this pass. "
+     "A CAPTCHA text field (id=ContentPlaceHolder1_txt_captcha_1) is present, same DOM-inspection "
+     "correction as Karnataka above -- a page-text summary alone also missed this one."),
+    ("Uttar Pradesh land records (Bhulekh + eKhasra)", "upbhulekh.gov.in (khatauni/ROR) and "
+     "ekhasra.up.gov.in (khasra/crop survey) -- two separate systems, not one",
+     "Partial", "Free + CAPTCHA (khatauni) / Free (eKhasra geography step)", "confirmed-live",
+     "Audited live 2026-09-01. upbhulekh.gov.in's khatauni (Record of Rights) copy view is behind a "
+     "CAPTCHA text field (name=captcha) on the homepage's own District/Tehsil/Pargana form; the site "
+     "ALSO has a separate full account login ('खतौनी लॉगिन' / 'रियल टाइम खतौनी लॉगिन') for a fuller "
+     "record, not audited here. ekhasra.up.gov.in is a DIFFERENT system for crop/khasra survey data "
+     "(fasli-year crop entries, tree counts), not land ownership -- its District -> Tehsil -> Village "
+     "selection step showed no CAPTCHA element in the DOM, but the final record-display step past "
+     "village selection was not reached this pass, so that step is unconfirmed rather than assumed "
+     "clean. Partial because the two systems only jointly cover part of what a 7/12-equivalent needs.",
+     ),
+    ("Telangana land records (Bhu Bharati, successor to Dharani)",
+     "bhubharati.telangana.gov.in -- dharani.telangana.gov.in (the name this codebase has referenced) "
+     "is retired",
+     "No", "Requires a mobile-OTP citizen account, not free-and-anonymous", "confirmed-live",
+     "Audited live 2026-09-01. dharani.telangana.gov.in itself refused every connection tried (browser "
+     "navigation AND a direct fetch both failed) -- not a network fluke on this end: Telangana's Revenue "
+     "Department retired Dharani and replaced it with Bhu Bharati under the Telangana Bhu Bharati "
+     "(Record of Rights in Land) Act, 2025, confirmed via web search, so this codebase's own comments "
+     "citing 'Dharani (TG)' are now stale. bhubharati.telangana.gov.in DOES load, but every visible "
+     "'Transactional Services' and 'Information Services' tile on its homepage routes to /Citizen, a "
+     "login gate asking for Mobile No. + Password/OTP with self-registration ('New user please Sign "
+     "Up') -- no anonymous district/survey-number lookup path was found anywhere on the public site, "
+     "unlike Karnataka, Gujarat or Uttar Pradesh above. A promoter's Telangana land details are "
+     "therefore not reachable by this pipeline without an Indian mobile number to receive an OTP, which "
+     "is a materially different access model from the other three states' CAPTCHA-only public search."),
 ]
 
 # =========================================================================
@@ -668,8 +708,10 @@ def build_cts_sheet(wb):
     ws = wb.create_sheet("B - CTS land records")
     ncols = 6
     _title(ws, "Workflow B: CTS / land records",
-           "The free portal already returns every field. The extraction is what is broken -- "
-           "no paid source is needed.", ncols)
+           "Maharashtra: the free portal already returns every field, and the extraction is what is "
+           "broken -- no paid source is needed. Karnataka, Gujarat and Uttar Pradesh's own land-record "
+           "portals are also free, CAPTCHA-gated, none built yet. Telangana is the exception: its own "
+           "portal requires a mobile-OTP citizen account, not just a CAPTCHA.", ncols)
     ws.append([])
     ws.append(["Field", "Source", "Availability", "Cost", "Evidence", "Note"])
     header_row = ws.max_row
@@ -828,6 +870,23 @@ def build_readme(wb):
          "project-type-dependent percentage-completion/status field). The JHARERA portal itself went "
          "down mid-audit -- 3 of 4 fetch attempts against the same URL timed out -- a reminder that "
          "an unreachable portal during a check is not the same finding as a confirmed absence.", None),
+        ("15. Sheet B's last 'unaudited'/'Not built' row -- land records for the four non-Maharashtra "
+         "states this pipeline touches -- is now four confirmed-live rows. Karnataka (Bhoomi) and "
+         "Gujarat (AnyROR) are both free, District/Taluk(a)/village drill-downs behind a CAPTCHA text "
+         "field, confirmed by inspecting the live DOM directly -- worth flagging because a first-pass "
+         "automated read of both pages, working from page text alone, wrongly reported no CAPTCHA on "
+         "either; the CAPTCHA element only exists once client-side JS renders it. AnyROR's own "
+         "record-type dropdown carries 15 options, including a 'KNOW KHATA BY OWNER NAME' owner-name "
+         "search. Uttar Pradesh splits across two separate systems: upbhulekh.gov.in's khatauni copy "
+         "view is CAPTCHA-gated (plus a separate full-login flow for a fuller record, not audited "
+         "here), while ekhasra.up.gov.in is a DIFFERENT system entirely for crop/khasra survey data, "
+         "not ownership. Telangana is the one genuine surprise: dharani.telangana.gov.in, the system "
+         "this codebase's own comments named, refuses every connection because Telangana retired "
+         "Dharani for Bhu Bharati (bhubharati.telangana.gov.in) under a 2025 Act -- and Bhu Bharati's "
+         "own public site routes every service through a mobile-OTP citizen login, no anonymous lookup "
+         "path found anywhere, unlike the other three states' CAPTCHA-only public search. The two "
+         "stale 'Dharani' comments this finding traces to (states/telangana.py, charter_document.py) "
+         "were corrected in the same pass.", None),
     ]
     for i, (text, font) in enumerate(lines, start=1):
         ws.cell(row=i, column=1, value=text)
