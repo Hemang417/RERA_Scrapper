@@ -26,15 +26,22 @@ returned row:
   real result -- _parse_document_results below is pinned against that exact
   row's HTML.
 
-  Property Details (search_by_property) -- Year -> District -> Village/Area
-  (a free-text field that triggers its own ASP.NET postback to populate a
-  companion dropdown -- NOT a plain <select>, see _fill_village_area) ->
-  Survey/CTS/Milkat/Gat/Plot No. Form mechanics confirmed live (the village
-  postback resolves, the CAPTCHA gate accepts a correctly-typed answer --
+  Property Details (search_by_property) -- Year -> District -> [Taluka ->]
+  Village/Area -> Survey/CTS/Milkat/Gat/Plot No. THREE SEPARATE REGIONS,
+  each its own field ids and cascade shape -- "mumbai" (2 districts, a
+  free-text village autocomplete), "rest_of_maharashtra" (35 districts,
+  REQUIRES a Taluka before Village cascades), "urban" (32 municipal
+  corporation/council areas, District cascades straight to Area, no
+  taluka). See the region-fields comment above search_by_property for the
+  full live-confirmed detail, including why the SAME locality can sit in
+  either the rural or the urban region depending on how it was annexed --
+  Pune's Market Yard (Gulatekadi) is in "urban", not the rural taluka/
+  village list a human would guess first. Form mechanics confirmed live
+  for all three (the CAPTCHA gate accepts a correctly-typed answer --
   "Entered Correct Captcha" was seen), but no property number tried this
-  pass belonged to a real registered parcel, so THE RESULT TABLE'S OWN SHAPE
-  IS NOT CONFIRMED for this mode. search_by_property returns whatever
-  rendered rather than guessing a schema no live row has actually shown.
+  pass belonged to a real registered parcel, so THE RESULT TABLE'S OWN
+  SHAPE IS NOT CONFIRMED for any region. search_by_property returns
+  whatever rendered rather than guessing a schema no live row has shown.
 
 A GENUINE LIMITATION, from the site's own FAQ, not a gap in this script:
 Power of Attorney and Will deeds are never returned by either search mode.
@@ -48,13 +55,16 @@ search_by_document_number is the same call for a mortgage as for a sale
 deed, no separate function needed for it.
 
     python igr_maharashtra_search.py docno "<district>" "<SRO contains>" <year> <doc_no> [registration_type]
-    python igr_maharashtra_search.py property "<district>" "<village/area>" <property_no>
+    python igr_maharashtra_search.py property <region> "<district>" "<village/area>" <property_no> ["<taluka>"]
 
-Both need a human at the keyboard. `district` for docno mode is matched by
-substring against the portal's own (Marathi-only) option text -- see
-_DISTRICT_HINTS for the two Mumbai districts spelled out, since that pair is
-where this pipeline's own subjects concentrate; anything else, pass the
-exact Marathi label shown on the portal.
+Both need a human at the keyboard. `region` is one of mumbai /
+rest_of_maharashtra / urban -- see the module comment above search_by_
+property if you're not sure which one covers a given locality; `<taluka>`
+is required (and only used) when region=rest_of_maharashtra. `district` is
+matched against _DISTRICT_HINTS first (Mumbai, Mumbai Suburban, Pune are
+spelled out, since those are what this pipeline's own subjects have needed
+so far), then used as typed -- pass the exact Marathi label shown on the
+portal for anything else.
 """
 
 from __future__ import annotations
@@ -68,16 +78,18 @@ import config
 
 _BASE_URL = "https://freesearchigrservice.maharashtra.gov.in/"
 
-# The portal's own district dropdown is Marathi-only. These are the two
-# districts this pipeline's Maharashtra subjects concentrate in (Mumbai
-# city and suburbs); anything else, the caller passes the exact Marathi
-# label straight off the portal -- building a full 37-district translation
-# table is not worth it for districts nothing here has ever needed yet.
+# The portal's own district dropdown is Marathi-only. Filled in as this
+# pipeline's actual subjects have needed them -- not a full 37-district
+# translation table, which nothing here has needed yet. Add one the same
+# way: confirm the exact Marathi label live off the portal's own dropdown
+# before trusting a translation, since a wrong guess would silently search
+# the wrong district rather than fail loudly.
 _DISTRICT_HINTS = {
     "mumbai": "मुंबई जिल्हा",
     "mumbai city": "मुंबई जिल्हा",
     "mumbai suburban": "मुंबई उपनगर जिल्हा",
     "mumbai suburb": "मुंबई उपनगर जिल्हा",
+    "pune": "पुणे",
 }
 
 _REGISTRATION_TYPE_RADIO = {
@@ -358,57 +370,151 @@ def search_by_document_number(
 
 
 # --- Property Details search -- form mechanics confirmed, result shape NOT
+#
+# THREE REGIONS, discovered live 2026-09-01 -- NOT one form with a district
+# dropdown, as the landing page's default (Mumbai) tab alone suggested. The
+# three buttons across the top of Property Details (Mumbai / Rest of
+# Maharashtra / Urban Areas in Rest of Maharashtra) each swap in a
+# DIFFERENT set of field ids and a different cascade shape entirely:
+#
+#   mumbai -- #ddlDistrict (2 options: the two Mumbai districts only) ->
+#     #txtAreaName, a free-text field whose own postback populates the
+#     companion #ddlareaname select (see _fill_cascading_select's mumbai
+#     branch). #txtAttributeValue / #txtImg / #btnSearch.
+#
+#   rest_of_maharashtra -- #ddlDistrict1 (35 options, genuinely statewide)
+#     -> #ddltahsil (Taluka, a REQUIRED third level Mumbai's flow doesn't
+#     have at all) -> #ddlvillage, a plain cascading <select>, no free text
+#     involved. #txtAttributeValue1 / #txtImg1 / #btnSearch_RestMaha.
+#     CONFIRMED LIVE against Pune: 14 real talukas, one of which (Pune
+#     City) cascades to only 6 villages -- all OUTLYING areas annexed into
+#     the city, not the old city core.
+#
+#   urban -- #ddlDistrictUrban (32 options -- municipal corporation/council
+#     areas) -> #ddlareanameUrban, a plain cascading <select> straight off
+#     the district, no taluka step at all. #txtAttributeValueUrban /
+#     #txtImgUrban / #btnSearchUrban. CONFIRMED LIVE this is where Pune's
+#     old-city core actually lives: selecting District="पुणे" here (the
+#     SAME Marathi label as rest_of_maharashtra's district, despite being a
+#     different <select> entirely) cascaded 47 real areas in ENGLISH,
+#     including "Gulatekadi" -- the Market Yard locality neither the
+#     rural-village Pune City taluka NOR any obvious substring match found.
+#
+# THE LESSON THIS COST: a locality that reads as part of "the city" to a
+# human can sit in EITHER the rural or the urban region depending on
+# whether it was annexed as a former village (rest_of_maharashtra) or was
+# always inside the municipal corporation's own ward system (urban) -- and
+# guessing wrong doesn't error, it just returns a real but WRONG village
+# list with no locality that matches, which looks identical to "this
+# locality genuinely isn't searchable here" unless both regions are tried.
 
-def _fill_village_area(page, village: str, timeout_ms: int = 25000) -> bool:
-    """Sets the Village/Area free-text field and fires the ASP.NET postback
-    its own onchange handler expects (`__doPostBack('txtAreaName','')`) --
-    confirmed live that a plain fill() alone leaves the companion
-    dropdown's options empty, since the site's autocomplete only resolves
-    on a genuine change-triggered postback, not on keystrokes. Returns
-    whether a matching area option appeared afterward.
+_REGION_FIELDS = {
+    "mumbai": {
+        "year": "#ddlFromYear", "district": "#ddlDistrict",
+        "property": "#txtAttributeValue", "captcha": "#txtImg",
+        "search": "#btnSearch", "search_control_name": "btnSearch",
+    },
+    "rest_of_maharashtra": {
+        "year": "#ddlFromYear1", "district": "#ddlDistrict1", "taluka": "#ddltahsil",
+        "village": "#ddlvillage", "property": "#txtAttributeValue1", "captcha": "#txtImg1",
+        "search": "#btnSearch_RestMaha", "search_control_name": "btnSearch_RestMaha",
+    },
+    "urban": {
+        "year": "#ddlFromYearUrban", "district": "#ddlDistrictUrban", "village": "#ddlareanameUrban",
+        "property": "#txtAttributeValueUrban", "captcha": "#txtImgUrban",
+        "search": "#btnSearchUrban", "search_control_name": "btnSearchUrban",
+    },
+}
 
-    POLLS THE DROPDOWN DIRECTLY rather than calling _settle() and trusting
-    it -- confirmed live this postback's own "networkidle" signal can fire
-    well before the dropdown actually repopulates (some background
-    connection on this page apparently never reads as fully idle), so a
-    caller trusting _settle() alone found zero options where 25s of plain
-    waiting found the real one. Polling the actual DOM condition is what
-    the CALLER cares about, not a proxy for it.
+_REGION_TAB_BUTTON = {
+    "mumbai": None,  # the landing page's own default tab -- no click needed
+    "rest_of_maharashtra": "#btnOtherdistrictSearch",
+    "urban": "#btnUrbansearch",
+}
+
+
+def _select_cascading(page, selector: str, label: str, timeout_ms: int = 25000) -> bool:
+    """Selects the <option> whose text exactly matches `label` (case-
+    insensitive), polling rather than reading the option list once.
+
+    Confirmed live this portal's own "networkidle" signal can report a
+    cascading dropdown idle well before it actually repopulates from the
+    postback that just fired (some background connection on this page
+    apparently never reads as fully idle) -- a caller trusting a fixed
+    settle() wait alone found a stale/empty option list where a poll found
+    the real one a few seconds later. Shared by every cascading select in
+    this module (Rest of Maharashtra's taluka/village, Urban's district/
+    area) -- each hits the identical race, confirmed independently for
+    more than one of them.
     """
-    page.fill("#txtAreaName", village)
-    page.evaluate("__doPostBack('txtAreaName','')")
+    needle = label.strip().casefold()
     deadline = time.time() + (timeout_ms / 1000)
     while time.time() < deadline:
-        for opt in page.query_selector_all("#ddlareaname option"):
-            if (opt.inner_text() or "").strip().casefold() == village.strip().casefold():
-                page.select_option("#ddlareaname", value=opt.get_attribute("value"))
+        for opt in page.query_selector_all(f"{selector} option"):
+            if (opt.inner_text() or "").strip().casefold() == needle:
+                page.select_option(selector, value=opt.get_attribute("value"))
                 return True
         page.wait_for_timeout(1000)
     return False
 
 
+def _fill_mumbai_area(page, village: str, timeout_ms: int = 25000) -> bool:
+    """Mumbai's OWN shape: #txtAreaName is free text whose own onchange
+    handler fires `__doPostBack('txtAreaName','')` -- confirmed live that a
+    plain fill() alone leaves #ddlareaname's options empty, since the
+    site's autocomplete only resolves on a genuine change-triggered
+    postback, not on keystrokes. Neither rest_of_maharashtra nor urban has
+    an equivalent free-text step; their area/village selects cascade
+    straight off a district or taluka select instead."""
+    page.fill("#txtAreaName", village)
+    page.evaluate("__doPostBack('txtAreaName','')")
+    return _select_cascading(page, "#ddlareaname", village, timeout_ms)
+
+
 def search_by_property(
+    region: str,
     district: str,
     village: str,
     property_number: str,
+    taluka: str | None = None,
     timeout_seconds: int = config.CAPTCHA_TIMEOUT_SECONDS,
     screenshot_path: str | None = None,
 ) -> dict:
     """Opens a VISIBLE browser at IGR Maharashtra's Property Details search
-    (Year defaults to the portal's own current-year default -- not set here,
-    since a promoter's registration could be any past year and there is no
-    single sensible default), pre-fills District/Village/Property No., then
-    waits for a human to read the CAPTCHA and click Search.
+    under the given `region` ("mumbai" | "rest_of_maharashtra" | "urban" --
+    see the module-level comment above for what each actually covers and
+    why a locality can sit in either the rural or urban one), pre-fills
+    District/[Taluka/]Village/Property No., then waits for a human to read
+    the CAPTCHA and click Search. Year defaults to the portal's own
+    current-year default -- not set here, since a promoter's registration
+    could be any past year and there is no single sensible default.
+
+    `taluka` is REQUIRED for region="rest_of_maharashtra" (that region's
+    village select cascades off Taluka, not District directly) and ignored
+    for the other two, which have no taluka step at all.
 
     UNLIKE search_by_document_number, the result table's own shape is NOT
-    confirmed live -- no property number tried during the audit that found
-    this portal belonged to a real registered parcel, so no real row was
-    ever seen to pin a parser against. This returns whatever the page's
-    body text/HTML actually shows rather than guessing a schema; a caller
-    needs to read raw_text (or the screenshot) to see what came back, and
-    a proper _parse_property_results should be written the next time this
-    runs against a real result -- not before.
+    confirmed live for ANY region -- no property number tried during the
+    audit that found this portal belonged to a real registered parcel, so
+    no real row was ever seen to pin a parser against. This returns
+    whatever the page's body text/HTML actually shows rather than guessing
+    a schema; a caller needs to read raw_text (or the screenshot) to see
+    what came back, and a proper _parse_property_results should be written
+    the next time this runs against a real result -- not before.
     """
+    if region not in _REGION_FIELDS:
+        return {
+            "found": False, "rows": [], "raw_text": "", "url": _BASE_URL,
+            "note": f"Unknown region {region!r} -- expected one of {sorted(_REGION_FIELDS)}.",
+        }
+    if region == "rest_of_maharashtra" and not taluka:
+        return {
+            "found": False, "rows": [], "raw_text": "", "url": _BASE_URL,
+            "note": "region='rest_of_maharashtra' requires `taluka` -- its village select "
+                    "cascades off Taluka, not District directly.",
+        }
+
+    fields = _REGION_FIELDS[region]
     district_label = _resolve_district(district)
 
     p, browser, page = _launch(headless=False)
@@ -418,37 +524,61 @@ def search_by_property(
             page.click("text=Close", timeout=5000)
         except Exception:
             pass
-        # The landing page defaults to Property Details already; no tab
-        # switch needed, unlike the Document Number search above.
 
-        page.select_option("#ddlDistrict", label=district_label)
+        tab_button = _REGION_TAB_BUTTON[region]
+        if tab_button:
+            page.click(tab_button)
+            # Confirmed live this switch alone can take well past a plain
+            # _settle() call before the new region's own fields even exist
+            # in the DOM -- wait for the district select itself, not a
+            # generic idle signal.
+            page.wait_for_selector(fields["district"], timeout=30000)
+
+        page.select_option(fields["district"], label=district_label)
         _settle(page)
-        # _settle's own networkidle wait is unreliable on this page (see
-        # _fill_village_area) -- a flat floor here too, since a district
-        # postback that hasn't actually landed server-side yet would make
-        # the village postback right after it resolve against the WRONG
-        # district's data rather than simply returning late.
-        page.wait_for_timeout(3000)
+        page.wait_for_timeout(3000)  # see _select_cascading's own docstring on why
 
-        if not _fill_village_area(page, village):
+        if region == "rest_of_maharashtra":
+            if not _select_cascading(page, fields["taluka"], taluka):
+                return {
+                    "found": False, "rows": [], "raw_text": "", "url": page.url,
+                    "note": f"No taluka option for district {district_label!r} matched "
+                            f"{taluka!r} exactly.",
+                }
+            village_matched = _select_cascading(page, fields["village"], village)
+        elif region == "urban":
+            village_matched = _select_cascading(page, fields["village"], village)
+        else:  # mumbai
+            village_matched = _fill_mumbai_area(page, village)
+
+        if not village_matched:
             return {
                 "found": False, "rows": [], "raw_text": "", "url": page.url,
                 "note": f"No village/area option matching {village!r} appeared for district "
-                        f"{district_label!r} -- the portal's own FAQ notes some names need an "
-                        f"unusual spelling (e.g. 'Daadar' not 'Dadar').",
+                        f"{district_label!r}"
+                        + (f", taluka {taluka!r}" if region == "rest_of_maharashtra" else "")
+                        + f" under region={region!r}. A locality can sit in a DIFFERENT region "
+                          f"than expected -- e.g. Pune's Market Yard (Gulatekadi) is under "
+                          f"region='urban', not the rural taluka/village list under "
+                          f"region='rest_of_maharashtra' -- try the other region before "
+                          f"assuming the locality isn't searchable at all. The portal's own FAQ "
+                          f"also notes some names need an unusual spelling (e.g. 'Daadar' not "
+                          f"'Dadar').",
             }
 
-        page.fill("#txtAttributeValue", str(property_number))
+        page.fill(fields["property"], str(property_number))
 
         print(f"\n[INFO] A browser window has opened at {_BASE_URL}")
-        print(f"[INFO] District={district_label}, Village/Area={village!r}, "
-              f"Property No.={property_number} are pre-filled.")
+        print(f"[INFO] Region={region}, District={district_label}, "
+              + (f"Taluka={taluka!r}, " if region == "rest_of_maharashtra" else "")
+              + f"Village/Area={village!r}, Property No.={property_number} are pre-filled.")
         print("[INFO] Please read the CAPTCHA shown there, type it into the box, and click Search.")
+        control_name = fields["search_control_name"]
         try:
             _wait_for_human_submit(
                 page, timeout_seconds,
-                request_predicate=lambda req: req.method == "POST" and "btnSearch" in (req.post_data or ""),
-                post_submit_marker="#txtAttributeValue",
+                request_predicate=lambda req: req.method == "POST" and control_name in (req.post_data or ""),
+                post_submit_marker=fields["property"],
             )
         except (CaptchaTimeoutError, BrowserClosedError) as e:
             return {"found": False, "rows": [], "raw_text": "", "url": page.url, "note": str(e)}
@@ -483,8 +613,11 @@ if __name__ == "__main__":
         result = search_by_document_number(
             sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], registration_type=registration_type,
         )
-    elif cmd == "property" and len(sys.argv) >= 5:
-        result = search_by_property(sys.argv[2], sys.argv[3], sys.argv[4])
+    elif cmd == "property" and len(sys.argv) >= 6:
+        taluka = sys.argv[6] if len(sys.argv) >= 7 else None
+        result = search_by_property(
+            sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], taluka=taluka,
+        )
     else:
         print(__doc__)
         raise SystemExit(2)

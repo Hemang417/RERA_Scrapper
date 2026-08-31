@@ -648,10 +648,17 @@ UNMAPPED = [
      "number() is confirmed against a real pulled result: seller/purchaser names, full property "
      "description and the ACTUAL CONSIDERATION AMOUNT in one row, no further click needed -- a direct "
      "corroboration (or contradiction) of a promoter's declared land dealings that nothing else in "
-     "this pipeline checks independently. search_by_property() is also built (form mechanics "
-     "confirmed live), but its OWN result table shape is not yet confirmed against a real row, unlike "
-     "document-number search. Also carries an integrated CERSAI cross-search on the same page, not "
-     "yet driven by either function. A standalone script, run by a human, same as every other "
+     "this pipeline checks independently. search_by_property() is also built and, confirmed live "
+     "chasing a real Pune search, turned out to need THREE separate regions (mumbai/rest_of_"
+     "maharashtra/urban), each its own field ids and cascade shape -- the landing page's default tab "
+     "covers only the two Mumbai districts, not the whole state as it first appeared. A locality can "
+     "sit in either the rural or urban region depending on how it was annexed: Pune's Market Yard "
+     "(Gulatekadi) is under 'urban', not the rural taluka/village list a human would try first, and "
+     "guessing wrong doesn't error -- it just returns a real but unrelated village list. All three "
+     "regions' form mechanics are confirmed live end-to-end up to the CAPTCHA gate; the RESULT TABLE'S "
+     "OWN SHAPE for search_by_property is still not confirmed against a real row for any of them, "
+     "unlike document-number search. Also carries an integrated CERSAI cross-search on the same page, "
+     "not yet driven by either function. A standalone script, run by a human, same as every other "
      "CAPTCHA-gated tool here -- not called from the automated Charter pipeline.",
      "High"),
     ("JHARERA audited balance sheet + 3 years ITR", "adapter_jharkhand.py document library (labelled, downloaded)",

@@ -96,10 +96,64 @@ def test_unknown_registration_type_is_rejected_before_a_browser_ever_opens():
     print("test_unknown_registration_type_is_rejected_before_a_browser_ever_opens: PASS")
 
 
+# --- Property Details' three regions ----------------------------------------
+#
+# Discovered live 2026-09-01, chasing a real search for CTS 3223, Gultekdi/
+# Market Yard, Pune: the landing page's default (Mumbai) tab is NOT one form
+# with a district dropdown covering the whole state -- it's one of THREE
+# separate regions, each its own field ids, and a locality can sit in either
+# the rural (rest_of_maharashtra) or urban region depending on how it was
+# annexed. Gulatekadi (Market Yard) turned out to be under "urban", not the
+# rural taluka/village list a human would try first.
+
+def test_an_unknown_region_is_rejected_before_a_browser_ever_opens():
+    result = igr.search_by_property("suburbann", "Mumbai Suburban", "Andheri", "1")
+    assert result["found"] is False, result
+    assert "suburbann" in result["note"], result
+    print("test_an_unknown_region_is_rejected_before_a_browser_ever_opens: PASS")
+
+
+def test_rest_of_maharashtra_requires_a_taluka():
+    """Its village select cascades off Taluka, not District directly -- a
+    call missing it would otherwise reach a browser and then fail on a
+    selector that was never going to be filled, burning a human's time on
+    a CAPTCHA for a search that could not have worked."""
+    result = igr.search_by_property("rest_of_maharashtra", "Pune", "Aundh", "1")
+    assert result["found"] is False, result
+    assert "taluka" in result["note"].lower(), result
+    print("test_rest_of_maharashtra_requires_a_taluka: PASS")
+
+
+def test_the_taluka_requirement_is_specific_to_rest_of_maharashtra():
+    """mumbai and urban have no taluka step at all -- their village/area
+    selects cascade straight off District. Checked against the field-map
+    itself rather than calling search_by_property for the "should succeed"
+    cases, since those launch a real browser and would hang/timeout here
+    without a human to solve the CAPTCHA."""
+    assert "taluka" not in igr._REGION_FIELDS["mumbai"]
+    assert "taluka" not in igr._REGION_FIELDS["urban"]
+    assert "taluka" in igr._REGION_FIELDS["rest_of_maharashtra"]
+    print("test_the_taluka_requirement_is_specific_to_rest_of_maharashtra: PASS")
+
+
+def test_every_region_has_a_distinct_search_control_name():
+    """_wait_for_human_submit keys on this string appearing in the Search
+    button's own POST data -- if two regions ever shared one, a human
+    solving the CAPTCHA on one region's page could be mistaken for having
+    submitted a different region's search."""
+    names = [f["search_control_name"] for f in igr._REGION_FIELDS.values()]
+    assert len(names) == len(set(names)), names
+    print("test_every_region_has_a_distinct_search_control_name: PASS")
+
+
 if __name__ == "__main__":
     test_the_real_captured_row_parses_with_party_names_and_consideration()
     test_a_table_without_the_expected_headers_is_ignored()
     test_a_header_only_table_with_no_data_rows_is_a_clean_empty_result()
     test_district_hints_cover_the_two_mumbai_districts()
     test_unknown_registration_type_is_rejected_before_a_browser_ever_opens()
+    test_an_unknown_region_is_rejected_before_a_browser_ever_opens()
+    test_rest_of_maharashtra_requires_a_taluka()
+    test_the_taluka_requirement_is_specific_to_rest_of_maharashtra()
+    test_every_region_has_a_distinct_search_control_name()
     print("\nAll tests passed.")
