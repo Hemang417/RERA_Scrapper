@@ -486,8 +486,14 @@ CTS_FINDINGS = [
      "Yes", "Free + CAPTCHA", "observed",
      "Compulsory in MAHARASHTRA AND GUJARAT ONLY. This is why CERSAI is not needed for those two states."),
     ("Lender, amount, satisfaction status", "MCA charge filings via ZaubaCorp",
-     "Yes", "Free -- page already fetched", "observed",
-     "NOT currently parsed. The only independent check on the promoter's declared mortgage. National, so it belongs in the CIN workflow."),
+     "Yes", "Free -- page already fetched", "confirmed-live",
+     "STALE ROW, RECONCILED 2026-09-01: this said 'observed'/'NOT currently parsed' months after it "
+     "actually was -- company_profile_check.charges was wired up and confirmed live on 2026-08-19 "
+     "(commit d0536e6), and Sheet C's own 'MCA CHARGE FILINGS' row has said confirmed-live since then. "
+     "This row just never got updated to match. See that row for the live evidence (4 open charges, "
+     "~Rs 90.3 crore, HDFC Bank and Catalyst Trusteeship) -- kept here too, duplicated rather than "
+     "deleted, because this is the only independent check on a promoter's declared mortgage and a "
+     "reader scanning the land-records sheet for that fact should not be told it is still unbuilt."),
     ("Karnataka land records (Bhoomi)", "landrecords.karnataka.gov.in, RTC and Mutation Copy view",
      "Yes", "Free + CAPTCHA", "confirmed-live",
      "Audited live 2026-09-01. District -> Taluk -> Hobli -> Village drill-down, then survey number, "
