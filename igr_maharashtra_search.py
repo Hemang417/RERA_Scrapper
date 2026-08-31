@@ -37,11 +37,17 @@ returned row:
   either the rural or the urban region depending on how it was annexed --
   Pune's Market Yard (Gulatekadi) is in "urban", not the rural taluka/
   village list a human would guess first. Form mechanics confirmed live
-  for all three (the CAPTCHA gate accepts a correctly-typed answer --
-  "Entered Correct Captcha" was seen), but no property number tried this
-  pass belonged to a real registered parcel, so THE RESULT TABLE'S OWN
-  SHAPE IS NOT CONFIRMED for any region. search_by_property returns
-  whatever rendered rather than guessing a schema no live row has shown.
+  for all three regions. TWO real runs (a deliberately-implausible test
+  property number, and a real human CAPTCHA solve against region=urban/
+  Pune/Gulatekadi/CTS 3223) both came back the SAME way: 'Entered Correct
+  Captcha' appears, the form resets to blank, no results table renders and
+  no distinct 'no results' message appears either -- search_by_property
+  now reports that pattern as found=False, but says explicitly that
+  reading is not yet confirmed against a genuine POSITIVE match in this
+  mode (unlike search_by_document_number, which has one). THE RESULT
+  TABLE'S OWN SHAPE for an actual match therefore remains unconfirmed for
+  every region; a caller still gets raw_text/screenshot to inspect rather
+  than a guessed schema.
 
 A GENUINE LIMITATION, from the site's own FAQ, not a gap in this script:
 Power of Attorney and Will deeds are never returned by either search mode.
@@ -237,6 +243,21 @@ def _wait_for_search_to_finish(page, timeout_seconds=120):
             return True
         page.wait_for_timeout(2000)
     return False
+
+
+def _property_search_shows_no_result(body_text: str) -> bool:
+    """Whether this Property Details result page matches the "search ran,
+    matched nothing" pattern -- confirmed live TWICE (2026-09-01): once
+    against a deliberately-implausible test property number, once against
+    a real human CAPTCHA solve for CTS 3223 in Gulatekadi, Pune. Both came
+    back identically -- 'Entered Correct Captcha' present, no results
+    table, form reset to blank placeholders, no distinct 'no results'
+    message anywhere. Pure: text in, bool out, so it is testable without a
+    live portal. See search_by_property's own docstring for the honesty
+    caveat this reading still carries -- no genuine POSITIVE match has
+    been seen in this search mode yet to rule out this same reset also
+    happening on a real hit."""
+    return "entered correct captcha" in body_text.casefold()
 
 
 def _safe_read(read_fn, attempts=6, delay=1.0, min_length=0):
@@ -541,13 +562,20 @@ def search_by_property(
     for the other two, which have no taluka step at all.
 
     UNLIKE search_by_document_number, the result table's own shape is NOT
-    confirmed live for ANY region -- no property number tried during the
-    audit that found this portal belonged to a real registered parcel, so
-    no real row was ever seen to pin a parser against. This returns
-    whatever the page's body text/HTML actually shows rather than guessing
-    a schema; a caller needs to read raw_text (or the screenshot) to see
-    what came back, and a proper _parse_property_results should be written
-    the next time this runs against a real result -- not before.
+    confirmed live for ANY region -- no property number tried so far
+    (across two real runs, one a deliberate test, one a real human search
+    against region=urban/Pune/Gulatekadi/CTS 3223) has belonged to a
+    registered parcel that actually returned a visible result, so no real
+    row has been seen to pin a parser against. Both instead came back with
+    the CAPTCHA accepted ('Entered Correct Captcha') and the form reset to
+    blank, no results table, no distinct 'no results' message -- reported
+    as found=False, with the note explicit that this reading is inferred
+    from a repeated pattern, not confirmed against a genuine positive
+    match. This returns whatever the page's body text/HTML actually shows
+    rather than guessing a schema; a caller needs to read raw_text (or the
+    screenshot) to see what came back, and a proper _parse_property_results
+    should be written the next time this runs against a real MATCH -- not
+    before.
     """
     if region not in _REGION_FIELDS:
         return {
@@ -634,20 +662,46 @@ def search_by_property(
         body_text = _safe_read(lambda: page.inner_text("body"), min_length=200)
         if screenshot_path:
             _safe_read(lambda: page.screenshot(path=screenshot_path, full_page=True))
-        note = (
-            "Result table shape not confirmed live for this search mode -- see raw_text/screenshot "
-            "for what actually came back, and use search_by_document_number instead where the "
-            "document number is already known."
-        )
+
         if not finished:
-            note = (
+            found, note = None, (
                 "The portal's own 'Please Wait.....' marker was STILL PRESENT when this was read -- "
                 "confirmed live 2026-09-01 that reading too early here captures the page back at "
                 "the blank search form, not a real result. This raw_text is likely incomplete; "
                 "re-run with a longer wait or check the screenshot before drawing any conclusion "
-                "from it. " + note
+                "from it."
             )
-        return {"found": None, "rows": [], "raw_text": body_text, "url": page.url, "note": note}
+        elif _property_search_shows_no_result(body_text):
+            # SEEN TWICE LIVE (2026-09-01), both real runs: 'Entered Correct
+            # Captcha' appears, the search form resets to its blank
+            # placeholders, and there is no results table and no distinct
+            # 'no results' message at all -- once against a deliberately
+            # implausible test property number, and once against a real
+            # CTS search (3223, Gulatekadi, Pune) run by a human. Reported
+            # as found=False, but NOT with the same confidence as
+            # search_by_document_number's own result: no genuine POSITIVE
+            # match has been seen in this mode yet to confirm this reset
+            # pattern is specifically "no results" rather than some other
+            # rendering quirk this search mode has that a real match would
+            # also share.
+            found, note = False, (
+                "The CAPTCHA was accepted ('Entered Correct Captcha' appeared) and the search ran, "
+                "but no results table rendered and the form reset to blank -- the same behaviour "
+                "seen on two independent live runs, both plausibly non-existent properties. This "
+                "READS as 'no registered document found' for this district/village/property "
+                "number, but that reading is not yet independently confirmed against a genuine "
+                "positive match in this search mode (unlike search_by_document_number, which has "
+                "one) -- treat it as a strong signal, not a certainty. It also only reports what "
+                "THIS AUTHORITY's index contains, never whether the property/CTS number itself "
+                "genuinely exists."
+            )
+        else:
+            found, note = None, (
+                "Result table shape not confirmed live for this search mode -- see raw_text/"
+                "screenshot for what actually came back, and use search_by_document_number instead "
+                "where the document number is already known."
+            )
+        return {"found": found, "rows": [], "raw_text": body_text, "url": page.url, "note": note}
     finally:
         try:
             browser.close()

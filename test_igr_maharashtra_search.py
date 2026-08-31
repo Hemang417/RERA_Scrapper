@@ -189,6 +189,33 @@ def test_wait_for_search_to_finish_times_out_honestly_rather_than_lying():
     print("test_wait_for_search_to_finish_times_out_honestly_rather_than_lying: PASS")
 
 
+# --- the "no visible result" pattern -----------------------------------
+#
+# Confirmed live TWICE (2026-09-01): a deliberately-implausible test
+# property number, and a real human CAPTCHA solve for CTS 3223 in
+# Gulatekadi, Pune -- both came back identically, "Entered Correct
+# Captcha" with no results table and the form reset to blank.
+
+def test_entered_correct_captcha_with_no_table_reads_as_no_result():
+    real_no_result_snippet = (
+        "मिळकत क्रमांक/Property No. (Enter SurveyNo./CTSNo./MilkatNo./GatNo./PlotNo.) "
+        "Entered Correct Captcha "
+        "* Information provided on this site is updated"
+    )
+    assert igr._property_search_shows_no_result(real_no_result_snippet) is True
+    print("test_entered_correct_captcha_with_no_table_reads_as_no_result: PASS")
+
+
+def test_a_page_that_never_confirmed_the_captcha_is_not_read_as_a_result():
+    """Absence of the confirmation string must not be mistaken for
+    presence of one -- an incorrect-CAPTCHA page or a genuinely different
+    error state should fall through to the honest "shape not confirmed"
+    branch instead of being misread as a clean zero-result search."""
+    assert igr._property_search_shows_no_result("Please try again.") is False
+    assert igr._property_search_shows_no_result("") is False
+    print("test_a_page_that_never_confirmed_the_captcha_is_not_read_as_a_result: PASS")
+
+
 if __name__ == "__main__":
     test_the_real_captured_row_parses_with_party_names_and_consideration()
     test_a_table_without_the_expected_headers_is_ignored()
@@ -201,4 +228,6 @@ if __name__ == "__main__":
     test_every_region_has_a_distinct_search_control_name()
     test_wait_for_search_to_finish_clears_once_please_wait_is_gone()
     test_wait_for_search_to_finish_times_out_honestly_rather_than_lying()
+    test_entered_correct_captcha_with_no_table_reads_as_no_result()
+    test_a_page_that_never_confirmed_the_captcha_is_not_read_as_a_result()
     print("\nAll tests passed.")
