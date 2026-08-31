@@ -640,14 +640,19 @@ UNMAPPED = [
     ("Maha Bhulekh card fields", "Free portal, extraction broken", "Maharashtra projects",
      "Owner, area, tenure, encumbrance and mutation are all ON the card and none reach the document.",
      "High"),
-    ("IGR Maharashtra registered-deed search", "freesearchigrservice.maharashtra.gov.in, confirmed "
-     "live 2026-09-01 (not built)", "Maharashtra projects",
+    ("IGR Maharashtra registered-deed search", "igr_maharashtra_search.py -- BUILT 2026-09-01, "
+     "human-in-the-loop like up_captcha_search.py/cts_resolve.py, not wired into run_company_charter()",
+     "Maharashtra projects",
      "An independent, free, party-named check on registrations against a property/CTS number or a "
-     "specific document number -- CAPTCHA-gated but otherwise unauthenticated. A real result already "
-     "pulled carries seller/purchaser names, full property description and the ACTUAL CONSIDERATION "
-     "AMOUNT in one row, no further click needed -- a direct corroboration (or contradiction) of a "
-     "promoter's declared land dealings that nothing else in this pipeline checks independently. Also "
-     "carries an integrated CERSAI cross-search on the same page. Nothing calls this portal yet.",
+     "specific document number -- CAPTCHA-gated but otherwise unauthenticated. search_by_document_"
+     "number() is confirmed against a real pulled result: seller/purchaser names, full property "
+     "description and the ACTUAL CONSIDERATION AMOUNT in one row, no further click needed -- a direct "
+     "corroboration (or contradiction) of a promoter's declared land dealings that nothing else in "
+     "this pipeline checks independently. search_by_property() is also built (form mechanics "
+     "confirmed live), but its OWN result table shape is not yet confirmed against a real row, unlike "
+     "document-number search. Also carries an integrated CERSAI cross-search on the same page, not "
+     "yet driven by either function. A standalone script, run by a human, same as every other "
+     "CAPTCHA-gated tool here -- not called from the automated Charter pipeline.",
      "High"),
     ("JHARERA audited balance sheet + 3 years ITR", "adapter_jharkhand.py document library (labelled, downloaded)",
      "Jharkhand projects",
