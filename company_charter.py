@@ -184,6 +184,17 @@ _HIGH_PRIORITY_DOC_KEYWORDS = (
     "sanction", "approval", "layout", "plan", "allotment", "agreement",
     "balance sheet", "profit", "loss", "audited", "income tax", "income-tax",
 )
+# WBRERA labels its filed income-tax returns just "ITR" in some spelling --
+# "ITR AY 2022-23.pdf", "ITR_3 Years.pdf", "5 ITR for AY 23-24.pdf",
+# "itr with blance sheet ay 23-4 & 24-25.pdf" -- confirmed live 2026-08-31
+# across a dozen real projects, alongside "Audited Balance Sheet <year>.PDF"
+# which the plain-substring list above already catches via "balance sheet"/
+# "audited". "itr" needs an ALPHA-BOUNDARY match, not a plain substring,
+# or it also fires on "arbitration", "contribution", "distribution" --
+# but a WORD-boundary (\b) is too strict: real filenames join it to a
+# digit with an underscore ("ITR_3", "ITR_23-24"), and \b treats "_" as a
+# word character, so \bitr\b misses both of those live filenames.
+_HIGH_PRIORITY_DOC_WORD_RE = re.compile(r"(?<![a-z])itr(?![a-z])")
 _MAX_CHARS_PER_DOC = 6000
 _MAX_TOTAL_DOC_CHARS = 30000
 
@@ -467,8 +478,13 @@ def _select_documents_for_extraction(documents_manifest: list, documents_dir: st
             all_labels.append({"document_name": label, "status": "Not opened this pass -- another document already opened under this same shared label"})
             continue
 
-        is_priority = any(k in label.lower() for k in _HIGH_PRIORITY_DOC_KEYWORDS) or any(
-            k in (entry["saved_filename"] or "").lower() for k in _HIGH_PRIORITY_DOC_KEYWORDS
+        label_lower = label.lower()
+        saved_lower = (entry["saved_filename"] or "").lower()
+        is_priority = (
+            any(k in label_lower for k in _HIGH_PRIORITY_DOC_KEYWORDS)
+            or any(k in saved_lower for k in _HIGH_PRIORITY_DOC_KEYWORDS)
+            or _HIGH_PRIORITY_DOC_WORD_RE.search(label_lower)
+            or _HIGH_PRIORITY_DOC_WORD_RE.search(saved_lower)
         )
         if is_priority and total_chars < _MAX_TOTAL_DOC_CHARS:
             path = os.path.join(documents_dir, entry["saved_filename"])

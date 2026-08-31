@@ -121,6 +121,39 @@ def test_financial_document_labels_are_marked_high_priority_for_extraction():
     print("test_financial_document_labels_are_marked_high_priority_for_extraction: PASS")
 
 
+def test_wbrera_itr_filenames_are_high_priority_without_false_positives():
+    """WBRERA labels its filed returns "ITR" in a dozen different real
+    spellings -- confirmed live 2026-08-31 across real projects -- none of
+    which contain "income tax", so the existing keyword list silently
+    skipped every one of them. "itr" must match as its own token: a plain
+    substring check would also fire on "arbitration", "distribution" and
+    "contribution", none of which are financial disclosure -- but a strict
+    \\b WORD boundary is too strict, since real filenames join "itr" to a
+    digit with an underscore ("ITR_3 Years.pdf", "ITR_23-24.pdf") and "_"
+    counts as a word character, so \\bitr\\b would miss both live filenames."""
+    import company_charter as cc
+
+    def is_priority(label):
+        lower = label.lower()
+        return (
+            any(k in lower for k in cc._HIGH_PRIORITY_DOC_KEYWORDS)
+            or bool(cc._HIGH_PRIORITY_DOC_WORD_RE.search(lower))
+        )
+
+    for real_filename in (
+        "ITR AY 2022-23.pdf", "ITR_3 Years.pdf", "ITR_23-24.pdf",
+        "5 ITR for AY 23-24.pdf", "itr with blance sheet ay 23-4 & 24-25.pdf",
+        "audited bs and itr declaration majumder_removed (1).pdf",
+    ):
+        assert is_priority(real_filename), f"{real_filename!r} should be high priority"
+    assert is_priority("Audited Balance Sheet 2024.PDF")  # already caught via "balance sheet"/"audited"
+    assert not is_priority("Deed of Conveyance.pdf")
+    assert not is_priority("Notice under Section 8 -- Arbitration Reference.pdf")
+    assert not is_priority("Contribution Certificate.pdf")
+    assert not is_priority("Distribution Certificate.pdf")
+    print("test_wbrera_itr_filenames_are_high_priority_without_false_positives: PASS")
+
+
 def test_professionals_are_normalised_to_maharera_shape():
     """company_charter.summarize_professionals expects ONE list of dicts
     carrying professionalTypeName. Gujarat splits them across four lists, so
@@ -391,6 +424,7 @@ if __name__ == "__main__":
     test_document_entries_pair_uid_with_a_readable_label()
     test_a_null_uid_is_skipped_not_downloaded()
     test_financial_document_labels_are_marked_high_priority_for_extraction()
+    test_wbrera_itr_filenames_are_high_priority_without_false_positives()
     test_professionals_are_normalised_to_maharera_shape()
     test_prettify_never_shows_a_raw_camelcase_key()
     test_capabilities_are_declared_honestly()

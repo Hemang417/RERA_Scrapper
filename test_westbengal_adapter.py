@@ -40,6 +40,7 @@ import states
 from states.adapter_westbengal import (
     document_entries,
     is_project_document,
+    land_details,
     parse_project_detail,
     parse_state_index,
     project_notes,
@@ -154,6 +155,81 @@ def test_a_real_litigation_row_survives_the_na_filter():
     assert len(parsed["litigation"]) == 1, parsed["litigation"]
     assert parsed["litigation_declared_none"] is False
     print("test_a_real_litigation_row_survives_the_na_filter: PASS")
+
+
+# --- land / bank accounts --------------------------------------------------
+#
+# Confirmed live 2026-08-31 against a random sample of six real projects
+# across six districts: Land Area and the address/district/pincode block
+# are always present; a dag/mouza/J.L. survey reference inside the address
+# is present on some projects and not others; a bank/escrow/collection
+# account field does not exist anywhere on the page. These fixtures mirror
+# the two real shapes rather than inventing a third.
+
+_LAND_HTML_WITH_REFERENCE = """
+<table><tr>
+<td>Project Address</td><td style="padding-right:20px;">:</td>
+<td style="padding-left:30px">Mahish Bathan, RS DAG NO - 489, 490, Mouza Thakdari - 852,918</td>
+</tr>
+<tr><td>District</td><td>:</td><td>North 24-Parganas</td></tr>
+<tr><td>Block/Municipality</td><td>:</td><td>Bidhannagar Municipal Corporation</td></tr>
+<tr><td>Police Station</td><td>:</td><td>Bidhannagar (North)</td></tr>
+<tr><td>Pincode</td><td>:</td><td>700059</td></tr>
+</table>
+<span style="font-size:16px;font-weight:900;">Project Type:</span><span>Residential</span>
+<span style="font-size:16px;font-weight:900;">Land Area:</span><span>35819 sq.mtr.</span>
+<span style="font-size:16px;font-weight:900;">Total Built Up Area:</span><span>64273 sq.mtr.</span>
+<span style="font-size:16px;font-weight:900;">Carpet Area:</span><span>55690 sq.mtr.</span>
+<span style="font-size:16px;font-weight:900;">No. of Apartments:</span><span>528</span>
+"""
+
+_LAND_HTML_WITHOUT_REFERENCE = """
+<table><tr>
+<td>Project Address</td><td>:</td><td>4627 GARIA STATION ROAD</td>
+</tr>
+<tr><td>District</td><td>:</td><td>South 24-Parganas</td></tr>
+<tr><td>Pincode</td><td>:</td><td>700084</td></tr>
+</table>
+<span style="font-size:16px;font-weight:900;">Land Area:</span><span>376 sq.mtr.</span>
+"""
+
+
+def test_land_area_and_location_are_read_when_a_survey_reference_is_present():
+    parsed = land_details(_LAND_HTML_WITH_REFERENCE)
+    assert parsed["land_area"] == "35819 sq.mtr.", parsed
+    assert parsed["district"] == "North 24-Parganas", parsed
+    assert parsed["pincode"] == "700059", parsed
+    assert parsed["number_of_apartments"] == "528", parsed
+    assert parsed["land_reference_present"] is True, parsed
+    print("test_land_area_and_location_are_read_when_a_survey_reference_is_present: PASS")
+
+
+def test_land_area_is_still_read_when_the_address_carries_no_survey_reference():
+    """Most West Bengal addresses are a plain postal address with no dag or
+    mouza number in them. That must not look like a parsing failure -- Land
+    Area and location are read regardless, and the flag says the reference
+    itself was not found, not that the field failed."""
+    parsed = land_details(_LAND_HTML_WITHOUT_REFERENCE)
+    assert parsed["land_area"] == "376 sq.mtr.", parsed
+    assert parsed["district"] == "South 24-Parganas", parsed
+    assert parsed["land_reference_present"] is False, parsed
+    print("test_land_area_is_still_read_when_the_address_carries_no_survey_reference: PASS")
+
+
+def test_project_notes_flags_a_land_area_with_no_identifiable_survey_reference():
+    parsed = parse_project_detail(_detail("") + _LAND_HTML_WITHOUT_REFERENCE)
+    notes = " ".join(project_notes(parsed))
+    assert "survey/plot number for this land could not be identified" in notes, notes
+    print("test_project_notes_flags_a_land_area_with_no_identifiable_survey_reference: PASS")
+
+
+def test_bank_account_absence_is_a_stated_authority_finding_not_a_todo():
+    from states.adapter_westbengal import _AUTHORITY_NOTES
+
+    joined = " ".join(_AUTHORITY_NOTES)
+    assert "escrow/collection bank account field" in joined, joined
+    assert "confirmed live across a random sample" in joined, joined
+    print("test_bank_account_absence_is_a_stated_authority_finding_not_a_todo: PASS")
 
 
 # --- the state index ------------------------------------------------------
@@ -335,6 +411,10 @@ if __name__ == "__main__":
     test_a_declared_nil_litigation_return_is_not_the_same_as_no_field()
     test_a_real_litigation_row_survives_the_na_filter()
     test_the_state_index_needs_a_procode_to_be_usable()
+    test_land_area_and_location_are_read_when_a_survey_reference_is_present()
+    test_land_area_is_still_read_when_the_address_carries_no_survey_reference()
+    test_project_notes_flags_a_land_area_with_no_identifiable_survey_reference()
+    test_bank_account_absence_is_a_stated_authority_finding_not_a_todo()
     test_west_bengal_does_not_claim_a_promoter_portfolio()
     test_the_hira_history_is_stated_because_absence_here_is_ambiguous()
     test_registration_format_resolves_to_west_bengal()

@@ -84,7 +84,7 @@ RERA_FINDINGS_LATER = {
     "Promoter / partner identity":
         ("Yes", "Yes", "Yes", "Partial"),
     "Professionals of record (architect/engineer/CA)":
-        ("Partial", "Partial", "Unaudited", "Not published"),
+        ("Partial", "Partial", "Not published", "Not published"),
     "Land details / survey numbers":
         ("Yes", "Partial", "Partial", "Not published"),
     "Bank accounts (escrow / collection)":
@@ -92,38 +92,78 @@ RERA_FINDINGS_LATER = {
     "Document library (downloadable files)":
         ("Yes", "Yes", "Yes", "Not published"),
     "Complaints register":
-        ("No", "Yes", "No", "Yes"),
+        ("Not published", "Yes", "Not published", "Yes"),
     "Appeals register":
-        ("Partial", "No", "Yes", "Yes"),
+        ("Partial", "Not published", "Yes", "Yes"),
     "Orders / judgments search":
-        ("No", "Yes", "No", "Yes"),
+        ("Not published", "Yes", "Not published", "Yes"),
     "Promoter's other projects (track record)":
         ("Partial", "Partial", "Yes", "Yes"),
     "Past-experience declarations":
-        ("Unaudited", "Unaudited", "Unaudited", "Not published"),
+        ("Not published", "Not published", "Not published", "Not published"),
     "AUDITED BALANCE SHEET":
-        ("No", "No", "Yes", "Not published"),
+        ("Not published", "Not published", "Yes", "Not published"),
     "Audited profit & loss statement":
-        ("No", "No", "No", "Not published"),
+        ("Not published", "Not published", "Not published", "Not published"),
     "Income-tax returns":
-        ("No", "No", "No", "Not published"),
+        ("Not published", "Not published", "Not published", "Not published"),
     "Defaulters list":
         ("Yes", "Yes", "Yes", "Partial"),
     "Projects under investigation":
-        ("Partial", "Partial", "No", "Yes"),
+        ("Partial", "Partial", "Not published", "Yes"),
     "Cost incurred vs estimated cost":
         ("Partial", "Partial", "Yes", "Not published"),
     "Delay reasons (promoter-declared)":
-        ("No", "No", "Partial", "Not published"),
+        ("Not published", "Not published", "Partial", "Not published"),
     "NOC expiry and renewal tracking":
-        ("No", "No", "No", "Not published"),
+        ("Not published", "Not published", "Not published", "Not published"),
     "Construction progress / QPR":
-        ("Partial", "Yes", "Unaudited", "Partial"),
+        ("Partial", "Yes", "Partial", "Partial"),
 }
 
 # Notes for the four new columns, appended to the row's existing note so the
 # reasoning travels with the cell rather than living only in a commit.
 RERA_NOTES_LATER = {
+    "Professionals of record (architect/engineer/CA)":
+        "HARERA is Not published, audited live 2026-08-31 across 7 real Gurugram-bench projects (detail ids "
+        "1444, 1011, 2953, 1641, 1353, 1856, 2967) plus a full listing of every numbered section "
+        "heading on the REP-I form: zero occurrences of 'architect' as a named professional on 6 of "
+        "7, and the one project where 'architect' does appear is only the phrase 'AS PER ARCHITECT "
+        "CERTIFICATE ATTACHED' inside a construction-status remark, naming no one. 'Chartered "
+        "Accountant' appears on every project, but only as the signer of a non-default certificate "
+        "and a balance-sheet compliance certificate -- a role, not a named professional-of-record "
+        "entry with a licence number the way MahaRERA's professionals table carries one. HARERA's "
+        "REP-I form simply asks for none of this: company/director details, land/FAR, approvals, "
+        "construction and sales status, financials and bank accounts, statutory approvals -- no "
+        "architect/engineer/CA identity section anywhere in the form's own structure.",
+    "Past-experience declarations":
+        "All three move from Unaudited to Not published, audited live 2026-08-31. UP-RERA: zero "
+        "hits for 'experience'/'past project'/'completed project'/'track record' across four real "
+        "detail pages (14636, 11528, 2499, plus two invalid ids returning the portal's own empty "
+        "shell) -- matches the authority's own detail-page contents already documented in "
+        "states/uttarpradesh.py (promoter identity, khasra grid, bank account, architect/engineer, "
+        "documents, QPR certificates), which never mentions past experience either. TNRERA: zero "
+        "hits across three real registrations spanning both the dynamic public-view2 project page "
+        "and public-view1 promoter page (TN/29/Building/0328/2024) and a legacy static register "
+        "entry (TN/16/Building/0001/2024) -- neither view's own section list (Financial Indicators, "
+        "Promoter Detail, Approval Details, Project Bank Details, etc.) includes anything resembling "
+        "past experience; this is a DIFFERENT data item from 'Promoter's other projects (track "
+        "record)' above, which is about finding a promoter's OTHER TNRERA filings by name match, not "
+        "a self-declared history filed with this application. HARERA: same REP-I heading sweep as "
+        "Professionals of record above -- no section asks for it.",
+    "Construction progress / QPR":
+        "HARERA is Partial, audited live 2026-08-31 across 8 real Gurugram-bench projects: the REP-I "
+        "form's own construction-status fields are real but inconsistent in shape by project type. "
+        "Plotted colonies carry a numeric 'Percentage completion Upto the date of application' for "
+        "infrastructure development (85% and 59.24% and 12.30% seen on three different projects) plus "
+        "a per-block-type qualitative status ('CIVIL STRUCTURE COMPLETED', 'WE HAVE RECEIVED OC ON "
+        "128 PLOTS'); group-housing/apartment projects instead carry only the qualitative narrative, "
+        "no percentage. Both also carry an itemised estimated-vs-actual-expenditure table per "
+        "infrastructure category (roads, water supply, drainage, electricity, etc.), which is a "
+        "genuine progress signal in its own right. Stays Partial rather than Yes for two reasons: the "
+        "field a reader gets depends on project type rather than being uniform, and there is no "
+        "visible mechanism confirming these figures refresh on a recurring cadence rather than being "
+        "frozen at the date of the last REP-I filing or amendment.",
     "Registration number retrievable from the portal":
         "UP-RERA is Partial: a legacy UPRERAPRJ number resolves with no search at all (the "
         "detail page id is the number's own numeric suffix), but the scheme used since ~2024 "
@@ -161,7 +201,7 @@ RERA_NOTES_LATER = {
         "own View control is inert and every detail route probed returns nothing, so a Delhi "
         "project's identity is its register row and nothing more.",
     "Appeals register":
-        "TNRERA is No, audited live 2026-08-26: a Tamil Nadu Real Estate Appellate Tribunal "
+        "TNRERA is Not published, audited live 2026-08-26: a Tamil Nadu Real Estate Appellate Tribunal "
         "(TNREAT) DOES exist, distinct from the authority -- it has its own domain, "
         "tnreat.tn.gov.in, linked from TNRERA's own homepage -- but its public page carries no "
         "case search, cause list or judgment register at all, only a sign-in and a virtual-"
@@ -196,11 +236,11 @@ RERA_NOTES_LATER = {
         "shape the parser doesn't recognise. search_appeals_by_party() is the promoter-facing "
         "search this unlocks, still unwired into acquire().",
     "AUDITED BALANCE SHEET":
-        "TNRERA is No, audited live 2026-08-26 against TNRERA/29/BLG/0001/2026, /0004/2026 and "
+        "TNRERA is Not published, audited live 2026-08-26 against TNRERA/29/BLG/0001/2026, /0004/2026 and "
         "/0005/2026: the promoter view carries a 'Financial Indicators (Rs. in Lakhs)' block "
         "with a bare self-declared Net Worth NUMBER (populated on one of three: Rs "
         "2,00,00,000) but no uploaded balance-sheet document anywhere in the documents list on "
-        "any of the three projects checked. UP-RERA is No: the document grid was read on three "
+        "any of the three projects checked. UP-RERA is Not published: the document grid was read on three "
         "real projects (51 rows, 20 distinct labels) and none resembles a balance sheet -- the "
         "closest is the Form REG-3 CA certificate, which certifies compliance rather than filing "
         "the statement itself. HARERA's Yes is real but softer than GujRERA's or JHARERA's actual "
@@ -209,17 +249,17 @@ RERA_NOTES_LATER = {
         "ACCOUNTS/ BALANCE SHEET' -- no document in the 60-row library checked is itself labelled "
         "'balance sheet'.",
     "Audited profit & loss statement":
-        "TNRERA is No, same 'Financial Indicators' block and same three projects: 'Net Profit / "
+        "TNRERA is Not published, same 'Financial Indicators' block and same three projects: 'Net Profit / "
         "Loss' is a bare self-declared number (Rs 72,16,670 on the one populated record), never "
-        "a filed P&L statement. UP-RERA is No, same three-project document-grid read as above. "
-        "HARERA is No: 'profit and loss'/'profit & loss' occurs zero times across four project "
+        "a filed P&L statement. UP-RERA is Not published, same three-project document-grid read as above. "
+        "HARERA is Not published: 'profit and loss'/'profit & loss' occurs zero times across four project "
         "detail pages checked (1444, 681, 3723, 431), against a single 'balance sheet' mention "
         "each -- the two are not filed together.",
     "Income-tax returns":
-        "TNRERA is No, same block: 'Taxes Paid - IT (GST/ST)' is a single number that conflates "
+        "TNRERA is Not published, same block: 'Taxes Paid - IT (GST/ST)' is a single number that conflates "
         "income tax with GST/service tax (Rs 27,92,915 on the populated record) and no ITR "
-        "document is filed anywhere in the three document sets checked. UP-RERA is No, same "
-        "document-grid read. HARERA is No: 'income tax'/'ITR' occurs zero times across the same "
+        "document is filed anywhere in the three document sets checked. UP-RERA is Not published, same "
+        "document-grid read. HARERA is Not published: 'income tax'/'ITR' occurs zero times across the same "
         "four pages.",
     "Defaulters list":
         "TNRERA is Yes, audited live 2026-08-26: https://rera.tn.gov.in/building/online/penalty "
@@ -261,7 +301,7 @@ RERA_NOTES_LATER = {
         "including a real browser driving the page's own default (empty-parameter) call -- "
         "confirmed live 2026-08-26 this is the AUTHORITY'S OWN backend failing, not a request-"
         "shaping problem on this end, so nothing was built against a data source that cannot "
-        "currently be read at all. HARERA is No: the only relevant menu item, 'Suo Motu "
+        "currently be read at all. HARERA is Not published: the only relevant menu item, 'Suo Motu "
         "(Projects) Cause List', is a hearing-schedule generator requiring a specific date and a "
         "CAPTCHA, not a browsable register; the only visible trace of suo-moto outcomes is "
         "inside HREAT's judgement text (case numbers containing 'MT' for Motu). Delhi-RERA is "
@@ -270,11 +310,11 @@ RERA_NOTES_LATER = {
         "investigation' register found on any of the four new states; got an unwired parser in "
         "states/adapter_delhi.py.",
     "Delay reasons (promoter-declared)":
-        "TNRERA is No, audited live against TN/29/Building/0328/2024 whose register row reads "
+        "TNRERA is Not published, audited live against TN/29/Building/0328/2024 whose register row reads "
         "'Extension given upto 31.07.2026 Completed': its detail view (public-view2) has no "
         "delay-reason, extension-reason or revised-completion-date field across any of its 20 "
         "sections -- the extension text lives only as free text in the register's own Current "
-        "Status column, never as a structured field, and never states WHY. UP-RERA is No: "
+        "Status column, never as a structured field, and never states WHY. UP-RERA is Not published: "
         "'delay'/'reason'/'extension'/'revised' were grepped across three project pages with "
         "zero hits for 'delay' or 'reason'; the only adjacent field is a bare revised valid-upto "
         "date with no promoter-declared justification. HARERA is Partial: the project detail "
@@ -283,13 +323,13 @@ RERA_NOTES_LATER = {
         "anywhere on the page, so there is no promoter-declared free-text reason, only the two "
         "dates.",
     "NOC expiry and renewal tracking":
-        "TNRERA is revised from Partial to No, audited live 2026-08-26: the detail view does "
+        "TNRERA is revised from Partial to Not published, audited live 2026-08-26: the detail view does "
         "carry a 'Clearance / NOC Details' section, but its only fields are 'Clearance Type' "
         "(e.g. 'PWD & RS') and 'Uploaded Document' -- confirmed on both a fresh 2026 "
         "registration and an already-extended 2024 one -- with no expiry date or renewal-status "
-        "field anywhere in either. UP-RERA is No: zero genuine 'NOC' occurrences across three "
+        "field anywhere in either. UP-RERA is Not published: zero genuine 'NOC' occurrences across three "
         "project pages and up-rera.in's full 153-link menu (the only raw-HTML hits were inside "
-        "the base64 __VIEWSTATE blob). HARERA is No: the 'Statutory Approvals Status' table "
+        "the base64 __VIEWSTATE blob). HARERA is Not published: the 'Statutory Approvals Status' table "
         "lists licence/clearance/NOC numbers each marked 'ALREADY BEEN OBTAINED' with a date -- "
         "but that date is when it was obtained, not an expiry or validity-end date, and no "
         "separate NOC-validity register exists.",
@@ -300,32 +340,41 @@ RERA_FINDINGS = [
     ("Project identity (name, status, type, dates)",
      "Yes", "Yes", "Yes", "Yes", "Yes", "Yes", "rera_core_fields", ""),
     ("Registration number retrievable from the portal",
-     "Yes", "No", "Yes", "Yes", "Yes", "Yes", "rera_core_fields.registration_number",
+     "Yes", "Not published", "Yes", "Yes", "Yes", "Yes", "rera_core_fields.registration_number",
      "TG-RERA's public record does not display its own registration number; search is by project name."),
     ("Promoter / partner identity",
      "Yes", "Yes", "Yes", "Yes", "Yes", "Yes", "corporate_identity",
      "K-RERA publishes partner PANs and land-owner SHARES -- neither appears on a MahaRERA record."),
     ("Professionals of record (architect/engineer/CA)",
-     "Yes", "No", "Yes", "Yes", "Yes", "Yes", "local_planning.professionals_of_record",
+     "Yes", "Not published", "Yes", "Yes", "Yes", "Yes", "local_planning.professionals_of_record",
      "GujRERA splits these across englist/calist/acrchlist/contr; the adapter normalises to one list. "
      "JHARERA is the only authority here that files a professional's PAN as a plain text field -- for "
      "the contractor, architect and structural engineer -- rather than a scanned card."),
     ("Land details / survey numbers",
-     "Yes", "Yes", "Yes", "Yes", "Yes", "Not built", "land_identification",
-     "K-RERA gives per-owner shares against survey numbers. WBRERA's project page carries no land/"
-     "survey table; not captured by this adapter, and whether the portal itself publishes one at all "
-     "is unaudited."),
+     "Yes", "Yes", "Yes", "Yes", "Yes", "Partial", "land_identification",
+     "K-RERA gives per-owner shares against survey numbers. WBRERA is now Partial, built and "
+     "confirmed live 2026-08-31: Land Area and a location block (address/district/block/police "
+     "station/pincode) are structured and present on every project sampled, via "
+     "adapter_westbengal.land_details(). A dag/mouza/J.L. survey reference is NOT structured -- it "
+     "is free text sometimes embedded in the project address, present on roughly a third of a "
+     "random six-district sample and absent from the rest, so land_reference_present says which "
+     "case a given project is rather than reading empty."),
     ("Bank accounts (escrow / collection)",
-     "Yes", "Yes", "Yes", "Yes", "Yes", "Not built", "rera_compliance.collection_account",
+     "Yes", "Yes", "Yes", "Yes", "Yes", "Not published", "rera_compliance.collection_account",
      "TG-RERA publishes the 100% collection account but leaves the 70/30 split accounts blank. "
-     "WBRERA's project page carries no bank-account table either -- same caveat as land details."),
+     "WBRERA is revised from Not built to Not published, confirmed live 2026-08-31 across a random "
+     "sample of six projects spanning six districts and registration years: 'account', 'escrow' and "
+     "'IFSC' occur zero times on any of them (the only 'bank' hits are the district-menu entry for "
+     "Bankura). This is the authority never publishing the field at all, not an adapter gap -- "
+     "adapter_westbengal.py now states this outright in _AUTHORITY_NOTES rather than leaving it to "
+     "look like unfinished work."),
     ("Document library (downloadable files)",
-     "Yes", "No", "Yes", "Yes", "Yes", "Yes", "document_library",
+     "Yes", "Not published", "Yes", "Yes", "Yes", "Yes", "document_library",
      "GujRERA 42/42 retrieved. K-RERA 112/152 -- the other 40 are LISTED but the portal serves 0 bytes. "
      "JHARERA labels every document link 'View'; document_label() derives the real name from the "
      "surrounding table or header. WBRERA's links already carry real text, so no derivation is needed."),
     ("Complaints register",
-     "Yes", "No", "Not published", "Yes", "Partial", "Not published",
+     "Yes", "Not published", "Not published", "Yes", "Partial", "Not published",
      "rera_core_fields.total_complaints_count",
      "K-RERA: use the STATE-WIDE /projectComplaintReport. The per-project page is NOT reliable -- it "
      "showed no complaints for a project the register lists with 12. JHARERA has no per-project count "
@@ -333,10 +382,10 @@ RERA_FINDINGS = [
      "register, which yields POSSIBLE matches to confirm, not a confirmed count. WBRERA publishes no "
      "complaint register through this interface at all -- recorded as None, never 0."),
     ("Appeals register",
-     "Yes", "No", "Not published", "Not published", "Not published", "Not published",
+     "Yes", "Not published", "Not published", "Not published", "Not published", "Not published",
      "rera_core_fields.total_appeals_count", ""),
     ("Orders / judgments search",
-     "Yes", "No", "Not published", "Yes", "Yes", "Partial", "sources[] (topic=litigation)",
+     "Yes", "Not published", "Not published", "Yes", "Yes", "Partial", "sources[] (topic=litigation)",
      "K-RERA now reads FIVE promoter-keyed registers (order search, authority orders, AO orders, "
      "interim orders, complaints under process) -- 15,600+ rows including a penalty table naming the "
      "violation, section and amount. JHARERA's judgement/order register is searchable by promoter, "
@@ -344,46 +393,75 @@ RERA_FINDINGS = [
      "that search. WBRERA's order register names no party at all; the join runs through its cause "
      "lists instead, so its coverage note matters more than its row count."),
     ("Promoter's other projects (track record)",
-     "Yes", "No", "No", "Yes", "Yes", "No", "promoter_portfolio",
+     "Yes", "Not published", "Not published", "Yes", "Yes", "Not published", "promoter_portfolio",
      "K-RERA embeds the WHOLE state index client-side (9,888 projects with promoter names), so a "
      "portfolio is one request. GujRERA confirmed absent. WBRERA publishes no promoter search and its "
      "state index does not name the promoter either, so a portfolio there would mean opening all "
      "~4,700 project pages -- the adapter returns None and says why rather than sampling a partial set."),
     ("Past-experience declarations",
-     "Yes", "No", "Yes", "Not published", "Yes", "Yes", "promoter_portfolio.totals", ""),
+     "Yes", "Not published", "Yes", "Not published", "Yes", "Yes", "promoter_portfolio.totals", ""),
     ("AUDITED BALANCE SHEET",
-     "No", "No", "Yes", "Partial", "Yes", "No", "(unmapped -- see Charter Mapping sheet)",
+     "Not published", "Not published", "Yes", "Partial", "Yes", "Yes", "(unmapped -- see Charter Mapping sheet)",
      "GujRERA findoc block. MahaRERA publishes nothing equivalent. Highest-value differential finding. "
      "JHARERA also files an audited balance sheet as a downloadable document, labelled directly on "
-     "the project page."),
+     "the project page. WBRERA is now Yes, confirmed live 2026-08-31 across 12 real projects checked: "
+     "the application's own item 2 ('Audited balance sheet of the promoter for the preceding financial "
+     "year and income tax returns... for three preceding financial years') carries real, downloaded "
+     "files on every one -- e.g. 'Audited_Balance Sheet.pdf', 'Audited Balance Sheet 2024.PDF' -- "
+     "already fetched by adapter_westbengal.py's existing document download, just never previously "
+     "flagged as filed. Labelling is inconsistent enough (misspellings like 'blance sheet', combined "
+     "balance-sheet+ITR files) that a downstream reader should still open the document rather than "
+     "trust the label alone."),
     ("Audited profit & loss statement",
-     "No", "No", "Yes", "No", "No", "No", "(unmapped)", "GujRERA findoc block."),
+     "Not published", "Not published", "Yes", "Not published", "Not published", "Not published", "(unmapped)",
+     "GujRERA findoc block. WBRERA's own disclosure item asks for a balance sheet and income-tax "
+     "returns ONLY, never a P&L statement by name -- checked live across the same 12 projects, no "
+     "filename or label suggests one is filed separately, so this stays Not published rather than "
+     "assuming a P&L rides along inside one of the combined financial-statement PDFs."),
     ("Income-tax returns",
-     "No", "No", "Yes", "No", "Yes", "No", "(unmapped)",
+     "Not published", "Not published", "Yes", "Not published", "Yes", "Yes", "(unmapped)",
      "GujRERA findoc block. JHARERA files three years of income-tax returns per project, also as "
      "downloadable documents."),
     ("Defaulters list",
-     "No", "No", "No", "Partial", "Partial", "Partial", "(unmapped)",
+     "Not published", "Not published", "Not published", "Partial", "Partial", "Partial", "(unmapped)",
      "K-RERA /viewDefaultProjects -- observed, not yet built. JHARERA's REJECTED and SURRENDERED "
      "registers are the closest equivalent: their URLs are imported into the adapter but nothing "
      "fetches them yet. WBRERA's defaulters list (17 rejected/defaulting applications by name) IS "
      "parsed by adapter_westbengal.fetch_defaulters(), but that function is called from nowhere in "
      "acquire() or the litigation sweep -- written, untested against a live page, and unused."),
     ("Projects under investigation",
-     "No", "No", "No", "Partial", "No", "No", "(unmapped)",
+     "Not published", "Not published", "Not published", "Partial", "Not published", "Not published", "(unmapped)",
      "K-RERA /unregProjectList -- observed, not yet built."),
     ("Cost incurred vs estimated cost",
-     "No", "No", "Partial", "Yes", "No", "No", "(unmapped)",
+     "Not published", "Not published", "Partial", "Yes", "Not published", "Not published", "(unmapped)",
      "K-RERA publishes both, per particular. Direct input to the financial-strength sub-metric."),
     ("Delay reasons (promoter-declared)",
-     "No", "No", "No", "Yes", "No", "No", "(unmapped)", "K-RERA detail page carries a delay-reason table."),
+     "Not published", "Not published", "Not published", "Yes", "Not published", "Not published", "(unmapped)",
+     "K-RERA detail page carries a delay-reason table."),
     ("NOC expiry and renewal tracking",
-     "No", "No", "No", "Yes", "No", "No", "(unmapped)",
+     "Not published", "Not published", "Not published", "Yes", "Not published", "Not published", "(unmapped)",
      "K-RERA tracks NOC validity dates and whether renewed."),
     ("Construction progress / QPR",
-     "Yes", "Partial", "Yes", "Yes", "Unaudited", "Unaudited", "rera_compliance.construction_progress",
-     "Not confirmed either way for JHARERA or WBRERA -- neither adapter currently extracts a "
-     "QPR-equivalent field, and nobody has checked whether either portal even publishes one."),
+     "Yes", "Partial", "Yes", "Yes", "Yes", "Not published", "rera_compliance.construction_progress",
+     "JHARERA is now Yes, audited live 2026-08-31 against a real project (jharera.jharkhand.gov.in "
+     "id 2625, PRANAMI BUILDERS): the flat/floor grid the adapter already reads for sold/unsold "
+     "counts (adapter_jharkhand.py's own 'units' table, matched on 'flat no'+'sold status') carries "
+     "its OWN per-unit 'Completion Status' column alongside Sold Status -- 101 rows, one per flat, "
+     "each independently marked (every one 'Under Process' on this project, since it is still under "
+     "construction). Real, structured, granular data that was already being fetched into `units` but "
+     "never surfaced as a construction-progress finding. WBRERA is now Not published, audited live "
+     "2026-08-31: the project detail page (Crown, WBRERA/P/NOR/2025/002592) carries only SITE-WIDE "
+     "marquee notices and a QPR_User_Manual.pdf link telling promoters a Quarterly Project Status "
+     "Update is mandatory -- the mechanism exists as a filing requirement, but no per-project "
+     "percentage, status or progress field is ever rendered on the page itself or in its document "
+     "library. THE JHARERA PORTAL ITSELF IS UNSTABLE, not merely slow -- worth flagging beyond this "
+     "one row. During the original audit 3 of 4 fetch attempts against the same URL (id 2625) timed "
+     "out before one succeeded and produced the finding above. A follow-up retry session immediately "
+     "after went 0 for 9 across three separate batches (40-50s timeouts, including three straight "
+     "attempts at the exact same id that had worked minutes earlier) -- the portal was not reachable "
+     "at all during that window. So JHARERA's Yes here rests on ONE successful live fetch, not a "
+     "repeatable check; a future run finding this authority's portal unresponsive is the portal's own "
+     "instability, not evidence the field is absent, and should not be read as a regression."),
 ]
 
 # =========================================================================
@@ -557,9 +635,11 @@ def build_rera_sheet(wb):
     ws = wb.create_sheet("A - RERA by authority")
     ncols = 3 + len(RERA_STATES)
     _title(ws, "Workflow A: RERA -- what each authority publishes",
-           "Yes / Partial / No / Not published / Unaudited. 'Unaudited' means nobody has looked yet -- "
-           "~20 of ~30 state portals are in that state, and so are whole data items on the "
-           "four newest authorities.", ncols)
+           "Yes / Partial / Not published / Unaudited. 'Not published' replaced the earlier separate "
+           "'No' label 2026-08-31 -- both meant the same thing here (this authority does not publish "
+           "this data item) and were used inconsistently row to row. 'Unaudited' means nobody has "
+           "looked yet -- ~20 of ~30 state portals are in that state, and so are whole data items on "
+           "the four newest authorities.", ncols)
     header = ["Data item"] + RERA_STATES + ["Charter facts field", "Note"]
     ws.append([])
     ws.append(header)
@@ -716,6 +796,38 @@ def build_readme(wb):
          "Delhi-RERA publish no balance sheet either, and none but K-RERA states an NOC EXPIRY date "
          "(HARERA's 'Statutory Approvals' table gives the date obtained, not the date it lapses).",
          None),
+        ("12. WBRERA's two 'Not built' rows are now built and confirmed live 2026-08-31. Land Area "
+         "and a full location block (address/district/block/police station/pincode) turned out to be "
+         "structured fields on every project page sampled -- adapter_westbengal.land_details() now "
+         "reads them. A dag/mouza/J.L. survey reference is genuinely inconsistent, embedded as free "
+         "text in the project address on roughly a third of a six-district sample and absent from the "
+         "rest, hence 'Partial' rather than 'Yes'. The bank-account row went the other way: checked "
+         "across the same six-project sample and confirmed the authority publishes no escrow/"
+         "collection account field at all, so it moves from 'Not built' to 'Not published' -- a "
+         "finding about WBRERA, not a gap in this adapter.", None),
+        ("13. WBRERA's document library was already downloading a real audited balance sheet and up "
+         "to three years of ITRs for every one of 12 projects sampled live 2026-08-31 -- the gap was "
+         "that company_charter.py's own high-priority-document keyword list never recognised WBRERA's "
+         "bare 'ITR' filenames ('ITR_3 Years.pdf', 'itr with blance sheet ay 23-4 & 24-25.pdf') as "
+         "financial disclosure, so they were fetched but never text-extracted for the Charter pass. "
+         "Fixed with an alpha-boundary regex rather than a plain substring (which would also fire on "
+         "'arbitration'/'distribution'/'contribution') or a strict word boundary (which would miss the "
+         "live 'ITR_3'/'ITR_23-24' filenames, since '_' counts as a word character). AUDITED BALANCE "
+         "SHEET and Income-tax returns both move from No to Yes for WB.", None),
+        ("14. Five of the sheet's 'Unaudited' cells were closed out live 2026-08-31. Professionals of "
+         "record and Past-experience declarations are both genuinely Not published on HARERA -- its "
+         "REP-I form has no section asking for either, confirmed by listing every numbered heading on "
+         "the form across 7 real projects, not just the absence of a keyword. Past-experience is "
+         "ALSO Not published on UP-RERA and TNRERA, checked on 4 and 3 real projects respectively -- "
+         "a different finding from 'Promoter's other projects (track record)' above, which is about "
+         "finding a promoter's OTHER filings by name match rather than a self-declared history on "
+         "this one. Construction progress/QPR moved three ways at once: JHARERA to Yes (a genuine "
+         "per-unit 'Completion Status' column already flowing through the adapter's own 'units' table "
+         "but never surfaced), WBRERA to Not published (the page only carries a site-wide notice that "
+         "QPR filing is mandatory, never a per-project figure), and HARERA to Partial (a real but "
+         "project-type-dependent percentage-completion/status field). The JHARERA portal itself went "
+         "down mid-audit -- 3 of 4 fetch attempts against the same URL timed out -- a reminder that "
+         "an unreachable portal during a check is not the same finding as a confirmed absence.", None),
     ]
     for i, (text, font) in enumerate(lines, start=1):
         ws.cell(row=i, column=1, value=text)

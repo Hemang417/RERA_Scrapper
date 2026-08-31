@@ -15,6 +15,18 @@ state index does not name the promoter, so building a promoter portfolio
 would mean opening all 4,721 project pages. It returns None and says so,
 rather than sampling a few pages and presenting the result as a portfolio.
 Gujarat already shipped a capability it could not deliver once.
+
+LAND AND BANK ACCOUNTS, confirmed live 2026-08-31. The project detail page
+carries a genuinely structured location block (Project Address, District,
+Block/Municipality, Police Station, Pincode) and a Land Area field --
+`land_details()` reads both. A survey-number reference is NOT structured:
+it is free text sometimes embedded in Project Address ("RS DAG NO - ...",
+"MOUZA: ...", "J.L.No.: ..."), present on roughly a third of a random
+sample and absent from the rest, so `land_reference_present` says which
+case a given project is rather than the field silently reading empty. A
+bank/escrow/collection account, by contrast, is not published AT ALL --
+confirmed absent across six projects sampled from six different districts
+and years, not inferred from one page.
 """
 
 import json
@@ -59,6 +71,11 @@ _AUTHORITY_NOTES = [
     "this authority.",
     "WBRERA does not publish a single point of contact register or sub-registrar office details "
     "for a project. Their absence here does not mean none exist.",
+    "WBRERA publishes no escrow/collection bank account field for a project anywhere on this "
+    "page -- confirmed live across a random sample of projects spanning six different districts "
+    "and registration years, not just this one. 'account', 'escrow' and 'IFSC' occur zero times "
+    "on any of them; the only 'bank' hits are the district-menu entry for Bankura. This is the "
+    "authority not publishing the account, not a gap in this adapter.",
 ]
 
 
@@ -223,6 +240,71 @@ def fetch_defaulters(fetcher=None):
     return out
 
 
+_TRIPLE_RE = re.compile(
+    r"<td[^>]*>\s*([^<]+?)\s*</td>\s*<td[^>]*>\s*:\s*</td>\s*<td[^>]*>(.*?)</td>", re.S,
+)
+_PANEL_FIELD_RE = re.compile(
+    r'font-weight:\s*900;">\s*([^<:]+?):\s*</span>\s*<span[^>]*>([^<]*)</span>', re.I,
+)
+
+# WBRERA writes a project's land parcel as free text inside "Project
+# Address" -- "RS DAG NO - 489, 490, ... Mouza Thakdari - 852,918,929" or
+# "LR DAG No.: 418(P) ... MOUZA: NOWABAD, J.L.No.:19" -- never as its own
+# field or table. Confirmed live against a random sample of West Bengal
+# projects: only about a third of addresses actually carry a dag/mouza/J.L.
+# reference, so this is a hint the Charter's own land-identification pass
+# can mine, never a promise that one exists.
+_LAND_REFERENCE_RE = re.compile(r"\bdag\b|\bmouza\b|\bj\.?l\.?\s*no\b|\bkhatian\b", re.I)
+
+
+def _table_label_values(html):
+    """Every `<td>Label</td><td>:</td><td>Value</td>` triple on the page,
+    keyed by the label exactly as WBRERA writes it (e.g. "Project Address",
+    "District", "Pincode"). The project detail page uses this shape for its
+    identity/location block; it is a different shape from the `<table>`
+    grids `_labelled_rows` reads."""
+    out = {}
+    for label, value_html in _TRIPLE_RE.findall(html):
+        out[label.strip()] = BeautifulSoup(f"<div>{value_html}</div>", "html.parser").get_text(" ", strip=True)
+    return out
+
+
+def _panel_fields(html):
+    """The bold-label/value pairs in the page's "Residential Details" style
+    panel -- Project Type, Land Area, Total Built Up Area, Carpet Area,
+    No. of Apartments. A template block, not a data table, hence the
+    separate regex rather than BeautifulSoup table parsing."""
+    return {label.strip(): value.strip() for label, value in _PANEL_FIELD_RE.findall(html)}
+
+
+def land_details(html):
+    """WBRERA's land/location fields for a project.
+
+    Land Area and the address/district/pincode fields are genuinely
+    structured and present on every project page sampled live. The
+    survey-number reference is NOT: it is free text embedded in the
+    project address, present on some projects and absent on others, so
+    `land_reference_present` says which case this one is rather than the
+    caller having to guess from an empty string.
+    """
+    triples = _table_label_values(html)
+    panel = _panel_fields(html)
+    address = triples.get("Project Address", "")
+    return {
+        "project_address": address,
+        "district": triples.get("District", ""),
+        "block_municipality": triples.get("Block/Municipality", ""),
+        "police_station": triples.get("Police Station", ""),
+        "pincode": triples.get("Pincode", ""),
+        "project_type": panel.get("Project Type", ""),
+        "land_area": panel.get("Land Area", ""),
+        "total_built_up_area": panel.get("Total Built Up Area", ""),
+        "carpet_area": panel.get("Carpet Area", ""),
+        "number_of_apartments": panel.get("No. of Apartments", ""),
+        "land_reference_present": bool(_LAND_REFERENCE_RE.search(address)),
+    }
+
+
 def _labelled_rows(table):
     if table is None:
         return None
@@ -326,6 +408,7 @@ def parse_project_detail(html):
         "litigation": litigation,
         "litigation_table_present": litigation_table is not None,
         "litigation_declared_none": bool(litigation_rows) and not litigation,
+        "land": land_details(html),
     }
 
 
@@ -346,6 +429,13 @@ def project_notes(parsed):
         notes.append(
             f"The promoter declared {len(parsed['other_projects'])} other project(s) on this "
             f"project's own filing."
+        )
+    land = parsed.get("land") or {}
+    if land.get("land_area") and not land.get("land_reference_present"):
+        notes.append(
+            "WBRERA gives this project's Land Area but its Project Address carries no dag, "
+            "mouza, J.L. or khatian reference -- a survey/plot number for this land could not "
+            "be identified from this record."
         )
     return notes
 
@@ -495,6 +585,7 @@ def fetch_project_summary(project_ref, reporter=None):
         "professionals": parsed["professionals"],
         "litigation": parsed["litigation"],
         "declared_other_projects": parsed["other_projects"],
+        "land": parsed["land"],
         "notes": project_notes(parsed),
     }
 
@@ -549,6 +640,7 @@ class WestBengalAdapter:
         parsed = parse_project_detail(detail_html)
         promoter_name = parsed["promoter_name"] or chosen["project_name"]
 
+        land = parsed["land"]
         category_data = {
             "projects": {
                 "projectName": chosen["project_name"],
@@ -556,6 +648,25 @@ class WestBengalAdapter:
                 "projectId": chosen["project_id"],
                 "projectProposeComplitionDate": chosen["completion_date"],
                 "reraRegistrationDate": chosen["registration_date"],
+                "projectType": land["project_type"],
+                "projectAddress": land["project_address"],
+                "district": land["district"],
+                "blockMunicipality": land["block_municipality"],
+                "policeStation": land["police_station"],
+                "pincode": land["pincode"],
+                "landArea": land["land_area"],
+                # Free text inside projectAddress, present on some projects
+                # and not others -- see land_details()'s docstring. Carried
+                # as its own flag so a Charter pass can tell "no reference
+                # found" apart from "field not read".
+                "landReferencePresent": land["land_reference_present"],
+                "totalBuiltUpArea": land["total_built_up_area"],
+                "carpetArea": land["carpet_area"],
+                "numberOfApartments": land["number_of_apartments"],
+                # WBRERA publishes no escrow/collection bank account field
+                # anywhere on this page -- confirmed live, not merely
+                # unbuilt. See _AUTHORITY_NOTES.
+                "bankAccount": None,
             },
             "partners": {"promoterDetails": {
                 "promoterName": promoter_name,
