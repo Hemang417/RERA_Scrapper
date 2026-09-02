@@ -5086,12 +5086,15 @@ def _verify_external_document_quality(docx_path: str) -> list[str]:
         for run in para.runs:
             color = run.font.color
             rgb = str(color.rgb) if color is not None and color.rgb is not None else None
-            if run.italic and rgb != "C00000":
-                # The one deliberate exception: the Standing Gap paragraph
-                # in the Gaps & Sources section is colored red AND italic on
-                # purpose -- red pairs only with that intentional styling,
-                # never with the grey-placeholder bug this check exists to
-                # catch.
+            if run.italic and rgb not in ("C00000", _TEXT_AMBER):
+                # Two deliberate exceptions: the Standing Gap paragraph in
+                # Gaps & Sources is colored red AND italic on purpose, and
+                # the Documentation Confidence Score's verification_warning/
+                # coverage_warning paragraph (_append_documentation_
+                # confidence_section) is colored amber AND italic on
+                # purpose -- red and amber pair only with that intentional
+                # styling, never with the grey-placeholder bug this check
+                # exists to catch.
                 violations.append(f"italic run (leftover template placeholder styling) in: {text[:80]!r}")
             if rgb not in _EXTERNAL_ALLOWED_RUN_COLORS:
                 violations.append(f"unexpected run color {rgb} (expected black/red/amber/heading-navy only) in: {text[:80]!r}")
