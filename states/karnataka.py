@@ -63,6 +63,21 @@ INTERIM_ORDERS_PAGE = BASE_URL + "/viewAllInterimOrders"
 PROJECT_ORDERS_PAGE = BASE_URL + "/viewAllProjectOrders"
 AO_ORDERS_PAGE = BASE_URL + "/viewAllAOorders"
 COMPLAINT_DETAILS_PAGE = BASE_URL + "/viewAllComplaintDetails"
+# K-RERA's own "DEFAULT PROJECT LIST" -- a distinct state-wide register from
+# the four order/complaint registers above, linked from the homepage menu
+# and confirmed live 2026-09-09: 2,991 rows with clean REGISTRATION NO,
+# PROMOTER and PROJECT columns, the strongest name-match register any
+# authority in this pipeline publishes. Not a case-law index, so kept apart
+# from ORDERS_PAGE/_ORDER_REGISTERS the way group_enforcement.py's other
+# defaulter/cancellation registers are kept apart from litigation_sweep.
+DEFAULT_PROJECTS_PAGE = BASE_URL + "/viewDefaultProjects"
+# Revenue Recovery Certificates -- promoters against whom an unpaid penalty
+# has escalated to an RRC, K-RERA's strongest enforcement signal short of a
+# criminal referral. Confirmed live 2026-09-09: 2,603 rows with COMPLAINT
+# NO, PROMOTER NAME, PROJECT NAME, AMOUNT, JUDGEMENT/EXECUTION/RRC dates --
+# richer than DEFAULT_PROJECTS_PAGE, and a different finding (unpaid
+# penalty enforcement, not registration default).
+REVENUE_RECOVERY_PAGE = BASE_URL + "/viewRevenueRecoveryList"
 CERTIFICATE_URL = BASE_URL + "/certificate?CER_NO={}"
 DOWNLOAD_URL = BASE_URL + "/download_jc?DOC_ID={}"
 

@@ -42,9 +42,12 @@ from states.adapter_jharkhand import (
     document_label,
     download_single_document,
     fetch_project_summary,
+    fetch_rejected_projects,
+    fetch_surrendered_projects,
     find_table,
     labelled_rows,
     parse_project_detail,
+    parse_rejected_or_surrendered_register,
     parse_search_rows,
     project_notes,
 )
@@ -389,6 +392,79 @@ def test_capabilities_match_what_the_portal_actually_offers():
     print("test_capabilities_match_what_the_portal_actually_offers: PASS")
 
 
+# --- rejected / surrendered registers ---------------------------------
+
+_REJECTED_HTML = """
+<table>
+ <tr><th>Sl.No.</th><th>Promoter Name</th><th>Project Name</th><th>Project Address</th></tr>
+ <tr><td>1</td><td>R.S. Agrawal Infratech Pvt. Ltd., Ranchi</td><td>Fulchand Gardenia</td>
+     <td>Powerhouse Road, Chutia, Ranchi</td></tr>
+</table>
+"""
+
+# The real live shape: a SECOND "Project Name" header whose cells actually
+# carry the JHARERA registration number, not another project name.
+_SURRENDERED_HTML = """
+<table>
+ <tr><th>Sl.No.</th><th>Promoter Name</th><th>Project Name</th><th>Project Name</th>
+     <th>Project Address</th></tr>
+ <tr><td>1</td><td>B T HIRANI</td><td>SUNSHINE HEIGHTS</td>
+     <td>JHARERA/PROJECT/229/2023</td><td>Kanke Road, Ranchi</td></tr>
+</table>
+"""
+
+
+def test_rejected_register_is_found_by_header_and_carries_no_reg_no():
+    """A rejected APPLICATION never reached registration -- there is no
+    number to carry, and the parser must not invent one from the wrong
+    column."""
+    rows = parse_rejected_or_surrendered_register(_REJECTED_HTML)
+    assert len(rows) == 1, rows
+    assert rows[0]["promoter_name"] == "R.S. Agrawal Infratech Pvt. Ltd., Ranchi", rows[0]
+    assert rows[0]["project_name"] == "Fulchand Gardenia", rows[0]
+    assert rows[0]["reg_no"] == "", rows[0]
+    assert rows[0]["address"] == "Powerhouse Road, Chutia, Ranchi", rows[0]
+    print("test_rejected_register_is_found_by_header_and_carries_no_reg_no: PASS")
+
+
+def test_surrendered_registers_mislabelled_second_column_becomes_reg_no():
+    """THE REAL BUG SHAPE. The surrendered table's own markup repeats
+    'Project Name' as a header for what is actually the registration
+    number column -- confirmed live 2026-09-09. Reading it positionally by
+    header text alone would either drop the number or overwrite the real
+    project name with it; this pins that the second occurrence lands in
+    `reg_no`, and the first stays the project name."""
+    rows = parse_rejected_or_surrendered_register(_SURRENDERED_HTML)
+    assert len(rows) == 1, rows
+    assert rows[0]["promoter_name"] == "B T HIRANI", rows[0]
+    assert rows[0]["project_name"] == "SUNSHINE HEIGHTS", rows[0]
+    assert rows[0]["reg_no"] == "JHARERA/PROJECT/229/2023", rows[0]
+    print("test_surrendered_registers_mislabelled_second_column_becomes_reg_no: PASS")
+
+
+def test_fetch_rejected_and_surrendered_use_the_injected_fetcher():
+    """Both fetch_* functions take a `fetcher` override -- the offline seam
+    group_enforcement.py's own fetchers dict relies on."""
+    assert fetch_rejected_projects(fetcher=lambda: _REJECTED_HTML) == \
+        parse_rejected_or_surrendered_register(_REJECTED_HTML)
+    assert fetch_surrendered_projects(fetcher=lambda: _SURRENDERED_HTML) == \
+        parse_rejected_or_surrendered_register(_SURRENDERED_HTML)
+    print("test_fetch_rejected_and_surrendered_use_the_injected_fetcher: PASS")
+
+
+def test_live_rejected_and_surrendered_registers_are_readable():
+    if not _LIVE:
+        print("test_live_rejected_and_surrendered_registers_are_readable: SKIPPED (set JHARERA_LIVE=1)")
+        return
+    rejected = fetch_rejected_projects()
+    surrendered = fetch_surrendered_projects()
+    assert rejected, "expected at least one rejected application"
+    assert surrendered, "expected at least one surrendered registration"
+    assert all(r["promoter_name"] for r in rejected), rejected
+    assert all(r["promoter_name"] for r in surrendered), surrendered
+    print("test_live_rejected_and_surrendered_registers_are_readable: PASS")
+
+
 # --- live ------------------------------------------------------------------
 
 def test_live_pranami_crest_end_to_end():
@@ -427,5 +503,9 @@ if __name__ == "__main__":
     test_both_registration_spellings_resolve_to_jharkhand()
     test_the_storage_key_flattens_the_slashes()
     test_capabilities_match_what_the_portal_actually_offers()
+    test_rejected_register_is_found_by_header_and_carries_no_reg_no()
+    test_surrendered_registers_mislabelled_second_column_becomes_reg_no()
+    test_fetch_rejected_and_surrendered_use_the_injected_fetcher()
+    test_live_rejected_and_surrendered_registers_are_readable()
     test_live_pranami_crest_end_to_end()
     print("\nAll tests passed.")

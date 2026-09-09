@@ -254,7 +254,8 @@ ORDERS_NOT_SEARCHABLE = (
 )
 
 
-def state_order_sweep(graph, searcher=None, register_coverage=None):
+def state_order_sweep(graph, searcher=None, register_coverage=None, karnataka_defaults=None,
+                      karnataka_revenue_recovery=None):
     """RERA authorities' OWN order registers, searched by promoter name.
 
     Separate from the case-law sweep because it is a different kind of
@@ -268,6 +269,14 @@ def state_order_sweep(graph, searcher=None, register_coverage=None):
     as a search would have reported "no orders" for every promoter ever
     queried. Validated with a control: 111 entries for a known Karnataka
     developer, 0 for a nonsense name.
+
+    KARNATAKA PUBLISHES TWO MORE REGISTERS OUTSIDE `searcher`'S FOUR ORDER/
+    COMPLAINT PAGES, each searched separately -- `karnataka_defaults` (the
+    "Default Project List", 2,991 rows naming every project K-RERA itself
+    has flagged in default) and `karnataka_revenue_recovery` (Revenue
+    Recovery Certificates -- unpaid penalties escalated to enforcement,
+    2,603 rows, K-RERA's strongest signal short of a criminal referral).
+    Both confirmed live 2026-09-09.
     """
     subjects = [s for s in _subjects(graph) if s["kind"] == SUBJECT_ENTITY]
     maharera = None
@@ -277,6 +286,8 @@ def state_order_sweep(graph, searcher=None, register_coverage=None):
         from states import adapter_karnataka
 
         searcher = adapter_karnataka.search_all_orders_by_promoter
+        karnataka_defaults = adapter_karnataka.search_default_projects_by_promoter
+        karnataka_revenue_recovery = adapter_karnataka.search_revenue_recovery_by_promoter
         # MahaRERA searches by RESPONDENT, and a complaint is filed against
         # the promoter -- so the respondent IS the promoter. Kept separate
         # from the injected searcher so an offline test stays offline.
@@ -380,6 +391,44 @@ def state_order_sweep(graph, searcher=None, register_coverage=None):
                 "detail": row.get("detail") or "",
                 "penalty_amount": row.get("penalty_amount") or "",
             })
+        if karnataka_defaults is not None:
+            try:
+                for row in karnataka_defaults(subject["name"]) or []:
+                    entries.append({
+                        "authority": "Karnataka (K-RERA)",
+                        "register": "Default Project List",
+                        "searched_name": subject["name"],
+                        "application_no": row.get("registration no") or "",
+                        "order_date": "",
+                        "project_name": row.get("project") or "",
+                        "promoter_name": row.get("promoter") or "",
+                        "detail": row.get("district") or "",
+                        "penalty_amount": "",
+                    })
+            except Exception as e:
+                limitations.append(
+                    f"K-RERA's Default Project List could not be searched for "
+                    f"{subject['name']} this pass: {type(e).__name__}: {e}"
+                )
+        if karnataka_revenue_recovery is not None:
+            try:
+                for row in karnataka_revenue_recovery(subject["name"]) or []:
+                    entries.append({
+                        "authority": "Karnataka (K-RERA)",
+                        "register": "Revenue Recovery Certificates",
+                        "searched_name": subject["name"],
+                        "application_no": row.get("complaint no") or "",
+                        "order_date": row.get("rrc date (dd-mm-yyyy)") or row.get("judgement date") or "",
+                        "project_name": row.get("project name") or "",
+                        "promoter_name": row.get("promoter name") or "",
+                        "detail": row.get("remarks") or "",
+                        "penalty_amount": row.get("amount") or "",
+                    })
+            except Exception as e:
+                limitations.append(
+                    f"K-RERA's Revenue Recovery Certificate list could not be searched for "
+                    f"{subject['name']} this pass: {type(e).__name__}: {e}"
+                )
     # WHICH OF K-RERA'S OWN REGISTERS ACTUALLY LOADED. Its authority-orders
     # page is 10.4 MB and has been seen to arrive truncated, dropping the
     # PENALTY table entirely -- a promoter with penalties would then show

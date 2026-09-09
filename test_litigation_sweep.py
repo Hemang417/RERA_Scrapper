@@ -200,6 +200,67 @@ def test_the_regulators_own_orders_name_the_registers_not_searched():
     print("test_the_regulators_own_orders_name_the_registers_not_searched: PASS")
 
 
+def test_the_karnataka_default_project_list_is_searched_separately():
+    """K-RERA's "Default Project List" is a different register from the
+    four order/complaint pages `searcher` covers -- this pins that a hit
+    there reaches `entries` under its own register label, independent of
+    whatever `searcher` returns."""
+    result = ls.state_order_sweep(
+        _GRAPH, searcher=lambda name: [],
+        karnataka_defaults=lambda name: [{
+            "registration no": "PRM/KA/RERA/1251/446/PR/040826/008858",
+            "promoter": name, "project": "Some Project", "district": "Bengaluru Urban",
+        }] if "Pranami Builders" in name else [],
+    )
+    hits = [e for e in result["entries"] if e["register"] == "Default Project List"]
+    assert len(hits) == 1, hits
+    assert hits[0]["authority"] == "Karnataka (K-RERA)", hits[0]
+    assert hits[0]["application_no"] == "PRM/KA/RERA/1251/446/PR/040826/008858", hits[0]
+    assert hits[0]["project_name"] == "Some Project", hits[0]
+    print("test_the_karnataka_default_project_list_is_searched_separately: PASS")
+
+
+def test_a_default_project_list_failure_is_named_not_silently_empty():
+    def dead(name):
+        raise ConnectionError("K-RERA unreachable")
+
+    result = ls.state_order_sweep(_GRAPH, searcher=lambda n: [], karnataka_defaults=dead)
+    assert any("Default Project List could not be searched" in l for l in result["limitations"]), \
+        result["limitations"]
+    print("test_a_default_project_list_failure_is_named_not_silently_empty: PASS")
+
+
+def test_the_karnataka_revenue_recovery_list_is_searched_separately():
+    """Revenue Recovery Certificates are a different K-RERA register from
+    both `searcher`'s four order/complaint pages and the Default Project
+    List -- this pins that a hit reaches `entries` under its own register
+    label, carrying the penalty amount and RRC date."""
+    result = ls.state_order_sweep(
+        _GRAPH, searcher=lambda name: [],
+        karnataka_revenue_recovery=lambda name: [{
+            "complaint no": "00537/2025", "promoter name": name,
+            "project name": "Some Project", "amount": "3110344",
+            "rrc date (dd-mm-yyyy)": "31/08/2026", "remarks": "RRC",
+        }] if "Pranami Builders" in name else [],
+    )
+    hits = [e for e in result["entries"] if e["register"] == "Revenue Recovery Certificates"]
+    assert len(hits) == 1, hits
+    assert hits[0]["authority"] == "Karnataka (K-RERA)", hits[0]
+    assert hits[0]["penalty_amount"] == "3110344", hits[0]
+    assert hits[0]["order_date"] == "31/08/2026", hits[0]
+    print("test_the_karnataka_revenue_recovery_list_is_searched_separately: PASS")
+
+
+def test_a_revenue_recovery_failure_is_named_not_silently_empty():
+    def dead(name):
+        raise ConnectionError("K-RERA unreachable")
+
+    result = ls.state_order_sweep(_GRAPH, searcher=lambda n: [], karnataka_revenue_recovery=dead)
+    assert any("Revenue Recovery Certificate list could not be searched" in l
+               for l in result["limitations"]), result["limitations"]
+    print("test_a_revenue_recovery_failure_is_named_not_silently_empty: PASS")
+
+
 def test_an_order_register_failure_does_not_silently_empty_the_table():
     """A portal outage must not produce an empty orders table that reads as
     "no orders against this group"."""
@@ -439,6 +500,10 @@ if __name__ == "__main__":
     test_proposed_entities_are_never_searched()
     test_the_same_name_is_never_searched_twice()
     test_the_regulators_own_orders_name_the_registers_not_searched()
+    test_the_karnataka_default_project_list_is_searched_separately()
+    test_a_default_project_list_failure_is_named_not_silently_empty()
+    test_the_karnataka_revenue_recovery_list_is_searched_separately()
+    test_a_revenue_recovery_failure_is_named_not_silently_empty()
     test_an_order_register_failure_does_not_silently_empty_the_table()
     test_only_entities_are_searched_in_order_registers()
     test_the_karnataka_order_index_refuses_to_pair_mismatched_arrays()

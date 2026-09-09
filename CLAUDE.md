@@ -57,8 +57,10 @@ the run continue. Nothing else may swallow an error.
    most of a group is unreachable), `_safe_group_litigation()`
    **[`--group-litigation`]** (case law + K-RERA orders; every hit a NAME match),
    `_safe_group_enforcement()` **[`--group-enforcement`]** (defaulter/cancellation/
-   penalty registers across UP-RERA, HARERA, TNRERA, Delhi-RERA; name match, same
-   discipline as the litigation sweep), `_safe_group_financial_disclosure()`
+   penalty/rejection/surrender registers across UP-RERA, HARERA, TNRERA,
+   Delhi-RERA, WBRERA, JHARERA; name match, same discipline as the litigation
+   sweep — WBRERA's own register names only the project, never the promoter, so
+   its hits are weaker evidence than the others), `_safe_group_financial_disclosure()`
    **[`--group-financial-disclosure`]** (balance sheet/P&L/ITR documents found on
    OTHER group entities' Gujarat/Jharkhand/Haryana/West Bengal/Uttar Pradesh/Tamil
    Nadu projects — the six portals with a searchable document list, of which only

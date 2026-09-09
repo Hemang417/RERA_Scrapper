@@ -175,6 +175,91 @@ def search_orders_by_promoter(name: str, fetcher=None) -> list:
             if needle in " ".join((row.get("respondent") or "").upper().split())]
 
 
+def parse_rejected_or_surrendered_register(html):
+    """Rows off either REJECTED_LIST or SURRENDERED_LIST -- same shape,
+    found by header (Promoter Name / Project Name), confirmed live
+    2026-09-09: 10 rejected rows, 3 surrendered rows as first read. Unlike
+    the order register, both carry a clean Promoter Name column rather than
+    one combined party string.
+
+    THE SURRENDERED LIST'S SECOND "PROJECT NAME" HEADER IS A MISLABEL.
+    Its table carries a fifth column literally headed "Project Name" a
+    second time, but every cell in it holds a JHARERA registration number
+    ("JHARERA/PROJECT/229/2023"), not another project name -- the portal's
+    own markup error, not a duplicate field. Recognised by position (the
+    first "Project Name" column is the real one; any later one is read as
+    `reg_no`), so a caller gets the registration number rather than a
+    second copy of the project name. The rejected list has no such column,
+    so `reg_no` is "" there -- these applications never reached
+    registration at all.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    for table in soup.find_all("table"):
+        rows = table.find_all("tr")
+        if len(rows) < 2:
+            continue
+        header = [c.get_text(" ", strip=True).casefold()
+                  for c in rows[0].find_all(["th", "td"])]
+        if "promoter name" not in header or "project name" not in header:
+            continue
+
+        promoter_idx = header.index("promoter name")
+        project_idx = header.index("project name")
+        address_idx = header.index("project address") if "project address" in header else None
+        reg_idx = next(
+            (i for i, h in enumerate(header) if h == "project name" and i != project_idx),
+            None,
+        )
+
+        def _cell(cells, idx):
+            return cells[idx] if idx is not None and idx < len(cells) else ""
+
+        out = []
+        for tr in rows[1:]:
+            cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
+            if not any(cells):
+                continue
+            out.append({
+                "promoter_name": _cell(cells, promoter_idx),
+                "project_name": _cell(cells, project_idx),
+                "reg_no": _cell(cells, reg_idx),
+                "address": _cell(cells, address_idx),
+            })
+        return out
+    return []
+
+
+def fetch_rejected_projects(fetcher=None):
+    """JHARERA's rejected-application register -- promoters whose
+    registration application was refused outright, never reaching a
+    project at all. Unwired by default: `acquire()` never calls this."""
+    if fetcher is not None:
+        html = fetcher()
+    else:
+        session = _session()
+        html = fetch_with_retry(
+            lambda: session.get(REJECTED_LIST, timeout=_TIMEOUT).text,
+            what="JHARERA rejected-applications register",
+        )
+    return parse_rejected_or_surrendered_register(html)
+
+
+def fetch_surrendered_projects(fetcher=None):
+    """JHARERA's surrendered-registration register -- a promoter who gave
+    up an existing registration, distinct from a rejected APPLICATION
+    (fetch_rejected_projects) or a lapsed/defaulted one. Unwired by
+    default: `acquire()` never calls this."""
+    if fetcher is not None:
+        html = fetcher()
+    else:
+        session = _session()
+        html = fetch_with_retry(
+            lambda: session.get(SURRENDERED_LIST, timeout=_TIMEOUT).text,
+            what="JHARERA surrendered-registrations register",
+        )
+    return parse_rejected_or_surrendered_register(html)
+
+
 def _rows(table):
     """Every data row of a table as a list of cell strings.
 

@@ -6822,6 +6822,7 @@ def _fill_template_inner(
         lambda: _append_group_companies_section(doc, facts),
         lambda: _append_state_footprint_section(doc, facts),
         lambda: _append_project_cost_extension_section(doc, facts),
+        lambda: _append_project_delay_noc_section(doc, facts),
         lambda: _append_group_rera_sweep_section(doc, facts),
         lambda: _append_group_gst_section(doc, facts),
         lambda: _append_group_financial_disclosure_section(doc, facts),
@@ -9884,8 +9885,9 @@ def _append_group_litigation_section(doc, facts: dict) -> None:
 
 
 def _append_group_enforcement_section(doc, facts: dict) -> None:
-    """Appends defaulter/cancellation/penalty/enforcement candidates from
-    UP-RERA, HARERA, TNRERA and Delhi-RERA's own published registers.
+    """Appends defaulter/cancellation/penalty/rejection/surrender/enforcement
+    candidates from UP-RERA, HARERA, TNRERA, Delhi-RERA, WBRERA and JHARERA's
+    own published registers.
 
     A DIFFERENT SOURCE FROM GROUP CASE-LAW SEARCH. These are the regulator's
     own rows, not a full-text index, but the same discipline applies: a name
@@ -10781,6 +10783,66 @@ def _append_project_cost_extension_section(doc, facts: dict) -> None:
         for run in sub.runs:
             run.bold = True
         _cost_extension_table(doc, incurred)
+
+
+def _append_project_delay_noc_section(doc, facts: dict) -> None:
+    """Appends K-RERA's own declared delay reasons and NOC status/expiry
+    tables, already fetched on every K-RERA run and unread until now.
+    Silent for every other state, purely because the key is absent there --
+    never a state check in this function.
+
+    TWO DIFFERENT NOC CLAIMS, NEVER COLLAPSED INTO ONE TABLE. `noc_status`
+    is whether each statutory NOC was ever obtained at all (Is Applicable? /
+    Status Of Approval); `noc_expiry` is an already-issued NOC's own expiry
+    and renewal history. A project with every NOC approved and none of them
+    expired would print an empty `noc_expiry` table -- that must read as
+    "nothing to report", not be merged with `noc_status` and made to look
+    like the NOCs themselves were never obtained.
+    """
+    check = facts.get("project_delay_noc_check") or {}
+    delay_reasons = check.get("delay_reasons") or []
+    noc_status = check.get("noc_status") or []
+    noc_expiry = check.get("noc_expiry") or []
+    if not delay_reasons and not noc_status and not noc_expiry:
+        return
+
+    heading_style = doc.paragraphs[4].style
+    doc.add_page_break()
+    heading_para = doc.add_paragraph(_external_heading(
+        facts, "Delay Reasons & NOC Status (Code-Computed)"
+    ))
+    heading_para.style = heading_style
+    _variant_paragraph(
+        doc, facts,
+        internal_text=(
+            "Read directly off the authority's own project detail page -- the promoter's "
+            "declared reasons for delay, and the status of each statutory No-Objection "
+            "Certificate -- rather than paraphrased, so it cannot disagree with what the "
+            "regulator itself shows."
+        ),
+        external_text=(
+            "Read directly off the authority's own project detail page: declared delay "
+            "reasons and statutory NOC status."
+        ),
+    )
+
+    if delay_reasons:
+        sub = doc.add_paragraph("Declared delay reasons")
+        for run in sub.runs:
+            run.bold = True
+        _cost_extension_table(doc, delay_reasons)
+
+    if noc_status:
+        sub = doc.add_paragraph("NOC status (obtained / applicable)")
+        for run in sub.runs:
+            run.bold = True
+        _cost_extension_table(doc, noc_status)
+
+    if noc_expiry:
+        sub = doc.add_paragraph("NOC expiry / renewal")
+        for run in sub.runs:
+            run.bold = True
+        _cost_extension_table(doc, noc_expiry)
 
 
 def _clean_scraped_address(address: str) -> str:
@@ -11833,12 +11895,13 @@ def _safe_group_litigation(group_result: dict, subject_promoter: str = "",
 
 def _safe_group_enforcement(group_result: dict, subject_promoter: str = "",
                             enabled: bool | None = None) -> dict:
-    """UP-RERA, HARERA, TNRERA and Delhi-RERA's own defaulter, cancellation,
-    penalty and enforcement registers, searched by name across the group.
+    """UP-RERA, HARERA, TNRERA, Delhi-RERA, WBRERA and JHARERA's own
+    defaulter, cancellation, penalty, rejection, surrender and enforcement
+    registers, searched by name across the group.
 
     OPT-IN (CHARTER_GROUP_ENFORCEMENT=1), separate from --group-litigation:
     these are the regulator's own published rows, not a full-text case-law
-    index, and one of the seven sources (Delhi's REAT appeal register) costs
+    index, and one of the ten sources (Delhi's REAT appeal register) costs
     a real OCR pass. Every hit is a CANDIDATE for the same reason
     litigation_sweep's are -- a name match on a public register is not
     confirmed identity. Never fatal.
@@ -11898,6 +11961,32 @@ def _safe_project_cost_extension(category_data: dict) -> dict:
         if not incurred and not estimated and not extensions:
             return {}
         return {"incurred": incurred, "estimated": estimated, "extensions": extensions}
+    except Exception:
+        return {}
+
+
+def _safe_project_delay_noc(category_data: dict) -> dict:
+    """K-RERA's own project detail page also publishes declared delay
+    reasons and two distinct NOC tables -- whether each statutory NOC was
+    obtained at all, and separately, an already-issued NOC's own expiry and
+    renewal status -- already fetched into category_data on every K-RERA run
+    (states/adapter_karnataka.py's primary acquire()) and left unread until
+    now, the same gap _safe_project_cost_extension closed for cost/extension
+    data. No other state adapter populates these keys, so the section this
+    feeds is silent everywhere else purely because the data is absent --
+    never because of a state check.
+
+    Never fatal: a shape this never expects (a portal redesign changing a
+    table's own header text) costs one section, not the run.
+    """
+    try:
+        category_data = category_data or {}
+        delay_reasons = category_data.get("delay_reasons") or []
+        noc_status = category_data.get("noc_status") or []
+        noc_expiry = category_data.get("noc_expiry") or []
+        if not delay_reasons and not noc_status and not noc_expiry:
+            return {}
+        return {"delay_reasons": delay_reasons, "noc_status": noc_status, "noc_expiry": noc_expiry}
     except Exception:
         return {}
 
@@ -12254,6 +12343,12 @@ def run_company_charter(
     # the render section stays silent when the key is absent, which is every
     # non-K-RERA state.
     facts["project_cost_extension_check"] = _safe_project_cost_extension(category_data)
+
+    # Same discipline as project_cost_extension_check just above -- K-RERA's
+    # own detail page also carries declared delay reasons and two distinct
+    # NOC tables (see _safe_project_delay_noc's own docstring), previously
+    # fetched but never rendered anywhere.
+    facts["project_delay_noc_check"] = _safe_project_delay_noc(category_data)
 
     # Also code-computed, never model-authored (see summarize_professionals'
     # own note for the real mis-reporting this replaces): MahaRERA's

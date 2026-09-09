@@ -1,7 +1,8 @@
 """
 Guards on the group financial disclosure sweep -- balance sheet/P&L/
 income-tax return documents found on OTHER group entities' Gujarat/
-Jharkhand/Haryana projects, via the group-wide RERA sweep.
+Jharkhand/Haryana/West Bengal/Uttar Pradesh/Tamil Nadu projects, via the
+group-wide RERA sweep.
 
 THE DISCIPLINE THIS FILE PINS: a project this pass never OPENED (the
 group-wide RERA sweep did not run, or opened it but hit its detail limit)
@@ -37,6 +38,18 @@ def _opened_project(state="JH", reg_no="JHARERA/PROJECT/35/2023", documents=None
         "detail_status": "opened",
         "detail": {"documents": documents if documents is not None else []},
     }
+
+
+def test_a_misspelled_balance_sheet_label_still_matches():
+    """WBRERA's own filed labels drop the first 'a' -- 'blance sheet',
+    confirmed live -- and a label naming that specific typo must still be
+    treated as a financial disclosure, not silently missed."""
+    assert gfd._is_high_priority("Blance Sheet 2022-23.pdf")
+    assert gfd._is_high_priority("Audited Balance Sheet.pdf")
+    assert not gfd._is_high_priority("Balance of Payments Report.pdf"), (
+        "must not match unrelated 'balance' text with no 'sheet' beside it"
+    )
+    print("test_a_misspelled_balance_sheet_label_still_matches: PASS")
 
 
 def _unopened_project(state="TG", reg_no="TG-999", matched_entity="Some Entity"):
@@ -184,6 +197,7 @@ if __name__ == "__main__":
     try:
         test_no_rera_sweep_produces_a_named_limitation_not_a_fabricated_zero()
         test_a_rera_sweep_that_found_zero_projects_is_named_differently_from_never_run()
+        test_a_misspelled_balance_sheet_label_still_matches()
         test_a_matching_document_is_downloaded_ocrd_and_reaches_statements()
         test_a_second_call_serves_the_cached_text_without_calling_the_downloader_again()
         test_a_project_with_no_matching_labels_is_checked_but_produces_no_statement()

@@ -695,6 +695,40 @@ def test_krera_cost_and_extension_section_is_silent_when_absent():
     print("test_krera_cost_and_extension_section_is_silent_when_absent: PASS")
 
 
+def test_krera_delay_reasons_and_noc_status_reach_the_page():
+    """K-RERA's own detail page also carries declared delay reasons and TWO
+    distinct NOC tables (whether obtained at all, vs. an obtained one's own
+    expiry/renewal) -- real shape captured live from
+    PRM/KA/RERA/1251/309/PR/201001/003607."""
+    facts = _base_facts()
+    facts["project_delay_noc_check"] = {
+        "delay_reasons": [{"Sl. No.": "1", "Delay Reason": "others"}],
+        "noc_status": [
+            {"Sl No.": "1", "NOC Name": "Water supply and sewage board", "Is Applicable ?": "Yes",
+             "Status Of Approval": "Approved", "Date of Application": "16-04-2019", "NOC": ""},
+            {"Sl No.": "6", "NOC Name": "Horticulture department", "Is Applicable ?": "No",
+             "Status Of Approval": "", "Date of Application": "", "NOC": ""},
+        ],
+        "noc_expiry": [],
+    }
+    text = _all_text(_render(facts, "internal", "kreradelaynoc"))
+    assert "others" in text, "the delay reason never reached the page"
+    assert "Water supply and sewage board" in text, "the NOC status row was dropped"
+    assert "Approved" in text, "the NOC approval status was dropped"
+    print("test_krera_delay_reasons_and_noc_status_reach_the_page: PASS")
+
+
+def test_krera_delay_noc_section_is_silent_when_absent():
+    """Nine of ten states never populate this key -- the section must render
+    nothing for them, gated on data presence, never on a state check."""
+    facts = _base_facts()
+    facts.pop("project_delay_noc_check", None)
+    text = _all_text(_render(facts, "internal", "kreradelaynocabsent"))
+    assert "Delay Reasons & NOC Status" not in text, \
+        "the section rendered with no data behind it"
+    print("test_krera_delay_noc_section_is_silent_when_absent: PASS")
+
+
 def test_a_group_enforcement_candidate_reaches_the_page_with_its_caution():
     """UP-RERA, HARERA, TNRERA and Delhi-RERA's own registers are a
     different source from case law, but the same discipline applies: a
@@ -816,6 +850,7 @@ def test_every_stage_this_session_added_is_reachable_from_the_pipeline():
         ("group_litigation", "_append_group_litigation_section"),
         ("group_enforcement_check", "_append_group_enforcement_section"),
         ("project_cost_extension_check", "_append_project_cost_extension_section"),
+        ("project_delay_noc_check", "_append_project_delay_noc_section"),
         ("group_financial_disclosure_check", "_append_group_financial_disclosure_section"),
     ):
         assert f'facts["{key}"] =' in source, f"{key} is never written into facts"
@@ -825,7 +860,7 @@ def test_every_stage_this_session_added_is_reachable_from_the_pipeline():
     for section in ("_append_secured_borrowing_section", "_append_state_footprint_section",
                     "_append_group_rera_sweep_section", "_append_group_gst_section",
                     "_append_group_litigation_section", "_append_group_enforcement_section",
-                    "_append_project_cost_extension_section",
+                    "_append_project_cost_extension_section", "_append_project_delay_noc_section",
                     "_append_group_financial_disclosure_section"):
         assert f"lambda: {section}(doc, facts)" in source,             f"{section} exists but is never called during a render"
     print("test_every_stage_this_session_added_is_reachable_from_the_pipeline: PASS")
@@ -868,6 +903,8 @@ if __name__ == "__main__":
         test_a_penalty_order_reaches_the_page_with_its_amount()
         test_krera_cost_and_extension_history_reaches_the_page()
         test_krera_cost_and_extension_section_is_silent_when_absent()
+        test_krera_delay_reasons_and_noc_status_reach_the_page()
+        test_krera_delay_noc_section_is_silent_when_absent()
         test_a_group_enforcement_candidate_reaches_the_page_with_its_caution()
         test_an_empty_group_enforcement_result_still_warns_against_reading_it_as_clean()
         test_a_group_financial_disclosure_statement_reaches_the_page()

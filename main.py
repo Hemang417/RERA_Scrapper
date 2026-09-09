@@ -158,12 +158,15 @@ def parse_args() -> argparse.Namespace:
         "--group-enforcement",
         action="store_true",
         help=(
-            "Search UP-RERA, HARERA, TNRERA and Delhi-RERA's own defaulter, cancellation, "
-            "penalty and enforcement registers for every group entity and director. Off by "
-            "default: one of the seven sources (Delhi's REAT appeal register) costs a real "
-            "OCR pass, cached across runs, and every hit is a NAME match that must be "
-            "confirmed. The Charter section names the authorities this pass does not reach, "
-            "so an empty table is never read as a clean national record."
+            "Search UP-RERA, HARERA, TNRERA, Delhi-RERA, WBRERA and JHARERA's own "
+            "defaulter, cancellation, penalty, rejection, surrender and enforcement "
+            "registers for every group entity and director. Off by default: one of the "
+            "ten sources (Delhi's REAT appeal register) costs a real OCR pass, cached "
+            "across runs, and every hit is a NAME match that must be confirmed -- "
+            "WBRERA's own register names only the project, not the promoter, so its hits "
+            "are weaker evidence than the others'. The Charter section names the "
+            "authorities this pass does not reach, so an empty table is never read as a "
+            "clean national record."
         ),
     )
     parser.add_argument(

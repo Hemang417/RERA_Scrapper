@@ -621,10 +621,15 @@ def test_live_a_known_project_resolves_from_the_number_alone():
 
 
 def test_live_fetch_project_summary_exposes_the_documents_list():
+    """Deliberately a CURRENT-application registration, not the module's own
+    _REG-equivalent "TN/16/Building/0001/2024" used elsewhere in this file --
+    that one is on the legacy static register, which has no detail view (and
+    so no `documents` key) at all. This needs a project whose detail view
+    actually exists to prove the exposure works."""
     if not _LIVE:
         print("test_live_fetch_project_summary_exposes_the_documents_list: SKIPPED (set TNRERA_LIVE=1)")
         return
-    summary = fetch_project_summary("TN/16/Building/0001/2024")
+    summary = fetch_project_summary("TN/29/Building/0001/2025")
     assert summary.get("opened") is True, summary
     assert "documents" in summary, "fetch_project_summary must expose a documents list"
     print("test_live_fetch_project_summary_exposes_the_documents_list: PASS")

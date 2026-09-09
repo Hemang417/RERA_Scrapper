@@ -30,6 +30,9 @@ def _fetchers(**overrides):
         "delhi_suomoto": lambda: [],
         "delhi_execution": lambda: [],
         "delhi_appeal_index": lambda: {"rows": [], "coverage": {}},
+        "wb_defaulters": lambda: [],
+        "jh_rejected": lambda: [],
+        "jh_surrendered": lambda: [],
     }
     base.update(overrides)
     return base
@@ -161,9 +164,61 @@ def test_reat_appeal_hits_check_both_appellant_and_respondent_sides():
 def test_every_unsearchable_authority_is_named_in_the_limitations():
     result = ge.sweep(_GRAPH, _DIRECTORS, fetchers=_fetchers())
     joined = " ".join(result["limitations"])
-    for authority in ("MahaRERA", "GujRERA", "WBRERA", "JHARERA", "TG-RERA", "K-RERA"):
+    for authority in ("MahaRERA", "GujRERA", "TG-RERA", "K-RERA"):
         assert authority in joined, f"{authority} was not named as unsearched"
     print("test_every_unsearchable_authority_is_named_in_the_limitations: PASS")
+
+
+def test_a_wb_defaulter_hit_matches_the_project_name_and_carries_its_caution():
+    """WBRERA's register names no promoter at all -- only the project -- so
+    the match, and the caution explaining why it is weaker evidence than
+    every other register here, both key off `name`, not a promoter field."""
+    result = ge.sweep(_GRAPH, _DIRECTORS, fetchers=_fetchers(
+        wb_defaulters=lambda: [{
+            "application no.": "WBRERA/NPR-004122",
+            "name": "PRANAMI BUILDERS PVT LTD TOWERS",
+            "address": "Kolkata",
+        }],
+    ))
+    hits = [c for c in result["candidates"] if c["authority"] == "West Bengal (WBRERA)"]
+    assert len(hits) == 1, hits
+    assert hits[0]["detail"] == "WBRERA/NPR-004122", hits[0]
+    assert "names the PROJECT, not the promoter" in hits[0]["caution"], hits[0]
+    print("test_a_wb_defaulter_hit_matches_the_project_name_and_carries_its_caution: PASS")
+
+
+def test_a_jh_rejected_hit_carries_its_own_caution():
+    result = ge.sweep(_GRAPH, _DIRECTORS, fetchers=_fetchers(
+        jh_rejected=lambda: [{
+            "promoter_name": "Pranami Builders Pvt Ltd, Ranchi",
+            "project_name": "Pranami Heights",
+            "reg_no": "", "address": "Ranchi",
+        }],
+    ))
+    hits = [c for c in result["candidates"] if c["register"] == "Rejected-applications register"]
+    assert len(hits) == 1, hits
+    assert hits[0]["authority"] == "Jharkhand (JHARERA)", hits[0]
+    assert hits[0]["detail"] == "Pranami Heights", hits[0]
+    assert "refused before ever reaching registration" in hits[0]["caution"], hits[0]
+    print("test_a_jh_rejected_hit_carries_its_own_caution: PASS")
+
+
+def test_a_jh_surrendered_hit_carries_the_registration_number_as_detail():
+    """The surrendered table's second 'Project Name' column is really the
+    reg_no (see adapter_jharkhand's own docstring on the mislabel) -- this
+    pins that the sweep surfaces it as `detail`, not a duplicated name."""
+    result = ge.sweep(_GRAPH, _DIRECTORS, fetchers=_fetchers(
+        jh_surrendered=lambda: [{
+            "promoter_name": "Pranami Builders Pvt Ltd",
+            "project_name": "Pranami Towers",
+            "reg_no": "JHARERA/PROJECT/35/2023", "address": "Ranchi",
+        }],
+    ))
+    hits = [c for c in result["candidates"] if c["register"] == "Surrendered-registrations register"]
+    assert len(hits) == 1, hits
+    assert hits[0]["detail"] == "JHARERA/PROJECT/35/2023", hits[0]
+    assert "given up" in hits[0]["caution"], hits[0]
+    print("test_a_jh_surrendered_hit_carries_the_registration_number_as_detail: PASS")
 
 
 def test_an_unreachable_register_is_named_never_dropped_to_zero():
@@ -203,6 +258,9 @@ if __name__ == "__main__":
     test_delhi_suomoto_and_execution_match_the_respondent_and_debtor_columns()
     test_reat_appeal_hits_check_both_appellant_and_respondent_sides()
     test_every_unsearchable_authority_is_named_in_the_limitations()
+    test_a_wb_defaulter_hit_matches_the_project_name_and_carries_its_caution()
+    test_a_jh_rejected_hit_carries_its_own_caution()
+    test_a_jh_surrendered_hit_carries_the_registration_number_as_detail()
     test_an_unreachable_register_is_named_never_dropped_to_zero()
     test_coverage_sentence_never_says_clean()
     test_no_subjects_produces_an_honest_sentence_not_a_crash()

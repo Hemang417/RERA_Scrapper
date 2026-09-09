@@ -53,9 +53,11 @@ from .karnataka import (
     COMPLAINT_DETAILS_PAGE,
     COMPLAINT_POST,
     COMPLAINT_REPORT,
+    DEFAULT_PROJECTS_PAGE,
     DETAIL_POST,
     DOWNLOAD_URL,
     PROFILE,
+    REVENUE_RECOVERY_PAGE,
     SEARCH_PAGE,
     SEARCH_POST,
 )
@@ -309,6 +311,103 @@ def search_all_orders_by_promoter(name: str, fetcher=None) -> list:
             "penalty_amount": "",
         })
     return hits
+
+
+def fetch_default_projects(fetcher=None) -> list:
+    """K-RERA's own "Default Project List" -- a distinct state-wide register
+    from the four order/complaint registers _ORDER_REGISTERS covers,
+    naming every project (and its promoter) the authority itself has
+    flagged in default. Confirmed live 2026-09-09: 2,991 rows with clean
+    REGISTRATION NO / PROMOTER / PROJECT / DISTRICT columns -- the
+    strongest name-match register any authority in this pipeline
+    publishes, unwired until now purely because nothing had ever looked
+    at the homepage's own "DEFAULT PROJECT LIST" menu link.
+
+    TWO TABLES ON ONE PAGE. A short (4-row) table sits above the full
+    2,991-row one, sharing the same core columns -- very likely a "most
+    recent" summary widget, not confirmed either way. Both are read and
+    combined, deduplicated by registration number (falling back to
+    promoter+project when one is blank), so this under-counts a genuine
+    duplicate before it would ever risk dropping a real entry on an
+    assumption about which table is authoritative.
+    """
+    if fetcher is not None:
+        html = fetcher()
+    else:
+        html = _fetch_complete(_session(), DEFAULT_PROJECTS_PAGE, "K-RERA default project list")
+    seen, out = set(), []
+    for table in parse_register_tables(html):
+        if "registration no" not in table["headers"]:
+            continue
+        for row in table["rows"]:
+            key = row.get("registration no") or (row.get("promoter") or "", row.get("project") or "")
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(row)
+    return out
+
+
+def search_default_projects_by_promoter(name: str, fetcher=None) -> list:
+    """Rows off fetch_default_projects whose PROMOTER names `name`.
+
+    Matched on a NAME substring -- K-RERA publishes no company identity
+    number on this register either, so each row is a candidate.
+    """
+    needle = " ".join(str(name or "").upper().split())
+    if not needle:
+        return []
+    return [row for row in fetch_default_projects(fetcher)
+            if needle in " ".join((row.get("promoter") or "").upper().split())]
+
+
+def fetch_revenue_recovery_list(fetcher=None) -> list:
+    """K-RERA's Revenue Recovery Certificate register -- promoters against
+    whom an unpaid penalty has escalated to an RRC, this authority's
+    strongest enforcement signal short of a criminal referral. A different
+    finding from fetch_default_projects (unpaid penalty enforcement, not
+    registration default) and a different page. Confirmed live 2026-09-09:
+    2,603 rows with a real PROMOTER NAME column, unlike most of this
+    pipeline's other registers.
+
+    THE PAGE CARRIES MORE THAN ONE TABLE, exactly like DEFAULT_PROJECTS_PAGE
+    -- a near-empty table alongside the full register, seen live. Every
+    table sharing the register's own header is read and combined,
+    deduplicated by complaint number (falling back to promoter+project+
+    amount when that is blank), for the same reason
+    fetch_default_projects does: under-count a genuine duplicate before
+    ever risking a dropped real entry.
+    """
+    if fetcher is not None:
+        html = fetcher()
+    else:
+        html = _fetch_complete(_session(), REVENUE_RECOVERY_PAGE, "K-RERA revenue recovery list")
+    seen, out = set(), []
+    for table in parse_register_tables(html):
+        if "promoter name" not in table["headers"] or "rrc date (dd-mm-yyyy)" not in table["headers"]:
+            continue
+        for row in table["rows"]:
+            key = row.get("complaint no") or (
+                row.get("promoter name") or "", row.get("project name") or "", row.get("amount") or "",
+            )
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(row)
+    return out
+
+
+def search_revenue_recovery_by_promoter(name: str, fetcher=None) -> list:
+    """Rows off fetch_revenue_recovery_list whose PROMOTER NAME names `name`.
+
+    Matched on a NAME substring -- K-RERA publishes no company identity
+    number on this register either, so each row is a candidate.
+    """
+    needle = " ".join(str(name or "").upper().split())
+    if not needle:
+        return []
+    return [row for row in fetch_revenue_recovery_list(fetcher)
+            if needle in " ".join((row.get("promoter name") or "").upper().split())]
 
 
 def search_orders_by_promoter(name: str, fetcher=None) -> list:
@@ -631,6 +730,9 @@ class KarnatakaAdapter:
             "appeals": None,
             "cost_details": parsed["costs"],
             "extensions": parsed["extensions"],
+            "delay_reasons": parsed["delay_reasons"],
+            "noc_status": parsed["noc_status"],
+            "noc_expiry": parsed["noc_expiry"],
         }
         for name, payload in category_data.items():
             with open(os.path.join(raw_dir, f"{name}.json"), "w", encoding="utf-8") as f:
@@ -721,6 +823,20 @@ class KarnatakaAdapter:
         costs_incurred = _labelled_rows(_find_table_by_header(tables, "cost incurred"))
         costs_estimated = _labelled_rows(_find_table_by_header(tables, "estimated cost"))
         extensions = _labelled_rows(_find_table_by_header(tables, "registration/extensions"))
+        # Confirmed live 2026-09-09 against a real project (PRM/KA/RERA/1251/
+        # 309/PR/201001/003607): "Delay Reason" is a real, sometimes-populated
+        # table (that project's own row reads "others"), and K-RERA carries
+        # TWO separate NOC tables the module docstring's "NOC expiry/renewal
+        # tracking" claim conflates -- one tracking whether each NOC was
+        # obtained at all (Is Applicable?/Status Of Approval/Date of
+        # Application, 10 real rows on that same project), the other tracking
+        # an already-issued NOC's own expiry and renewal (Expired Date/
+        # RENEWED?/NOC Validity From-To, empty on both projects checked but a
+        # real table header, not a guess). "noc name" alone would match
+        # either -- the second needle in each call is what tells them apart.
+        delay_reasons = _labelled_rows(_find_table_by_header(tables, "delay reason"))
+        noc_status = _labelled_rows(_find_table_by_header(tables, "noc name", "is applicable"))
+        noc_expiry = _labelled_rows(_find_table_by_header(tables, "noc name", "expired date"))
 
         professionals = []
         for needle, type_name in (
@@ -744,6 +860,9 @@ class KarnatakaAdapter:
             "documents": {"tables": [t for t in tables if t and "document name" in " | ".join(t[0]).lower()]},
             "costs": {"incurred": costs_incurred, "estimated": costs_estimated},
             "extensions": extensions,
+            "delay_reasons": delay_reasons,
+            "noc_status": noc_status,
+            "noc_expiry": noc_expiry,
         }
 
     def _complaint_count(self, session, project_name, ctx):

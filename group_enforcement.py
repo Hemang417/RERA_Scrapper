@@ -1,16 +1,17 @@
 """
 Group Enforcement & Defaulter Search -- opt-in via --group-enforcement.
 
-Seven registers across four authorities (UP-RERA, HARERA, TNRERA and
-Delhi-RERA), written and live-verified 2026-08-26 and never called from
-anywhere until now (docs/PAN_INDIA_PROGRESS.md's "the 32 Unaudited cells
-got audited" section names all seven). None of these is a promoter-
-portfolio API: each publishes a defaulter, cancellation, penalty or
-enforcement list and names the party in its own right, so this searches by
-name the same way litigation_sweep.state_order_sweep already does for
-K-RERA/MahaRERA/JHARERA's order registers -- and inherits that function's
-central discipline: every hit is a CANDIDATE, never a fact, and every
-register this pipeline does NOT search is named on the page, never
+Ten registers across six authorities (UP-RERA, HARERA, TNRERA, Delhi-RERA,
+WBRERA and JHARERA), written and live-verified 2026-08-26 (the first
+seven), 2026-09-09 (WBRERA's) and 2026-09-09 (JHARERA's two), and never
+called from anywhere until now (docs/PAN_INDIA_PROGRESS.md's "the 32
+Unaudited cells got audited" section names the first seven). None of these
+is a promoter-portfolio API: each publishes a defaulter, cancellation,
+penalty or enforcement list and names the party in its own right, so this
+searches by name the same way litigation_sweep.state_order_sweep already
+does for K-RERA/MahaRERA/JHARERA's order registers -- and inherits that
+function's central discipline: every hit is a CANDIDATE, never a fact, and
+every register this pipeline does NOT search is named on the page, never
 silently absent.
 
 WHY A SEPARATE MODULE FROM litigation_sweep.py. Case law is a full-text
@@ -21,11 +22,29 @@ postback, a PDF needing OCR, two states' tables carrying no name column at
 all). Kept apart the way group_sweep.py, gst_group.py and
 litigation_sweep.py already are: one module per check domain.
 
-WHAT THIS DOES NOT COVER. MahaRERA, GujRERA, WBRERA, JHARERA and TG-RERA
-publish no defaulter/enforcement register of this shape; K-RERA's own
-penalty register is already covered by litigation_sweep.state_order_sweep,
-not duplicated here. See NOT_ENFORCEMENT_SEARCHABLE -- an empty result
-table here says nothing about any authority named in it.
+WBRERA'S REGISTER NAMES THE PROJECT, NOT THE PROMOTER. Confirmed live
+2026-09-09 (18 rows): the columns are application no., type, name, address,
+rejection intimation and remarks -- `name` is the PROJECT's name
+("231 GARFA", "AAA FORTUNA"), and no column names the promoter or builder
+at all, unlike every other register this module searches. A subject is
+still matched against it (an Indian project name often embeds the
+promoter's own name), but a miss here proves far less than a miss on the
+other registers, and a hit is weaker evidence too -- see _WB_CAUTION.
+
+JHARERA'S TWO ARE THE OPPOSITE: THE CLEANEST NAME COLUMN HERE. Confirmed
+live 2026-09-09 -- REJECTED_LIST (10 rows: applications refused before
+ever reaching registration) and SURRENDERED_LIST (3 rows: an existing
+registration given up) both carry an actual Promoter Name column, not a
+combined party string or a project-only one. See
+adapter_jharkhand.parse_rejected_or_surrendered_register's own docstring
+on the surrendered table's mislabelled second "Project Name" column
+(really the registration number).
+
+WHAT THIS DOES NOT COVER. MahaRERA, GujRERA and TG-RERA publish no
+defaulter/enforcement register of this shape; K-RERA's own penalty
+register is already covered by litigation_sweep.state_order_sweep, not
+duplicated here. See NOT_ENFORCEMENT_SEARCHABLE -- an empty result table
+here says nothing about any authority named in it.
 
 THE DELHI REAT APPEAL INDEX IS THE EXPENSIVE ONE. Confirming a party name
 on it costs a real OCR pass over up to 481 order PDFs
@@ -64,6 +83,24 @@ _REAT_CAUTION = (
     "page, not the register's own columns, so this is a candidate to confirm "
     "against the order itself."
 )
+_WB_CAUTION = (
+    "WBRERA's defaulter register names the PROJECT, not the promoter -- it "
+    "publishes no promoter/builder column at all. This is a match against the "
+    "project name, which sometimes embeds the promoter's own name and "
+    "sometimes does not, so a miss here is much weaker evidence than a miss "
+    "on this pass's other registers, and a hit still needs confirming against "
+    "the register itself."
+)
+_JH_REJECTED_CAUTION = (
+    "This application was refused before ever reaching registration, so this "
+    "is not a registered project -- it is a name match on JHARERA's own "
+    "rejected-application register, not confirmed proof of identity."
+)
+_JH_SURRENDERED_CAUTION = (
+    "This is a name match on JHARERA's own surrendered-registration register, "
+    "not confirmed proof of identity -- a registration once held and then "
+    "given up, not a defaulter finding on its own."
+)
 
 # Authorities/registers this pass does not reach, established rather than
 # assumed -- an empty result table must not read as clean for any of these.
@@ -71,8 +108,6 @@ NOT_ENFORCEMENT_SEARCHABLE = (
     "MahaRERA -- publishes no state-wide defaulter/enforcement register "
     "distinct from its per-project orders search",
     "GujRERA -- no defaulter or enforcement register was found on the portal",
-    "WBRERA -- no defaulter or enforcement register was found on the portal",
-    "JHARERA -- no defaulter or enforcement register was found on the portal",
     "TG-RERA -- publishes no promoter-keyed register of any kind",
     "K-RERA -- its penalty register is searched by litigation_sweep's own "
     "state order sweep, not duplicated here",
@@ -177,11 +212,29 @@ def _default_delhi_appeal_index(appeal_ocr_limit, appeal_cache_dir, reporter):
     )
 
 
+def _default_wb_defaulters():
+    from states import adapter_westbengal
+
+    return adapter_westbengal.fetch_defaulters()
+
+
+def _default_jh_rejected():
+    from states import adapter_jharkhand
+
+    return adapter_jharkhand.fetch_rejected_projects()
+
+
+def _default_jh_surrendered():
+    from states import adapter_jharkhand
+
+    return adapter_jharkhand.fetch_surrendered_projects()
+
+
 def sweep(graph, directors=None, fetchers=None, appeal_ocr_limit=None,
           appeal_cache_dir=DEFAULT_APPEAL_CACHE_DIR, reporter=None):
-    """Searches UP-RERA, HARERA, TNRERA and Delhi-RERA's defaulter,
-    cancellation, penalty and enforcement registers for every group entity
-    and director.
+    """Searches UP-RERA, HARERA, TNRERA, Delhi-RERA, WBRERA and JHARERA's
+    defaulter, cancellation, penalty, rejection, surrender and enforcement
+    registers for every group entity and director.
 
     Returns {"subjects": [...], "candidates": [...], "searched", "total",
     "limitations"}. Every subject appears with a hit count, including zero,
@@ -193,8 +246,9 @@ def sweep(graph, directors=None, fetchers=None, appeal_ocr_limit=None,
     `fetchers` overrides any of the underlying calls for testing -- keys:
     up_defaulters (), haryana_defaulters (bench), tn_penalty (kind),
     tn_enforcement_search (name), delhi_suomoto (), delhi_execution (),
-    delhi_appeal_index () -> {"rows": [...], "coverage": {...}}. Passing all
-    seven means nothing touches the network.
+    delhi_appeal_index () -> {"rows": [...], "coverage": {...}}, wb_defaulters
+    (), jh_rejected (), jh_surrendered (). Passing all ten means nothing
+    touches the network.
     """
     fetchers = fetchers or {}
     subject_names = _subjects(graph, directors)
@@ -220,6 +274,20 @@ def sweep(graph, directors=None, fetchers=None, appeal_ocr_limit=None,
         rows = _safe_fetch(lambda k=kind: tn_penalty_fn(k), limitations,
                             f"TNRERA's {kind} penalty register")
         tn_penalty_rows.extend(rows)
+
+    wb_rows = _safe_fetch(
+        fetchers.get("wb_defaulters") or _default_wb_defaulters,
+        limitations, "WBRERA's defaulter register",
+    )
+
+    jh_rejected_rows = _safe_fetch(
+        fetchers.get("jh_rejected") or _default_jh_rejected,
+        limitations, "JHARERA's rejected-applications register",
+    )
+    jh_surrendered_rows = _safe_fetch(
+        fetchers.get("jh_surrendered") or _default_jh_surrendered,
+        limitations, "JHARERA's surrendered-registrations register",
+    )
 
     delhi_suomoto_rows = _safe_fetch(
         fetchers.get("delhi_suomoto") or _default_delhi_suomoto,
@@ -295,6 +363,41 @@ def sweep(graph, directors=None, fetchers=None, appeal_ocr_limit=None,
                 f"pass: {type(e).__name__}: {e}"
             )
 
+        for row in wb_rows:
+            # No promoter/builder column exists on this register -- see
+            # _WB_CAUTION -- so the match is against the project name only.
+            if _matches(name, row.get("name")):
+                hits.append({
+                    "authority": "West Bengal (WBRERA)",
+                    "register": "Defaulter register",
+                    "searched_name": name,
+                    "matched_text": row.get("name") or "",
+                    "detail": row.get("application no.") or "",
+                    "caution": _WB_CAUTION,
+                })
+
+        for row in jh_rejected_rows:
+            if _matches(name, row.get("promoter_name"), row.get("project_name")):
+                hits.append({
+                    "authority": "Jharkhand (JHARERA)",
+                    "register": "Rejected-applications register",
+                    "searched_name": name,
+                    "matched_text": row.get("promoter_name") or row.get("project_name") or "",
+                    "detail": row.get("project_name") or "",
+                    "caution": _JH_REJECTED_CAUTION,
+                })
+
+        for row in jh_surrendered_rows:
+            if _matches(name, row.get("promoter_name"), row.get("project_name")):
+                hits.append({
+                    "authority": "Jharkhand (JHARERA)",
+                    "register": "Surrendered-registrations register",
+                    "searched_name": name,
+                    "matched_text": row.get("promoter_name") or row.get("project_name") or "",
+                    "detail": row.get("reg_no") or row.get("project_name") or "",
+                    "caution": _JH_SURRENDERED_CAUTION,
+                })
+
         for row in delhi_suomoto_rows:
             if _matches(name, row.get("respondent_name")):
                 hits.append({
@@ -365,9 +468,10 @@ def coverage_sentence(result):
     searched = result.get("searched") or 0
     hits = len(result.get("candidates") or [])
     sentence = (
-        f"UP-RERA, HARERA, TNRERA and Delhi-RERA's defaulter, cancellation, penalty and "
-        f"enforcement registers were searched for {searched} of {total} group "
-        f"{'name' if total == 1 else 'names'} (entities and directors), returning {hits} "
+        f"UP-RERA, HARERA, TNRERA, Delhi-RERA, WBRERA and JHARERA's defaulter, "
+        f"cancellation, penalty, rejection, surrender and enforcement registers were "
+        f"searched for {searched} of {total} group {'name' if total == 1 else 'names'} "
+        f"(entities and directors), returning {hits} "
         f"candidate {'match' if hits == 1 else 'matches'}."
     )
     if searched < total:

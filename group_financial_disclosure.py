@@ -72,9 +72,16 @@ import states
 # one small helper per check-domain module (see group_enforcement._subjects,
 # duplicated from litigation_sweep._subjects).
 _HIGH_PRIORITY_DOC_KEYWORDS = (
-    "balance sheet", "profit", "loss", "audited", "income tax", "income-tax",
+    "profit", "loss", "audited", "income tax", "income-tax",
 )
 _HIGH_PRIORITY_DOC_WORD_RE = re.compile(r"(?<![a-z])itr(?![a-z])")
+# "balance sheet" as its own regex, not a plain substring in the tuple above --
+# WBRERA's own filed labels misspell it as "blance sheet" (confirmed live,
+# docs/RERA_Data_Coverage.xlsx sheet A's AUDITED BALANCE SHEET row), dropping
+# the first "a". `ba?lance` matches both spellings without loosening the match
+# for anything else -- "balance" (b-a-lance) and "blance" (b-lance) are the
+# only two strings it accepts, nothing broader.
+_BALANCE_SHEET_RE = re.compile(r"\bba?lance\s+sheet\b", re.I)
 
 # National, not per-promoter -- a document already OCR'd for one Charter run
 # should not be re-downloaded/re-OCR'd for the next. Cache TEXT only, never
@@ -92,6 +99,7 @@ def _is_high_priority(label):
     return bool(
         any(k in label_lower for k in _HIGH_PRIORITY_DOC_KEYWORDS)
         or _HIGH_PRIORITY_DOC_WORD_RE.search(label_lower)
+        or _BALANCE_SHEET_RE.search(label_lower)
     )
 
 
