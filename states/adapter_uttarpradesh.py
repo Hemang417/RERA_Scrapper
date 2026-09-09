@@ -295,6 +295,33 @@ def looks_like_a_document(content):
     return not content.lstrip()[:9].lower().startswith((b"<!doctype", b"<html"))
 
 
+def download_single_document(entry, dest_path, session=None):
+    """Fetches ONE document by its {label, url} entry (see
+    document_entries) and writes it to dest_path.
+
+    An entry whose status is "not filed" carries no `url` at all -- the
+    promoter's own declaration that the slot is empty, not a document to
+    fetch -- so this reports that as a published absence, never a failed
+    request. Factored out of _download_documents's per-entry body so a
+    caller who wants exactly one specific document -- group_financial_
+    disclosure.py, checking a single balance sheet on a project it is not
+    otherwise downloading -- does not need a full acquire() to get it.
+    Never raises.
+    """
+    url = entry.get("url") or ""
+    if not url:
+        return {"status": "no link published", "saved_path": None}
+    try:
+        content = _get(session or _session(), url, what="UP-RERA document", binary=True)
+        if not looks_like_a_document(content):
+            return {"status": "not held by the portal", "saved_path": None}
+        with open(dest_path, "wb") as f:
+            f.write(content)
+        return {"status": "downloaded", "saved_path": dest_path}
+    except Exception as e:  # noqa: BLE001 -- recorded, never raised
+        return {"status": f"failed: {type(e).__name__}", "saved_path": None}
+
+
 def land_parcels(html):
     """The KHASRA/PLOT grid -- the promoter's declared land, with areas."""
     out = []
@@ -456,6 +483,11 @@ def fetch_project_summary(project_ref, reporter=None):
         "district": detail["district"],
         "project_cost": detail["project_cost"],
         "registration_date": detail["registration_date"],
+        # The entries themselves, not just a count -- costs nothing extra
+        # since `detail` already parsed them off this same page fetch. Lets
+        # group_financial_disclosure.py find a promoter's balance sheet/P&L/
+        # ITR without a second fetch or a full acquire().
+        "documents": detail["documents"],
         "notes": project_notes(detail),
     }
 
@@ -733,22 +765,15 @@ class UttarPradeshAdapter:
             name = safe_document_filename(documents_dir, entry["label"], used,
                                           extension=document_extension(entry["filename"]))
             path = os.path.join(documents_dir, name)
-            try:
-                content = _get(session, entry["url"], what="UP-RERA document", binary=True)
-                if not looks_like_a_document(content):
-                    manifest.append({"label": entry["label"], "url": entry["url"],
-                                     "filename": entry["filename"],
-                                     "status": "not held by the portal"})
-                    continue
-                with open(path, "wb") as f:
-                    f.write(content)
+            result = download_single_document(entry, path, session=session)
+            if result["status"] == "downloaded":
                 manifest.append({"label": entry["label"], "url": entry["url"],
-                                 "filename": entry["filename"], "path": path,
+                                 "filename": entry["filename"], "path": result["saved_path"],
                                  "uploaded_on": entry.get("uploaded_on", ""),
                                  "status": "downloaded"})
-            except Exception as e:  # noqa: BLE001 -- recorded per document
+            else:
                 manifest.append({"label": entry["label"], "url": entry["url"],
-                                 "status": f"failed: {type(e).__name__}"})
+                                 "filename": entry["filename"], "status": result["status"]})
         downloaded = sum(1 for d in manifest if d.get("status") == "downloaded")
         ctx.reporter.ok(
             f"{downloaded}/{len(listed)} UP-RERA document(s) retrieved"

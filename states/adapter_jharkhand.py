@@ -465,6 +465,36 @@ def document_entries(html):
     return entries
 
 
+def download_single_document(entry, dest_path, session=None):
+    """Fetches ONE document by its {label, url} entry (see
+    document_entries) and writes it to dest_path.
+
+    Factored out of _download_documents's per-entry body so a caller who
+    wants exactly one specific document -- group_financial_disclosure.py,
+    checking a single balance sheet on a project it is not otherwise
+    downloading -- does not need a full acquire() to get it. Never raises.
+    """
+    url = entry.get("url")
+    if not url:
+        return {"status": "failed (no url on this entry)", "saved_path": None}
+    try:
+        response = (session or _session()).get(url, timeout=_TIMEOUT)
+        content_type = (response.headers.get("Content-Type") or "").lower()
+        # An HTML body here is the portal's error page, not a document.
+        # Saving it as a .pdf would put a file on disk that every later
+        # reader would treat as a real filing.
+        if response.status_code == 200 and response.content and "html" not in content_type:
+            with open(dest_path, "wb") as f:
+                f.write(response.content)
+            return {"status": "downloaded", "saved_path": dest_path}
+        if "html" in content_type:
+            return {"status": "failed (portal served a web page, not a document)", "saved_path": None}
+        return {"status": f"failed (HTTP {response.status_code}, {len(response.content)} bytes)",
+                "saved_path": None}
+    except requests.RequestException as e:
+        return {"status": f"failed ({type(e).__name__})", "saved_path": None}
+
+
 def search_promoter_projects(name, reporter=None):
     """Projects on JHARERA whose record matches `name`.
 
@@ -588,6 +618,11 @@ def fetch_project_summary(project_ref, reporter=None):
         "units_sold": sold,
         "land_parcels": len(parsed.get("land") or []),
         "documents_on_page": len(document_entries(html)),
+        # The entries themselves, not just the count -- costs nothing extra
+        # since `html` is already in hand. This is what lets
+        # group_financial_disclosure.py find a promoter's balance sheet/P&L/
+        # ITR without a second fetch or a full acquire().
+        "documents": document_entries(html),
         "notes": project_notes(parsed),
     }
 
@@ -792,26 +827,15 @@ class JharkhandAdapter:
                 documents_dir, entry["label"], used_names,
                 suffix=f"_{entry['document_id']}" if entry["document_id"] else "",
             )
+            dest_path = os.path.join(documents_dir, candidate)
 
             row = {"label": entry["label"], "original_url": entry["url"],
                    "saved_filename": candidate, "status": "failed", "method": "http-get",
                    "document_id": entry["document_id"]}
-            try:
-                response = session.get(entry["url"], timeout=_TIMEOUT)
-                content_type = (response.headers.get("Content-Type") or "").lower()
-                # An HTML body here is the portal's error page, not a
-                # document. Saving it as a .pdf would put a file on disk that
-                # every later reader would treat as a real filing.
-                if response.status_code == 200 and response.content and "html" not in content_type:
-                    with open(os.path.join(documents_dir, candidate), "wb") as f:
-                        f.write(response.content)
-                    row["status"] = "downloaded"
-                elif "html" in content_type:
-                    row["status"] = "failed (portal served a web page, not a document)"
-                else:
-                    row["status"] = f"failed (HTTP {response.status_code}, {len(response.content)} bytes)"
-            except requests.RequestException as e:
-                row["status"] = f"failed ({type(e).__name__})"
+            result = download_single_document(entry, dest_path, session=session)
+            row["status"] = result["status"]
+            if result["status"] != "downloaded":
+                row["saved_filename"] = None
             manifest.append(row)
 
         got = sum(1 for r in manifest if r["status"] == "downloaded")

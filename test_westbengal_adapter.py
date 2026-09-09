@@ -35,10 +35,14 @@ Run directly: python test_westbengal_adapter.py
 """
 
 import os
+import shutil
+import tempfile
 
 import states
 from states.adapter_westbengal import (
     document_entries,
+    download_single_document,
+    fetch_project_summary,
     is_project_document,
     land_details,
     parse_project_detail,
@@ -130,6 +134,66 @@ def test_the_pan_card_label_is_one_promoter_identity_recognises():
     labels = [e["label"] for e in document_entries(_DOC_HTML)]
     assert any(any(h in f" {l.lower()} " for h in pi._PAN_DOC_HINTS) for l in labels), labels
     print("test_the_pan_card_label_is_one_promoter_identity_recognises: PASS")
+
+
+class _FakeResponse:
+    def __init__(self, content=b"%PDF-1.4 x", content_type="application/pdf", status_code=200):
+        self.content = content
+        self.headers = {"Content-Type": content_type}
+        self.status_code = status_code
+
+
+class _FakeSession:
+    def __init__(self, response):
+        self.response = response
+        self.asked = []
+
+    def get(self, url, **kwargs):
+        self.asked.append(url)
+        return self.response
+
+
+def test_download_single_document_writes_the_bytes_and_reports_the_path():
+    """The seam group_financial_disclosure.py uses to pull one specific
+    document -- a balance sheet -- without a full acquire()."""
+    directory = tempfile.mkdtemp(prefix="westbengal_docs_")
+    try:
+        dest = os.path.join(directory, "balance_sheet")
+        result = download_single_document(
+            {"label": "Balance Sheet", "url": f"{_REPO}/nproj/1/x/Balance Sheet FY 2022-23.pdf"},
+            dest, session=_FakeSession(_FakeResponse()),
+        )
+        assert result["status"] == "downloaded", result
+        assert result["saved_path"] == dest
+        with open(dest, "rb") as f:
+            assert f.read() == b"%PDF-1.4 x"
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+    print("test_download_single_document_writes_the_bytes_and_reports_the_path: PASS")
+
+
+def test_download_single_document_refuses_an_html_error_page():
+    """The portal's error page for a missing document is still HTTP 200 --
+    the content type, not the status code, is what proves it is not the
+    file (same discipline as the Jharkhand and Haryana adapters)."""
+    directory = tempfile.mkdtemp(prefix="westbengal_docs_")
+    try:
+        dest = os.path.join(directory, "missing")
+        result = download_single_document(
+            {"label": "Missing Doc", "url": f"{_REPO}/nproj/1/x/missing.pdf"},
+            dest, session=_FakeSession(_FakeResponse(b"<html>nope</html>", "text/html")),
+        )
+        assert result["status"] == "failed (portal served a web page, not a document)", result
+        assert not os.path.exists(dest)
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+    print("test_download_single_document_refuses_an_html_error_page: PASS")
+
+
+def test_download_single_document_with_no_url_fails_without_a_request():
+    result = download_single_document({"label": "x"}, os.path.join(tempfile.mkdtemp(), "x"))
+    assert result["status"] == "failed (no url on this entry)", result
+    print("test_download_single_document_with_no_url_fails_without_a_request: PASS")
 
 
 # --- litigation -----------------------------------------------------------
@@ -398,6 +462,27 @@ def test_westbengal_an_unreadable_register_is_not_an_absence():
     print("test_westbengal_an_unreadable_register_is_not_an_absence: PASS")
 
 
+def test_westbengal_fetch_project_summary_exposes_the_documents_list():
+    """The seam group_financial_disclosure.py needs: the entries themselves,
+    not just a count, off the same detail_html fetch_project_summary
+    already made -- no second fetch or full acquire()."""
+    summary = _wb_open("WBRERA/P/NOR/2025/002592", detail_html=_WB_DETAIL_HTML + _DOC_HTML)
+    labels = [e["label"] for e in summary["documents"]]
+    assert "Balance Sheet" in labels, labels
+    assert "QPR manual" not in labels, "portal boilerplate leaked into the documents list"
+    print("test_westbengal_fetch_project_summary_exposes_the_documents_list: PASS")
+
+
+def test_live_fetch_project_summary_exposes_the_documents_list():
+    if not _LIVE:
+        print("test_live_fetch_project_summary_exposes_the_documents_list: SKIPPED (set WBRERA_LIVE=1)")
+        return
+    summary = fetch_project_summary(_REG)
+    assert summary.get("opened") is True, summary
+    assert "documents" in summary, "fetch_project_summary must expose a documents list"
+    print("test_live_fetch_project_summary_exposes_the_documents_list: PASS")
+
+
 if __name__ == "__main__":
     test_westbengal_opens_a_project_and_names_its_promoter()
     test_westbengal_opens_by_any_of_the_three_identifiers_a_row_carries()
@@ -408,6 +493,11 @@ if __name__ == "__main__":
     test_the_classification_rule_is_explicit_about_each_case()
     test_backslashed_hrefs_are_normalised()
     test_the_pan_card_label_is_one_promoter_identity_recognises()
+    test_download_single_document_writes_the_bytes_and_reports_the_path()
+    test_download_single_document_refuses_an_html_error_page()
+    test_download_single_document_with_no_url_fails_without_a_request()
+    test_westbengal_fetch_project_summary_exposes_the_documents_list()
+    test_live_fetch_project_summary_exposes_the_documents_list()
     test_a_declared_nil_litigation_return_is_not_the_same_as_no_field()
     test_a_real_litigation_row_survives_the_na_filter()
     test_the_state_index_needs_a_procode_to_be_usable()

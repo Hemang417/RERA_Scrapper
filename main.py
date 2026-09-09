@@ -166,6 +166,20 @@ def parse_args() -> argparse.Namespace:
             "so an empty table is never read as a clean national record."
         ),
     )
+    parser.add_argument(
+        "--group-financial-disclosure",
+        action="store_true",
+        help=(
+            "Check OTHER group entities' Gujarat/Jharkhand/Haryana/West Bengal/Uttar Pradesh/"
+            "Tamil Nadu projects for a balance sheet, P&L or income-tax return document, and "
+            "OCR any match. Off by default, and REQUIRES --group-sweep to also be on: it reuses "
+            "that sweep's already-opened projects rather than re-opening them, and finds "
+            "nothing if that sweep did not run. Those six are the only portals that expose a "
+            "searchable document list at all -- and of those, only Gujarat, Jharkhand, Haryana "
+            "and West Bengal have ever produced a live-confirmed hit -- but nothing here checks "
+            "for any state by name; document downloads are cached across runs."
+        ),
+    )
     gst = parser.add_mutually_exclusive_group()
     gst.add_argument(
         "--gstin",
@@ -524,6 +538,7 @@ def main() -> int:
             state_profile=profile, group_sweep=args.group_sweep,
             group_gst=args.group_gst, group_litigation=args.group_litigation,
             group_enforcement=args.group_enforcement,
+            group_financial_disclosure=args.group_financial_disclosure,
         )
         external_charter_path = charter_path.replace("_Internal.docx", "_External.docx")
         print(f"[OK] Company Charter (Internal) written to {charter_path}")

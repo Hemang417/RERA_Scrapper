@@ -34,6 +34,8 @@ Run directly: python test_uttarpradesh_adapter.py
 """
 
 import os
+import shutil
+import tempfile
 
 import group_sweep as gs
 import states
@@ -42,6 +44,7 @@ from states.adapter_uttarpradesh import (
     control_values,
     document_entries,
     document_extension,
+    download_single_document,
     fetch_project_summary,
     land_parcels,
     parse_project_detail,
@@ -322,6 +325,87 @@ def test_a_document_keeps_the_extension_the_portal_gave_it():
     print("test_a_document_keeps_the_extension_the_portal_gave_it: PASS")
 
 
+def test_fetch_project_summary_exposes_the_documents_list():
+    """The seam group_financial_disclosure.py needs: the entries themselves,
+    not just a count, off the same page fetch_project_summary already
+    fetched -- no second request or full acquire()."""
+    import states.adapter_uttarpradesh as up
+
+    saved_get = up._get
+    up._get = lambda session, url, what="page", binary=False: _DETAIL_HTML
+    try:
+        summary = fetch_project_summary(_REG)
+    finally:
+        up._get = saved_get
+    assert summary["opened"] is True, summary
+    labels = [e["label"] for e in summary["documents"]]
+    assert "Details of Encumbrances" in labels, labels
+    assert "CA CERTIFICATE" in labels, labels
+    print("test_fetch_project_summary_exposes_the_documents_list: PASS")
+
+
+class _FakeDocResponse:
+    def __init__(self, content=b"%PDF-1.4 x"):
+        self.content = content
+
+    def raise_for_status(self):
+        pass
+
+
+class _FakeDocSession:
+    def __init__(self, response):
+        self.response = response
+
+    def get(self, url, **kwargs):
+        return self.response
+
+
+def test_download_single_document_writes_the_bytes_and_reports_the_path():
+    """The seam group_financial_disclosure.py uses to pull one specific
+    document -- a balance sheet -- without a full acquire()."""
+    directory = tempfile.mkdtemp(prefix="uprera_docs_")
+    try:
+        dest = os.path.join(directory, "balance_sheet")
+        result = download_single_document(
+            {"label": "Balance Sheet", "url": "https://x/ViewDocument?Param=bs.pdf"},
+            dest, session=_FakeDocSession(_FakeDocResponse()),
+        )
+        assert result["status"] == "downloaded", result
+        assert result["saved_path"] == dest
+        with open(dest, "rb") as f:
+            assert f.read() == b"%PDF-1.4 x"
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+    print("test_download_single_document_writes_the_bytes_and_reports_the_path: PASS")
+
+
+def test_download_single_document_refuses_the_no_record_shell():
+    """A file the portal does not hold answers 200 with the same page shell
+    an unissued project id serves -- checked on the body, not the status,
+    same discipline as _download_documents."""
+    directory = tempfile.mkdtemp(prefix="uprera_docs_")
+    try:
+        dest = os.path.join(directory, "missing")
+        result = download_single_document(
+            {"label": "Missing Doc", "url": "https://x/ViewDocument?Param=NOSUCHFILE.pdf"},
+            dest, session=_FakeDocSession(_FakeDocResponse(_SHELL_HTML.encode())),
+        )
+        assert result["status"] == "not held by the portal", result
+        assert not os.path.exists(dest)
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+    print("test_download_single_document_refuses_the_no_record_shell: PASS")
+
+
+def test_download_single_document_reports_an_unfiled_slot_without_a_request():
+    """An entry the promoter declared NA (see document_entries) carries no
+    url at all -- this must report that rather than attempt a request."""
+    result = download_single_document({"label": "CA CERTIFICATE"},
+                                      os.path.join(tempfile.mkdtemp(), "x"))
+    assert result["status"] == "no link published", result
+    print("test_download_single_document_reports_an_unfiled_slot_without_a_request: PASS")
+
+
 class _FakeResponse:
     def __init__(self, text):
         self.text = text
@@ -456,6 +540,16 @@ def test_live_an_unissued_id_answers_200_with_no_record():
     print("test_live_an_unissued_id_answers_200_with_no_record: PASS")
 
 
+def test_live_fetch_project_summary_exposes_the_documents_list():
+    if not _LIVE:
+        print("test_live_fetch_project_summary_exposes_the_documents_list: SKIPPED (set UPRERA_LIVE=1)")
+        return
+    summary = fetch_project_summary(_REG)
+    assert summary.get("opened") is True, summary
+    assert "documents" in summary, "fetch_project_summary must expose a documents list"
+    print("test_live_fetch_project_summary_exposes_the_documents_list: PASS")
+
+
 def test_live_a_document_the_portal_does_not_hold_is_not_saved():
     """ViewDocument answers a missing file with the HTML shell at 200, so a
     downloader trusting the status code writes a web page as a PDF."""
@@ -486,10 +580,15 @@ if __name__ == "__main__":
     test_a_document_the_promoter_declared_NA_is_neither_filed_nor_failed()
     test_the_unfiled_certificates_reach_the_reader()
     test_a_document_keeps_the_extension_the_portal_gave_it()
+    test_fetch_project_summary_exposes_the_documents_list()
+    test_download_single_document_writes_the_bytes_and_reports_the_path()
+    test_download_single_document_refuses_the_no_record_shell()
+    test_download_single_document_reports_an_unfiled_slot_without_a_request()
     test_the_defaulter_register_is_reached_by_postback_not_a_plain_get()
     test_uttar_pradesh_is_not_searchable_and_says_why()
     test_a_project_can_still_be_opened_even_though_the_state_is_not_searchable()
     test_live_the_id_route_serves_the_number_it_was_asked_for()
     test_live_an_unissued_id_answers_200_with_no_record()
+    test_live_fetch_project_summary_exposes_the_documents_list()
     test_live_a_document_the_portal_does_not_hold_is_not_saved()
     print("\nAll tests passed.")

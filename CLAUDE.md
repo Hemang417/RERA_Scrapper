@@ -14,7 +14,8 @@ not be skipped.
 ## Entry point
 
 `python main.py <REG_NO|project name> [--state MH|GJ|KA|TG|JH|WB|UP|TN|HR|DL] [--group-sweep] [--group-gst] [--group-litigation]
-[--gstin X | --pan Y] [--headed] [--token T] [--no-auto-auth] [--project-id N] [--output-dir D]`
+[--group-enforcement] [--group-financial-disclosure] [--gstin X | --pan Y] [--headed] [--token T] [--no-auto-auth]
+[--project-id N] [--output-dir D]`
 
 Everything below runs from `main.py::main()` in this order. Stages marked
 **[opt-in]** do nothing unless asked; **[never fatal]** log a warning and let
@@ -54,7 +55,15 @@ the run continue. Nothing else may swallow an error.
    `_safe_state_footprint()` (registered vs built), `_safe_group_rera_sweep()`
    **[`--group-sweep`]**, `_safe_group_gst()` **[`--group-gst`]** (PAN-keyed, so
    most of a group is unreachable), `_safe_group_litigation()`
-   **[`--group-litigation`]** (case law + K-RERA orders; every hit a NAME match).
+   **[`--group-litigation`]** (case law + K-RERA orders; every hit a NAME match),
+   `_safe_group_enforcement()` **[`--group-enforcement`]** (defaulter/cancellation/
+   penalty registers across UP-RERA, HARERA, TNRERA, Delhi-RERA; name match, same
+   discipline as the litigation sweep), `_safe_group_financial_disclosure()`
+   **[`--group-financial-disclosure`]** (balance sheet/P&L/ITR documents found on
+   OTHER group entities' Gujarat/Jharkhand/Haryana/West Bengal/Uttar Pradesh/Tamil
+   Nadu projects — the six portals with a searchable document list, of which only
+   the first four have ever produced a live-confirmed hit — via `--group-sweep`'s
+   already-opened projects — needs `--group-sweep` on or there is nothing to check).
    Each reports its own coverage: no finding never means no check (`guardrails.md`).
 3. `_record_source_hits_and_promote()` — cross-run source-trust bookkeeping.
 4. `_normalize_misfiled_facts()` then `run_finding_research()` **[never fatal]**

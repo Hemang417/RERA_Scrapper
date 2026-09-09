@@ -145,6 +145,41 @@ def document_extension(response):
     return _CONTENT_TYPE_EXTENSIONS.get(ctype, ".pdf")
 
 
+def download_single_document(entry, dest_path, session=None):
+    """Fetches ONE document by its {label, url} entry (see
+    parse_project_detail's `documents`) and writes it to dest_path plus a
+    sniffed extension.
+
+    HARERA's document URLs are opaque hashes with no filename, so the
+    extension is only known once the response arrives -- the bytes may
+    therefore land at `dest_path` + an extension rather than `dest_path`
+    exactly; `saved_path` in the return says where. Factored out of
+    _download_documents's per-entry body so a caller who wants exactly one
+    specific document -- group_financial_disclosure.py, checking a single
+    balance sheet on a project it is not otherwise downloading -- does not
+    need a full acquire() to get it. Never raises.
+    """
+    url = entry.get("url") or ""
+    if not url:
+        return {"status": "no link published", "saved_path": None}
+    if not url.startswith("http"):
+        url = "https://haryanarera.gov.in/" + url.lstrip("/")
+    try:
+        response = (session or _session()).get(url, timeout=_TIMEOUT, verify=False)
+        response.raise_for_status()
+        if not looks_like_a_document(response):
+            return {"status": "not held by the portal", "saved_path": None, "url": url}
+        saved_path = dest_path + document_extension(response)
+        with open(saved_path, "wb") as f:
+            f.write(response.content)
+        return {"status": "downloaded", "saved_path": saved_path, "url": url}
+    except Exception as e:  # noqa: BLE001 -- recorded, never raised
+        # "failed: X", not "failed (X)" -- matches this adapter's own
+        # pre-existing manifest-status convention (see
+        # test_a_naming_or_write_failure_is_a_manifest_row_not_an_exception).
+        return {"status": f"failed: {type(e).__name__}", "saved_path": None, "url": url}
+
+
 def _rows_of(table):
     rows = []
     for tr in table.find_all("tr"):
@@ -571,6 +606,11 @@ def fetch_project_summary(project_ref, reporter=None):
         "litigation_declared": parsed.get("litigation_declared") or "",
         "pan_masked": bool(parsed.get("pan_masked")),
         "documents_on_page": len(parsed.get("documents") or []),
+        # The entries themselves, not just the count -- costs nothing extra
+        # since `parsed` already parsed them off this same page fetch. Lets
+        # group_financial_disclosure.py find a promoter's balance sheet/P&L/
+        # ITR without a second fetch or a full acquire().
+        "documents": parsed.get("documents") or [],
         "notes": notes,
     }
 
@@ -764,29 +804,31 @@ class HaryanaAdapter:
             if not url:
                 manifest.append({"label": entry.get("label", ""), "status": "no link published"})
                 continue
-            if not url.startswith("http"):
-                url = "https://haryanarera.gov.in/" + url.lstrip("/")
-            try:
-                response = session.get(url, timeout=_TIMEOUT, verify=False)
-                response.raise_for_status()
-                if not looks_like_a_document(response):
-                    manifest.append({"label": entry.get("label", ""), "url": url,
-                                     "status": "not held by the portal"})
-                    continue
-                # Promoters file different slots under one filename;
-                # de-duplicate or they overwrite each other, the bug both
-                # new-state adapters hit at 15 of 42 documents. The set is
-                # passed in and updated by the helper itself.
-                name = safe_document_filename(documents_dir, label, used,
-                                              extension=document_extension(response))
-                path = os.path.join(documents_dir, name)
-                with open(path, "wb") as f:
-                    f.write(response.content)
-                manifest.append({"label": entry.get("label", ""), "url": url,
-                                 "path": path, "status": "downloaded"})
-            except Exception as e:  # noqa: BLE001 -- recorded per document
-                manifest.append({"label": entry.get("label", ""), "url": url,
-                                 "status": f"failed: {type(e).__name__}"})
+            # Promoters file different slots under one filename;
+            # de-duplicate or they overwrite each other, the bug both
+            # new-state adapters hit at 15 of 42 documents. The set is
+            # passed in and updated by the helper itself. The extension is
+            # unknown until download_single_document sniffs the response, so
+            # the length budget reserves room for the LONGEST one this
+            # adapter ever serves (".xlsx"/".docx", 5 chars) rather than
+            # none, then that placeholder is stripped back off -- otherwise
+            # a label already at the length limit plus a real 5-char
+            # extension could overflow the very path-length budget this
+            # de-duplication exists to respect.
+            budgeted = safe_document_filename(documents_dir, label, used, extension=".xlsx")
+            base_name = budgeted[:-len(".xlsx")]
+            base_path = os.path.join(documents_dir, base_name)
+            result = download_single_document(entry, base_path, session=session)
+            # The resolved (absolute) URL that was actually fetched, not the
+            # raw possibly-relative one off the entry -- see
+            # download_single_document's own resolution against the portal.
+            resolved_url = result.get("url") or url
+            if result["status"] == "downloaded":
+                manifest.append({"label": entry.get("label", ""), "url": resolved_url,
+                                 "path": result["saved_path"], "status": "downloaded"})
+                continue
+            manifest.append({"label": entry.get("label", ""), "url": resolved_url,
+                             "status": result["status"]})
         downloaded = sum(1 for d in manifest if d.get("status") == "downloaded")
         ctx.reporter.ok(f"{downloaded}/{len(manifest)} HARERA document(s) retrieved.")
         return manifest

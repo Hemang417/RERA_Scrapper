@@ -33,11 +33,15 @@ Run directly: python test_jharkhand_adapter.py
 """
 
 import os
+import shutil
+import tempfile
 
 import states
 from states.adapter_jharkhand import (
     document_entries,
     document_label,
+    download_single_document,
+    fetch_project_summary,
     find_table,
     labelled_rows,
     parse_project_detail,
@@ -133,6 +137,70 @@ def test_document_label_never_returns_the_word_view():
     for entry in document_entries(_DOC_HTML):
         assert entry["label"].strip().lower() not in ("view", "download", ""), entry
     print("test_document_label_never_returns_the_word_view: PASS")
+
+
+class _FakeResponse:
+    def __init__(self, content=b"%PDF-1.4 x", content_type="application/pdf", status_code=200):
+        self.content = content
+        self.headers = {"Content-Type": content_type}
+        self.status_code = status_code
+
+
+class _FakeSession:
+    def __init__(self, response):
+        self.response = response
+        self.asked = []
+
+    def get(self, url, **kwargs):
+        self.asked.append(url)
+        return self.response
+
+
+def test_download_single_document_writes_the_bytes_and_reports_the_path():
+    """The seam group_financial_disclosure.py uses to pull one specific
+    document -- a balance sheet -- without a full acquire()."""
+    directory = tempfile.mkdtemp(prefix="jharkhand_docs_")
+    try:
+        dest = os.path.join(directory, "balance_sheet")
+        result = download_single_document(
+            {"label": "Balance Sheet", "url": "/FirstLevel/ViewDocument/106946"},
+            dest, session=_FakeSession(_FakeResponse()),
+        )
+        assert result["status"] == "downloaded", result
+        assert result["saved_path"] == dest
+        with open(dest, "rb") as f:
+            assert f.read() == b"%PDF-1.4 x"
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+    print("test_download_single_document_writes_the_bytes_and_reports_the_path: PASS")
+
+
+def test_download_single_document_refuses_an_html_error_page():
+    """JHARERA's error page for a missing document is still HTTP 200 -- the
+    content type, not the status code, is what proves it is not the file."""
+    directory = tempfile.mkdtemp(prefix="jharkhand_docs_")
+    try:
+        dest = os.path.join(directory, "missing")
+        result = download_single_document(
+            {"label": "Missing Doc", "url": "/FirstLevel/ViewDocument/999999"},
+            dest, session=_FakeSession(_FakeResponse(b"<html>nope</html>", "text/html")),
+        )
+        assert result["status"] == "failed (portal served a web page, not a document)", result
+        assert not os.path.exists(dest)
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+    print("test_download_single_document_refuses_an_html_error_page: PASS")
+
+
+def test_live_fetch_project_summary_exposes_the_documents_list():
+    if not _LIVE:
+        print("test_live_fetch_project_summary_exposes_the_documents_list: SKIPPED (set JHARERA_LIVE=1)")
+        return
+    summary = fetch_project_summary(_REG)
+    assert summary.get("opened") is True, summary
+    assert summary.get("documents"), "fetch_project_summary must expose the documents it already parsed"
+    assert summary["documents_on_page"] == len(summary["documents"])
+    print("test_live_fetch_project_summary_exposes_the_documents_list: PASS")
 
 
 def test_a_filename_can_never_overflow_the_platform_path_limit():
@@ -345,6 +413,9 @@ if __name__ == "__main__":
     test_a_documents_label_comes_from_its_table_not_its_link_text()
     test_the_pan_card_label_is_one_promoter_identity_recognises()
     test_document_label_never_returns_the_word_view()
+    test_download_single_document_writes_the_bytes_and_reports_the_path()
+    test_download_single_document_refuses_an_html_error_page()
+    test_live_fetch_project_summary_exposes_the_documents_list()
     test_a_filename_can_never_overflow_the_platform_path_limit()
     test_an_empty_litigation_table_is_a_clean_check_but_a_missing_one_is_not()
     test_tables_are_found_by_header_not_by_index()

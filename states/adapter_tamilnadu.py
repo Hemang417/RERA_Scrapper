@@ -357,6 +357,32 @@ def looks_like_a_document(response):
     return not content.lstrip()[:9].lower().startswith((b"<!doctype", b"<html", b"page not"))
 
 
+def download_single_document(entry, dest_path, session=None):
+    """Fetches ONE document by its {label, url} entry (see
+    parse_public_view's `documents`) and writes it to dest_path plus a
+    sniffed extension.
+
+    Factored out of _download_documents's per-entry body so a caller who
+    wants exactly one specific document -- group_financial_disclosure.py,
+    checking a single balance sheet on a project it is not otherwise
+    downloading -- does not need a full acquire() to get it. Never raises.
+    """
+    url = entry.get("url") or ""
+    if not url:
+        return {"status": "no link published", "saved_path": None}
+    try:
+        response = (session or _session()).get(url, timeout=_TIMEOUT, verify=False)
+        response.raise_for_status()
+        if not looks_like_a_document(response):
+            return {"status": "not held by the portal", "saved_path": None}
+        saved_path = dest_path + document_extension(url)
+        with open(saved_path, "wb") as f:
+            f.write(response.content)
+        return {"status": "downloaded", "saved_path": saved_path}
+    except Exception as e:  # noqa: BLE001 -- recorded, never raised
+        return {"status": f"failed: {type(e).__name__}", "saved_path": None}
+
+
 def _links_in(cells, index):
     if index is None or index >= len(cells):
         return []
@@ -1100,6 +1126,12 @@ def fetch_project_summary(project_ref, reporter=None):
             summary["district"] = field_value(view, "District")
             summary["total_project_cost"] = field_value(view, "Total Project Cost")
             summary["documents_on_page"] = len(view["documents"])
+            # The entries themselves, not just the count -- costs nothing
+            # extra since `view` already parsed them off this same page
+            # fetch. Lets group_financial_disclosure.py find a promoter's
+            # balance sheet/P&L/income-tax return without a second fetch or
+            # a full acquire().
+            summary["documents"] = view["documents"]
         except StateFetchError:
             summary["notes"].append(
                 "The project's detail view did not load, so only what the register states "
@@ -1376,23 +1408,18 @@ class TamilNaduAdapter:
             if not url:
                 manifest.append({"label": label, "status": "no link published"})
                 continue
-            name = safe_document_filename(documents_dir, label, used,
-                                          extension=document_extension(url))
-            path = os.path.join(documents_dir, name)
-            try:
-                response = session.get(url, timeout=_TIMEOUT, verify=False)
-                response.raise_for_status()
-                if not looks_like_a_document(response):
-                    manifest.append({"label": label, "url": url,
-                                     "status": "not held by the portal"})
-                    continue
-                with open(path, "wb") as f:
-                    f.write(response.content)
-                manifest.append({"label": label, "url": url, "path": path,
+            extension = document_extension(url)
+            name = safe_document_filename(documents_dir, label, used, extension=extension)
+            # download_single_document appends its own (identically computed)
+            # extension, so the budgeted one is stripped back off here first
+            # -- otherwise the file would land as "name.pdf.pdf".
+            base_path = os.path.join(documents_dir, name[:-len(extension)])
+            result = download_single_document(entry, base_path, session=session)
+            if result["status"] == "downloaded":
+                manifest.append({"label": label, "url": url, "path": result["saved_path"],
                                  "status": "downloaded"})
-            except Exception as e:  # noqa: BLE001 -- recorded per document
-                manifest.append({"label": label, "url": url,
-                                 "status": f"failed: {type(e).__name__}"})
+            else:
+                manifest.append({"label": label, "url": url, "status": result["status"]})
         downloaded = sum(1 for d in manifest if d.get("status") == "downloaded")
         ctx.reporter.ok(f"{downloaded}/{len(manifest)} TNRERA document(s) retrieved.")
         return manifest

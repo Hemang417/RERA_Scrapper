@@ -28,10 +28,19 @@ stays offline. Run them deliberately with GUJRERA_LIVE=1.
 Run directly: python test_gujarat_adapter.py
 """
 
+import json
 import os
+import shutil
+import tempfile
 
 import states
-from states.adapter_gujarat import _document_entries, _prettify, _professionals
+from states.adapter_gujarat import (
+    _document_entries,
+    _prettify,
+    _professionals,
+    download_single_document,
+    fetch_project_summary,
+)
 from states.base import storage_key
 
 _LIVE = os.environ.get("GUJRERA_LIVE") == "1"
@@ -83,6 +92,80 @@ def test_a_null_uid_is_skipped_not_downloaded():
     entries = _document_entries({"projectdoc": {"aUId": None, "bUId": ""}})
     assert entries == [], entries
     print("test_a_null_uid_is_skipped_not_downloaded: PASS")
+
+
+class _FakeDMSResponse:
+    def __init__(self, data, status=200):
+        self.data = data
+        self.status = status
+
+
+class _FakeDMSPool:
+    """Minimal urllib3.PoolManager stand-in: .request(method, url, timeout=)
+    -> object with .status/.data, matching what download_single_document
+    actually calls. download_single_document always calls the metadata URL
+    first, then the download URL -- the two canned responses are returned
+    in that fixed order."""
+
+    def __init__(self, meta, content):
+        self.responses = [meta, content]
+        self.urls = []
+
+    def request(self, method, url, timeout=None):
+        self.urls.append(url)
+        return self.responses[len(self.urls) - 1]
+
+
+def test_download_single_document_writes_the_bytes_and_reports_the_path():
+    """The seam group_financial_disclosure.py uses to pull one specific
+    document -- a balance sheet -- without a full acquire(). GujRERA's DMS
+    is a two-step lookup: metadata first (JSON), then the raw bytes."""
+    directory = tempfile.mkdtemp(prefix="gujarat_docs_")
+    try:
+        pool = _FakeDMSPool(
+            meta=_FakeDMSResponse(json.dumps({"fileName": "Audited Balance Sheet.pdf"}).encode()),
+            content=_FakeDMSResponse(b"%PDF-1.4 x"),
+        )
+        dest = os.path.join(directory, "balance_sheet")
+        result = download_single_document({"label": "Audited balance sheet", "uid": "UID-C"},
+                                          dest, pool=pool)
+        assert result["status"] == "downloaded", result
+        assert result["saved_path"] == dest
+        with open(dest, "rb") as f:
+            assert f.read() == b"%PDF-1.4 x"
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+    print("test_download_single_document_writes_the_bytes_and_reports_the_path: PASS")
+
+
+def test_download_single_document_refuses_a_json_error_body_as_content():
+    """The DMS answers a bad uid's content call with a JSON error object,
+    not bytes -- writing it to disk as a .pdf would file an error message
+    as though it were the document."""
+    pool = _FakeDMSPool(
+        meta=_FakeDMSResponse(json.dumps({"fileName": "x.pdf"}).encode()),
+        content=_FakeDMSResponse(b'{"error": "not found"}'),
+    )
+    result = download_single_document({"label": "x", "uid": "bad-uid"},
+                                      os.path.join(tempfile.mkdtemp(), "x"), pool=pool)
+    assert result["status"] == "failed (metadata only, file bytes not served)", result
+    print("test_download_single_document_refuses_a_json_error_body_as_content: PASS")
+
+
+def test_download_single_document_with_no_uid_fails_without_a_request():
+    result = download_single_document({"label": "x"}, "/tmp/x")
+    assert result["status"] == "failed (no uid on this entry)", result
+    print("test_download_single_document_with_no_uid_fails_without_a_request: PASS")
+
+
+def test_live_fetch_project_summary_exposes_the_documents_list():
+    if not _LIVE:
+        print("test_live_fetch_project_summary_exposes_the_documents_list: SKIPPED (set GUJRERA_LIVE=1)")
+        return
+    summary = fetch_project_summary(_SAMPLE_REG_NO)
+    assert summary.get("opened") is True, summary
+    assert "documents" in summary, "fetch_project_summary must expose a documents list"
+    print("test_live_fetch_project_summary_exposes_the_documents_list: PASS")
 
 
 def test_financial_document_labels_are_marked_high_priority_for_extraction():
@@ -423,6 +506,10 @@ if __name__ == "__main__":
     test_the_storage_key_is_flat_but_the_real_number_survives()
     test_document_entries_pair_uid_with_a_readable_label()
     test_a_null_uid_is_skipped_not_downloaded()
+    test_download_single_document_writes_the_bytes_and_reports_the_path()
+    test_download_single_document_refuses_a_json_error_body_as_content()
+    test_download_single_document_with_no_uid_fails_without_a_request()
+    test_live_fetch_project_summary_exposes_the_documents_list()
     test_financial_document_labels_are_marked_high_priority_for_extraction()
     test_wbrera_itr_filenames_are_high_priority_without_false_positives()
     test_professionals_are_normalised_to_maharera_shape()

@@ -232,6 +232,56 @@ def test_the_served_type_names_the_file_not_the_url():
     print("test_the_served_type_names_the_file_not_the_url: PASS")
 
 
+def test_download_single_document_appends_the_sniffed_extension():
+    """The seam group_financial_disclosure.py uses to pull one specific
+    document -- a balance sheet -- without a full acquire(). dest_path is
+    given WITHOUT an extension; the real one is only known after the
+    response arrives."""
+    directory = tempfile.mkdtemp(prefix="harera_single_doc_")
+    try:
+        dest = os.path.join(directory, "balance_sheet")
+        result = hr.download_single_document(
+            {"label": "Balance Sheet", "url": "/project/view_uploaded_Document_open/abc"},
+            dest, session=_Session(),
+        )
+        assert result["status"] == "downloaded", result
+        assert result["saved_path"] == dest + ".pdf", result
+        assert os.path.isfile(result["saved_path"])
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+    print("test_download_single_document_appends_the_sniffed_extension: PASS")
+
+
+def test_download_single_document_matches_the_adapters_own_failure_wording():
+    """_download_documents's manifest status strings are an established
+    contract (see test_a_naming_or_write_failure_is_a_manifest_row_not_an_exception)
+    -- this function must keep using them, not a different-looking format."""
+    class _Boom(_Session):
+        def get(self, url, **kwargs):
+            raise OSError("disk went away")
+
+    result = hr.download_single_document(
+        {"label": "JAMABANDI", "url": "/project/x"},
+        os.path.join(tempfile.mkdtemp(prefix="harera_single_doc_"), "x"), session=_Boom(),
+    )
+    assert result["status"] == "failed: OSError", result
+    print("test_download_single_document_matches_the_adapters_own_failure_wording: PASS")
+
+
+def test_live_fetch_project_summary_exposes_the_documents_list():
+    if not _LIVE:
+        print("test_live_fetch_project_summary_exposes_the_documents_list: SKIPPED (set HARERA_LIVE=1)")
+        return
+    from states.adapter_haryana import _all_projects, _session
+
+    row = next(r for r in _all_projects(_session()) if r["project_id"] == _REG)
+    summary = fetch_project_summary(row["detail_id"])
+    assert summary.get("opened") is True, summary
+    assert summary.get("documents"), "fetch_project_summary must expose the documents it already parsed"
+    assert summary["documents_on_page"] == len(summary["documents"])
+    print("test_live_fetch_project_summary_exposes_the_documents_list: PASS")
+
+
 # --- the register ---------------------------------------------------------
 
 # The register, with the three shapes that bite: the decoy search form, a
@@ -599,6 +649,9 @@ if __name__ == "__main__":
     test_a_naming_or_write_failure_is_a_manifest_row_not_an_exception()
     test_an_error_page_is_not_saved_as_a_document()
     test_the_served_type_names_the_file_not_the_url()
+    test_download_single_document_appends_the_sniffed_extension()
+    test_download_single_document_matches_the_adapters_own_failure_wording()
+    test_live_fetch_project_summary_exposes_the_documents_list()
     test_live_a_real_record_downloads_its_documents()
     test_live_a_document_the_portal_does_not_hold_answers_200_with_html()
     print("\nAll tests passed.")

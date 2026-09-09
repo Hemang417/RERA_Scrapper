@@ -37,12 +37,16 @@ Run directly: python test_tamilnadu_adapter.py
 """
 
 import os
+import shutil
+import tempfile
 
 import group_sweep as gs
 from states.adapter_tamilnadu import (
     coverage_note,
     document_extension,
+    download_single_document,
     fetch_penalty_notices,
+    fetch_project_summary,
     field_value,
     looks_like_a_document,
     parse_order_register,
@@ -317,6 +321,91 @@ def test_only_filed_documents_are_collected_not_the_menu():
     print("test_only_filed_documents_are_collected_not_the_menu: PASS")
 
 
+def test_fetch_project_summary_exposes_the_documents_list():
+    """The seam group_financial_disclosure.py needs: the entries themselves,
+    not just a count, off the same project-view fetch fetch_project_summary
+    already made -- no second request or full acquire()."""
+    import states.adapter_tamilnadu as tn
+
+    fake_row = {
+        "reg_no": "TN/16/BUILDING/0001/2024", "promoter_name": "TNUHDB",
+        "promoter_block": "TNUHDB", "project_name": "Test Project",
+        "registered_on": "", "completion_date": "", "current_status": "",
+        "source": "current register", "project_view_url": "https://x/view",
+    }
+    saved_registers_for, saved_get = tn.registers_for, tn._get
+    tn.registers_for = lambda parsed, session=None: ([fake_row], [])
+    tn._get = lambda session, url, what="page", data=None: _VIEW_HTML
+    try:
+        summary = fetch_project_summary("TN/16/Building/0001/2024")
+    finally:
+        tn.registers_for, tn._get = saved_registers_for, saved_get
+    assert summary["opened"] is True, summary
+    assert summary["documents"], "fetch_project_summary must expose the parsed documents"
+    assert summary["documents"][0]["url"].endswith("/storage/upload/abc.pdf"), summary["documents"]
+    print("test_fetch_project_summary_exposes_the_documents_list: PASS")
+
+
+class _FakeDocResponse:
+    def __init__(self, content=b"%PDF-1.4 x", content_type="application/pdf", status_code=200):
+        self.content = content
+        self.headers = {"Content-Type": content_type}
+        self.status_code = status_code
+
+    def raise_for_status(self):
+        pass
+
+
+class _FakeDocSession:
+    def __init__(self, response):
+        self.response = response
+
+    def get(self, url, **kwargs):
+        return self.response
+
+
+def test_download_single_document_writes_the_bytes_and_reports_the_path():
+    """The seam group_financial_disclosure.py uses to pull one specific
+    document -- a balance sheet -- without a full acquire()."""
+    directory = tempfile.mkdtemp(prefix="tamilnadu_docs_")
+    try:
+        dest = os.path.join(directory, "balance_sheet")
+        result = download_single_document(
+            {"label": "Balance Sheet", "url": "https://x/storage/upload/bs.pdf"},
+            dest, session=_FakeDocSession(_FakeDocResponse()),
+        )
+        assert result["status"] == "downloaded", result
+        assert result["saved_path"] == dest + ".pdf", result
+        with open(result["saved_path"], "rb") as f:
+            assert f.read() == b"%PDF-1.4 x"
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+    print("test_download_single_document_writes_the_bytes_and_reports_the_path: PASS")
+
+
+def test_download_single_document_refuses_the_page_not_found_body():
+    """TNRERA answers a missing file with 14 bytes of HTML at HTTP 200 --
+    the body, not the status code, is what proves it is not the file."""
+    directory = tempfile.mkdtemp(prefix="tamilnadu_docs_")
+    try:
+        dest = os.path.join(directory, "missing")
+        result = download_single_document(
+            {"label": "Missing Doc", "url": "https://x/storage/upload/missing.pdf"},
+            dest, session=_FakeDocSession(_FakeDocResponse(b"Page not found", "text/html")),
+        )
+        assert result["status"] == "not held by the portal", result
+        assert not os.path.exists(dest + ".pdf")
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+    print("test_download_single_document_refuses_the_page_not_found_body: PASS")
+
+
+def test_download_single_document_with_no_url_fails_without_a_request():
+    result = download_single_document({"label": "x"}, os.path.join(tempfile.mkdtemp(), "x"))
+    assert result["status"] == "no link published", result
+    print("test_download_single_document_with_no_url_fails_without_a_request: PASS")
+
+
 # --- orders ---------------------------------------------------------------
 
 def test_orders_are_matched_on_the_respondent():
@@ -531,6 +620,16 @@ def test_live_a_known_project_resolves_from_the_number_alone():
     print("test_live_a_known_project_resolves_from_the_number_alone: PASS")
 
 
+def test_live_fetch_project_summary_exposes_the_documents_list():
+    if not _LIVE:
+        print("test_live_fetch_project_summary_exposes_the_documents_list: SKIPPED (set TNRERA_LIVE=1)")
+        return
+    summary = fetch_project_summary("TN/16/Building/0001/2024")
+    assert summary.get("opened") is True, summary
+    assert "documents" in summary, "fetch_project_summary must expose a documents list"
+    print("test_live_fetch_project_summary_exposes_the_documents_list: PASS")
+
+
 if __name__ == "__main__":
     test_the_four_ways_the_old_pattern_was_wrong()
     test_an_agent_registration_is_not_a_project()
@@ -544,6 +643,10 @@ if __name__ == "__main__":
     test_a_pan_in_the_wrong_box_is_refused()
     test_sections_come_from_both_heading_kinds()
     test_only_filed_documents_are_collected_not_the_menu()
+    test_fetch_project_summary_exposes_the_documents_list()
+    test_download_single_document_writes_the_bytes_and_reports_the_path()
+    test_download_single_document_refuses_the_page_not_found_body()
+    test_download_single_document_with_no_url_fails_without_a_request()
     test_orders_are_matched_on_the_respondent()
     test_all_three_registers_are_read_and_an_unread_one_is_named()
     test_the_penalty_register_is_found_by_header_and_keeps_the_promoter_block_whole()
@@ -555,4 +658,5 @@ if __name__ == "__main__":
     test_tamil_nadu_is_searchable_and_every_hit_is_a_candidate()
     test_live_the_two_registers_do_not_overlap()
     test_live_a_known_project_resolves_from_the_number_alone()
+    test_live_fetch_project_summary_exposes_the_documents_list()
     print("\nAll tests passed.")

@@ -74,6 +74,7 @@ import finalize_report
 import geo_lookup
 import group_enforcement
 import group_entities
+import group_financial_disclosure
 import group_sweep
 import gst_group
 import litigation_sweep
@@ -604,6 +605,27 @@ _CHARTER_FACTS_SCHEMA = {
             },
         },
         "area_intelligence_trend": _PLAIN_FIELD,
+        # Surfaces the audited balance sheet / P&L / income-tax return text that
+        # _HIGH_PRIORITY_DOC_KEYWORDS already routes into extracted_docs for GujRERA,
+        # JHARERA and Haryana projects (the only three of ten states that label these
+        # documents at all) -- previously reaching only free-text narration, never a
+        # structured place a reader could rely on. Deliberately not in `required`
+        # below: omitted entirely, not an empty list, for the seven states and any
+        # project with no such document, same discipline as developer_track_record.
+        "financial_disclosure": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "statement_type": {"type": "string", "description": "E.g. 'Audited Balance Sheet', 'Profit & Loss Statement', 'Income Tax Return'."},
+                    "fiscal_year": {"type": "string"},
+                    "filed_with": {"type": "string", "description": "The authority this was filed with, e.g. 'JHARERA', 'GujRERA', 'HARERA'."},
+                    "key_figures": {"type": "string", "description": "A narrative summary of what the figures actually say -- revenue, profit/loss, total assets, tax paid, etc. -- drawn only from the OCR'd document text, never invented."},
+                    "source": {"type": "string"},
+                },
+                "required": ["statement_type", "fiscal_year", "key_figures", "source"],
+            },
+        },
         "rera_core_fields": {
             "type": "object",
             "properties": {
@@ -726,6 +748,12 @@ estate development, and fill `developer_track_record.years_in_industry` (a plain
 recorded project launch in 1998, per the group's own corporate website") and its source. If you \
 cannot confirm this from any source, omit `developer_track_record` entirely rather than guessing \
 a number or assuming the SPV's own incorporation date equals the group's real experience.
+- If the extracted document text includes a balance sheet, profit & loss statement, or income \
+tax return, populate `financial_disclosure` with one entry per statement actually present in that \
+text -- `key_figures` must summarise only what that document's own OCR'd text says (revenue, \
+profit/loss, total assets, tax paid, whatever it actually states), never a figure you recall from \
+general knowledge of the company. Omit `financial_disclosure` entirely if no such document text \
+was provided this pass, rather than inventing an entry or returning an empty list.
 - Every entry in `sources` needs a `topic` (see the exact known values listed on that field), a \
 `published_date` (YYYY-MM-DD if the source states one, or literally "unknown" if it does not -- \
 never invent one), and an `accessed_date` (YYYY-MM-DD, when you actually looked at it this pass). \
@@ -6790,11 +6818,13 @@ def _fill_template_inner(
         lambda: _append_ibbi_check_section(doc, facts),
         lambda: _append_company_profile_section(doc, facts),
         lambda: _append_secured_borrowing_section(doc, facts),
+        lambda: _append_financial_disclosure_section(doc, facts),
         lambda: _append_group_companies_section(doc, facts),
         lambda: _append_state_footprint_section(doc, facts),
         lambda: _append_project_cost_extension_section(doc, facts),
         lambda: _append_group_rera_sweep_section(doc, facts),
         lambda: _append_group_gst_section(doc, facts),
+        lambda: _append_group_financial_disclosure_section(doc, facts),
         lambda: _append_group_litigation_section(doc, facts),
         lambda: _append_group_enforcement_section(doc, facts),
         lambda: _append_developer_score_section(doc, facts),
@@ -9661,6 +9691,84 @@ def _append_group_gst_section(doc, facts: dict) -> None:
         doc.add_paragraph(limitation)
 
 
+def _append_group_financial_disclosure_section(doc, facts: dict) -> None:
+    """Appends balance sheet/P&L/income-tax return statements found on
+    OTHER group entities' projects, via the group-wide RERA sweep.
+
+    GATED ON DATA PRESENCE, NEVER A STATE CHECK. `projects_checked` is
+    empty whenever the group-wide RERA sweep never ran (--group-sweep was
+    off) or found nothing to open; this section is silent in either case,
+    same discipline as _append_project_cost_extension_section. Six of ten
+    portals expose a searchable document list at all (see
+    group_financial_disclosure.py's own docstring), and of those, only
+    Gujarat, Jharkhand, Haryana and West Bengal have ever produced a
+    live-confirmed matching document -- nothing here checks for any state by
+    name.
+    """
+    check = facts.get("group_financial_disclosure_check") or {}
+    projects_checked = check.get("projects_checked") or []
+    if not projects_checked:
+        return
+
+    heading_style = doc.paragraphs[4].style
+    doc.add_page_break()
+    heading_para = doc.add_paragraph(_external_heading(
+        facts, "Group Financial Disclosure (Code-Computed)"
+    ))
+    heading_para.style = heading_style
+
+    doc.add_paragraph(group_financial_disclosure.coverage_sentence(check))
+
+    statements = check.get("statements") or []
+    if statements:
+        table = doc.add_table(rows=1, cols=5)
+        _set_table_borders(table)
+        for idx, label in enumerate(("Entity", "State", "Registration", "Document", "Excerpt")):
+            cell = table.rows[0].cells[idx]
+            cell.text = label
+            _shade_cell(cell, "D9E2F3")
+            for para in cell.paragraphs:
+                for run in para.runs:
+                    run.bold = True
+        for row_data in statements:
+            row = table.add_row()
+            _set_row_cell(row, 0, ", ".join(row_data.get("entities") or []))
+            _set_row_cell(row, 1, row_data.get("state") or "")
+            _set_row_cell(row, 2, row_data.get("reg_no") or "")
+            _set_row_cell(row, 3, row_data.get("label") or "")
+            _set_row_cell(row, 4, row_data.get("text_excerpt") or "")
+        doc.add_paragraph(
+            "Each excerpt above is this pass's own OCR of the filed document, not an "
+            "independent audit of the entity's finances."
+        )
+
+    # Projects that WERE opened but produced no matching document -- the
+    # point being that a project absent from the statements table above was
+    # actually looked at, not skipped.
+    checked_empty = [p for p in projects_checked if not p.get("matches_found")]
+    if checked_empty:
+        sub = doc.add_paragraph("Projects checked, nothing found")
+        for run in sub.runs:
+            run.bold = True
+        empty_table = doc.add_table(rows=1, cols=3)
+        _set_table_borders(empty_table)
+        for idx, label in enumerate(("Entity", "State", "Registration")):
+            cell = empty_table.rows[0].cells[idx]
+            cell.text = label
+            _shade_cell(cell, "D9E2F3")
+            for para in cell.paragraphs:
+                for run in para.runs:
+                    run.bold = True
+        for row_data in checked_empty:
+            row = empty_table.add_row()
+            _set_row_cell(row, 0, ", ".join(row_data.get("entities") or []))
+            _set_row_cell(row, 1, row_data.get("state") or "")
+            _set_row_cell(row, 2, row_data.get("reg_no") or "")
+
+    for limitation in check.get("limitations") or []:
+        doc.add_paragraph(limitation)
+
+
 def _append_group_litigation_section(doc, facts: dict) -> None:
     """Appends case-law candidates for the group's entities and directors.
 
@@ -10377,6 +10485,60 @@ def _append_secured_borrowing_section(doc, facts: dict) -> None:
     citation = _citation_text(facts, _clean_source_label(profile.get("url", "")) or profile.get("url", ""))
     if citation:
         doc.add_paragraph(f"Source: {citation}")
+
+
+def _append_financial_disclosure_section(doc, facts: dict) -> None:
+    """Appends audited balance sheet / P&L / income-tax return statements
+    the model found in this project's own OCR'd document text.
+
+    GATED PURELY ON THE FIELD BEING PRESENT, NEVER ON STATE. Only GujRERA,
+    JHARERA and Haryana projects ever populate `financial_disclosure` --
+    they are the only three of ten authorities that publish a document
+    labelled this way -- but nothing here checks the state directly; the
+    other seven simply never produce the field, and this function is silent
+    for them exactly as it would be for a GJ/JH/HR project that filed none.
+
+    Every figure here is the model's OWN reading of the document text
+    provided to it this pass, not an independent recomputation, so it
+    carries the same citation discipline as any other model-sourced fact.
+    """
+    entries = facts.get("financial_disclosure") or []
+    if not entries:
+        return
+
+    heading_style = doc.paragraphs[4].style
+    doc.add_page_break()
+    heading_para = doc.add_paragraph(_external_heading(facts, "Financial Disclosure"))
+    heading_para.style = heading_style
+
+    doc.add_paragraph(_externalize_prose(
+        facts,
+        "Balance sheet, profit & loss and income-tax return figures found in this project's "
+        "own filed documents. These are read directly off the filed statement, not an "
+        "independent audit of the promoter's finances."
+    ))
+
+    table = doc.add_table(rows=1, cols=4)
+    _set_table_borders(table)
+    for idx, label in enumerate(("Statement", "Fiscal Year", "Filed With", "Key Figures")):
+        cell = table.rows[0].cells[idx]
+        cell.text = label
+        _shade_cell(cell, "D9E2F3")
+        for para in cell.paragraphs:
+            for run in para.runs:
+                run.bold = True
+
+    for entry in entries:
+        row = table.add_row()
+        _set_row_cell(row, 0, entry.get("statement_type") or "")
+        _set_row_cell(row, 1, entry.get("fiscal_year") or "")
+        _set_row_cell(row, 2, entry.get("filed_with") or "")
+        _set_row_cell(row, 3, _externalize_prose(facts, entry.get("key_figures") or ""))
+
+    for entry in entries:
+        citation = _citation_text(facts, _clean_source_label(entry.get("source") or ""))
+        if citation:
+            doc.add_paragraph(f"Source ({entry.get('statement_type') or 'statement'}): {citation}")
 
 
 def _append_group_rera_sweep_section(doc, facts: dict) -> None:
@@ -11593,6 +11755,33 @@ def _safe_group_gst(group_result: dict, subject_promoter: str = "",
                 "limitations": [f"The group-wide GST check could not run this pass: {e}"]}
 
 
+def _safe_group_financial_disclosure(rera_sweep: dict | None = None,
+                                     enabled: bool | None = None,
+                                     downloaders=None) -> dict:
+    """Balance sheet/P&L/income-tax return statements found on OTHER group
+    entities' GJ/JH/HR projects, opt-in via CHARTER_GROUP_FINANCIAL_DISCLOSURE.
+
+    WIDENS group_rera_sweep RATHER THAN RE-RUNNING IT -- the same
+    already-paid-for-fetch idiom `_safe_group_gst`'s `rera_sweep` parameter
+    uses. Depends on `--group-sweep` having already opened the group's
+    projects; if it was not enabled, `group_financial_disclosure.sweep`
+    itself returns a named limitation rather than a fabricated empty result.
+
+    No Anthropic call: unlike the single-project `financial_disclosure`
+    field, this can touch dozens of other entities' projects, so it renders
+    OCR'd text directly, the same zero-extra-cost pattern gst_group.py uses.
+    """
+    if enabled is None:
+        enabled = os.environ.get("CHARTER_GROUP_FINANCIAL_DISCLOSURE") == "1"
+    if not enabled:
+        return {}
+    try:
+        return group_financial_disclosure.sweep(rera_sweep, downloaders=downloaders)
+    except Exception as e:
+        return {"projects_checked": [], "statements": [], "checked": 0, "total": 0,
+                "limitations": [f"The group financial disclosure sweep could not run this pass: {e}"]}
+
+
 def _safe_group_litigation(group_result: dict, subject_promoter: str = "",
                            state_footprint: dict | None = None,
                            enabled: bool | None = None, searcher=None) -> dict:
@@ -11978,6 +12167,7 @@ def run_company_charter(
     group_gst: bool = False,
     group_litigation: bool = False,
     group_enforcement: bool = False,
+    group_financial_disclosure: bool = False,
 ) -> tuple[str, dict]:
     """Returns (out_path, facts) -- facts is the complete, code-and-model
     -assembled Charter data (same content as the .facts.json written
@@ -12223,6 +12413,12 @@ def run_company_charter(
             # PANs are what make a GST lookup possible for entities the MCA
             # side of the graph can never key.
             rera_sweep=facts.get("group_rera_sweep"),
+        )
+        facts["group_financial_disclosure_check"] = _safe_group_financial_disclosure(
+            # Same already-opened project pages the GST harvest above reads --
+            # this check depends on --group-sweep having run, not on group_gst.
+            rera_sweep=facts.get("group_rera_sweep"),
+            enabled=group_financial_disclosure or None,
         )
         facts["group_litigation"] = _safe_group_litigation(
             group_result, _portal_promoter_name(category_data),

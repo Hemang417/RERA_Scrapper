@@ -491,6 +491,54 @@ def document_entries(html):
     return entries
 
 
+def _plain_session():
+    """A PLAIN requests session, not the legacy-TLS pool. Two reasons, both
+    found live: the document host is a different machine that does not need
+    the TLS workaround, and it serves over plain HTTP -- and urllib3 rejects
+    `assert_hostname` on a non-TLS connection with a TypeError, so every
+    single http:// document failed with what looked like a download error.
+    267 of 275 documents were being reported as unretrievable for that
+    reason alone. Shared by _download_documents and download_single_document
+    so both carry the same fix.
+    """
+    session = requests.Session()
+    session.verify = False
+    session.headers.update({"User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+    )})
+    return session
+
+
+def download_single_document(entry, dest_path, session=None):
+    """Fetches ONE document by its {label, url} entry (see document_entries)
+    and writes it to dest_path.
+
+    Factored out of _download_documents's per-entry body so a caller who
+    wants exactly one specific document -- group_financial_disclosure.py,
+    checking a single balance sheet on a project it is not otherwise
+    downloading -- does not need a full acquire() to get it. Never raises.
+    """
+    url = entry.get("url") or ""
+    if not url:
+        return {"status": "failed (no url on this entry)", "saved_path": None}
+    try:
+        response = (session or _plain_session()).get(url, timeout=_TIMEOUT)
+        content_type = (response.headers.get("Content-Type") or "").lower()
+        # An HTML body here is the portal's error page, not a document --
+        # same discipline as the other adapters this function's siblings.
+        if response.status_code == 200 and response.content and "html" not in content_type:
+            with open(dest_path, "wb") as f:
+                f.write(response.content)
+            return {"status": "downloaded", "saved_path": dest_path}
+        if "html" in content_type:
+            return {"status": "failed (portal served a web page, not a document)", "saved_path": None}
+        return {"status": f"failed (HTTP {response.status_code}, {len(response.content)} bytes)",
+                "saved_path": None}
+    except requests.RequestException as e:
+        return {"status": f"failed ({type(e).__name__})", "saved_path": None}
+
+
 class _NullReporter:
     def info(self, *a, **k): pass
     def warn(self, *a, **k): pass
@@ -563,15 +611,14 @@ def fetch_project_summary(project_ref, reporter=None):
                          f"West Bengal project may have no WBRERA record at all.")}
 
     try:
-        parsed = parse_project_detail(
-            _get(_pool(), PROJECT_DETAIL.format(entry["procode"]), _NullCtx(),
-                 what="project detail")
-        )
+        detail_html = _get(_pool(), PROJECT_DETAIL.format(entry["procode"]), _NullCtx(),
+                           what="project detail")
     except StateFetchError as e:
         return {"opened": False,
                 "note": f"WBRERA's page for {entry['reg_no']} could not be read "
                         f"({type(e).__name__})."}
 
+    parsed = parse_project_detail(detail_html)
     return {
         "opened": True,
         # The whole point: the index does not carry this, the page does.
@@ -586,6 +633,11 @@ def fetch_project_summary(project_ref, reporter=None):
         "litigation": parsed["litigation"],
         "declared_other_projects": parsed["other_projects"],
         "land": parsed["land"],
+        # The entries themselves, not just a count -- costs nothing extra
+        # since `detail_html` is already in hand. This is what lets
+        # group_financial_disclosure.py find a promoter's balance sheet/P&L/
+        # ITR without a second fetch or a full acquire().
+        "documents": document_entries(detail_html),
         "notes": project_notes(parsed),
     }
 
@@ -715,13 +767,11 @@ class WestBengalAdapter:
     def _download_documents(self, pool, detail_html, documents_dir, ctx):
         """Downloads this project's filings.
 
-        Uses a PLAIN requests session, not the legacy-TLS pool. Two reasons,
-        both found live: the document host is a different machine that does
-        not need the TLS workaround, and it serves over plain HTTP -- and
-        urllib3 rejects `assert_hostname` on a non-TLS connection with a
-        TypeError, so every single http:// document failed with what looked
-        like a download error. 267 of 275 documents were being reported as
-        unretrievable for that reason alone.
+        Delegates the actual fetch to download_single_document -- see that
+        function's own docstring on why a PLAIN requests session is used
+        instead of the legacy-TLS pool; that fix now lives in one place
+        instead of being duplicated between this method and the single-
+        document seam.
         """
         entries = document_entries(detail_html)
         if not entries:
@@ -729,12 +779,7 @@ class WestBengalAdapter:
             return []
 
         os.makedirs(documents_dir, exist_ok=True)
-        session = requests.Session()
-        session.verify = False
-        session.headers.update({"User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
-        )})
+        session = _plain_session()
 
         manifest, used = [], set()
         for entry in entries:
@@ -743,21 +788,13 @@ class WestBengalAdapter:
             candidate = safe_document_filename(
                 documents_dir, stem, used, extension=ext or ".pdf"
             )
+            dest_path = os.path.join(documents_dir, candidate)
             row = {"label": entry["label"], "original_url": entry["url"],
                    "saved_filename": candidate, "status": "failed", "method": "http-get"}
-            try:
-                response = session.get(entry["url"], timeout=_TIMEOUT)
-                content_type = (response.headers.get("Content-Type") or "").lower()
-                if response.status_code == 200 and response.content and "html" not in content_type:
-                    with open(os.path.join(documents_dir, candidate), "wb") as f:
-                        f.write(response.content)
-                    row["status"] = "downloaded"
-                elif "html" in content_type:
-                    row["status"] = "failed (portal served a web page, not a document)"
-                else:
-                    row["status"] = f"failed (HTTP {response.status_code}, {len(response.content)} bytes)"
-            except requests.RequestException as e:
-                row["status"] = f"failed ({type(e).__name__})"
+            result = download_single_document(entry, dest_path, session=session)
+            row["status"] = result["status"]
+            if result["status"] != "downloaded":
+                row["saved_filename"] = None
             manifest.append(row)
 
         got = sum(1 for r in manifest if r["status"] == "downloaded")

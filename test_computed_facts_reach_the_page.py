@@ -354,6 +354,38 @@ def test_a_charge_lookup_that_never_ran_asserts_nothing():
     print("test_a_charge_lookup_that_never_ran_asserts_nothing: PASS")
 
 
+# --- financial disclosure (balance sheet / P&L / income-tax return) -------
+
+def test_financial_disclosure_reaches_the_page_in_both_variants():
+    """The whole point of the schema field: a balance sheet/P&L/ITR the
+    model found in this project's own OCR'd documents must land somewhere a
+    reader can find it, not just in free-text narration."""
+    facts = _base_facts()
+    facts["financial_disclosure"] = [{
+        "statement_type": "Audited Balance Sheet",
+        "fiscal_year": "2024-25",
+        "filed_with": "JHARERA",
+        "key_figures": "Total assets Rs 42,00,00,000; net profit Rs 3,10,00,000.",
+        "source": "Audited Balance Sheet FY 2024-25.pdf, JHARERA project document library",
+    }]
+    for variant in ("internal", "external"):
+        text = _all_text(_render(facts, variant, f"findisc_{variant}"))
+        assert "Audited Balance Sheet" in text, f"the statement type was dropped ({variant})"
+        assert "2024-25" in text, f"the fiscal year was dropped ({variant})"
+        assert "42,00,00,000" in text, f"the key figures were dropped ({variant})"
+    print("test_financial_disclosure_reaches_the_page_in_both_variants: PASS")
+
+
+def test_financial_disclosure_section_is_silent_when_absent():
+    """Seven of ten states never populate this field -- the section must
+    render nothing for them, gated on data presence, never a state check."""
+    facts = _base_facts()
+    facts.pop("financial_disclosure", None)
+    text = _all_text(_render(facts, "internal", "findiscabsent"))
+    assert "Financial Disclosure" not in text, "the section rendered with no data behind it"
+    print("test_financial_disclosure_section_is_silent_when_absent: PASS")
+
+
 # --- the pan-India state footprint ----------------------------------------
 
 def test_a_declared_out_of_state_project_reaches_the_page():
@@ -705,6 +737,66 @@ def test_an_empty_group_enforcement_result_still_warns_against_reading_it_as_cle
     print("test_an_empty_group_enforcement_result_still_warns_against_reading_it_as_clean: PASS")
 
 
+def test_a_group_financial_disclosure_statement_reaches_the_page():
+    """A balance sheet found on ANOTHER group entity's Jharkhand project,
+    via the group-wide RERA sweep -- distinct from the single-project
+    financial_disclosure field above, which only ever covers the one
+    project being charted."""
+    facts = _base_facts()
+    facts["group_financial_disclosure_check"] = {
+        "projects_checked": [{
+            "state": "JH", "reg_no": "JHARERA/PROJECT/35/2023",
+            "entities": ["Pranami Builders Pvt Ltd"],
+            "documents_seen": 12, "matches_found": 1,
+        }],
+        "statements": [{
+            "state": "JH", "reg_no": "JHARERA/PROJECT/35/2023",
+            "entities": ["Pranami Builders Pvt Ltd"],
+            "label": "Audited Balance Sheet 2023-24.pdf",
+            "text_excerpt": "Total assets Rs 12,34,56,789 as at 31 March 2024.",
+            "cache_status": "downloaded",
+        }],
+        "checked": 1, "total": 1,
+        "limitations": ["Only Gujarat, Jharkhand and Haryana projects expose a document "
+                        "list this pass can search."],
+    }
+    text = _all_text(_render(facts, "internal", "groupfindisc"))
+    assert "JHARERA/PROJECT/35/2023" in text, "the registration never reached the page"
+    assert "12,34,56,789" in text, "the excerpt was dropped"
+    assert "own OCR" in text, "the page did not disclaim this as an independent audit"
+    print("test_a_group_financial_disclosure_statement_reaches_the_page: PASS")
+
+
+def test_a_group_financial_disclosure_project_checked_with_nothing_found_is_still_named():
+    """A project the sweep actually opened, with no matching document, must
+    be listed as checked -- not silently absent, which would read the same
+    as a project the sweep never reached at all."""
+    facts = _base_facts()
+    facts["group_financial_disclosure_check"] = {
+        "projects_checked": [{
+            "state": "HR", "reg_no": "RERA-GRG-741-2020",
+            "entities": ["Quiet Entity Ltd"], "documents_seen": 60, "matches_found": 0,
+        }],
+        "statements": [], "checked": 1, "total": 1,
+        "limitations": ["Only Gujarat, Jharkhand and Haryana projects expose a document "
+                        "list this pass can search."],
+    }
+    text = _all_text(_render(facts, "internal", "groupfindiscempty"))
+    assert "RERA-GRG-741-2020" in text, "the checked-but-empty project was dropped"
+    assert "Projects checked, nothing found" in text
+    print("test_a_group_financial_disclosure_project_checked_with_nothing_found_is_still_named: PASS")
+
+
+def test_group_financial_disclosure_section_is_silent_when_the_sweep_never_ran():
+    """--group-sweep off, or --group-financial-disclosure off -- either way
+    projects_checked is empty and the section must not appear."""
+    facts = _base_facts()
+    facts["group_financial_disclosure_check"] = {}
+    text = _all_text(_render(facts, "internal", "groupfindiscoff"))
+    assert "Group Financial Disclosure" not in text, "the section rendered for a sweep that never ran"
+    print("test_group_financial_disclosure_section_is_silent_when_the_sweep_never_ran: PASS")
+
+
 def test_every_stage_this_session_added_is_reachable_from_the_pipeline():
     """Anti-drift guard, and the reason this file exists: each of these was
     at some point computed correctly and rendered nowhere. A stage must be
@@ -724,6 +816,7 @@ def test_every_stage_this_session_added_is_reachable_from_the_pipeline():
         ("group_litigation", "_append_group_litigation_section"),
         ("group_enforcement_check", "_append_group_enforcement_section"),
         ("project_cost_extension_check", "_append_project_cost_extension_section"),
+        ("group_financial_disclosure_check", "_append_group_financial_disclosure_section"),
     ):
         assert f'facts["{key}"] =' in source, f"{key} is never written into facts"
         assert f'facts.get("{key}")' in source, f"{key} is written but never read back"
@@ -732,7 +825,8 @@ def test_every_stage_this_session_added_is_reachable_from_the_pipeline():
     for section in ("_append_secured_borrowing_section", "_append_state_footprint_section",
                     "_append_group_rera_sweep_section", "_append_group_gst_section",
                     "_append_group_litigation_section", "_append_group_enforcement_section",
-                    "_append_project_cost_extension_section"):
+                    "_append_project_cost_extension_section",
+                    "_append_group_financial_disclosure_section"):
         assert f"lambda: {section}(doc, facts)" in source,             f"{section} exists but is never called during a render"
     print("test_every_stage_this_session_added_is_reachable_from_the_pipeline: PASS")
 
@@ -756,6 +850,8 @@ if __name__ == "__main__":
         test_unreadable_amounts_report_a_count_and_never_a_zero()
         test_a_promoter_with_no_charges_gets_the_empty_section_form()
         test_a_charge_lookup_that_never_ran_asserts_nothing()
+        test_financial_disclosure_reaches_the_page_in_both_variants()
+        test_financial_disclosure_section_is_silent_when_absent()
         test_a_declared_out_of_state_project_reaches_the_page()
         test_incorporation_and_operation_are_reported_separately()
         test_llps_are_counted_out_loud_not_quietly_omitted()
@@ -774,6 +870,9 @@ if __name__ == "__main__":
         test_krera_cost_and_extension_section_is_silent_when_absent()
         test_a_group_enforcement_candidate_reaches_the_page_with_its_caution()
         test_an_empty_group_enforcement_result_still_warns_against_reading_it_as_clean()
+        test_a_group_financial_disclosure_statement_reaches_the_page()
+        test_a_group_financial_disclosure_project_checked_with_nothing_found_is_still_named()
+        test_group_financial_disclosure_section_is_silent_when_the_sweep_never_ran()
         test_every_stage_this_session_added_is_reachable_from_the_pipeline()
         print("\nAll tests passed.")
     finally:

@@ -146,6 +146,35 @@ def _document_entries(doc_payload: dict) -> list:
     return entries
 
 
+def download_single_document(entry, dest_path, pool=None):
+    """Fetches ONE document by its {label, uid} entry (see
+    _document_entries) and writes it to dest_path.
+
+    GujRERA's DMS is a two-step lookup -- a metadata call resolves the real
+    filename, then a separate call serves the bytes -- unlike the other two
+    adapters with this same function, which fetch a plain URL. Factored out
+    of _download_documents's per-entry body so a caller who wants exactly
+    one specific document -- group_financial_disclosure.py, checking a
+    single balance sheet on a project it is not otherwise downloading --
+    does not need a full acquire() to get it. Never raises.
+    """
+    uid = entry.get("uid")
+    if not uid:
+        return {"status": "failed (no uid on this entry)", "saved_path": None}
+    pool = pool or _pool()
+    try:
+        meta_resp = pool.request("GET", DMS_METADATA_URL.format(uid), timeout=_TIMEOUT)
+        json.loads(meta_resp.data.decode("utf-8", "replace"))  # confirms metadata resolves at all
+        content = pool.request("GET", DMS_DOWNLOAD_URL.format(uid), timeout=_TIMEOUT)
+        if content.status == 200 and content.data and not content.data.lstrip().startswith(b"{"):
+            with open(dest_path, "wb") as f:
+                f.write(content.data)
+            return {"status": "downloaded", "saved_path": dest_path}
+        return {"status": "failed (metadata only, file bytes not served)", "saved_path": None}
+    except Exception as e:
+        return {"status": f"failed ({e})", "saved_path": None}
+
+
 def _prettify(camel: str) -> str:
     """Fallback label for a document field this module has not named yet --
     better than showing the reader a raw camelCase key."""
@@ -220,6 +249,11 @@ def fetch_project_summary(project_ref, reporter=None):
         ) or {}
         alldata = _get(pool, f"public/alldatabyprojectid/{entity_id}") or {}
         prev = _get(pool, f"public/getprev-project-list/{entity_id}") or {}
+        # One extra request, made only for a project this pass actually opens
+        # (group_sweep bounds that count). Unlike JHARERA/Haryana, GujRERA's
+        # summary call above never touches the documents endpoint on its
+        # own, so there is no already-fetched payload to reuse here.
+        docs = _get(pool, f"public/getproject-doc/{entity_id}") or {}
     except StateFetchError as e:
         return {"opened": False,
                 "note": f"GujRERA's record for '{project_ref}' could not be read "
@@ -253,6 +287,9 @@ def fetch_project_summary(project_ref, reporter=None):
         "district": project.get("distName") or project.get("districtName") or "",
         "professionals": _professionals(details),
         "declared_other_projects": declared_previous,
+        # Lets group_financial_disclosure.py find a promoter's balance
+        # sheet/P&L/income-tax return without a full acquire().
+        "documents": _document_entries(docs),
         "notes": notes,
     }
 
