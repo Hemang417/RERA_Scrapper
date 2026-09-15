@@ -57,12 +57,35 @@ def _load_charter_facts(reg_no: str, output_dir: str) -> dict | None:
     return _load_json(os.path.join(charter_dir, matches[0]))
 
 
-def rebuild(reg_no: str, output_dir: str = config.OUTPUT_ROOT) -> str:
+def ingest_research_json(reg_no: str, research_json_path: str, output_dir: str = config.OUTPUT_ROOT) -> str:
+    """Copies an externally-produced deep_research.json (e.g. from a
+    server-side/API research pass that has no access to this repo's own
+    research step) into output/<reg_no>/research/deep_research.json, where
+    `rebuild` reads it from. Raises if the file isn't valid JSON -- better to
+    fail loudly here than silently ship a report missing the research someone
+    just handed over."""
+    with open(research_json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError(f"{research_json_path} must contain a JSON object, got {type(data).__name__}")
+
+    research_dir = os.path.join(output_dir, reg_no, "research")
+    os.makedirs(research_dir, exist_ok=True)
+    dest_path = os.path.join(research_dir, "deep_research.json")
+    with open(dest_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    return dest_path
+
+
+def rebuild(reg_no: str, output_dir: str = config.OUTPUT_ROOT, research_json_path: str | None = None) -> str:
     project_out_dir = os.path.join(output_dir, reg_no)
     raw_dir = os.path.join(project_out_dir, "raw")
 
     if not os.path.isdir(raw_dir):
         raise FileNotFoundError(f"No raw data found at {raw_dir} -- run `python main.py {reg_no}` first.")
+
+    if research_json_path:
+        ingest_research_json(reg_no, research_json_path, output_dir)
 
     category_data = load_category_data(raw_dir)
 
@@ -103,11 +126,20 @@ def main() -> int:
     parser.add_argument(
         "--output-dir", default=config.OUTPUT_ROOT, help=f"Root output directory (default: {config.OUTPUT_ROOT})"
     )
+    parser.add_argument(
+        "--research-json",
+        default=None,
+        help=(
+            "Path to a deep_research.json produced elsewhere (e.g. a separate API/server-side "
+            "research pass) -- copied into output/<reg_no>/research/deep_research.json and folded "
+            "in, in this same command, instead of requiring a manual copy step beforehand."
+        ),
+    )
     args = parser.parse_args()
 
     try:
-        pdf_path = rebuild(args.reg_no, args.output_dir)
-    except FileNotFoundError as e:
+        pdf_path = rebuild(args.reg_no, args.output_dir, research_json_path=args.research_json)
+    except (FileNotFoundError, ValueError) as e:
         print(f"[ERROR] {e}")
         return 1
 

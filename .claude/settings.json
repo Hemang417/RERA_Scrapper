@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "autoMode": {
+    "environment": [
+      "$defaults",
+      "### Org-wide",
+      "**Organization**: None configured",
+      "**Cloud provider(s)**: None configured",
+      "**Repository visibility**: not queryable here — assume private (default per shipped fallback); note repo name/host give no public indication",
+      "**Internal sharing / snippet hosting**: None configured — treat public paste/gist services as outside the trust boundary",
+      "**Secrets management**: None configured",
+      "**Default / protected branches**: main (default branch); protection status not queryable here — do not assume unprotected",
+      "**CI/CD deploy targets**: None configured",
+      "**Network posture**: None configured",
+      "**Host containment**: None configured — assume Claude Code runs on an ordinary developer machine with open internet",
+      "**Source control**: The trusted repo (Hemang417/RERA_Scrapper) and its origin remote (https://github.com/Hemang417/RERA_Scrapper.git) only — no additional orgs configured",
+      "**Trusted internal domains**: None configured",
+      "**Trusted cloud buckets**: None configured",
+      "**Key internal services**: None configured",
+      "**Internal package registry**: None configured",
+      "**Sensitive data locations & audiences**: `.guest_token_cache.json` (MahaRERA guest session token, gitignored) and any downloaded RERA project documents, promoter PAN/financial data, or scraped complaint/appeal records under `output/` — treat as confidential business/personal data; share only with audiences cleared at the [named+specifics] bar",
+      "**Data retention / declassification**: None configured",
+      "**Sensitive remote targets**: any namespace, host, or container whose name carries `prod` or `production` as a whole word or name segment",
+      "**Protected deployment namespaces / environments**: None configured — fall back to the Sensitive remote targets heuristic",
+      "**Protected IaC scopes**: IAM, RBAC, networking, quota, and node-pool resources; anything whose name or tag carries `prod` or `production` as a whole word or name segment",
+      "### User-specific",
+      "**Primary use of Claude Code**: software development — this repo scrapes MahaRERA (and other state RERA) public project/promoter data, cross-checks corporate registries, runs agentic deep research, and generates PDF Company Charter reports",
+      "**Trusted repo**: this repo, C:\\Users\\Hemang\\OneDrive - Integrow Asset Management Pvt Ltd\\Desktop\\Integrow_Data\\RERA_Scrapper, and its origin remote (https://github.com/Hemang417/RERA_Scrapper.git)",
+      "**Org-specific CLIs**: None configured"
+    ],
+    "allow": ["$defaults"],
+    "soft_deny": ["$defaults"],
+    "hard_deny": ["$defaults"]
+  }
+}
