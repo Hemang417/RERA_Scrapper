@@ -118,6 +118,12 @@ _ALLOWED = {
         "run_company_charter": ("MahaRERA Orders/Judgments",),
         # CLI --help text, never rendered into a document.
         "main": ("MahaRERA registration number whose output/ folder already exists.",),
+        # Default argument value, so an unqualified call behaves sensibly
+        # today: NCLT's Mumbai Bench is the natural default for a
+        # Maharashtra-based promoter, same reasoning as promoter_portfolio
+        # .py's own Maharashtra-default entries below. Revisit alongside
+        # those when a second state's promoters start reaching this check.
+        "_safe_nclt_check": ("Mumbai",),
     },
     "report.py": {
         # Fallback for the stashed acronym, so a caller that never passed a

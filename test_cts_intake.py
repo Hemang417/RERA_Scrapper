@@ -256,6 +256,26 @@ def test_interactive_resolution_aborts_on_blank_input():
     print("test_interactive_resolution_aborts_on_blank_input: PASS")
 
 
+def test_eof_during_interactive_prompt_is_treated_as_abort():
+    """Confirmed live: sys.stdin.isatty() can be True with no human actually
+    feeding it a line (a detached/automated process holding a tty-like
+    stdin), which makes input() raise EOFError. Must degrade to the same
+    gap-note fallback as a blank answer -- never an uncaught exception
+    escaping run_cts_land_lookup (see _safe_input's own docstring)."""
+    shutil.rmtree(os.path.join(_SCRATCH_DIR, _INTERACTIVE_REG_NO), ignore_errors=True)
+    _seed_office_candidates(_INTERACTIVE_REG_NO, ["Pune City Office"])
+
+    with mock.patch("sys.stdin.isatty", return_value=True), \
+         mock.patch("builtins.input", side_effect=EOFError()):
+        facts = cc.run_cts_land_lookup({}, _INTERACTIVE_REG_NO, output_dir=_SCRATCH_DIR)
+
+    input_path = os.path.join(_SCRATCH_DIR, _INTERACTIVE_REG_NO, "cts_lookup_input.json")
+    assert not os.path.exists(input_path)
+    assert any("cts_office_candidates.json" in g for g in facts.get("gaps", []))
+    shutil.rmtree(os.path.join(_SCRATCH_DIR, _INTERACTIVE_REG_NO), ignore_errors=True)
+    print("test_eof_during_interactive_prompt_is_treated_as_abort: PASS")
+
+
 if __name__ == "__main__":
     test_output_key_matches_run_cts_land_lookups_own_facts_key()
     test_source_appended_only_when_found()
@@ -268,4 +288,5 @@ if __name__ == "__main__":
     test_non_interactive_falls_back_to_gap_note()
     test_interactive_resolution_completes_the_full_chain()
     test_interactive_resolution_aborts_on_blank_input()
+    test_eof_during_interactive_prompt_is_treated_as_abort()
     print("\nAll tests passed.")

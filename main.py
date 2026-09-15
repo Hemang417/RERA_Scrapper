@@ -307,14 +307,22 @@ class CliReporter:
 
         None on a non-TTY preserves main()'s previous behaviour exactly: it
         returned exit code 2 rather than hanging on a blocked read or
-        silently picking the first match."""
+        silently picking the first match. Also None if input() itself
+        raises EOFError -- confirmed live that sys.stdin.isatty() can be
+        True with no human actually feeding it a line (e.g. a detached/
+        automated process holding a tty-like stdin), which would otherwise
+        surface as an uncaught exception instead of the same "cannot ask"
+        outcome a non-TTY already produces."""
         if not sys.stdin.isatty():
             return None
         print(f"\n{prompt}")
         for i, option in enumerate(options, start=1):
             print(f"  {i}. {option}")
         while True:
-            raw = input(f"Enter 1-{len(options)} (or blank to abort): ").strip()
+            try:
+                raw = input(f"Enter 1-{len(options)} (or blank to abort): ").strip()
+            except EOFError:
+                return None
             if not raw:
                 return None
             if raw.isdigit() and 1 <= int(raw) <= len(options):

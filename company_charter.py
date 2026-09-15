@@ -3161,6 +3161,22 @@ def discover_cts_number_candidates(reg_no: str, office_label: str, village_label
     return {"found": True, "candidates": result.get("candidates"), "note": record["note"]}
 
 
+def _safe_input(prompt: str) -> str:
+    """input() can raise EOFError even when sys.stdin.isatty() is True --
+    confirmed live: a real pty/pipe can report isatty()=True while having
+    no human actually feeding it a line (e.g. a detached/automated
+    process holding a tty-like stdin with nothing typed into it). Every
+    interactive prompt in this module goes through this instead of
+    calling input() directly, so that gap can never turn into an
+    uncaught exception escaping run_company_charter -- a hard violation
+    of this whole codebase's never-fatal discipline. An EOFError is
+    treated exactly like a blank/declined answer."""
+    try:
+        return input(prompt)
+    except EOFError:
+        return ""
+
+
 def _prompt_choice(prompt: str, options: list[str]) -> int | None:
     """Same TTY-gated numbered-choice convention as main.py's
     CliReporter.choose -- kept independent here since this module has no
@@ -3174,7 +3190,7 @@ def _prompt_choice(prompt: str, options: list[str]) -> int | None:
     for i, option in enumerate(options, start=1):
         print(f"  {i}. {option}")
     while True:
-        raw = input(f"Enter 1-{len(options)} (or blank to skip/abort): ").strip()
+        raw = _safe_input(f"Enter 1-{len(options)} (or blank to skip/abort): ").strip()
         if not raw:
             return None
         if raw.isdigit() and 1 <= int(raw) <= len(options):
@@ -3221,7 +3237,7 @@ def _interactively_resolve_cts_lookup(reg_no: str, output_dir: str, office_candi
         return False
     village_label = villages[village_idx]
 
-    cts_query = input("Enter the CTS number to search for (e.g. 100): ").strip()
+    cts_query = _safe_input("Enter the CTS number to search for (e.g. 100): ").strip()
     if not cts_query:
         return False
 
@@ -3236,7 +3252,7 @@ def _interactively_resolve_cts_lookup(reg_no: str, output_dir: str, office_candi
         return False
     cts_number = candidates[cts_idx]
 
-    mobile = input("Enter a mobile number to submit on the Property Card form: ").strip()
+    mobile = _safe_input("Enter a mobile number to submit on the Property Card form: ").strip()
     if not mobile:
         return False
 
@@ -6940,6 +6956,8 @@ def _fill_template_inner(
         lambda: _append_group_gst_section(doc, facts),
         lambda: _append_group_financial_disclosure_section(doc, facts),
         lambda: _append_group_litigation_section(doc, facts),
+        lambda: _append_nclt_check_section(doc, facts),
+        lambda: _append_bombay_hc_check_section(doc, facts),
         lambda: _append_group_enforcement_section(doc, facts),
         lambda: _append_developer_score_section(doc, facts),
     ):
@@ -10475,6 +10493,133 @@ def _append_ibbi_check_section(doc, facts: dict) -> None:
     doc.add_paragraph(f"Source: {_citation_text(facts, _clean_source_label(check.get('url', '')) or check.get('url', ''))}")
 
 
+def _append_nclt_check_section(doc, facts: dict) -> None:
+    """Appends a section reporting the direct NCLT party-name check (see
+    _safe_nclt_check). Silently does nothing if nclt_check was never set
+    (e.g. no promoter name was extractable this pass). Distinct from the
+    Indian Kanoon-based Group Litigation Sweep section: this is a direct
+    tribunal-portal query, not a third-party name-search candidate list."""
+    check = facts.get("nclt_check")
+    if not check:
+        return
+
+    heading_style = doc.paragraphs[4].style
+    doc.add_page_break()
+    heading_para = doc.add_paragraph(_external_heading(facts, "NCLT Case Status Check (Code-Assisted, Human-Verified)"))
+    heading_para.style = heading_style
+
+    if not check.get("attempted"):
+        doc.add_paragraph(f"Not run this pass: {check.get('note', 'reason not recorded')}.")
+        return
+
+    _variant_paragraph(
+        doc, facts,
+        internal_text=(
+            f"Checked directly against NCLT's own e-filing Case Status portal, {check.get('bench')} Bench, "
+            f"by party name -- a human read and solved the site's own CAPTCHA to run this search. Only this "
+            f"one bench was checked; NCLT has 16 benches nationwide."
+        ),
+        external_text=f"Checked against NCLT's Case Status portal, {check.get('bench')} Bench, by party name.",
+    )
+
+    note = check.get("note") or ""
+    if not check.get("found") and not note:
+        # A confirmed clean result -- CLAUDE.md Section B discipline: no
+        # citation on an absence, same as the IBBI section above.
+        doc.add_paragraph("Nothing found.")
+        return
+
+    if not check.get("found") and note:
+        # Inconclusive, not a confirmed clean check -- see nclt_search's
+        # own module note on why a genuine hit's shape isn't parseable yet.
+        doc.add_paragraph(f"Inconclusive this pass: {note}")
+        return
+
+    doc.add_paragraph(
+        "Result: this search returned something other than the confirmed 'No Record Found' result. "
+        "The raw extracted page content is reproduced below verbatim for a human to read directly -- "
+        "this checker was not validated against a real matching case, so it does not attempt to "
+        "summarize or classify this content itself:"
+    )
+    for row in check.get("rows") or []:
+        doc.add_paragraph(str(row))
+    if not check.get("rows"):
+        doc.add_paragraph((check.get("raw_text") or "")[:4000])
+    doc.add_paragraph(f"Source: {_citation_text(facts, _clean_source_label(check.get('url', '')) or check.get('url', ''))}")
+
+
+def _append_bombay_hc_check_section(doc, facts: dict) -> None:
+    """Appends a section reporting the direct Bombay High Court party-name
+    check across multiple benches/years (see _safe_bombay_hc_check).
+    Silently does nothing if bombay_hc_check was never set. Distinct from
+    the Indian Kanoon-based Group Litigation Sweep section: this is a
+    direct court-portal query, not a third-party name-search candidate
+    list."""
+    check = facts.get("bombay_hc_check")
+    if not check:
+        return
+
+    heading_style = doc.paragraphs[4].style
+    doc.add_page_break()
+    heading_para = doc.add_paragraph(_external_heading(facts, "Bombay High Court Case Status Check (Code-Assisted, Human-Verified)"))
+    heading_para.style = heading_style
+
+    if not check.get("attempted"):
+        doc.add_paragraph(f"Not run this pass: {check.get('note', 'reason not recorded')}.")
+        return
+
+    runs = check.get("runs") or []
+    benches = check.get("benches_checked") or []
+    years = check.get("years_checked") or []
+    _variant_paragraph(
+        doc, facts,
+        internal_text=(
+            f"Checked directly against the eCourts High Courts Services portal's Case Status : Search by "
+            f"Petitioner/Respondent form, for {', '.join(benches)} -- {len(years)} registration year(s) "
+            f"({min(years) if years else '?'}-{max(years) if years else '?'}) per bench, one CAPTCHA solved "
+            f"by a human per bench-year combination. Bombay High Court has 7 benches total and this portal "
+            f"requires a specific registration year per search, so this check does not cover every possible "
+            f"bench/year for this promoter -- see guardrails.md for the coverage discipline this follows."
+        ),
+        external_text=(
+            f"Checked against the eCourts High Courts Services portal for {', '.join(benches)}, "
+            f"{len(years)} registration year(s) per bench."
+        ),
+    )
+
+    problems = [r for r in runs if r.get("note")]
+    clean = [r for r in runs if not r.get("note") and not r.get("found")]
+    hits = [r for r in runs if r.get("found")]
+
+    if not runs:
+        doc.add_paragraph("Nothing found.")
+        return
+
+    if hits:
+        doc.add_paragraph(
+            "Result: at least one bench/year search returned something other than a rejected CAPTCHA. "
+            "The raw response for each such search is reproduced below verbatim -- this checker was not "
+            "validated against a real matching case, so it does not attempt to summarize or classify "
+            "this content itself:"
+        )
+        for r in hits:
+            doc.add_paragraph(f"{r['bench']}, {r['year']}: {r.get('raw_response')}")
+    if clean:
+        doc.add_paragraph(
+            f"{len(clean)} of {len(runs)} bench/year search(es) completed with no CAPTCHA rejection and no "
+            f"parseable indication of a match (see bombay_hc_search's own module note: a genuine hit's exact "
+            f"response shape has not been confirmed live yet, so this is reported as inconclusive rather than "
+            f"a confirmed clean result)."
+        )
+    if problems:
+        doc.add_paragraph(
+            f"{len(problems)} of {len(runs)} bench/year search(es) did not complete (CAPTCHA not solved in "
+            f"time, rejected, or the browser was closed) -- see below."
+        )
+        for r in problems:
+            doc.add_paragraph(f"{r['bench']}, {r['year']}: {r['note']}")
+
+
 def _format_rupees(amount) -> str:
     """Indian-convention rendering: crore above a crore, lakh above a lakh.
 
@@ -11685,6 +11830,93 @@ def _safe_group_companies(identifier: str) -> dict:
         return {"found": False, "note": f"ZaubaCorp group-companies crosswalk could not run this pass: {e}"}
 
 
+def _safe_nclt_check(promoter_name: str, bench: str = "Mumbai") -> dict:
+    """Direct NCLT (National Company Law Tribunal) party-name check on
+    `bench` (default Mumbai -- the natural bench for a Maharashtra-based
+    promoter; see nclt_search.BENCHES for the other 15). Distinct from
+    _safe_group_litigation's Indian Kanoon name search: this queries the
+    tribunal's own portal directly. CAPTCHA-gated (one solve), so this
+    only ever runs when a human is actually at this terminal -- same
+    Streamlit-safety gate as CTS's interactive resolution -- never
+    headlessly, and never fatal."""
+    if not sys.stdin.isatty():
+        return {"attempted": False, "bench": bench, "note": "No terminal available to solve a CAPTCHA -- skipped this pass."}
+
+    import nclt_search
+
+    try:
+        result = nclt_search.search_party(promoter_name, bench)
+    except Exception as e:
+        return {
+            "attempted": True, "bench": bench, "found": False, "rows": [], "raw_text": "",
+            "note": f"NCLT check could not run this pass: {e}",
+        }
+    return {"attempted": True, "bench": bench, **result}
+
+
+def _confirm_bombay_hc_sweep(promoter_name: str, benches: tuple, years: list) -> bool:
+    """A plain y/N terminal prompt -- deliberately NOT the same TTY-gated
+    numbered-choice helper CTS uses (_prompt_choice), because this isn't
+    picking from a real list, it's asking permission for a specific,
+    heavy commitment (one CAPTCHA per bench x year) before spending it.
+    Caller has already confirmed sys.stdin.isatty()."""
+    total = len(benches) * len(years)
+    print(
+        f"\n[INFO] Bombay High Court litigation check for {promoter_name!r} would search "
+        f"{len(benches)} bench(es) x {len(years)} registration year(s) = {total} separate "
+        f"CAPTCHA-gated lookups (one browser window, one CAPTCHA solve, per lookup)."
+    )
+    raw = _safe_input(f"Proceed with all {total} lookups now? [y/N]: ").strip().lower()
+    return raw == "y"
+
+
+def _safe_bombay_hc_check(promoter_name: str) -> dict:
+    """Direct Bombay High Court party-name check across the two Bombay
+    -city benches (Original Side + Appellate Side -- see
+    bombay_hc_search.BENCHES for the other 5, covering Aurangabad/Nagpur/
+    Kolhapur/Goa/Special Court, not searched by default) and the last 5
+    registration years. Distinct from _safe_group_litigation's Indian
+    Kanoon name search: this queries the court's own portal directly.
+
+    Unlike every other CAPTCHA-gated check in this codebase (one solve),
+    this is genuinely heavy -- one CAPTCHA per bench x year, confirmed
+    live that the portal requires a mandatory Registration Year alongside
+    the CAPTCHA (see bombay_hc_search's own module note) -- so this ALWAYS
+    asks for explicit human confirmation before running, on top of the
+    usual sys.stdin.isatty() gate. Never fatal; a decline or any single
+    lookup's failure is recorded, not raised."""
+    if not sys.stdin.isatty():
+        return {"attempted": False, "runs": [], "note": "No terminal available to ask for consent -- skipped this pass."}
+
+    import bombay_hc_search
+
+    benches = bombay_hc_search.BENCHES[:2]
+    current_year = datetime.now().year
+    years = [current_year - i for i in range(5)]
+
+    if not _confirm_bombay_hc_sweep(promoter_name, benches, years):
+        return {
+            "attempted": False, "runs": [], "benches_offered": list(benches), "years_offered": years,
+            "note": (
+                f"Declined this pass -- Bombay HC direct check ({len(benches)} bench(es) x "
+                f"{len(years)} year(s), one CAPTCHA each) was not run."
+            ),
+        }
+
+    runs = []
+    for bench in benches:
+        for year in years:
+            try:
+                result = bombay_hc_search.search_party(promoter_name, year, bench)
+            except Exception as e:
+                result = {
+                    "found": False, "rows": [], "raw_response": None, "url": "",
+                    "note": f"Bombay HC check could not run this pass: {e}",
+                }
+            runs.append({"bench": bench, "year": year, **result})
+    return {"attempted": True, "runs": runs, "benches_checked": list(benches), "years_checked": years}
+
+
 def _record_promoter_identity_gap(facts: dict) -> None:
     """Turns a failed PAN read into a gap, and a successful one into a source.
 
@@ -12678,6 +12910,16 @@ def run_company_charter(
                 "published_date": "unknown",
                 "accessed_date": datetime.now().strftime("%Y-%m-%d"),
             })
+
+    # Direct government court checks -- distinct from _safe_group_litigation
+    # just above, which is a NAME search against a third-party case-law
+    # index (Indian Kanoon), never a confirmed finding. These query the
+    # tribunal/court portals themselves, CAPTCHA-gated like CTS/GST, so they
+    # only ever run when a human is actually at this terminal (see each
+    # function's own note) -- never headlessly, never guessing consent.
+    if promoter_name_for_rating:
+        facts["nclt_check"] = _safe_nclt_check(promoter_name_for_rating)
+        facts["bombay_hc_check"] = _safe_bombay_hc_check(promoter_name_for_rating)
 
     # No automated review-fetching mechanism exists in this pipeline (see
     # run_review_authenticity_triage's own module note) -- this only runs
