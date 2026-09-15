@@ -19,11 +19,13 @@ import contextlib
 import json
 import os
 import shutil
+from unittest import mock
 
 import mahabhumi
 import company_charter as cc
 
 _SCRATCH_DIR = os.path.join("output", "_test_scratch_cts_intake")
+_INTERACTIVE_REG_NO = "P00000000000"
 
 
 @contextlib.contextmanager
@@ -177,6 +179,83 @@ def test_scrape_result_page_ocr_recovers_real_text_from_an_image():
     print("test_scrape_result_page_ocr_recovers_real_text_from_an_image: PASS")
 
 
+def _seed_office_candidates(reg_no: str, offices: list, output_dir: str = _SCRATCH_DIR) -> None:
+    project_dir = os.path.join(output_dir, reg_no)
+    os.makedirs(project_dir, exist_ok=True)
+    with open(os.path.join(project_dir, "cts_office_candidates.json"), "w", encoding="utf-8") as f:
+        json.dump({"district": "Pune", "offices": offices}, f)
+
+
+def test_non_interactive_falls_back_to_gap_note():
+    """A Streamlit-driven run (app.py) has no real stdin -- confirmed here
+    by forcing isatty() False, the same gate main.py's CliReporter.choose
+    uses. Must behave exactly as before this feature existed: a gap note
+    pointing at cts_office_candidates.json, no cts_lookup_input.json
+    written, no crash."""
+    shutil.rmtree(os.path.join(_SCRATCH_DIR, _INTERACTIVE_REG_NO), ignore_errors=True)
+    _seed_office_candidates(_INTERACTIVE_REG_NO, ["Office A", "Office B"])
+
+    with mock.patch("sys.stdin.isatty", return_value=False):
+        facts = cc.run_cts_land_lookup({}, _INTERACTIVE_REG_NO, output_dir=_SCRATCH_DIR)
+
+    assert "cts_land_record_check" not in facts
+    assert any("cts_office_candidates.json" in g for g in facts.get("gaps", []))
+    input_path = os.path.join(_SCRATCH_DIR, _INTERACTIVE_REG_NO, "cts_lookup_input.json")
+    assert not os.path.exists(input_path)
+    shutil.rmtree(os.path.join(_SCRATCH_DIR, _INTERACTIVE_REG_NO), ignore_errors=True)
+    print("test_non_interactive_falls_back_to_gap_note: PASS")
+
+
+def test_interactive_resolution_completes_the_full_chain():
+    """A human at a real terminal picks office #1, village #1, confirms
+    the CTS candidate, and supplies a mobile number -- cts_lookup_input
+    .json gets written AND the function falls straight through into the
+    Property Card fetch in the SAME call, matching the point of this
+    feature: one continuous main.py run instead of stopping to wait for a
+    separate cts_resolve.py session."""
+    shutil.rmtree(os.path.join(_SCRATCH_DIR, _INTERACTIVE_REG_NO), ignore_errors=True)
+    _seed_office_candidates(_INTERACTIVE_REG_NO, ["Pune City Office"])
+    found_card = {"found": True, "fields": {"Owner": "Test Owner"}, "raw_text": "...", "url": "https://bhulekh.mahabhumi.gov.in/x"}
+
+    with _patch_mahabhumi(
+        list_villages=lambda district, office: {"found": True, "villages": ["Wagholi"]},
+        search_cts_candidates=lambda district, office, village, cts: {"found": True, "candidates": ["100"]},
+        fetch_property_card=lambda district, office, village, cts, mobile, screenshot_path=None: found_card,
+    ), mock.patch("sys.stdin.isatty", return_value=True), \
+       mock.patch("builtins.input", side_effect=["1", "1", "100", "1", "9999999999"]):
+        facts = cc.run_cts_land_lookup({}, _INTERACTIVE_REG_NO, output_dir=_SCRATCH_DIR)
+
+    input_path = os.path.join(_SCRATCH_DIR, _INTERACTIVE_REG_NO, "cts_lookup_input.json")
+    assert os.path.exists(input_path)
+    with open(input_path, encoding="utf-8") as f:
+        written = json.load(f)
+    assert written == {
+        "district": "Pune", "office": "Pune City Office", "village": "Wagholi",
+        "cts_number": "100", "mobile": "9999999999",
+    }
+    assert facts["cts_land_record_check"] == found_card
+    shutil.rmtree(os.path.join(_SCRATCH_DIR, _INTERACTIVE_REG_NO), ignore_errors=True)
+    print("test_interactive_resolution_completes_the_full_chain: PASS")
+
+
+def test_interactive_resolution_aborts_on_blank_input():
+    """A human declining at any prompt (blank answer) must fall back to
+    the same gap-note behavior as the non-interactive case -- never guess
+    an office/village/mobile on their behalf."""
+    shutil.rmtree(os.path.join(_SCRATCH_DIR, _INTERACTIVE_REG_NO), ignore_errors=True)
+    _seed_office_candidates(_INTERACTIVE_REG_NO, ["Pune City Office"])
+
+    with mock.patch("sys.stdin.isatty", return_value=True), \
+         mock.patch("builtins.input", side_effect=[""]):
+        facts = cc.run_cts_land_lookup({}, _INTERACTIVE_REG_NO, output_dir=_SCRATCH_DIR)
+
+    input_path = os.path.join(_SCRATCH_DIR, _INTERACTIVE_REG_NO, "cts_lookup_input.json")
+    assert not os.path.exists(input_path)
+    assert any("cts_office_candidates.json" in g for g in facts.get("gaps", []))
+    shutil.rmtree(os.path.join(_SCRATCH_DIR, _INTERACTIVE_REG_NO), ignore_errors=True)
+    print("test_interactive_resolution_aborts_on_blank_input: PASS")
+
+
 if __name__ == "__main__":
     test_output_key_matches_run_cts_land_lookups_own_facts_key()
     test_source_appended_only_when_found()
@@ -186,4 +265,7 @@ if __name__ == "__main__":
     test_slugify_handles_slashes_and_whitespace()
     test_screenshot_path_is_computed_before_the_captcha_gated_fetch()
     test_scrape_result_page_ocr_recovers_real_text_from_an_image()
+    test_non_interactive_falls_back_to_gap_note()
+    test_interactive_resolution_completes_the_full_chain()
+    test_interactive_resolution_aborts_on_blank_input()
     print("\nAll tests passed.")

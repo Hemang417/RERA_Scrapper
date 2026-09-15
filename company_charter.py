@@ -62,6 +62,7 @@ import shutil
 import sys
 import time
 from datetime import datetime
+from typing import Callable
 
 import fitz  # PyMuPDF
 import pytesseract
@@ -3160,6 +3161,97 @@ def discover_cts_number_candidates(reg_no: str, office_label: str, village_label
     return {"found": True, "candidates": result.get("candidates"), "note": record["note"]}
 
 
+def _prompt_choice(prompt: str, options: list[str]) -> int | None:
+    """Same TTY-gated numbered-choice convention as main.py's
+    CliReporter.choose -- kept independent here since this module has no
+    reporter object of its own. Blank input aborts (returns None); the
+    isatty() check is a defense-in-depth repeat of the caller's own gate,
+    not a substitute for it -- a Streamlit-driven run must never reach
+    here at all."""
+    if not sys.stdin.isatty():
+        return None
+    print(f"\n{prompt}")
+    for i, option in enumerate(options, start=1):
+        print(f"  {i}. {option}")
+    while True:
+        raw = input(f"Enter 1-{len(options)} (or blank to skip/abort): ").strip()
+        if not raw:
+            return None
+        if raw.isdigit() and 1 <= int(raw) <= len(options):
+            return int(raw) - 1
+        print("  Not a valid choice.")
+
+
+def _interactively_resolve_cts_lookup(reg_no: str, output_dir: str, office_candidates_record: dict) -> bool:
+    """Walks a human at THIS terminal through the same office -> village ->
+    CTS-number -> mobile chain cts_resolve.py's four subcommands walk them
+    through by hand, but inline, in the same run -- called only when the
+    caller (run_cts_land_lookup) has already confirmed sys.stdin.isatty().
+
+    Never auto-picks an office or village itself: office/village labels on
+    Maha Bhulekh are Marathi-only with no reliable automatic match to
+    RERA's own district/taluka/village text (confirmed live: one real
+    project's office ["...,Andheri"] named a different place than its own
+    village ["Aambivali"] -- see discover_cts_office_candidates). The
+    mobile number is never guessable from any data this pipeline holds
+    either, so it's always asked for directly. Returns True and writes
+    output/<reg_no>/cts_lookup_input.json only if the human completes
+    every step; False (nothing written) the moment they decline (blank
+    answer) or a step comes back empty/ambiguous, so the caller falls back
+    to today's existing gap-note-and-wait behavior rather than guessing."""
+    district = office_candidates_record["district"]
+    offices = office_candidates_record.get("offices") or []
+    if not offices:
+        return False
+
+    print(f"\n[INFO] CTS land-record lookup: {len(offices)} Maha Bhulekh office(s) found for {district}.")
+    office_idx = _prompt_choice("Pick the office covering this project's own recorded taluka/village:", offices)
+    if office_idx is None:
+        return False
+    office_label = offices[office_idx]
+
+    village_result = discover_cts_village_candidates(reg_no, office_label, output_dir)
+    villages = village_result.get("villages") or []
+    if not village_result.get("found") or not villages:
+        print(f"[WARN] {village_result.get('note', 'Village lookup failed')}")
+        return False
+
+    village_idx = _prompt_choice(f"Pick the village under {office_label!r}:", villages)
+    if village_idx is None:
+        return False
+    village_label = villages[village_idx]
+
+    cts_query = input("Enter the CTS number to search for (e.g. 100): ").strip()
+    if not cts_query:
+        return False
+
+    number_result = discover_cts_number_candidates(reg_no, office_label, village_label, cts_query, output_dir)
+    candidates = number_result.get("candidates") or []
+    if not number_result.get("found") or not candidates:
+        print(f"[WARN] {number_result.get('note', 'CTS candidate search failed')}")
+        return False
+
+    cts_idx = _prompt_choice(f"Confirm the exact CTS sub-division for {cts_query!r}:", candidates)
+    if cts_idx is None:
+        return False
+    cts_number = candidates[cts_idx]
+
+    mobile = input("Enter a mobile number to submit on the Property Card form: ").strip()
+    if not mobile:
+        return False
+
+    record = {
+        "district": district, "office": office_label, "village": village_label,
+        "cts_number": cts_number, "mobile": mobile,
+    }
+    project_dir = os.path.join(output_dir, reg_no)
+    os.makedirs(project_dir, exist_ok=True)
+    with open(os.path.join(project_dir, "cts_lookup_input.json"), "w", encoding="utf-8") as f:
+        json.dump(record, f, indent=2, ensure_ascii=False)
+    print("[OK] CTS lookup input confirmed -- proceeding straight to the Property Card fetch.")
+    return True
+
+
 def run_cts_land_lookup(facts: dict, reg_no: str, output_dir: str = config.OUTPUT_ROOT) -> dict:
     """Runs the CTS -> Property Card lookup only if output/<reg_no>/
     cts_lookup_input.json exists, containing:
@@ -3216,23 +3308,44 @@ def run_cts_land_lookup(facts: dict, reg_no: str, output_dir: str = config.OUTPU
         # exists, so this doesn't go quiet and get forgotten after the
         # first mention.
         office_candidates_path = os.path.join(output_dir, reg_no, "cts_office_candidates.json")
-        district_for_gap = None
+        office_candidates_record = None
         if not os.path.exists(office_candidates_path):
             discovery = discover_cts_office_candidates(facts, reg_no, output_dir)
             if discovery.get("found"):
-                district_for_gap = discovery["district"]
+                office_candidates_record = {"district": discovery["district"], "offices": discovery["offices"]}
         else:
             with open(office_candidates_path, "r", encoding="utf-8") as f:
-                district_for_gap = json.load(f).get("district")
+                office_candidates_record = json.load(f)
+        district_for_gap = office_candidates_record.get("district") if office_candidates_record else None
 
-        if district_for_gap:
-            facts.setdefault("gaps", []).append(
-                f"CTS land-record lookup: office candidates for {district_for_gap} are in "
-                f"output/{reg_no}/cts_office_candidates.json. Pick the office covering this project's own "
-                f"recorded taluka/village, then run cts_resolve.py to continue (villages, then CTS-number "
-                f"candidates, then the final Property Card fetch)."
-            )
-        return facts
+        # If a human is actually at this terminal (checked the same way
+        # main.py's CliReporter.choose does -- a Streamlit-driven run via
+        # app.py has no real stdin and must not block on one), walk them
+        # through the same office -> village -> CTS-number -> mobile chain
+        # cts_resolve.py's four subcommands do by hand, but inline, right
+        # here, so a single `python main.py <reg_no>` run can go straight
+        # into the Property Card fetch below instead of stopping and
+        # waiting for a separate cts_resolve.py session afterward. Never
+        # auto-picks an office or village itself (same Marathi-label/
+        # no-reliable-RERA-match reasoning as discover_cts_office_candidates)
+        # and always asks for the mobile number directly -- neither is
+        # guessable from any data this pipeline holds.
+        resolved_interactively = (
+            bool(district_for_gap) and sys.stdin.isatty()
+            and _interactively_resolve_cts_lookup(reg_no, output_dir, office_candidates_record)
+        )
+
+        if not resolved_interactively:
+            if district_for_gap:
+                facts.setdefault("gaps", []).append(
+                    f"CTS land-record lookup: office candidates for {district_for_gap} are in "
+                    f"output/{reg_no}/cts_office_candidates.json. Pick the office covering this project's own "
+                    f"recorded taluka/village, then run cts_resolve.py to continue (villages, then CTS-number "
+                    f"candidates, then the final Property Card fetch)."
+                )
+            return facts
+        # else: cts_lookup_input.json now exists -- fall through below,
+        # exactly as if a prior cts_resolve.py session had written it.
 
     import mahabhumi
 
@@ -12257,12 +12370,28 @@ def run_company_charter(
     group_litigation: bool = False,
     group_enforcement: bool = False,
     group_financial_disclosure: bool = False,
+    research_wait: Callable[[], dict | None] | None = None,
 ) -> tuple[str, dict]:
     """Returns (out_path, facts) -- facts is the complete, code-and-model
     -assembled Charter data (same content as the .facts.json written
     alongside the docx), so callers can build a separate output (e.g.
     report.py's PDF) from the same source data without re-reading it from
     disk.
+
+    `research_wait`: an optional zero-arg callable a caller running
+    deep_research.run_deep_research CONCURRENTLY with this function (rather
+    than sequentially before calling it) passes in, so this function can
+    block on that other thread's completion at the one point it genuinely
+    needs to: right before tallying this run's total API usage/cost, which
+    reads the SAME shared deep_research._USAGE_LOG that a concurrently
+    running deep-research pass is still appending to. Everything before
+    that point -- the charter pass, document grounding, the CIN/IBBI/credit/
+    group checks, CTS office discovery, per-finding research -- runs fully
+    overlapped with deep research; `research_data` above just won't include
+    it as reuse context unless the caller's deep-research call already
+    finished by the time this function started (same graceful fallback as
+    when deep research fails outright). Omitted or None (every other
+    caller): behaves exactly as before, no wait.
 
     `pre_built_facts`: skips the `_run_charter_pass` API call entirely and
     uses this dict as the model-authored layer instead (still schema-shaped
@@ -12659,6 +12788,11 @@ def run_company_charter(
     # verification passes, document grounding, etc. all log to the same
     # deep_research._USAGE_LOG). Only passed into the Internal render below
     # -- External never receives these kwargs, so it stays unaffected.
+    if research_wait is not None:
+        # Concurrent caller (see `research_wait` param note above): block
+        # here, right before reading the shared usage log, so this snapshot
+        # can't land mid-way through deep research still appending to it.
+        research_wait()
     _usage_total = deep_research.usage_summary()["total"]
     _run_elapsed_seconds = time.time() - (pipeline_start_time or _charter_start_time)
 

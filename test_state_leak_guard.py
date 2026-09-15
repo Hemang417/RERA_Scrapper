@@ -93,6 +93,10 @@ _ALLOWED = {
         # Maha Bhulekh -- only reachable with CAP_LAND_RECORDS.
         "run_cts_land_lookup": ("Maha Bhulekh Property Card",),
         "run_cts_lookup_standalone": ("Maha Bhulekh Property Card",),
+        # Only reachable from inside run_cts_land_lookup's own CAP_LAND_RECORDS
+        # -gated branch, so this is the same real Maharashtra-only endpoint
+        # name as the entries just above, not a leaked default.
+        "_interactively_resolve_cts_lookup": (" Maha Bhulekh office(s) found for ",),
         # Verbatim rewrites of sentences from SPECIFIC past projects'
         # facts.json -- data about real Maharashtra projects, not templates.
         # Parameterising these would rewrite the record.

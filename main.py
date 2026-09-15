@@ -24,6 +24,7 @@ with `python deep_research.py <REG_NO>` / `python company_charter.py
 """
 
 import argparse
+import concurrent.futures
 import json
 import os
 import re
@@ -506,19 +507,51 @@ def main() -> int:
     # run_gst_compliance_check picks up during Charter generation below.
     gst_status = _run_gst_intake_step(args.gstin or args.pan, reg_no, args.output_dir)
 
-    print("\n[INFO] Running agentic deep research (market + promoter profile)...")
-    try:
-        research_data = deep_research.run_deep_research(
-            reg_no, category_data, args.output_dir, prior_research=prior_research
-        )
-        gap_count = sum(len(research_data.get(key, {}).get("gaps", [])) for key in deep_research.RESEARCH_KEYS)
-        reused_note = " (reused prior confirmed sources -- only open gaps re-attempted)" if research_data.get("_reused_prior") else ""
-        print(f"[OK] Deep research complete{reused_note} ({gap_count} unresolved gap(s) across all sections).")
-    except Exception as e:
-        # Never fatal: a missing ANTHROPIC_API_KEY, rate limit, or network
-        # hiccup here must not take down an otherwise-successful RERA scrape.
-        print(f"[WARN] Deep research failed ({e}) -- continuing without it.")
-        research_data = None
+    # Deep research (agentic web search, unattended, minutes long) has no
+    # hard dependency on the Company Charter step below -- the Charter only
+    # ever uses it as an optional "already confirmed" prompt hint (see
+    # run_company_charter's `research_data` param), not something it blocks
+    # on -- so the two now run CONCURRENTLY instead of one waiting on the
+    # other. The only place that genuinely needs deep research to have
+    # finished is the Charter's own usage/cost tally near the end of its run
+    # (both write to the same deep_research._USAGE_LOG), which is why
+    # `_await_deep_research` below is handed to it as `research_wait` rather
+    # than just blocked on here.
+    print("\n[INFO] Starting agentic deep research (market + promoter profile) in the background...")
+    _research_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    _research_future = _research_executor.submit(
+        deep_research.run_deep_research, reg_no, category_data, args.output_dir, prior_research=prior_research
+    )
+    _research_outcome = {"data": None, "reported": False}
+
+    def _await_deep_research() -> dict | None:
+        """Blocks until the background deep-research pass finishes (a no-op
+        if it already has) and reports its outcome exactly once, however
+        many times this is called (company_charter.run_company_charter calls
+        it once internally; the fallback call below covers the case where
+        Charter generation fails before ever reaching that point)."""
+        if _research_outcome["reported"]:
+            return _research_outcome["data"]
+        try:
+            data = _research_future.result()
+            gap_count = sum(len(data.get(key, {}).get("gaps", [])) for key in deep_research.RESEARCH_KEYS)
+            reused_note = " (reused prior confirmed sources -- only open gaps re-attempted)" if data.get("_reused_prior") else ""
+            print(f"[OK] Deep research complete{reused_note} ({gap_count} unresolved gap(s) across all sections).")
+            _research_outcome["data"] = data
+        except Exception as e:
+            # Never fatal: a missing ANTHROPIC_API_KEY, rate limit, or network
+            # hiccup here must not take down an otherwise-successful RERA scrape.
+            print(f"[WARN] Deep research failed ({e}) -- continuing without it.")
+            _research_outcome["data"] = None
+        finally:
+            _research_outcome["reported"] = True
+        return _research_outcome["data"]
+
+    # A small, safe bonus: if deep research happens to have already finished
+    # by the time the Charter pass is about to start (e.g. a full prior-run
+    # cache hit), let the Charter reuse it as prompt context same as before --
+    # otherwise pass None, same graceful fallback as when deep research fails.
+    research_data = _await_deep_research() if _research_future.done() else None
 
     # No automated review-fetching mechanism exists in this pipeline (see
     # company_charter.run_review_authenticity_triage's own module note) --
@@ -542,6 +575,7 @@ def main() -> int:
             group_gst=args.group_gst, group_litigation=args.group_litigation,
             group_enforcement=args.group_enforcement,
             group_financial_disclosure=args.group_financial_disclosure,
+            research_wait=_await_deep_research,
         )
         external_charter_path = charter_path.replace("_Internal.docx", "_External.docx")
         print(f"[OK] Company Charter (Internal) written to {charter_path}")
@@ -551,6 +585,14 @@ def main() -> int:
         # or a corrupt/unreadable document must not take down the scrape.
         print(f"[WARN] Company Charter generation failed ({e}) -- continuing without it.")
         charter_path = None
+    finally:
+        # Guarantees the background deep-research thread is joined and its
+        # outcome reported exactly once even if Charter generation raised
+        # before ever reaching its own internal `research_wait()` call, and
+        # refreshes `research_data` (used below for report.build_pdf) from
+        # whatever it actually finished with -- not the pre-Charter guess.
+        research_data = _await_deep_research()
+        _research_executor.shutdown(wait=False)
 
     # Persisted so finalize_report.py can rebuild the PDF later with zero
     # network calls (these were previously only ever held in memory).
