@@ -3430,6 +3430,128 @@ def run_cts_land_lookup(facts: dict, reg_no: str, output_dir: str = config.OUTPU
     return facts
 
 
+def _interactively_resolve_igr_search(reg_no: str, output_dir: str) -> bool:
+    """Walks a human at THIS terminal through IGR Maharashtra's Document
+    Number search (district/SRO/year/document number/registration type) --
+    called only when the caller (run_igr_registered_deed_check) has already
+    confirmed sys.stdin.isatty(). Unlike CTS's office/village chain, there
+    is no live-fetchable candidate list to pick from here: a document
+    number is either something a human already has in hand (e.g. a
+    mortgage/agreement serial number named in the project's own Title
+    Report -- see igr_maharashtra_search's own module note on the
+    Bellagio-style "registered at serial number 4054 of 2024" pattern) or
+    it genuinely isn't knowable from anything this pipeline holds, so it is
+    always asked for directly -- same reasoning CTS uses for the mobile
+    number. Deliberately uses ONLY search_by_document_number, never
+    search_by_property: the latter's result-table shape has not been
+    confirmed live against a real match (see igr_maharashtra_search's own
+    module note), so building an interactive flow around it risks silently
+    reporting a false negative. Returns True and writes
+    output/<reg_no>/igr_lookup_input.json only if the human completes every
+    step; False (nothing written) the moment they decline (blank answer)."""
+    print(
+        "\n[INFO] Registered-deed corroboration (IGR Maharashtra e-Search) -- optional. If you have a "
+        "specific registered document in mind (e.g. a mortgage or sale-deed serial number mentioned in "
+        "this project's own Title Report), this cross-checks it against the actual registered record: "
+        "seller/purchaser names and the real consideration amount. Leave any answer blank to skip."
+    )
+    district = _safe_input("District (e.g. Mumbai, Mumbai Suburban, Pune -- or the exact Marathi label): ").strip()
+    if not district:
+        return False
+    sro = _safe_input("SRO office (any distinctive substring, e.g. 'Andheri 2'): ").strip()
+    if not sro:
+        return False
+    year = _safe_input("Registration year (e.g. 2024): ").strip()
+    if not year:
+        return False
+    doc_number = _safe_input("Document number: ").strip()
+    if not doc_number:
+        return False
+    registration_type = _safe_input(
+        "Registration type [efiling/eregistration/regular/isarita 2.0] (blank = regular): "
+    ).strip() or "regular"
+
+    record = {
+        "district": district, "sro_contains": sro, "year": year,
+        "doc_number": doc_number, "registration_type": registration_type,
+    }
+    project_dir = os.path.join(output_dir, reg_no)
+    os.makedirs(project_dir, exist_ok=True)
+    with open(os.path.join(project_dir, "igr_lookup_input.json"), "w", encoding="utf-8") as f:
+        json.dump(record, f, indent=2, ensure_ascii=False)
+    print("[OK] IGR lookup input confirmed -- proceeding straight to the registered-deed search.")
+    return True
+
+
+def run_igr_registered_deed_check(facts: dict, reg_no: str, output_dir: str = config.OUTPUT_ROOT) -> dict:
+    """Runs IGR Maharashtra's registered-deed Document Number search (see
+    igr_maharashtra_search.search_by_document_number) only if output/
+    <reg_no>/igr_lookup_input.json exists, containing {"district", "sro_
+    contains", "year", "doc_number", "registration_type"}. Same opt-in
+    shape as run_cts_land_lookup: silently returns facts unchanged if that
+    file is absent AND no human is at this terminal to supply it
+    interactively -- there is no automated, CAPTCHA-free path here.
+
+    This is a DIFFERENT, independent evidence source from run_cts_land_
+    lookup: Maha Bhulekh's Property Card states current ownership/tenure;
+    IGR's e-Search confirms (or contradicts) a SPECIFIC registered
+    transaction -- a sale, mortgage, or lease -- naming both counterparties
+    and the actual consideration amount, which nothing else in this
+    pipeline checks independently (see igr_maharashtra_search.py's own
+    module note on the 2026-09-01 live find).
+
+    Maharashtra-only, checked explicitly here (unlike run_cts_land_lookup,
+    which gets the same effect implicitly -- its district-hint extraction
+    simply never matches a non-Maharashtra project's land text). IGR has no
+    such natural gate: its interactive prompt asks for a district directly,
+    so without this check a human running a Gujarat/Karnataka/etc. project
+    interactively would be asked Maharashtra-specific questions that could
+    never resolve to anything real."""
+    if (facts.get("state") or {}).get("code", "MH") != "MH":
+        return facts
+
+    input_path = os.path.join(output_dir, reg_no, "igr_lookup_input.json")
+    if not os.path.exists(input_path):
+        if sys.stdin.isatty() and _interactively_resolve_igr_search(reg_no, output_dir):
+            pass  # igr_lookup_input.json now exists -- fall through below.
+        else:
+            return facts
+
+    import igr_maharashtra_search
+
+    with open(input_path, "r", encoding="utf-8") as f:
+        igr_input = json.load(f)
+
+    required = ("district", "sro_contains", "year", "doc_number")
+    missing = [k for k in required if not igr_input.get(k)]
+    if missing:
+        facts["igr_registered_deed_check"] = {"found": False, "note": f"{input_path} is missing required field(s): {', '.join(missing)}"}
+        return facts
+
+    print(f"\n[INFO] {input_path} found -- opening a browser to search the registered-deed record. "
+          f"Please solve the CAPTCHA when it appears.")
+    try:
+        result = igr_maharashtra_search.search_by_document_number(
+            igr_input["district"], igr_input["sro_contains"], igr_input["year"], igr_input["doc_number"],
+            registration_type=igr_input.get("registration_type") or "regular",
+        )
+    except (igr_maharashtra_search.CaptchaTimeoutError, igr_maharashtra_search.BrowserClosedError) as e:
+        result = {"found": False, "rows": [], "raw_text": "", "url": "", "note": f"IGR registered-deed search did not complete: {e}"}
+    except Exception as e:
+        result = {"found": False, "rows": [], "raw_text": "", "url": "", "note": f"IGR registered-deed search could not run this pass: {e}"}
+
+    facts["igr_registered_deed_check"] = result
+    if result.get("found"):
+        facts.setdefault("sources", []).append({
+            "label": "IGR Maharashtra e-Search (registered deed)",
+            "ref": f"Doc #{igr_input['doc_number']}, {igr_input['sro_contains']}, {igr_input['year']} -- {result.get('url', '')}",
+            "topic": "registered_deed",
+            "published_date": "unknown",
+            "accessed_date": datetime.now().strftime("%Y-%m-%d"),
+        })
+    return facts
+
+
 # ---------------------------------------------------------------------------
 # GST filing-compliance intake -- same opt-in convention as
 # run_cts_land_lookup/reviews.json just above: does nothing unless a human
@@ -6943,6 +7065,7 @@ def _fill_template_inner(
 
     diligence_appendix_batch = []
     for append_fn in (
+        lambda: _append_promoter_profile_section(doc, facts),
         lambda: _append_credit_rating_section(doc, facts),
         lambda: _append_ibbi_check_section(doc, facts),
         lambda: _append_company_profile_section(doc, facts),
@@ -10359,6 +10482,251 @@ def _add_rating_comparison_table(doc, rating_result: dict, facts: dict) -> None:
         doc.add_paragraph(f"No public rating found from: {', '.join(not_found)}.")
 
 
+def _promoter_trust_signals(facts: dict) -> list:
+    """A short, code-computed checklist of promoter trust signals -- this
+    Charter's answer to a wealth-intelligence "coverage meter", but a
+    checklist rather than a numeric 1-4 score. Deliberately NOT a scored
+    gauge: nothing here rests on the kind of investor-side visibility a
+    real net-worth/investment-portfolio score would need (see
+    _append_promoter_profile_section's own note on what genuinely isn't
+    publicly available), and inventing a number out of signals this
+    different in kind and completeness would be exactly the "plausible
+    -sounding figure" this codebase's own gap discipline exists to refuse.
+    Each row is {"signal", "status", "detail"} -- "status" is always one of
+    Clean / Flagged / Not checked / Not applicable, read directly off a
+    check this Charter already ran, never inferred."""
+    rows = []
+
+    charges = (facts.get("company_profile_check") or {}).get("charges")
+    if charges is None:
+        rows.append({"signal": "MCA Charge Transparency", "status": "Not checked",
+                     "detail": "No CIN/LLPIN was extractable this pass."})
+    else:
+        # Reuses summarise_charges rather than re-summing "amount" here --
+        # that field is a raw, sometimes-unparseable STRING (confirmed by a
+        # real live crash caught by this repo's own test suite the first
+        # time this was hand-rolled), and summarise_charges already handles
+        # the comma-stripping/float-parsing and the "None means unreadable,
+        # never a misleading 0" distinction correctly.
+        summary = summarise_charges(charges)
+        if summary["open_charges"]:
+            amount_text = _format_rupees(summary["total_open_amount"]) or "amount unreadable"
+            rows.append({"signal": "MCA Charge Transparency", "status": "Flagged",
+                         "detail": f"{summary['open_charges']} open charge(s), {amount_text}, to {', '.join(summary['open_lenders']) or 'an unnamed lender'}."})
+        else:
+            rows.append({"signal": "MCA Charge Transparency", "status": "Clean", "detail": "No open charges on record."})
+
+    rating_check = facts.get("credit_rating_check") or {}
+    promoter_rating = rating_check.get("promoter") or {}
+    if not promoter_rating:
+        rows.append({"signal": "Credit Rating Coverage", "status": "Not checked", "detail": "No promoter name was available to check."})
+    elif promoter_rating.get("ratings"):
+        agencies = ", ".join(sorted({r["agency"] for r in promoter_rating["ratings"]}))
+        rows.append({"signal": "Credit Rating Coverage", "status": "Clean", "detail": f"Rated by {agencies}."})
+    else:
+        rows.append({"signal": "Credit Rating Coverage", "status": "Not applicable",
+                     "detail": "No public rating from any agency checked -- ordinary for a private, unlisted promoter."})
+
+    ibbi = facts.get("ibbi_insolvency_check") or {}
+    if ibbi.get("found_process") is None:
+        rows.append({"signal": "Insolvency (IBBI)", "status": "Not checked", "detail": ibbi.get("note") or "No CIN/LLPIN was extractable this pass."})
+    elif ibbi.get("found_process"):
+        rows.append({"signal": "Insolvency (IBBI)", "status": "Flagged", "detail": "Insolvency process record found -- see the Insolvency Check section."})
+    else:
+        rows.append({"signal": "Insolvency (IBBI)", "status": "Clean", "detail": "No insolvency process recorded against this CIN."})
+
+    for label, key in (("NCLT Case Status", "nclt_check"), ("Bombay High Court Case Status", "bombay_hc_check")):
+        check = facts.get(key) or {}
+        if not check.get("attempted"):
+            rows.append({"signal": label, "status": "Not checked", "detail": check.get("note") or "Not run this pass -- needs a human at the terminal."})
+        elif key == "nclt_check":
+            found = check.get("found")
+            note = check.get("note") or ""
+            rows.append({"signal": label, "status": "Flagged" if found else ("Not checked" if note else "Clean"),
+                         "detail": note or ("Result found -- see the NCLT Case Status Check section." if found else "No record found.")})
+        else:
+            runs = check.get("runs") or []
+            hits = [r for r in runs if r.get("found")]
+            rows.append({"signal": label, "status": "Flagged" if hits else "Not checked",
+                         "detail": (f"{len(hits)} of {len(runs)} bench/year search(es) returned a result -- see the Bombay High Court Case Status Check section."
+                                    if hits else "No confirmed hit across the bench/year combinations checked; see that section for what was and wasn't covered.")})
+
+    group_check = facts.get("group_companies_check") or {}
+    if not group_check.get("found"):
+        rows.append({"signal": "Group Entity Transparency", "status": "Not checked", "detail": group_check.get("note") or "No CIN/LLPIN was extractable this pass."})
+    else:
+        n = len(group_check.get("companies") or [])
+        undisclosed = sum((group_check.get("undisclosed_relationship_counts") or {}).values())
+        detail = f"{n} confirmed linked entit(y/ies)."
+        if undisclosed:
+            detail += f" {undisclosed} further relationship(s) exist but their counterparty is paywalled."
+        rows.append({"signal": "Group Entity Transparency", "status": "Clean" if n or not undisclosed else "Flagged", "detail": detail})
+
+    # IGR Maharashtra e-Search only exists for Maharashtra -- showing this
+    # row for a Gujarat/Karnataka/etc. promoter would name a portal that
+    # was never applicable, not merely unchecked. Reads the ACTIVE render
+    # profile (_state_profile(), Maharashtra when nothing set it -- same
+    # convention as every other state-aware render in this module), not
+    # facts["state"] directly: this is a RENDERING decision, and a caller
+    # re-rendering the same saved facts under an explicit different profile
+    # (see test_state_labels.py) must get that profile's answer, not the
+    # original run's.
+    if _state_profile().code == "MH":
+        signal_name = "Registered-Deed Corroboration (IGR Maharashtra)"
+        igr = facts.get("igr_registered_deed_check")
+        if not igr:
+            rows.append({"signal": signal_name, "status": "Not checked",
+                         "detail": "IGR Maharashtra e-Search not run this pass -- needs a human at the terminal with a specific document number in hand."})
+        elif igr.get("found"):
+            rows.append({"signal": signal_name, "status": "Clean",
+                         "detail": "A specific IGR Maharashtra registered deed was corroborated -- see the Registered-Deed Corroboration section."})
+        else:
+            rows.append({"signal": signal_name, "status": "Not checked",
+                         "detail": f"IGR Maharashtra e-Search: {igr.get('note') or 'lookup did not complete.'}"})
+
+    return rows
+
+
+def _append_promoter_profile_section(doc, facts: dict) -> None:
+    """Consolidates promoter/corporate-identity evidence that otherwise
+    sits scattered across many separate sections (Credit Rating, IBBI,
+    Company Profile, Group Companies, NCLT/Bombay HC, MCA Charges) into one
+    scannable overview -- modeled loosely on a wealth-intelligence investor
+    coverage report, but built strictly from data this Charter already
+    fetched, never invented to fill a gap that report's format implies.
+
+    Deliberately does NOT re-render the Group Companies table or its
+    Director Relationship Map diagram (see _append_group_companies_section)
+    -- this section cross-references them by name instead, so the same
+    data is never shown twice under two different labels.
+
+    Genuinely NOT available from any public source this pipeline can reach,
+    stated here explicitly rather than left blank: the promoter's personal
+    net worth, family/next-of-kin, personal investment portfolio (AIF/PMS/
+    bonds), and market-value estimates for privately-held entities or
+    property. That is investor-side wealth data a firm with direct visibility
+    into someone's own disclosures would have -- not something an RERA/MCA/
+    land-record trail can produce, and guessing a plausible-sounding figure
+    for it would be worse than saying so."""
+    identity = facts.get("corporate_identity") or {}
+    profile_check = facts.get("company_profile_check") or {}
+    if not identity and not profile_check.get("found"):
+        return
+
+    heading_style = doc.paragraphs[4].style
+    doc.add_page_break()
+    heading_para = doc.add_paragraph(_external_heading(facts, "Promoter Profile"))
+    heading_para.style = heading_style
+
+    promoter_name = (identity.get("promoter_name") or {}).get("value") or profile_check.get("name") or "This promoter"
+    identity_lines = []
+    cin_llpin = (identity.get("cin_llpin") or {}).get("value")
+    if cin_llpin:
+        identity_lines.append(f"CIN/LLPIN: {cin_llpin}")
+    if profile_check.get("found"):
+        if profile_check.get("registered_address"):
+            identity_lines.append(f"Registered office: {profile_check['registered_address']}")
+        if profile_check.get("incorporation_date"):
+            identity_lines.append(f"Incorporated: {profile_check['incorporation_date']}")
+        if profile_check.get("paid_up_capital"):
+            identity_lines.append(f"Paid-up capital: {profile_check['paid_up_capital']}")
+    doc.add_paragraph(f"{promoter_name}" + (" -- " + "; ".join(identity_lines) if identity_lines else ""))
+
+    external_research = facts.get("promoter_external_research") or {}
+    brief = external_research.get("summary")
+    if brief:
+        sub_heading = doc.add_paragraph("Brief Profile")
+        for run in sub_heading.runs:
+            run.bold = True
+        doc.add_paragraph(brief)
+
+    group_check = facts.get("group_companies_check") or {}
+    if group_check.get("found") and group_check.get("companies"):
+        n = len(group_check["companies"])
+        director_rows = _build_director_company_links(facts)
+        linked_directors = [r for r in director_rows if r["link_count"] > 0]
+        sub_heading = doc.add_paragraph("Business Ventures & Network")
+        for run in sub_heading.runs:
+            run.bold = True
+        network_line = f"{n} linked group entit(y/ies) identified via shared director or registered office."
+        if linked_directors:
+            network_line += (
+                f" {len(linked_directors)} director(s) named across them, led by "
+                f"{linked_directors[0]['name']} ({linked_directors[0]['link_count']} entit(y/ies)) -- "
+                f"full list and relationship map in the Group / Affiliated Companies section below."
+            )
+        else:
+            network_line += " See the Group / Affiliated Companies section below for the full list."
+        doc.add_paragraph(network_line)
+
+    sub_heading = doc.add_paragraph("Trust Signals")
+    for run in sub_heading.runs:
+        run.bold = True
+    _variant_paragraph(
+        doc, facts,
+        internal_text=(
+            "A checklist of promoter-level checks this Charter actually ran, not a numeric score -- each "
+            "status is read directly off a check performed elsewhere in this document, with a pointer to "
+            "the full detail. \"Not checked\" means exactly that, never a clean result."
+        ),
+        external_text="A checklist of promoter-level checks this report actually ran, not a numeric score.",
+    )
+    signal_table = doc.add_table(rows=1, cols=3)
+    _set_table_borders(signal_table)
+    header_cells = signal_table.rows[0].cells
+    for i, label in enumerate(("Signal", "Status", "Detail")):
+        header_cells[i].text = label
+        _shade_cell(header_cells[i], "D9E2F3")
+        for p in header_cells[i].paragraphs:
+            for run in p.runs:
+                run.bold = True
+    for signal in _promoter_trust_signals(facts):
+        row = signal_table.add_row()
+        row.cells[0].text = signal["signal"]
+        row.cells[1].text = signal["status"]
+        # Table-cell .text assignment bypasses the doc.add_paragraph
+        # monkeypatch that normally applies _externalize_prose for every
+        # OTHER piece of rendered text -- routed through it explicitly here
+        # so a " -- " in a detail string doesn't survive into the External
+        # document (Section C forbids it; the External gate blocks the save
+        # if one does).
+        row.cells[2].text = _externalize_prose(facts, signal["detail"])
+
+    igr = facts.get("igr_registered_deed_check")
+    if igr and igr.get("found"):
+        sub_heading = doc.add_paragraph("Registered-Deed Corroboration (IGR Maharashtra e-Search)")
+        for run in sub_heading.runs:
+            run.bold = True
+        doc.add_paragraph(
+            "A specific registered document was looked up directly against IGR Maharashtra's own e-Search "
+            "(freesearchigrservice.maharashtra.gov.in) -- a human read and solved the site's own CAPTCHA to "
+            "reveal this record. The raw extracted result is reproduced below verbatim; this checker was not "
+            "validated against enough real matches to summarize or classify the content itself:"
+        )
+        for row in igr.get("rows") or []:
+            doc.add_paragraph(str(row))
+        if not igr.get("rows"):
+            doc.add_paragraph((igr.get("raw_text") or "")[:4000])
+        doc.add_paragraph(f"Source: {_citation_text(facts, _clean_source_label(igr.get('url', '')) or igr.get('url', ''))}")
+
+    doc.add_paragraph()
+    _variant_paragraph(
+        doc, facts,
+        internal_text=(
+            "Not available from any public source this pipeline can reach, and not estimated here: this "
+            "promoter's personal net worth, family/next-of-kin, personal investment portfolio (AIF/PMS/bonds/"
+            "G-Sec), or market-value estimates for privately-held entities or property. RERA and MCA filings "
+            "are entity-level records, not personal wealth disclosures -- producing figures like these would "
+            "need direct investor-side visibility this pipeline does not have, and a plausible-sounding "
+            "number here would be worse than stating the gap plainly."
+        ),
+        external_text=(
+            "Personal net worth, family details, personal investment holdings, and market-value estimates "
+            "for privately-held entities are not available from any public source and are not estimated here."
+        ),
+    )
+
+
 def _append_credit_rating_section(doc, facts: dict) -> None:
     """Appends a section reporting the code-computed credit-rating check
     on the promoter's exact legal name across every agency checked (see
@@ -12683,6 +13051,14 @@ def run_company_charter(
         )
 
         facts = _run_charter_pass(user_prompt)
+    # Persisted here, not just used as a transient prompt hint above: before
+    # this, deep_research's promoter_external narrative fed the LLM call and
+    # was then discarded -- .facts.json never carried it, so nothing later
+    # (including _append_promoter_profile_section) could surface it. Kept
+    # even when pre_built_facts was used, as long as a caller also passed
+    # research_data alongside it.
+    if research_data and research_data.get("promoter_external"):
+        facts["promoter_external_research"] = research_data["promoter_external"]
     facts = _verify_material_claims(facts)
     facts = _check_document_grounding(facts, extracted_docs, category_data, documents_manifest)
     facts["document_library"] = doc_library_status  # always the full, code-computed list -- not model-generated
@@ -12941,6 +13317,7 @@ def run_company_charter(
     facts["state"] = _profile_for_run.as_facts_dict()
 
     facts = run_cts_land_lookup(facts, reg_no, output_dir)
+    facts = run_igr_registered_deed_check(facts, reg_no, output_dir)
     facts = run_gst_compliance_check(facts, reg_no, output_dir)
 
     land = facts.get("land_identification", {})

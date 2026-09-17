@@ -47,13 +47,18 @@ the run continue. Nothing else may swallow an error.
 
 1. Assemble facts (`_run_charter_pass`, registry and insolvency checks,
    document grounding). Section B of `rules.md` is injected into every such call.
-2. `run_cts_land_lookup()` **[opt-in]** and `run_gst_compliance_check()`
-   **[opt-in]** — each does nothing without its human-supplied input file,
-   unless a human is actually at this terminal (`sys.stdin.isatty()`), in
-   which case CTS walks them through office → village → CTS-number →
-   mobile inline instead of stopping to wait for a separate
-   `cts_resolve.py` session (never auto-picks office/village — Marathi
-   labels don't reliably match RERA's own text).
+2. `run_cts_land_lookup()`, `run_igr_registered_deed_check()`, and
+   `run_gst_compliance_check()` **[opt-in]** — each does nothing without its
+   human-supplied input file, unless a human is actually at this terminal
+   (`sys.stdin.isatty()`), in which case CTS walks them through office →
+   village → CTS-number → mobile inline instead of stopping to wait for a
+   separate `cts_resolve.py` session (never auto-picks office/village —
+   Marathi labels don't reliably match RERA's own text), and IGR asks
+   directly for a district/SRO/year/document-number (no candidate list to
+   pick from — a document number is either already in hand, from e.g. the
+   project's own Title Report, or not knowable at all). IGR is Maharashtra
+   -only, checked explicitly (`facts["state"]["code"] == "MH"`) since unlike
+   CTS it has no district-hint step that would naturally fail elsewhere.
 2b. **Identity and group passes** — code-computed, never model-authored, each
    with its own Charter section: `_safe_promoter_identity()` (PAN off the filed
    card), `_safe_charge_movement()` (borrowing moved since last run),
@@ -82,6 +87,18 @@ the run continue. Nothing else may swallow an error.
    court/tribunal queries, distinct from `_safe_group_litigation()`'s indirect
    Indian Kanoon name search just above.
    Each reports its own coverage: no finding never means no check (`guardrails.md`).
+   `_append_promoter_profile_section()` consolidates the above into one
+   scannable overview — corporate identity, a Brief Profile narrative (from
+   `deep_research`'s `promoter_external`, persisted into `facts["promoter_
+   external_research"]` rather than only used as a transient prompt hint),
+   a Business Ventures & Network summary, a Trust Signals checklist
+   (`_promoter_trust_signals()` — Clean/Flagged/Not checked/Not applicable
+   per already-run check, deliberately NOT a numeric 1-4 score), and the
+   Registered-Deed Corroboration result if IGR ran. Cross-references the
+   Group Companies section's own table/director-relationship diagram rather
+   than re-rendering them. States outright, rather than estimating, what
+   genuinely isn't available from any public source: personal net worth,
+   family, personal investment portfolios, and private-entity valuations.
 3. `_record_source_hits_and_promote()` — cross-run source-trust bookkeeping.
 4. `_normalize_misfiled_facts()` then `run_finding_research()` **[never fatal]**
    — per-finding deep research. Confirmed findings only, never gaps. A failed
@@ -124,6 +141,9 @@ an API call. Full map of all four: `guardrails.md`.
 `group_sweep.py <names...>` · `cts_resolve.py` and `ts_rera_client.py <name>`
 (human-in-the-loop, CAPTCHA) · `nclt_search.py <party name> [bench]` and
 `bombay_hc_search.py <party name> <year> [bench]` (human-in-the-loop, CAPTCHA —
-direct court/tribunal portal queries) · `charter_report.py` via
+direct court/tribunal portal queries) · `igr_maharashtra_search.py docno
+<district> <SRO> <year> <doc_no>` (human-in-the-loop, CAPTCHA — registered-deed
+search, Maharashtra only; also reachable inline via `run_igr_registered_deed_
+check()`) · `charter_report.py` via
 `run_charter_pipeline.py` / `build_report.py` · `executive_briefing.py` ·
 `finalize_report.py` (no API).

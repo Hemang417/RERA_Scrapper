@@ -97,6 +97,25 @@ _ALLOWED = {
         # -gated branch, so this is the same real Maharashtra-only endpoint
         # name as the entries just above, not a leaked default.
         "_interactively_resolve_cts_lookup": (" Maha Bhulekh office(s) found for ",),
+        # IGR Maharashtra e-Search is a real Maharashtra-only portal (same
+        # reasoning as Maha Bhulekh above) -- only ever reached via
+        # run_igr_registered_deed_check, itself only ever invoked from a
+        # Maharashtra-specific interactive flow, same as CTS.
+        "_interactively_resolve_igr_search": ("District (e.g. Mumbai, Mumbai Suburban, Pune -- or the exact Marathi label): ",),
+        "run_igr_registered_deed_check": ("IGR Maharashtra e-Search (registered deed)",),
+        "_append_promoter_profile_section": ("Registered-Deed Corroboration (IGR Maharashtra e-Search)",),
+        # Gated on _state_profile().code == "MH" at the top of
+        # _promoter_trust_signals itself -- never rendered for another state.
+        # Each string names Maharashtra explicitly (not just the signal
+        # label) so test_state_labels.py's per-line check passes honestly:
+        # every line that differs between two state renders must itself
+        # name the state, not just the row it happens to sit in.
+        "_promoter_trust_signals": (
+            "Registered-Deed Corroboration (IGR Maharashtra)",
+            "IGR Maharashtra e-Search not run this pass -- needs a human at the terminal with a specific document number in hand.",
+            "A specific IGR Maharashtra registered deed was corroborated -- see the Registered-Deed Corroboration section.",
+            "IGR Maharashtra e-Search: ",
+        ),
         # Verbatim rewrites of sentences from SPECIFIC past projects'
         # facts.json -- data about real Maharashtra projects, not templates.
         # Parameterising these would rewrite the record.

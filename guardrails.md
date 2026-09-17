@@ -479,13 +479,19 @@ never stubbed — see `states/base.py`.
 | `company_charter._state_profile` | A render defaulting to `None` | Falls back to Maharashtra, so every pre-existing caller renders identically |
 | `company_charter._state_dash_rewrites` | The External gate blocking a save | Generates the Internal/External subtitle pair together, per state, so they cannot drift out of lockstep |
 | `states.get_adapter` | A blank failure for a state with no adapter | Raises naming the `pre_built_facts` route that does work |
+| `company_charter.run_igr_registered_deed_check` | A Gujarat/Karnataka/etc. run asking a human IGR Maharashtra questions | IGR's e-Search only exists for Maharashtra and, unlike CTS, has no district-hint step that would naturally fail for another state — the interactive prompt asks for a district directly, so this checks `facts["state"]["code"] == "MH"` explicitly instead |
+| `company_charter._promoter_trust_signals` | The Trust Signals table naming IGR Maharashtra for a non-Maharashtra promoter | Same check, so the row is absent rather than shown as "not checked" for a portal that was never applicable |
 
 Three capability gates fix live bugs rather than prevent future ones: the
 MahaRERA Orders/Judgments scrape used to fire for Telangana projects it could
 never match; `company_charter._extract_district_hint` used to query
 Maharashtra's district map for every state; and
 `charter_document.classify_claim_evidence` used to downgrade any non-MahaRERA
-RERA record to "stated only".
+RERA record to "stated only". The two IGR Maharashtra guards above fix the
+same species of bug, caught before it shipped rather than after: unlike CTS,
+which gets state-scoping for free from its district-hint extraction, IGR's
+interactive flow would otherwise have asked a human at a Gujarat/Karnataka
+run's terminal for a Maharashtra district with no natural reason to fail.
 
 `test_state_leak_guard.py` walks the rendering modules' ASTs and fails on a new
 hardcoded state literal. `test_state_labels.py` renders the same facts under two
