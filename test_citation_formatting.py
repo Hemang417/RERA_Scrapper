@@ -61,6 +61,21 @@ def test_clean_source_label_still_splits_genuinely_separate_sources():
     print("test_clean_source_label_still_splits_genuinely_separate_sources: PASS")
 
 
+def test_clean_source_label_does_not_mangle_a_plain_non_path_source():
+    """Real regression case: a _FIELD_WITH_SOURCE value written with
+    "source": "n/a" (a field with nothing real to cite) was treated as a
+    filesystem path -- "n/a".split("/")[-1] -- producing the single stray
+    letter "a" as the entire citation label, with no real source behind it
+    (it went on to create a bogus Sources list entry, "[8] a"). Only a
+    genuine output/<reg_no>/... path may be reduced to its last segment;
+    anything else must come back unchanged."""
+    assert cc._clean_source_label("n/a") == "n/a"
+    assert cc._clean_source_label("Not sourced") == "Not sourced"
+    # A real path must still be reduced -- this is the guard's other side.
+    assert cc._clean_source_label("output/P123/raw/projects.json") == "MahaRERA projects.json"
+    print("test_clean_source_label_does_not_mangle_a_plain_non_path_source: PASS")
+
+
 def test_citation_text_does_not_refragment_a_parenthetical_annotation():
     """_citation_text re-splits the ALREADY-cleaned label on ";" a second
     time (to register each real source separately) -- it must use the same

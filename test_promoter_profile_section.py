@@ -92,6 +92,32 @@ def test_bombay_hc_declined_consent_is_not_checked():
     print("test_bombay_hc_declined_consent_is_not_checked: PASS")
 
 
+def test_bombay_hc_attempted_with_no_hits_is_inconclusive_not_not_checked():
+    """A real, completed run (attempted=True, real CAPTCHA-gated queries
+    made) must never read as "Not checked" just because no hit was
+    confirmed -- that label is reserved for a check that never ran at all.
+    See bombay_hc_search.py's own parser-confidence caveat: every
+    successful run reports found=False without yet being able to certify
+    it as a confirmed clean result."""
+    facts = {"bombay_hc_check": {"attempted": True, "runs": [
+        {"bench": "Original Side,Bombay", "year": "2026", "found": False},
+        {"bench": "Appellate Side,Bombay", "year": "2026", "found": False},
+    ]}}
+    row = next(s for s in cc._promoter_trust_signals(facts) if s["signal"] == "Bombay High Court Case Status")
+    assert row["status"] == "Inconclusive"
+    print("test_bombay_hc_attempted_with_no_hits_is_inconclusive_not_not_checked: PASS")
+
+
+def test_nclt_attempted_with_a_note_is_inconclusive_not_not_checked():
+    """Same distinction for NCLT: attempted=True plus a note (this pass
+    couldn't be certified clean) is "Inconclusive", not "Not checked"."""
+    facts = {"nclt_check": {"attempted": True, "found": False,
+                             "note": "No confirmed-live parser exists yet for a genuine hit's response shape."}}
+    row = next(s for s in cc._promoter_trust_signals(facts) if s["signal"] == "NCLT Case Status")
+    assert row["status"] == "Inconclusive"
+    print("test_nclt_attempted_with_a_note_is_inconclusive_not_not_checked: PASS")
+
+
 def test_igr_row_absent_for_a_non_maharashtra_promoter():
     """_promoter_trust_signals reads the ACTIVE render profile
     (_state_profile()), not facts["state"] directly -- a rendering
@@ -191,6 +217,8 @@ if __name__ == "__main__":
     test_igr_row_absent_for_a_non_maharashtra_promoter()
     test_igr_row_present_when_no_profile_is_active_defaults_to_mh()
     test_bombay_hc_declined_consent_is_not_checked()
+    test_bombay_hc_attempted_with_no_hits_is_inconclusive_not_not_checked()
+    test_nclt_attempted_with_a_note_is_inconclusive_not_not_checked()
     test_group_entity_transparency_reports_undisclosed_relationships()
     test_section_renders_once_and_does_not_duplicate_group_companies_table()
     test_not_publicly_available_block_is_present_and_honest()

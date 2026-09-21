@@ -78,7 +78,14 @@ def _launch(headless: bool):
             "playwright is required. Run: pip install playwright && playwright install chromium"
         ) from e
     p = sync_playwright().start()
-    browser = p.chromium.launch(headless=headless)
+    try:
+        browser = p.chromium.launch(headless=headless)
+    except Exception:
+        # Bundled Chromium can fail to spawn on a machine missing the
+        # Windows runtime it needs (side-by-side config error) -- fall
+        # back to the system-installed Chrome, which doesn't have that
+        # dependency gap.
+        browser = p.chromium.launch(channel="chrome", headless=headless)
     page = browser.new_context(viewport={"width": 1366, "height": 950}).new_page()
     return p, browser, page
 
@@ -209,8 +216,18 @@ def search_party(
         page.goto(_CASE_STATUS_URL, timeout=30000)
         page.wait_for_selector(_SEL_SEARCH_BY, timeout=15000)
         page.select_option(_SEL_SEARCH_BY, value="party_wise")
-        page.evaluate("change()")  # real full-page POST, confirmed live -- see module note
-        page.wait_for_selector(_SEL_PARTY_NAME, timeout=15000)
+        try:
+            page.evaluate("change()")  # real full-page POST, confirmed live -- see module note
+        except Exception:
+            # Confirmed live: change() -> document.frm.submit() navigates the
+            # page from inside this same evaluate() call, so the round-trip
+            # can itself observe "Execution context was destroyed, most
+            # likely because of a navigation" -- that's evidence the postback
+            # happened, not a real failure (same convention as mahabhumi.py's
+            # CAPTCHA-postback handling). The wait_for_selector below is what
+            # actually confirms the party-name field arrived.
+            pass
+        page.wait_for_selector(_SEL_PARTY_NAME, timeout=30000)
 
         page.select_option(_SEL_BENCH, value=_BENCHES[bench])
         page.fill(_SEL_PARTY_NAME, party_name)

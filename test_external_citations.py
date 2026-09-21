@@ -138,6 +138,26 @@ def test_marker_goes_to_the_clause_end_not_next_to_the_keyword():
     print("test_marker_goes_to_the_clause_end_not_next_to_the_keyword: PASS")
 
 
+def test_marker_never_lands_inside_an_abbreviation():
+    """Confirmed live: 'case C.P. (IB)/1043(MB)2020' (an NCLT case number,
+    not two sentences) had its FIRST period matched as a clause boundary,
+    producing 'C[3].P.' -- splitting the abbreviation itself. A genuine
+    clause-ending '.' is followed by whitespace; an abbreviation's internal
+    period is immediately followed by another letter and must be skipped."""
+    text = "one same-name match for case C.P. (IB)/1043(MB)2020, filed 13-Feb-2020, not confirmed."
+    out = cc._insert_marker_at_clause_end(text, text.index("C.P."), "[3]")
+    # The original bug: the marker landed on the FIRST period, splitting the
+    # abbreviation itself apart ("C[3].P."). Consistent with how this
+    # function already places a marker before whatever punctuation ends the
+    # clause it lands in (see test_marker_goes_to_the_clause_end_not_next_
+    # to_the_keyword's "tied to this promoter[4]."), the fixed behavior
+    # places it right before the abbreviation's OWN trailing period instead
+    # of between its two letters -- "C.P[3]." keeps "C.P" intact as a unit.
+    assert "C[3].P." not in out, out
+    assert "C.P[3]." in out, out
+    print("test_marker_never_lands_inside_an_abbreviation: PASS")
+
+
 # --- source labels -----------------------------------------------------------
 
 def test_sources_are_descriptive_never_filenames_or_categories():
@@ -349,6 +369,7 @@ if __name__ == "__main__":
     test_internal_is_not_given_numbered_markers()
     test_no_marker_lands_mid_token()
     test_marker_goes_to_the_clause_end_not_next_to_the_keyword()
+    test_marker_never_lands_inside_an_abbreviation()
     test_sources_are_descriptive_never_filenames_or_categories()
     test_a_catalogued_document_resolves_to_its_descriptive_ref()
     test_an_uncatalogued_document_never_renders_as_project_record()

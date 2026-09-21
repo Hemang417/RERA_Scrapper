@@ -51,8 +51,32 @@ def test_nclt_check_exception_is_never_fatal():
 
     assert result["attempted"] is True
     assert result["found"] is False
-    assert "browser crashed" in result["note"]
+    assert "RuntimeError" in result["note"]
+    assert "browser crashed" not in result["note"]
     print("test_nclt_check_exception_is_never_fatal: PASS")
+
+
+def test_nclt_check_never_leaks_raw_exception_text():
+    """rules.md Section B: 'no file path... or raw exception string into
+    either document.' Confirmed live: a bare Playwright browser-launch
+    failure's str(e) embeds the full local chrome.exe command line --
+    absolute filesystem paths, the OS username in a temp-profile path --
+    which reached a real generated Charter before this was fixed. The note
+    must carry only the exception's TYPE name, never its message."""
+    leaky_message = (
+        "BrowserType.launch: spawn UNKNOWN\nCall log:\n"
+        "  - <launching> C:\\Users\\SomeUser\\AppData\\Local\\ms-playwright\\chromium-1234\\chrome-win64\\chrome.exe "
+        "--user-data-dir=C:\\Users\\SomeUser\\AppData\\Local\\Temp\\playwright_chromiumdev_profile-abc123"
+    )
+    with mock.patch("sys.stdin.isatty", return_value=True), \
+         mock.patch.object(nclt_search, "search_party", side_effect=RuntimeError(leaky_message)):
+        result = cc._safe_nclt_check("Some Promoter LLP")
+
+    assert "C:\\Users" not in result["note"]
+    assert "user-data-dir" not in result["note"]
+    assert "chrome.exe" not in result["note"]
+    assert "RuntimeError" in result["note"]
+    print("test_nclt_check_never_leaks_raw_exception_text: PASS")
 
 
 def test_bombay_hc_check_skips_when_not_interactive():
@@ -129,17 +153,41 @@ def test_bombay_hc_check_one_failure_does_not_abort_the_sweep():
     assert len(result["runs"]) == 10  # every combination still attempted
     failed = [r for r in result["runs"] if r.get("note")]
     assert len(failed) == 1
-    assert "captcha timed out" in failed[0]["note"]
+    assert "RuntimeError" in failed[0]["note"]
+    assert "captcha timed out" not in failed[0]["note"]
     print("test_bombay_hc_check_one_failure_does_not_abort_the_sweep: PASS")
+
+
+def test_bombay_hc_check_never_leaks_raw_exception_text():
+    """Same leak class as NCLT (bombay_hc_search.py also opens a real
+    Playwright browser, and this call site has no separate named-exception
+    branch, so every failure funnels through the one generic handler)."""
+    leaky_message = (
+        "BrowserType.launch: spawn UNKNOWN\nCall log:\n"
+        "  - <launching> C:\\Users\\SomeUser\\AppData\\Local\\ms-playwright\\chromium-1234\\chrome-win64\\chrome.exe "
+        "--user-data-dir=C:\\Users\\SomeUser\\AppData\\Local\\Temp\\playwright_chromiumdev_profile-abc123"
+    )
+    with mock.patch("sys.stdin.isatty", return_value=True), \
+         mock.patch("builtins.input", return_value="y"), \
+         mock.patch.object(bombay_hc_search, "search_party", side_effect=RuntimeError(leaky_message)):
+        result = cc._safe_bombay_hc_check("Some Promoter LLP")
+
+    for run in result["runs"]:
+        assert "C:\\Users" not in (run.get("note") or "")
+        assert "user-data-dir" not in (run.get("note") or "")
+        assert "chrome.exe" not in (run.get("note") or "")
+    print("test_bombay_hc_check_never_leaks_raw_exception_text: PASS")
 
 
 if __name__ == "__main__":
     test_nclt_check_skips_when_not_interactive()
     test_nclt_check_wraps_nclt_search_result()
     test_nclt_check_exception_is_never_fatal()
+    test_nclt_check_never_leaks_raw_exception_text()
     test_bombay_hc_check_skips_when_not_interactive()
     test_bombay_hc_check_eof_during_consent_prompt_is_treated_as_decline()
     test_bombay_hc_check_skips_when_declined()
     test_bombay_hc_check_runs_all_combinations_when_confirmed()
     test_bombay_hc_check_one_failure_does_not_abort_the_sweep()
+    test_bombay_hc_check_never_leaks_raw_exception_text()
     print("\nAll tests passed.")

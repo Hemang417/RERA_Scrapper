@@ -114,7 +114,14 @@ def _launch(headless: bool):
             "playwright is required. Run: pip install playwright && playwright install chromium"
         ) from e
     p = sync_playwright().start()
-    browser = p.chromium.launch(headless=headless)
+    try:
+        browser = p.chromium.launch(headless=headless)
+    except Exception:
+        # Bundled Chromium can fail to spawn on a machine missing the
+        # Windows runtime it needs (side-by-side config error) -- fall
+        # back to the system-installed Chrome, which doesn't have that
+        # dependency gap.
+        browser = p.chromium.launch(channel="chrome", headless=headless)
     page = browser.new_context(viewport={"width": 1366, "height": 950}).new_page()
     return p, browser, page
 
@@ -194,6 +201,16 @@ def search_party(
 
         page.fill(_SEL_PARTY_NAME, party_name)
         page.fill(_SEL_YEAR, str(year))
+        # The same stray "Please Select Highcourt and Bench.." modal
+        # _open_party_name_form already dismisses once can reappear here --
+        # confirmed live, the bench <select>'s own onchange postback can
+        # re-show it after that first dismissal, which otherwise blocks
+        # this click for the full 30s timeout on an intercepted-pointer-
+        # events error. Same harmless dismiss-if-present handling.
+        try:
+            page.click("#bs_alert button", timeout=2000)
+        except Exception:
+            pass
         page.check(status_radio)
 
         print(f"\n[INFO] A browser window has opened at {_MAIN_URL}")

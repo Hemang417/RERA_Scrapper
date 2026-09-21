@@ -94,6 +94,54 @@ def test_captcha_timeout_is_caught_not_raised():
     print("test_captcha_timeout_is_caught_not_raised: PASS")
 
 
+def test_property_card_fetch_never_leaks_raw_exception_text():
+    """rules.md Section B: 'no file path... or raw exception string into
+    either document.' Confirmed live: a bare Playwright browser-launch
+    failure's str(e) embeds the full local chrome.exe command line --
+    absolute filesystem paths, the OS username in a temp-profile path --
+    which reached a real generated Charter before this was fixed. The
+    generic (non-CaptchaTimeoutError/BrowserClosedError) exception branch
+    must carry only the exception's TYPE name, never its message."""
+    leaky_message = (
+        "BrowserType.launch: spawn UNKNOWN\nCall log:\n"
+        "  - <launching> C:\\Users\\SomeUser\\AppData\\Local\\ms-playwright\\chromium-1234\\chrome-win64\\chrome.exe "
+        "--user-data-dir=C:\\Users\\SomeUser\\AppData\\Local\\Temp\\playwright_chromiumdev_profile-abc123"
+    )
+    with _patch_mahabhumi(
+        search_cts_candidates=lambda district, office, village, cts: {"found": True, "candidates": ["100"]},
+        fetch_property_card=lambda *a, **k: (_ for _ in ()).throw(RuntimeError(leaky_message)),
+    ):
+        record = cc.run_cts_lookup_standalone("Pune", "Pune City", "Wagholi", "100", "9999999999", output_dir=_SCRATCH_DIR)
+
+    note = record["cts_land_record_check"]["note"]
+    assert "C:\\Users" not in note
+    assert "user-data-dir" not in note
+    assert "chrome.exe" not in note
+    assert "RuntimeError" in note
+    print("test_property_card_fetch_never_leaks_raw_exception_text: PASS")
+
+
+def test_candidate_search_never_leaks_raw_exception_text():
+    """Same leak class, the other Playwright-driving call in this chain."""
+    leaky_message = (
+        "BrowserType.launch: spawn UNKNOWN\nCall log:\n"
+        "  - <launching> C:\\Users\\SomeUser\\AppData\\Local\\ms-playwright\\chromium-1234\\chrome-win64\\chrome.exe "
+        "--user-data-dir=C:\\Users\\SomeUser\\AppData\\Local\\Temp\\playwright_chromiumdev_profile-abc123"
+    )
+    with _patch_mahabhumi(
+        search_cts_candidates=lambda district, office, village, cts: (_ for _ in ()).throw(RuntimeError(leaky_message)),
+        fetch_property_card=lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not fetch after candidate search failed")),
+    ):
+        record = cc.run_cts_lookup_standalone("Pune", "Pune City", "Wagholi", "100", "9999999999", output_dir=_SCRATCH_DIR)
+
+    note = record["cts_land_record_check"]["note"]
+    assert "C:\\Users" not in note
+    assert "user-data-dir" not in note
+    assert "chrome.exe" not in note
+    assert "RuntimeError" in note
+    print("test_candidate_search_never_leaks_raw_exception_text: PASS")
+
+
 def test_writes_to_slugified_pending_directory():
     shutil.rmtree(_SCRATCH_DIR, ignore_errors=True)
     found_card = {"found": True, "fields": {}, "raw_text": "", "url": "https://bhulekh.mahabhumi.gov.in/x"}
@@ -281,6 +329,8 @@ if __name__ == "__main__":
     test_source_appended_only_when_found()
     test_cts_not_in_candidates_is_a_clean_not_found_not_a_crash()
     test_captcha_timeout_is_caught_not_raised()
+    test_property_card_fetch_never_leaks_raw_exception_text()
+    test_candidate_search_never_leaks_raw_exception_text()
     test_writes_to_slugified_pending_directory()
     test_slugify_handles_slashes_and_whitespace()
     test_screenshot_path_is_computed_before_the_captcha_gated_fetch()

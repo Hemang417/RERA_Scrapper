@@ -120,6 +120,38 @@ def test_captcha_timeout_is_caught_not_raised():
     print("test_captcha_timeout_is_caught_not_raised: PASS")
 
 
+def test_generic_failure_never_leaks_raw_exception_text():
+    """rules.md Section B: 'no file path... or raw exception string into
+    either document.' Confirmed live elsewhere in this codebase (the CTS/
+    NCLT/Bombay HC checks): a bare Playwright browser-launch failure's
+    str(e) embeds the full local chrome.exe command line -- absolute
+    filesystem paths, the OS username in a temp-profile path. This
+    function's own generic (non-CaptchaTimeoutError/BrowserClosedError)
+    exception branch must carry only the exception's TYPE name."""
+    _clean()
+    os.makedirs(os.path.join(_SCRATCH_DIR, _REG_NO), exist_ok=True)
+    with open(os.path.join(_SCRATCH_DIR, _REG_NO, "igr_lookup_input.json"), "w", encoding="utf-8") as f:
+        json.dump({"district": "Pune", "sro_contains": "Haveli", "year": "2024", "doc_number": "100", "registration_type": "regular"}, f)
+
+    leaky_message = (
+        "BrowserType.launch: spawn UNKNOWN\nCall log:\n"
+        "  - <launching> C:\\Users\\SomeUser\\AppData\\Local\\ms-playwright\\chromium-1234\\chrome-win64\\chrome.exe "
+        "--user-data-dir=C:\\Users\\SomeUser\\AppData\\Local\\Temp\\playwright_chromiumdev_profile-abc123"
+    )
+    with mock.patch.object(
+        igr_maharashtra_search, "search_by_document_number", side_effect=RuntimeError(leaky_message),
+    ):
+        facts = cc.run_igr_registered_deed_check({}, _REG_NO, output_dir=_SCRATCH_DIR)
+
+    note = facts["igr_registered_deed_check"]["note"]
+    assert "C:\\Users" not in note
+    assert "user-data-dir" not in note
+    assert "chrome.exe" not in note
+    assert "RuntimeError" in note
+    _clean()
+    print("test_generic_failure_never_leaks_raw_exception_text: PASS")
+
+
 def test_non_maharashtra_state_is_never_asked_igr_questions():
     """IGR Maharashtra e-Search only exists for Maharashtra -- unlike CTS,
     which gets the same effect implicitly via its district-hint extraction,
@@ -162,5 +194,6 @@ if __name__ == "__main__":
     test_eof_during_interactive_prompt_is_treated_as_abort()
     test_non_maharashtra_state_is_never_asked_igr_questions()
     test_captcha_timeout_is_caught_not_raised()
+    test_generic_failure_never_leaks_raw_exception_text()
     test_malformed_input_file_is_a_clean_not_found_not_a_crash()
     print("\nAll tests passed.")

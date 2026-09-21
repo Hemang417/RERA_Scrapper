@@ -3388,7 +3388,14 @@ def run_cts_land_lookup(facts: dict, reg_no: str, output_dir: str = config.OUTPU
             cts_input["district"], cts_input["office"], cts_input["village"], cts_input["cts_number"]
         )
     except Exception as e:
-        facts["cts_land_record_check"] = {"found": False, "note": f"CTS candidate search could not run this pass: {e}"}
+        # type(e).__name__ only: this reaches mahabhumi.py's Playwright
+        # automation, and a bare BrowserType.launch failure's str(e) embeds
+        # the full local chrome.exe command line -- absolute filesystem
+        # paths, the OS username in a temp-profile path -- which rules.md
+        # forbids in either document. mahabhumi's OWN named exceptions just
+        # below (CaptchaTimeoutError etc.) are hand-authored, short, and
+        # safe to keep verbatim; only this catch-all needs sanitizing.
+        facts["cts_land_record_check"] = {"found": False, "note": f"CTS candidate search could not run this pass ({type(e).__name__})."}
         return facts
 
     if not candidates_result.get("found"):
@@ -3416,7 +3423,8 @@ def run_cts_land_lookup(facts: dict, reg_no: str, output_dir: str = config.OUTPU
     except (mahabhumi.CaptchaTimeoutError, mahabhumi.BrowserClosedError, mahabhumi.AmbiguousSelectionError) as e:
         result = {"found": False, "note": f"CTS Property Card lookup did not complete: {e}"}
     except Exception as e:
-        result = {"found": False, "note": f"CTS Property Card lookup could not run this pass: {e}"}
+        # See the type(e).__name__ note above -- same Playwright-launch leak risk.
+        result = {"found": False, "note": f"CTS Property Card lookup could not run this pass ({type(e).__name__})."}
 
     facts["cts_land_record_check"] = result
     if result.get("found"):
@@ -3538,7 +3546,9 @@ def run_igr_registered_deed_check(facts: dict, reg_no: str, output_dir: str = co
     except (igr_maharashtra_search.CaptchaTimeoutError, igr_maharashtra_search.BrowserClosedError) as e:
         result = {"found": False, "rows": [], "raw_text": "", "url": "", "note": f"IGR registered-deed search did not complete: {e}"}
     except Exception as e:
-        result = {"found": False, "rows": [], "raw_text": "", "url": "", "note": f"IGR registered-deed search could not run this pass: {e}"}
+        # type(e).__name__ only -- same Playwright-launch leak risk as the
+        # CTS candidate search above (this also opens a real browser).
+        result = {"found": False, "rows": [], "raw_text": "", "url": "", "note": f"IGR registered-deed search could not run this pass ({type(e).__name__})."}
 
     facts["igr_registered_deed_check"] = result
     if result.get("found"):
@@ -3683,7 +3693,9 @@ def run_cts_lookup_standalone(
     try:
         candidates_result = mahabhumi.search_cts_candidates(district, office, village, cts_number)
     except Exception as e:
-        result = {"found": False, "note": f"CTS candidate search could not run this pass: {e}"}
+        # type(e).__name__ only -- see the sibling cts_lookup_input.json
+        # path above for why (Playwright launch failures embed local paths).
+        result = {"found": False, "note": f"CTS candidate search could not run this pass ({type(e).__name__})."}
     else:
         if not candidates_result.get("found"):
             result = {"found": False, "note": candidates_result.get("note", "CTS candidate search failed")}
@@ -3705,7 +3717,7 @@ def run_cts_lookup_standalone(
             except (mahabhumi.CaptchaTimeoutError, mahabhumi.BrowserClosedError, mahabhumi.AmbiguousSelectionError) as e:
                 result = {"found": False, "note": f"CTS Property Card lookup did not complete: {e}"}
             except Exception as e:
-                result = {"found": False, "note": f"CTS Property Card lookup could not run this pass: {e}"}
+                result = {"found": False, "note": f"CTS Property Card lookup could not run this pass ({type(e).__name__})."}
 
     record = {
         "district": district, "office": office, "village": village,
@@ -7441,9 +7453,19 @@ def _clean_source_label(raw_source: str) -> str | None:
         if piece.lower().startswith(("http://", "https://")):
             domain = re.sub(r"^https?://(www\.)?", "", piece).split("/")[0]
             return domain + annotation
-        piece = piece.replace("\\", "/")
-        name = piece.split("/")[-1]
-        folder = piece.rsplit("/", 2)[-2] if "/" in piece else ""
+        normalized = piece.replace("\\", "/")
+        # Only a genuine output/<reg_no>/... path gets the "last path
+        # segment" treatment. Confirmed live: a plain non-path source value
+        # that merely happens to contain a "/" -- e.g. "n/a", written as a
+        # source placeholder for a field with nothing to cite -- was
+        # getting split the same way a real path is, producing a single
+        # stray letter ("n/a" -> "a") as the entire citation label, with no
+        # corresponding real source behind it. Anything not shaped like this
+        # codebase's own output path convention is returned as typed.
+        if not normalized.startswith("output/"):
+            return piece + annotation
+        name = normalized.split("/")[-1]
+        folder = normalized.rsplit("/", 2)[-2] if "/" in normalized else ""
         if folder == "raw" and name.endswith(".json"):
             name = f"{_state_profile().rera_acronym} {name}"
         return name + annotation
@@ -7718,7 +7740,17 @@ def _insert_marker_at_clause_end(text: str, from_index: int, marker: str) -> str
     "never lands mid-word or mid-token". Inserting immediately after the matched
     keyword produced literally the example the rule cites against --
     "MahaRERA[10]-registered" -- because the mention sits inside a compound.
-    Scanning to the clause boundary satisfies both halves at once."""
+    Scanning to the clause boundary satisfies both halves at once.
+
+    A "." inside an abbreviation ("C.P. (IB)/1043(MB)2020", a case number,
+    not a sentence) is not a clause boundary either -- confirmed live: the
+    first period in "C.P." was matched, splitting the abbreviation itself
+    ("C[3].P."), which is the exact mid-token failure this function exists
+    to prevent, just one abbreviation-period further along than the
+    original bug. A genuine clause-ending "." or ";" is followed by
+    whitespace or the end of the string; an abbreviation's internal period
+    is immediately followed by another letter, so it is skipped and the
+    scan continues to the next candidate."""
     end = len(text)
     depth = 0
     for i in range(from_index, len(text)):
@@ -7727,7 +7759,7 @@ def _insert_marker_at_clause_end(text: str, from_index: int, marker: str) -> str
             depth += 1
         elif ch == ")":
             depth = max(0, depth - 1)
-        elif depth == 0 and ch in ".;":
+        elif depth == 0 and ch in ".;" and (i + 1 >= len(text) or text[i + 1] in " \n\t"):
             end = i
             break
     return text[:end] + marker + text[end:]
@@ -10493,8 +10525,12 @@ def _promoter_trust_signals(facts: dict) -> list:
     different in kind and completeness would be exactly the "plausible
     -sounding figure" this codebase's own gap discipline exists to refuse.
     Each row is {"signal", "status", "detail"} -- "status" is always one of
-    Clean / Flagged / Not checked / Not applicable, read directly off a
-    check this Charter already ran, never inferred."""
+    Clean / Flagged / Inconclusive / Not checked / Not applicable, read
+    directly off a check this Charter already ran, never inferred.
+    "Not checked" means the check never ran; "Inconclusive" means it ran
+    (a real query was made) but the result can't be certified as a
+    confirmed clean pass -- keep these distinct, they read very
+    differently to someone scanning just the status column."""
     rows = []
 
     charges = (facts.get("company_profile_check") or {}).get("charges")
@@ -10542,14 +10578,23 @@ def _promoter_trust_signals(facts: dict) -> list:
         elif key == "nclt_check":
             found = check.get("found")
             note = check.get("note") or ""
-            rows.append({"signal": label, "status": "Flagged" if found else ("Not checked" if note else "Clean"),
+            # A note on an attempted check means it ran but isn't a
+            # confirmed clean pass (see _append_nclt_check_section's own
+            # "Inconclusive this pass" handling) -- distinct from never
+            # having run at all, which is the "not attempted" branch above.
+            rows.append({"signal": label, "status": "Flagged" if found else ("Inconclusive" if note else "Clean"),
                          "detail": note or ("Result found -- see the NCLT Case Status Check section." if found else "No record found.")})
         else:
             runs = check.get("runs") or []
             hits = [r for r in runs if r.get("found")]
-            rows.append({"signal": label, "status": "Flagged" if hits else "Not checked",
+            # Every completed Bombay HC run carries a parser-confidence
+            # caveat (bombay_hc_search.py has never observed a genuine
+            # hit's response shape to validate against), so an attempted,
+            # hit-free result is "Inconclusive", never "Not checked" -- it
+            # was a real CAPTCHA-gated query, not a skipped one.
+            rows.append({"signal": label, "status": "Flagged" if hits else "Inconclusive",
                          "detail": (f"{len(hits)} of {len(runs)} bench/year search(es) returned a result -- see the Bombay High Court Case Status Check section."
-                                    if hits else "No confirmed hit across the bench/year combinations checked; see that section for what was and wasn't covered.")})
+                                    if hits else "Attempted across all bench/year combinations checked; no confirmed hit, but see that section for why this can't yet be certified as a fully clean result.")})
 
     group_check = facts.get("group_companies_check") or {}
     if not group_check.get("found"):
@@ -12215,9 +12260,17 @@ def _safe_nclt_check(promoter_name: str, bench: str = "Mumbai") -> dict:
     try:
         result = nclt_search.search_party(promoter_name, bench)
     except Exception as e:
+        # type(e).__name__ only, never the raw exception text: a Playwright
+        # launch failure's str(e) includes the full local chrome.exe command
+        # line -- absolute filesystem paths, the OS username in a temp-profile
+        # path, browser flags -- none of which rules.md permits in either
+        # document ("no file path... or raw exception string"). Confirmed
+        # live: this exact leak reached both Internal and External on a
+        # machine with an incompatible bundled Chromium. Same safe pattern
+        # group_sweep.py already uses for its own per-project fetch failures.
         return {
             "attempted": True, "bench": bench, "found": False, "rows": [], "raw_text": "",
-            "note": f"NCLT check could not run this pass: {e}",
+            "note": f"NCLT check could not run this pass ({type(e).__name__}).",
         }
     return {"attempted": True, "bench": bench, **result}
 
@@ -12277,9 +12330,13 @@ def _safe_bombay_hc_check(promoter_name: str) -> dict:
             try:
                 result = bombay_hc_search.search_party(promoter_name, year, bench)
             except Exception as e:
+                # type(e).__name__ only -- bombay_hc_search.py also opens a
+                # real Playwright browser; unlike nclt_search.py/mahabhumi.py
+                # this call site has no separate named-exception branch, so
+                # every failure mode funnels through here and must be safe.
                 result = {
                     "found": False, "rows": [], "raw_response": None, "url": "",
-                    "note": f"Bombay HC check could not run this pass: {e}",
+                    "note": f"Bombay HC check could not run this pass ({type(e).__name__}).",
                 }
             runs.append({"bench": bench, "year": year, **result})
     return {"attempted": True, "runs": runs, "benches_checked": list(benches), "years_checked": years}
@@ -12446,8 +12503,11 @@ def _safe_charge_movement(profile_result: dict, output_dir: str) -> dict:
             charge_watch.save(current)
         return movement
     except Exception as e:
+        # type(e).__name__ only: charge_watch.py reads/writes a local
+        # snapshot file (charge_watch.SNAPSHOT_DIR), and a FileNotFoundError/
+        # PermissionError's str(e) embeds that file's path.
         return {"checked": False, "changes": [], "still_open": [],
-                "note": f"Charge movement could not be checked this pass: {e}"}
+                "note": f"Charge movement could not be checked this pass ({type(e).__name__})."}
 
 
 def _safe_group_rera_sweep(group_result: dict, subject_promoter: str = "",
@@ -12554,7 +12614,10 @@ def _safe_group_financial_disclosure(rera_sweep: dict | None = None,
         return group_financial_disclosure.sweep(rera_sweep, downloaders=downloaders)
     except Exception as e:
         return {"projects_checked": [], "statements": [], "checked": 0, "total": 0,
-                "limitations": [f"The group financial disclosure sweep could not run this pass: {e}"]}
+                # type(e).__name__ only: group_financial_disclosure.py reads/
+                # writes a local cache file, and a file-I/O exception's str(e)
+                # embeds that file's path.
+                "limitations": [f"The group financial disclosure sweep could not run this pass ({type(e).__name__})."]}
 
 
 def _safe_group_litigation(group_result: dict, subject_promoter: str = "",
@@ -12731,9 +12794,13 @@ def _safe_promoter_identity(documents_manifest: list, documents_dir: str, catego
             documents_manifest, documents_dir, _portal_promoter_name(category_data)
         )
     except Exception as e:
+        # type(e).__name__ only: promoter_identity.py opens each PAN-card
+        # PDF/image directly from the local document library (fitz.open,
+        # PIL), and a corrupt-file or read exception's str(e) embeds that
+        # file's local path.
         return {
             "pan": None, "verified": False, "unverified_candidates": [],
-            "notes": [f"Promoter PAN extraction could not run this pass: {e}"],
+            "notes": [f"Promoter PAN extraction could not run this pass ({type(e).__name__})."],
         }
 
 
