@@ -500,7 +500,11 @@ CTS_FINDINGS = [
      "that specific view stays unconfirmed rather than assumed. A real, stated limitation from the "
      "site's own FAQ: Power of Attorney and Will deeds are NOT available in search results. Mumbai "
      "city and Suburban districts go back to 1985; 'selected offices' elsewhere now reach back before "
-     "the earlier 2002 baseline too, per the site's own notice."),
+     "the earlier 2002 baseline too, per the site's own notice. WIRED IN 2026-09-15 "
+     "(run_igr_registered_deed_check): document-number search only, asked directly of a human at the "
+     "terminal (district/SRO/year/doc-no, no candidate list) since a document number is either already "
+     "in hand or not knowable at all; search_by_property() stays unwired since its result shape is "
+     "still unconfirmed against a real row."),
     ("Equitable mortgages", "IGR Notice of Intimation (freesearchigrservice.maharashtra.gov.in)",
      "Yes", "Free + CAPTCHA", "confirmed-live",
      "The MECHANISM is confirmed live, sharing the exact same interface, schema and evidence as the "
@@ -616,6 +620,20 @@ CIN_FINDINGS = [
      "but resolving which numeric Id belongs to a given company needs more reverse-engineering than "
      "this pass did. CRISIL is unchanged -- its own factsheet page already carried a short inline "
      "excerpt (the `rationale` key), not a document link, before this pass."),
+    ("NCLT Case Status (direct tribunal query)", "NCLT e-filing Case Status portal, party-name search",
+     "Yes", "Free + CAPTCHA", "confirmed-live", "nclt_check",
+     "WIRED IN 2026-09-15. A DIRECT party-name query against the tribunal's own portal -- distinct "
+     "from _safe_group_litigation's indirect Indian Kanoon name search just above. CAPTCHA-gated (one "
+     "solve) and human-in-the-loop: only runs when a human is actually at this terminal, never "
+     "headlessly. Mumbai Bench only; the other 15 benches nationwide are not searched."),
+    ("Bombay High Court Case Status (direct eCourts query)", "Bombay HC eCourts Case Status, party-name search",
+     "Yes", "Free + CAPTCHA", "confirmed-live", "bombay_hc_check",
+     "WIRED IN 2026-09-15. A DIRECT party-name query, Original Side + Appellate Side (the two Bombay-"
+     "city benches) across the last 5 registration years -- 10 separate CAPTCHA-gated lookups, since "
+     "the portal requires a mandatory Registration Year per search. The other 5 benches (Aurangabad/"
+     "Nagpur/Kolhapur/Goa/Special Court) are not searched by default. Used to also require an explicit "
+     "human consent prompt before running, on top of the terminal check, given the 10x cost; removed "
+     "2026-09-23 once a human being present for every run of this pipeline was no longer in question."),
 ]
 
 # =========================================================================
@@ -639,27 +657,6 @@ UNMAPPED = [
      "Promoter-declared delay reasons and lapsed-NOC tracking; no equivalent elsewhere.", "Medium"),
     ("Maha Bhulekh card fields", "Free portal, extraction broken", "Maharashtra projects",
      "Owner, area, tenure, encumbrance and mutation are all ON the card and none reach the document.",
-     "High"),
-    ("IGR Maharashtra registered-deed search", "igr_maharashtra_search.py -- BUILT 2026-09-01, "
-     "human-in-the-loop like up_captcha_search.py/cts_resolve.py, not wired into run_company_charter()",
-     "Maharashtra projects",
-     "An independent, free, party-named check on registrations against a property/CTS number or a "
-     "specific document number -- CAPTCHA-gated but otherwise unauthenticated. search_by_document_"
-     "number() is confirmed against a real pulled result: seller/purchaser names, full property "
-     "description and the ACTUAL CONSIDERATION AMOUNT in one row, no further click needed -- a direct "
-     "corroboration (or contradiction) of a promoter's declared land dealings that nothing else in "
-     "this pipeline checks independently. search_by_property() is also built and, confirmed live "
-     "chasing a real Pune search, turned out to need THREE separate regions (mumbai/rest_of_"
-     "maharashtra/urban), each its own field ids and cascade shape -- the landing page's default tab "
-     "covers only the two Mumbai districts, not the whole state as it first appeared. A locality can "
-     "sit in either the rural or urban region depending on how it was annexed: Pune's Market Yard "
-     "(Gulatekadi) is under 'urban', not the rural taluka/village list a human would try first, and "
-     "guessing wrong doesn't error -- it just returns a real but unrelated village list. All three "
-     "regions' form mechanics are confirmed live end-to-end up to the CAPTCHA gate; the RESULT TABLE'S "
-     "OWN SHAPE for search_by_property is still not confirmed against a real row for any of them, "
-     "unlike document-number search. Also carries an integrated CERSAI cross-search on the same page, "
-     "not yet driven by either function. A standalone script, run by a human, same as every other "
-     "CAPTCHA-gated tool here -- not called from the automated Charter pipeline.",
      "High"),
     ("JHARERA audited balance sheet + 3 years ITR", "adapter_jharkhand.py document library (labelled, downloaded)",
      "Jharkhand projects",
