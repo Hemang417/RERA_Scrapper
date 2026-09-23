@@ -144,6 +144,48 @@ an API call. Full map of all four: `guardrails.md`.
 direct court/tribunal portal queries) · `igr_maharashtra_search.py docno
 <district> <SRO> <year> <doc_no>` (human-in-the-loop, CAPTCHA — registered-deed
 search, Maharashtra only; also reachable inline via `run_igr_registered_deed_
-check()`) · `charter_report.py` via
+check()`) · `promoter_intake.py <CIN> [company_name]` (company profile/IBBI/
+group-companies/credit-rating checks from a bare CIN, no RERA number needed —
+writes `output/_pending/<CIN>/promoter_profile.json`) · `charter_report.py` via
 `run_charter_pipeline.py` / `build_report.py` · `executive_briefing.py` ·
 `finalize_report.py` (no API).
+
+### `prereg_charter.py` — the full automatic pipeline with no RERA registration
+
+`python prereg_charter.py [--project-name N] [--promoter-name N] [--cin C]
+[--cts-district D --cts-number N --cts-mobile M] [--gstin X | --pan Y]
+[--group-sweep] [--group-gst] [--group-litigation] [--group-enforcement]
+[--group-financial-disclosure] [--output-dir D]`
+
+For a project that has no RERA registration at all yet (pre-registration —
+only a CTS land-parcel number and/or the promoter's CIN are known). Requires
+at least one of `--project-name` / `--promoter-name` / `--cin`; the CTS trio
+is all-or-nothing. Runs the SAME GST intake, deep research, and Charter
+stages as `main.py`, but skips stages 0–6 (no state/authority to resolve,
+nothing to scrape) and stage 10 (`report.build_pdf` is the RERA project
+report — nothing to report on). What replaces the RERA scrape:
+
+- `company_charter.run_promoter_intake()` (if `--cin`) and
+  `run_cts_lookup_standalone()` (if the CTS trio) — the same standalone
+  functions `promoter_intake.py`/the CTS-carryover path already use for "an
+  identifier reached this pipeline before the RERA number did" — write to
+  `output/_pending/<case_id>/`, then `attach_rera_number()` copies the
+  result into this run's own `output/<reg_no>/*_carryover.json`.
+  `run_company_charter()`'s own internal carryover-loading logic
+  (`_load_promoter_carryover`, `run_cts_land_lookup`'s carryover branch)
+  then picks it up automatically — no check logic is duplicated in
+  `prereg_charter.py` itself. Promoter name is auto-derived from the CIN's
+  own MCA-mirror profile (`lookup_company_by_cin` returns `"name"`) when
+  `--promoter-name` is omitted — there is no name→CIN lookup anywhere in
+  this codebase, so a CIN, if you want the registry/IBBI/credit-rating/
+  group-companies sections at all, must be given directly.
+- CTS office/village are NEVER guessed — fetched live and picked by a human
+  at this terminal, same discipline as `run_cts_land_lookup`'s own inline
+  resolution; a non-interactive run skips the land check with a warning
+  rather than blocking or guessing.
+- Deep research and `_run_charter_pass` build their entire prompt from
+  `category_data["projects"]`/`["partners"]` (confirmed: with no RERA scrape
+  that's normally `{}`, meaning nothing to research at all) — `prereg_
+  charter.py` seeds a minimal shim from whatever identity is actually known
+  instead. Anything not given is left for the model to mark honestly as
+  "not yet known" / "Not applicable" rather than inferred.
