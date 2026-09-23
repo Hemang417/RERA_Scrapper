@@ -152,7 +152,13 @@ def sweep(entity_names, state_codes=None, searcher=None, reporter=None,
 
     Returns {entities, coverage, projects, states_searched, states_total,
     truncated, limitations}. `projects` rows are CANDIDATES.
+
+    `search_limit=None` removes the budget entirely (every name x every
+    searchable state gets a real query) -- used when a caller wants "no
+    cap" rather than DEFAULT_SEARCH_LIMIT's bound.
     """
+    if search_limit is None:
+        search_limit = float("inf")
     names = [n for n in dict.fromkeys(entity_names or []) if n and n.strip()]
     codes = list(state_codes) if state_codes is not None else sorted(states.PROFILES)
 
@@ -318,7 +324,12 @@ def enrich_projects(result, fetcher=None, reporter=None, limit=DEFAULT_DETAIL_LI
 
     Mutates and returns `result`. Never raises: one unreachable project must
     not sink the pass.
+
+    `limit=None` removes the cap entirely -- every matched project with a
+    usable fetcher gets opened, no matter how many there are.
     """
+    if limit is None:
+        limit = float("inf")
     if not result:
         return result
     projects = result.get("projects") or []

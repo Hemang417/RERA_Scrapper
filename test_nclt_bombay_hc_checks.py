@@ -7,9 +7,14 @@ Mocks nclt_search.search_party / bombay_hc_search.search_party (network + a
 real browser/CAPTCHA) to keep this offline and fast, same convention as
 test_cts_intake.py mocking mahabhumi.search_cts_candidates/
 fetch_property_card -- this file tests company_charter's own wrapper logic
-(TTY gating, the Bombay HC consent prompt, per-lookup failure isolation),
-not the Playwright/DOM internals of either search module, which need a real
-human CAPTCHA solve to fully validate (see each module's own docstring).
+(TTY gating, per-lookup failure isolation), not the Playwright/DOM internals
+of either search module, which need a real human CAPTCHA solve to fully
+validate (see each module's own docstring).
+
+Bombay HC's own extra "proceed with all N lookups?" consent prompt was
+removed once a human being present on this run was no longer in question --
+it now runs unconditionally once past the sys.stdin.isatty() gate, same as
+NCLT.
 
 Run directly: python test_nclt_bombay_hc_checks.py
 """
@@ -89,42 +94,16 @@ def test_bombay_hc_check_skips_when_not_interactive():
     print("test_bombay_hc_check_skips_when_not_interactive: PASS")
 
 
-def test_bombay_hc_check_eof_during_consent_prompt_is_treated_as_decline():
-    """Confirmed live: sys.stdin.isatty() can be True with no human actually
-    feeding it a line, which makes input() raise EOFError. Must degrade to
-    the same declined-consent fallback as a plain 'n' answer -- never an
-    uncaught exception escaping run_company_charter (see _safe_input's own
-    docstring in company_charter.py)."""
-    with mock.patch("sys.stdin.isatty", return_value=True), \
-         mock.patch("builtins.input", side_effect=EOFError()), \
-         mock.patch.object(bombay_hc_search, "search_party") as fake_search:
-        result = cc._safe_bombay_hc_check("Some Promoter LLP")
-
-    assert result["attempted"] is False
-    fake_search.assert_not_called()
-    print("test_bombay_hc_check_eof_during_consent_prompt_is_treated_as_decline: PASS")
-
-
-def test_bombay_hc_check_skips_when_declined():
-    with mock.patch("sys.stdin.isatty", return_value=True), \
-         mock.patch("builtins.input", return_value="n"), \
-         mock.patch.object(bombay_hc_search, "search_party") as fake_search:
-        result = cc._safe_bombay_hc_check("Some Promoter LLP")
-
-    assert result["attempted"] is False
-    assert len(result["benches_offered"]) == 2
-    assert len(result["years_offered"]) == 5
-    fake_search.assert_not_called()
-    print("test_bombay_hc_check_skips_when_declined: PASS")
-
-
-def test_bombay_hc_check_runs_all_combinations_when_confirmed():
+def test_bombay_hc_check_runs_all_combinations_unconditionally():
+    """No consent prompt any more -- once past the isatty() gate, every
+    bench x year combination is attempted with no human "proceed?" step."""
     fake_result = {"found": False, "rows": [], "raw_response": {"ok": True}, "url": "https://x", "note": ""}
     with mock.patch("sys.stdin.isatty", return_value=True), \
-         mock.patch("builtins.input", return_value="y"), \
+         mock.patch("builtins.input") as fake_input, \
          mock.patch.object(bombay_hc_search, "search_party", return_value=fake_result) as fake_search:
         result = cc._safe_bombay_hc_check("Some Promoter LLP")
 
+    fake_input.assert_not_called()
     assert result["attempted"] is True
     # 2 benches x 5 years, per _safe_bombay_hc_check's own scoping.
     assert len(result["runs"]) == 10
@@ -132,7 +111,7 @@ def test_bombay_hc_check_runs_all_combinations_when_confirmed():
     for run in result["runs"]:
         assert run["bench"] in result["benches_checked"]
         assert run["year"] in result["years_checked"]
-    print("test_bombay_hc_check_runs_all_combinations_when_confirmed: PASS")
+    print("test_bombay_hc_check_runs_all_combinations_unconditionally: PASS")
 
 
 def test_bombay_hc_check_one_failure_does_not_abort_the_sweep():
@@ -145,7 +124,6 @@ def test_bombay_hc_check_one_failure_does_not_abort_the_sweep():
         return {"found": False, "rows": [], "raw_response": {"ok": True}, "url": "https://x", "note": ""}
 
     with mock.patch("sys.stdin.isatty", return_value=True), \
-         mock.patch("builtins.input", return_value="y"), \
          mock.patch.object(bombay_hc_search, "search_party", side_effect=flaky_search):
         result = cc._safe_bombay_hc_check("Some Promoter LLP")
 
@@ -168,7 +146,6 @@ def test_bombay_hc_check_never_leaks_raw_exception_text():
         "--user-data-dir=C:\\Users\\SomeUser\\AppData\\Local\\Temp\\playwright_chromiumdev_profile-abc123"
     )
     with mock.patch("sys.stdin.isatty", return_value=True), \
-         mock.patch("builtins.input", return_value="y"), \
          mock.patch.object(bombay_hc_search, "search_party", side_effect=RuntimeError(leaky_message)):
         result = cc._safe_bombay_hc_check("Some Promoter LLP")
 
@@ -185,9 +162,7 @@ if __name__ == "__main__":
     test_nclt_check_exception_is_never_fatal()
     test_nclt_check_never_leaks_raw_exception_text()
     test_bombay_hc_check_skips_when_not_interactive()
-    test_bombay_hc_check_eof_during_consent_prompt_is_treated_as_decline()
-    test_bombay_hc_check_skips_when_declined()
-    test_bombay_hc_check_runs_all_combinations_when_confirmed()
+    test_bombay_hc_check_runs_all_combinations_unconditionally()
     test_bombay_hc_check_one_failure_does_not_abort_the_sweep()
     test_bombay_hc_check_never_leaks_raw_exception_text()
     print("\nAll tests passed.")

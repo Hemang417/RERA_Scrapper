@@ -12275,22 +12275,6 @@ def _safe_nclt_check(promoter_name: str, bench: str = "Mumbai") -> dict:
     return {"attempted": True, "bench": bench, **result}
 
 
-def _confirm_bombay_hc_sweep(promoter_name: str, benches: tuple, years: list) -> bool:
-    """A plain y/N terminal prompt -- deliberately NOT the same TTY-gated
-    numbered-choice helper CTS uses (_prompt_choice), because this isn't
-    picking from a real list, it's asking permission for a specific,
-    heavy commitment (one CAPTCHA per bench x year) before spending it.
-    Caller has already confirmed sys.stdin.isatty()."""
-    total = len(benches) * len(years)
-    print(
-        f"\n[INFO] Bombay High Court litigation check for {promoter_name!r} would search "
-        f"{len(benches)} bench(es) x {len(years)} registration year(s) = {total} separate "
-        f"CAPTCHA-gated lookups (one browser window, one CAPTCHA solve, per lookup)."
-    )
-    raw = _safe_input(f"Proceed with all {total} lookups now? [y/N]: ").strip().lower()
-    return raw == "y"
-
-
 def _safe_bombay_hc_check(promoter_name: str) -> dict:
     """Direct Bombay High Court party-name check across the two Bombay
     -city benches (Original Side + Appellate Side -- see
@@ -12302,27 +12286,21 @@ def _safe_bombay_hc_check(promoter_name: str) -> dict:
     Unlike every other CAPTCHA-gated check in this codebase (one solve),
     this is genuinely heavy -- one CAPTCHA per bench x year, confirmed
     live that the portal requires a mandatory Registration Year alongside
-    the CAPTCHA (see bombay_hc_search's own module note) -- so this ALWAYS
-    asks for explicit human confirmation before running, on top of the
-    usual sys.stdin.isatty() gate. Never fatal; a decline or any single
+    the CAPTCHA (see bombay_hc_search's own module note). It used to also
+    ask for explicit human confirmation before running, on top of the
+    sys.stdin.isatty() gate below -- removed on the user's explicit
+    instruction once a human being present (on the terminal-owning side of
+    this run) was no longer in question, so the cost-disclosure prompt was
+    just an extra step with nothing left to decide. Never fatal; any single
     lookup's failure is recorded, not raised."""
     if not sys.stdin.isatty():
-        return {"attempted": False, "runs": [], "note": "No terminal available to ask for consent -- skipped this pass."}
+        return {"attempted": False, "runs": [], "note": "No terminal available to solve a CAPTCHA -- skipped this pass."}
 
     import bombay_hc_search
 
     benches = bombay_hc_search.BENCHES[:2]
     current_year = datetime.now().year
     years = [current_year - i for i in range(5)]
-
-    if not _confirm_bombay_hc_sweep(promoter_name, benches, years):
-        return {
-            "attempted": False, "runs": [], "benches_offered": list(benches), "years_offered": years,
-            "note": (
-                f"Declined this pass -- Bombay HC direct check ({len(benches)} bench(es) x "
-                f"{len(years)} year(s), one CAPTCHA each) was not run."
-            ),
-        }
 
     runs = []
     for bench in benches:
@@ -12515,14 +12493,20 @@ def _safe_group_rera_sweep(group_result: dict, subject_promoter: str = "",
     """Searches every RERA authority that can answer, for this group's other
     projects. Never fatal: a sweep that cannot run costs one section.
 
-    OPT-IN, because it is the only step here that queries several state
-    portals in sequence and a group can carry dozens of entities. Set
-    CHARTER_GROUP_SWEEP=1 to enable. Off, the Charter simply does not carry
-    the section -- which is different from carrying an empty one, and the
-    difference is the whole point of group_sweep's coverage reporting.
+    ON BY DEFAULT (per the user's explicit "no cap" instruction) even though
+    it is the only step here that queries several state portals in sequence
+    and a group can carry dozens to hundreds of entities -- CHARTER_GROUP_
+    SWEEP=0 (or enabled=False) still turns it off for a caller that wants
+    the old opt-in behavior back. Passes search_limit/limit=None through to
+    group_sweep.sweep/enrich_projects to remove their own default caps
+    (searches/detail-opens bounded at 25/12 otherwise) -- every matched
+    entity's project gets searched and opened, no matter how many there
+    are. Off, the Charter simply does not carry the section -- which is
+    different from carrying an empty one, and the difference is the whole
+    point of group_sweep's coverage reporting.
     """
     if enabled is None:
-        enabled = os.environ.get("CHARTER_GROUP_SWEEP") == "1"
+        enabled = os.environ.get("CHARTER_GROUP_SWEEP") != "0"
     if not enabled:
         return {}
     try:
@@ -12532,8 +12516,9 @@ def _safe_group_rera_sweep(group_result: dict, subject_promoter: str = "",
         names = group_entities.entity_names_for_sweep(graph)
         # Open the matched projects too: a bare list of registrations proves
         # they exist and says nothing about litigation, sales or who is
-        # building them. Bounded, and unopened ones say so.
-        return group_sweep.enrich_projects(group_sweep.sweep(names))
+        # building them. No cap: search_limit/limit=None removes
+        # group_sweep's own default bounds (see its docstring).
+        return group_sweep.enrich_projects(group_sweep.sweep(names, search_limit=None), limit=None)
     except Exception as e:
         return {"coverage": [], "projects": [],
                 "limitations": [f"The group-wide RERA sweep could not run this pass: {e}"]}
@@ -13032,11 +13017,11 @@ def run_company_charter(
     pre_built_facts: dict | None = None,
     pipeline_start_time: float | None = None,
     state_profile=None,
-    group_sweep: bool = False,
-    group_gst: bool = False,
-    group_litigation: bool = False,
-    group_enforcement: bool = False,
-    group_financial_disclosure: bool = False,
+    group_sweep: bool = True,
+    group_gst: bool = True,
+    group_litigation: bool = True,
+    group_enforcement: bool = True,
+    group_financial_disclosure: bool = True,
     research_wait: Callable[[], dict | None] | None = None,
 ) -> tuple[str, dict]:
     """Returns (out_path, facts) -- facts is the complete, code-and-model

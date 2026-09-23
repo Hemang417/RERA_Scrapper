@@ -125,63 +125,72 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--group-sweep",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
             "Search every RERA authority that can answer for OTHER projects belonging to this "
-            "promoter's corporate group, and open each match to confirm or refute it. Off by "
-            "default because it queries several state portals in sequence. The Charter then "
-            "carries a per-authority coverage table saying which registers were actually "
-            "searched, so a short result is never mistaken for a clean national record."
+            "promoter's corporate group, and open each match to confirm or refute it. ON by "
+            "default (pass --no-group-sweep to disable) -- queries several state portals in "
+            "sequence, with no cap on how many entities/projects get searched and opened. The "
+            "Charter then carries a per-authority coverage table saying which registers were "
+            "actually searched, so a short result is never mistaken for a clean national record."
         ),
     )
     parser.add_argument(
         "--group-gst",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
             "Check GST filing standing for every group entity a PAN is actually held for. "
-            "Off by default because each entity costs a human at least two CAPTCHA solves. "
-            "GST is keyed on PAN and no public MCA source publishes one, so most of a group "
-            "cannot be reached at all; the Charter section leads with how many entities were "
-            "checked out of how many exist, and names the ones that were not."
+            "ON by default (pass --no-group-gst to disable) -- each entity costs a human at "
+            "least two CAPTCHA solves. GST is keyed on PAN and no public MCA source publishes "
+            "one, so most of a group cannot be reached at all; the Charter section leads with "
+            "how many entities were checked out of how many exist, and names the ones that "
+            "were not."
         ),
     )
     parser.add_argument(
         "--group-litigation",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
-            "Search open case law for every group entity and director. Off by default: it "
-            "queries a public index once per name, and every hit is a NAME match that must "
-            "be confirmed, not a finding. The Charter section names the forums open search "
-            "does not reliably cover, so an empty table is never read as a clean record."
+            "Search open case law for every group entity and director. ON by default (pass "
+            "--no-group-litigation to disable) -- queries a public index once per name, and "
+            "every hit is a NAME match that must be confirmed, not a finding. The Charter "
+            "section names the forums open search does not reliably cover, so an empty table "
+            "is never read as a clean record."
         ),
     )
     parser.add_argument(
         "--group-enforcement",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
             "Search UP-RERA, HARERA, TNRERA, Delhi-RERA, WBRERA and JHARERA's own "
             "defaulter, cancellation, penalty, rejection, surrender and enforcement "
-            "registers for every group entity and director. Off by default: one of the "
-            "ten sources (Delhi's REAT appeal register) costs a real OCR pass, cached "
-            "across runs, and every hit is a NAME match that must be confirmed -- "
-            "WBRERA's own register names only the project, not the promoter, so its hits "
-            "are weaker evidence than the others'. The Charter section names the "
-            "authorities this pass does not reach, so an empty table is never read as a "
-            "clean national record."
+            "registers for every group entity and director. ON by default (pass "
+            "--no-group-enforcement to disable) -- one of the ten sources (Delhi's REAT "
+            "appeal register) costs a real OCR pass, cached across runs, and every hit is a "
+            "NAME match that must be confirmed -- WBRERA's own register names only the "
+            "project, not the promoter, so its hits are weaker evidence than the others'. The "
+            "Charter section names the authorities this pass does not reach, so an empty "
+            "table is never read as a clean national record."
         ),
     )
     parser.add_argument(
         "--group-financial-disclosure",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
             "Check OTHER group entities' Gujarat/Jharkhand/Haryana/West Bengal/Uttar Pradesh/"
             "Tamil Nadu projects for a balance sheet, P&L or income-tax return document, and "
-            "OCR any match. Off by default, and REQUIRES --group-sweep to also be on: it reuses "
-            "that sweep's already-opened projects rather than re-opening them, and finds "
-            "nothing if that sweep did not run. Those six are the only portals that expose a "
-            "searchable document list at all -- and of those, only Gujarat, Jharkhand, Haryana "
-            "and West Bengal have ever produced a live-confirmed hit -- but nothing here checks "
-            "for any state by name; document downloads are cached across runs."
+            "OCR any match. ON by default (pass --no-group-financial-disclosure to disable), "
+            "and REQUIRES --group-sweep to also be on: it reuses that sweep's already-opened "
+            "projects rather than re-opening them, and finds nothing if that sweep did not "
+            "run. Those six are the only portals that expose a searchable document list at "
+            "all -- and of those, only Gujarat, Jharkhand, Haryana and West Bengal have ever "
+            "produced a live-confirmed hit -- but nothing here checks for any state by name; "
+            "document downloads are cached across runs."
         ),
     )
     gst = parser.add_mutually_exclusive_group()
@@ -258,8 +267,11 @@ def summarise_category_health(category_data: dict, not_published: set, profile,
 
 
 def _run_gst_intake_step(gst_identifier: str | None, reg_no: str, output_dir: str) -> str:
-    """Runs the opt-in GST filing-history intake and returns a one-line status
-    for the run summary.
+    """Runs the GST filing-history intake and returns a one-line status for
+    the run summary. `gst_identifier` is --gstin/--pan if either was given,
+    else the promoter's own verified PAN auto-derived from the filed PAN
+    card (see this function's caller in main()) -- None only when neither
+    source produced one.
 
     NEVER raises. The intake opens its own browser, depends on a live
     third-party portal, and needs a human to solve a CAPTCHA -- any of which
@@ -268,8 +280,11 @@ def _run_gst_intake_step(gst_identifier: str | None, reg_no: str, output_dir: st
     the whole scrape. Same policy as the promoter portfolio and deep research
     steps either side of it."""
     if not gst_identifier:
-        print("\n[INFO] No --gstin/--pan supplied -- skipping GST filing-history intake.")
-        return "not requested (pass --gstin or --pan to enable)"
+        print(
+            "\n[INFO] No --gstin/--pan supplied and no verified PAN could be read off the "
+            "filed PAN card -- skipping GST filing-history intake."
+        )
+        return "not requested (no --gstin/--pan, and no verified PAN on file)"
 
     print(f"\n[INFO] Running GST filing-history intake for {gst_identifier}...")
     try:
@@ -508,12 +523,33 @@ def main() -> int:
         print(f"[INFO] {note}")
 
 
-    # Opt-in, and placed here on purpose: this is the last step that needs a
-    # human at the keyboard (a CAPTCHA solve per portal lookup), so it sits
-    # beside the other browser work rather than after deep research, which
-    # runs unattended for minutes. Writes gst_filing_input.json, which
+    # Placed here on purpose: this is the last step that needs a human at
+    # the keyboard (a CAPTCHA solve per portal lookup), so it sits beside
+    # the other browser work rather than after deep research, which runs
+    # unattended for minutes. Writes gst_filing_input.json, which
     # run_gst_compliance_check picks up during Charter generation below.
-    gst_status = _run_gst_intake_step(args.gstin or args.pan, reg_no, args.output_dir)
+    #
+    # No --gstin/--pan given -- try the promoter's OWN PAN, read off the PAN
+    # card already sitting in the document library, before giving up on GST
+    # entirely. Only a VERIFIED read is used (never an unverified_candidate):
+    # this identifier goes on to enumerate every GSTIN under it and run a
+    # real CAPTCHA-gated lookup per one, and doing that against the WRONG
+    # entity's PAN is worse than not running GST intake at all. Duplicates
+    # one OCR pass that run_company_charter's own _safe_promoter_identity
+    # repeats internally moments later -- accepted, since it's a local OCR
+    # read, not a network/CAPTCHA cost, and the alternative (restructuring
+    # run_company_charter to surface this earlier) touches far more code
+    # for a cost this small.
+    gst_identifier = args.gstin or args.pan
+    if not gst_identifier:
+        _pan_check = company_charter._safe_promoter_identity(documents_manifest, documents_dir, category_data)
+        if _pan_check.get("status") == "verified" and _pan_check.get("pan"):
+            gst_identifier = _pan_check["pan"]
+            print(
+                f"[INFO] No --gstin/--pan supplied -- using the promoter's own verified PAN "
+                f"({gst_identifier}) from the filed PAN card for GST intake."
+            )
+    gst_status = _run_gst_intake_step(gst_identifier, reg_no, args.output_dir)
 
     # Deep research (agentic web search, unattended, minutes long) has no
     # hard dependency on the Company Charter step below -- the Charter only
