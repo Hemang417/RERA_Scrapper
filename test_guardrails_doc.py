@@ -22,11 +22,13 @@ import re
 import charter_report
 import company_charter
 import charge_watch
+import geo_lookup
 import group_enforcement
 import group_sweep
 import gst_group
 import litigation_sweep
 import promoter_identity
+import promoter_portfolio
 import states
 import deep_research
 import main
@@ -59,6 +61,12 @@ _MODULES = {
     # look" being read as "there is nothing there".
     "group_sweep": group_sweep,
     "charge_watch": charge_watch,
+    # The Key Landmarks / Comparable Projects geo pipeline -- code-computed
+    # against free OSM services, replacing what used to be a model guess.
+    "geo_lookup": geo_lookup,
+    # Its pincode-over-locality geocoding precedence is reused (not
+    # duplicated) by the comparables radius check above.
+    "promoter_portfolio": promoter_portfolio,
 }
 
 

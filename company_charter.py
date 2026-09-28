@@ -18,38 +18,53 @@ Guardrails, same philosophy as deep_research.py:
     re-verified (reusing deep_research._verify_claim) before being trusted.
   - Anything that can't be confirmed goes in `gaps`, verbatim, never
     silently filled in or approximated as fact.
-  - Distances start as a web_search estimate (no live browser/Maps API
-    here) -- the template's own Methodology Note says so explicitly,
-    matching its existing "state plainly what's confirmed vs approximated"
-    philosophy -- then get a precision upgrade per the two passes below.
+  - Key Landmarks (`distances`) are entirely code-computed, never
+    model-authored -- see _compute_landmark_distances() below, same
+    discipline as the identity/group passes in run_company_charter()'s
+    step 2b. Comparable projects (`comparables`) still come from the
+    model's own web_search (no structured project database exists to
+    replace that), but every candidate is independently geocoded and
+    distance-verified afterward -- see _verify_comparables_within_radius().
 
 Requires: ANTHROPIC_API_KEY (same as deep_research.py), and a local
 Tesseract OCR install for scanned/no-text PDFs (falls back to a plain
 "[OCR unavailable]" marker per-document if Tesseract isn't found, rather
 than failing the whole run).
 
-Two precision upgrades for the Distances table, tried in order, each
-falling back to the next on failure -- never to a blank field:
+Key Landmarks table (`distances`): fully code-computed, no model
+involvement, so no hallucinated landmark names or distances --
+_compute_landmark_distances():
+1. Geocodes the subject project's own locality via OpenStreetMap's free
+   Nominatim API (geo_lookup.geocode).
+2. For each of geo_lookup.LANDMARK_CATEGORIES (Airport, School, Metro
+   station, Mall, Hospital, Religious place, Hotel, Infrastructure --
+   "Infrastructure" meaning major transport infra: highways/flyovers/
+   junctions/railway stations, not metro), finds the 2 genuinely nearest
+   named OSM points of interest via the free Overpass API
+   (geo_lookup.find_nearest_landmarks), expanding the search radius until
+   2 are found -- there is no distance cap for landmarks (a metro station
+   50km away is still "nearest", not "none"); fewer than 2 in a category
+   means genuinely fewer than that exist within the widest radius tried,
+   stated as such rather than padded.
+3. Computes a real driving DISTANCE for each selected landmark via the
+   free OSRM routing server (geo_lookup.driving_route) -- distance only,
+   deliberately never OSRM's duration, confirmed live to be a pure
+   free-flow number with no traffic model (a real 9.7km Mumbai route came
+   back as 10 minutes, ~58 km/h average, nothing like real city traffic).
+   If OSRM can't compute a route at all, the entry says so plainly
+   ("Can't route") -- it deliberately does NOT fall back to the
+   straight-line distance Overpass ranking already computed internally,
+   because that would look like a driving distance without being one.
 
-1. _refine_distances_with_nominatim() -- ON by default. Geocodes the
-   subject project's own locality and each landmark the model's
-   web_search already named via OpenStreetMap's free Nominatim API (see
-   geo_lookup.py), and replaces the estimate with a computed straight-line
-   (haversine) distance, labelled as such. No ToS risk, no scraping -- but
-   it's straight-line, not driving, distance, and only resolves a landmark
-   Nominatim can actually geocode by name.
-2. _refine_distances_with_maps() -- opt-in (COMPANY_CHARTER_USE_MAPS_SCRAPE=1),
-   tried only for whatever landmarks step 1 couldn't resolve. Launches a
-   headless Playwright browser per landmark and reads the real driving
-   route off Google Maps. Verified against the live site, but it scrapes
-   Google's consumer UI rather than their paid Distance Matrix/Routes API,
-   so it may not comply with Google's Terms of Service and can break
-   without warning if Google changes their page.
-
-Either failing leaves the model's own web_search estimate untouched.
+Comparable projects table (`comparables`): the model proposes candidates
+via web_search (must be genuinely independent developments -- not the
+subject's own adjacent phase -- similar in segment, ready-to-move or
+under construction) with NO distance cap enforced by the model itself;
+_verify_comparables_within_radius() then geocodes each candidate and
+drops any that don't actually verify within 2km of the subject project,
+rather than trusting the model's own distance claim at face value.
 
     python company_charter.py <REG_NO>
-    COMPANY_CHARTER_USE_MAPS_SCRAPE=1 python company_charter.py <REG_NO>
 """
 
 import argparse
@@ -537,16 +552,20 @@ _CHARTER_FACTS_SCHEMA = {
             "type": "object",
             "properties": {k: _PLAIN_FIELD for k in ("east", "west", "north", "south")},
         },
+        # Deliberately NOT populated by the model -- see the module docstring
+        # and _compute_landmark_distances(). Kept in the schema purely as
+        # documentation of the shape a later, code-only step fills in.
         "distances": {
             "type": "array",
             "items": {
                 "type": "object",
                 "properties": {
+                    "category": {"type": "string"},
                     "landmark": {"type": "string"},
                     "distance_time": {"type": "string"},
                     "route_note": {"type": "string"},
                 },
-                "required": ["landmark", "distance_time", "route_note"],
+                "required": ["category", "landmark", "distance_time", "route_note"],
             },
         },
         "connectivity": {
@@ -600,9 +619,11 @@ _CHARTER_FACTS_SCHEMA = {
                 "properties": {
                     "project": {"type": "string"}, "configuration": {"type": "string"},
                     "pricing": {"type": "string"}, "source": {"type": "string"},
-                    "distance_km": {"type": "string", "description": "Approximate straight-line or driving distance from the subject project, as a bare number with NO 'km' suffix -- e.g. '3.8', not '3.8 km'"},
+                    "locality": {"type": "string", "description": "This comparable's own well-known neighbourhood/area name and city -- NOT the subject project's, and NOT a specific street or building -- e.g. 'Wakad, Pune', not 'Building name, XYZ Road, Wakad, Pune'. A later code-only step geocodes this (preferring `pincode` below when given) to independently verify the 2km distance claim; an unfindable or overly specific/obscure locality means that verification fails and the candidate gets dropped, so prefer the broadest well-known area name that is still accurate."},
+                    "pincode": {"type": "string", "description": "This comparable's own 6-digit Indian PIN code, if your source states one -- NOT the subject project's. Omit entirely if unknown; never guess one. A later code-only step geocodes THIS in preference to `locality` when present, because a bare pincode resolves far more reliably via free-text geocoding than a locality/neighbourhood name does."},
+                    "distance_km": {"type": "string", "description": "Approximate straight-line or driving distance from the subject project, as a bare number with NO 'km' suffix -- e.g. '1.8', not '1.8 km'. Only report a candidate you believe is genuinely within 2km -- a later step verifies this by geocoding and drops anything that doesn't hold up."},
                 },
-                "required": ["project", "configuration", "pricing", "source", "distance_km"],
+                "required": ["project", "configuration", "pricing", "source", "locality", "distance_km"],
             },
         },
         "area_intelligence_trend": _PLAIN_FIELD,
@@ -694,7 +715,7 @@ _CHARTER_FACTS_SCHEMA = {
     "required": [
         "methodology_note", "executive_summary", "land_identification", "corporate_identity",
         "address_discrepancy_note", "corporate_registry_cross_check", "litigation_status",
-        "location_coordinates_note", "neighbourhood", "distances", "connectivity",
+        "location_coordinates_note", "neighbourhood", "connectivity",
         "social_infrastructure", "fsi_governing_framework", "fsi_interpretation", "fsi_metrics",
         "rules_statutory", "rera_compliance", "local_planning", "micro_market_overview",
         "comparables", "area_intelligence_trend", "rera_core_fields", "unit_summary_note",
@@ -720,13 +741,11 @@ been extended/pushed back, or the exact literal empty string "" if it has never 
 (same as current) -- never omit these because the prose already covers it, and never guess a \
 number you can't confirm (state the uncertainty in the prose field instead, and leave the count \
 fields out of your JSON entirely for that one project rather than invent a number).
-- Distances/routes: you do NOT have a live Maps browsing tool here -- use web_search to find \
-driving distances/times and state plainly in `location_coordinates_note` that these are \
-web-search estimates, not live Maps-verified routes (this template explicitly wants that kind \
-of honesty about what's confirmed vs approximated). Each `distances[].landmark` MUST be an \
-actual named place (e.g. "Chhatrapati Shivaji Maharaj International Airport"), never a generic \
-category label like "Nearest airport" -- a later step may look up the precise route for the \
-named place you give.
+- Do NOT populate `distances` (the Key Landmarks table) -- omit it from your JSON entirely. A \
+later, code-only step finds the genuinely nearest 2 airports/schools/metro stations/malls/ \
+hospitals/religious places/hotels/major-transport-infrastructure points via OpenStreetMap and \
+computes real driving distances for them, with no model involvement and no risk of a hallucinated \
+name or distance. Spend your web_search budget elsewhere -- this field costs you nothing to skip.
 - Do not conflate similarly-named companies -- cross-check any CIN/LLPIN claim against the \
 promoter's registered legal name and address from the provided RERA data before accepting it.
 - For the FSI section, show the computation (net area, approved/sanctioned BUA -> implied FSI) \
@@ -735,13 +754,20 @@ figure confirmed by an actual sanctioned-FSI certificate.
 - The standing gap about promoter shareholding splits/personal net worth is permanent and \
 already in the template -- do not attempt to research it, and do not repeat it in your own \
 `gaps` list.
-- Comparable projects (`comparables`) must be GENUINELY INDEPENDENT developments located within \
-approximately 3-5 km of the subject project -- not the subject's own adjacent phase or the same \
-complex under a different marketing name (e.g. do not count a project's own "Phase 2" or an \
-immediately-adjacent same-developer extension as a comparable; it is the same product, not a \
-market comparable). State the approximate distance for each comparable in `distance_km`. If no \
-genuinely independent comparable exists within that radius, say so in `gaps` rather than \
-substituting a same-complex neighbor or a locality-wide average as if it satisfied the radius.
+- Comparable projects (`comparables`) must be GENUINELY INDEPENDENT developments within \
+approximately 2 km of the subject project, in the SAME SEGMENT (residential/commercial \
+configuration and price band broadly comparable), either ready-to-move-in or under construction \
+-- not the subject's own adjacent phase or the same complex under a different marketing name \
+(e.g. do not count a project's own "Phase 2" or an immediately-adjacent same-developer extension \
+as a comparable; it is the same product, not a market comparable). State each candidate's own \
+`locality` (its area/city, for independent geocoding -- NOT the subject project's) and, if your \
+source states one, its own `pincode` (a bare 6-digit PIN geocodes far more reliably than a \
+locality name, so give it whenever you actually have it -- never guess one) and its approximate \
+distance in `distance_km`; a later, code-only step geocodes each candidate and DROPS any that \
+don't actually verify within 2km, so an inflated or vague distance just gets that entry removed \
+rather than trusted. If no genuinely independent, same-segment comparable exists within 2km, say \
+so in `gaps` rather than substituting a same-complex neighbor, a farther-out project, or a \
+locality-wide average as if it satisfied the radius.
 - Use web_search to find how many years this promoter (or its parent group, if this is a \
 group-affiliated SPV incorporated recently for one project) has actually been active in real- \
 estate development, and fill `developer_track_record.years_in_industry` (a plain integer) with \
@@ -772,7 +798,7 @@ directly, so just make sure it's a real, specific document name/URL, not a vague
 - You have a HARD LIMIT of {deep_research.CHARTER_PASS_MAX_SEARCHES} web searches for this \
 whole pass, enforced by the API, and every search result is charged against the same budget \
 you have to write your reply with. Spend them only on the fields above that explicitly ask you \
-to look something up (landmark distances, comparables, the promoter's years in industry). Do \
+to look something up (comparables, the promoter's years in industry). Do \
 not research the wider market here; a separate stage already does that. An honest entry in \
 `gaps` costs nothing, whereas running out of room before you reply loses the entire pass.
 - Write your reply while you still have budget to write it in. Your FINAL reply must be ONLY a \
@@ -793,138 +819,153 @@ def _run_charter_pass(user_prompt: str) -> dict:
                                           max_searches=deep_research.CHARTER_PASS_MAX_SEARCHES)
 
 
-_MAPS_SCRAPE_ENV_VAR = "COMPANY_CHARTER_USE_MAPS_SCRAPE"
-_MAPS_ROUTE_PATTERN = re.compile(
-    r"Copy link\n.*?\n((?:\d+\s*hr\s*)?\d+\s*min)\n([\d.]+\s*km)\nvia ([^\n]+)"
+_LANDMARK_NOT_FOUND_NOTE = (
+    "No {category} could be found via OpenStreetMap within {radius}km."
 )
-_MAPS_MIN_TOKEN_OVERLAP = 0.5
 
 
-def _tokenize(s: str) -> set:
-    return {w for w in re.findall(r"[a-z0-9]+", s.lower()) if len(w) > 2}
+def _compute_landmark_distances(facts: dict, origin_coords: tuple | None) -> dict:
+    """Fills `facts["distances"]` (the Key Landmarks table) entirely in
+    code -- never model-authored, see the module docstring. For each of
+    geo_lookup.LANDMARK_CATEGORIES, takes the 2 genuinely nearest named OSM
+    points of interest (geo_lookup.find_nearest_landmarks, no distance cap
+    -- "nearest" wins even if far) and computes a real driving distance for
+    each via the free OSRM routing server (geo_lookup.driving_route). OSRM
+    failing to route to a specific landmark shows "Can't route" rather than
+    silently substituting the straight-line distance Overpass used for
+    ranking -- that would look like a driving distance without being one.
 
+    Deliberately shows distance ONLY, never OSRM's duration: confirmed live
+    (2026-09-28, a real Andheri West -> CSMIA route) that OSRM's public
+    server has no traffic model at all -- it returned 10 minutes for a
+    9.7km route (~58 km/h average) that takes 30-45+ minutes in actual
+    Mumbai traffic. The road-network distance is real; the free-flow
+    duration would be a plainly misleading number in a due-diligence
+    document, worse than omitting it.
 
-def _destination_plausibly_resolved(requested: str, resolved: str) -> bool:
-    """Sanity check against Maps silently mis-resolving a bad/ambiguous
-    destination to an unrelated nearby point instead of failing outright --
-    confirmed live: a nonsense query like "Not a real place asdkjaskdj12345"
-    still returns a route, just to a random unrelated address, with zero
-    word overlap with what was asked for. A genuine match (even lightly
-    reworded/expanded by Maps, e.g. a city name appended) retains most of
-    the requested landmark's significant words."""
-    requested_tokens = _tokenize(requested)
-    if not requested_tokens:
-        return True  # nothing meaningful to check against
-    overlap = requested_tokens & _tokenize(resolved)
-    return len(overlap) / len(requested_tokens) >= _MAPS_MIN_TOKEN_OVERLAP
-
-
-def _lookup_maps_distance(origin: str, destination: str) -> dict | None:
-    """Launches a headless Playwright browser, opens Google Maps driving
-    directions from origin to destination, and reads the rendered
-    duration/distance/route off the page. Returns None on ANY failure
-    (selector miss, timeout, network, or Maps resolving `destination` to an
-    unrelated place -- see _destination_plausibly_resolved) -- callers must
-    fall back to the model's own web_search estimate rather than treat None
-    as an error.
-
-    Verified against the live site (short in-city and long inter-city
-    routes, plus a deliberately bogus destination to confirm the
-    mis-resolution check actually fires) before shipping, but this scrapes
-    Google Maps' consumer web UI rather than their Distance Matrix/Routes
-    API -- it can break without warning if Google changes their page, and
-    likely doesn't comply with Google's Terms of Service (which is exactly
-    why they sell an API for this). Off by default -- see
-    _MAPS_SCRAPE_ENV_VAR."""
-    from urllib.parse import quote
-
-    from playwright.sync_api import sync_playwright
-
-    url = f"https://www.google.com/maps/dir/{quote(origin)}/{quote(destination)}"
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
-            page.goto(url, timeout=20000)
-            page.get_by_role("radio", name="Driving").click(timeout=10000)
-            page.wait_for_timeout(4000)
-            dest_box = page.get_by_role("combobox").nth(1)
-            resolved_destination = dest_box.locator("input, textarea").first.input_value()
-            text = page.inner_text("body")
-            browser.close()
-        if not _destination_plausibly_resolved(destination, resolved_destination):
-            return None
-        match = _MAPS_ROUTE_PATTERN.search(text)
-        if not match:
-            return None
-        duration, distance, route = match.groups()
-        return {"duration": duration, "distance": distance, "route": route}
-    except Exception:
-        return None
-
-
-def _refine_distances_with_nominatim(facts: dict, origin: str) -> set:
-    """PRIORITY precision upgrade for the Distances table, on by default
-    (no env gate, unlike the Maps scrape below) -- geocodes the subject
-    project's own locality once via OpenStreetMap's free Nominatim API
-    (geo_lookup.py, shared with promoter_portfolio.py's 5km filter, which
-    also owns the rate limiter), then each distance entry's landmark name
-    -- the model's own web_search already found -- and replaces its
-    estimated distance_time with a computed straight-line (haversine)
-    distance. Free, no scraping, no Terms-of-Service ambiguity -- but it is
-    a STRAIGHT-LINE distance, not a driving route, and it only resolves
-    landmarks specific/well-formed enough for Nominatim's free-form search
-    to find; both are stated plainly in route_note rather than presented as
-    a driving distance. An entry left untouched here (bad origin geocode,
-    or a landmark Nominatim can't resolve) keeps the model's own estimate
-    unless _refine_distances_with_maps, called next, resolves it instead.
-
-    Returns the set of landmark names this pass DID resolve, so that next
-    call knows to skip them -- there is no reason to also pay for (and
-    risk) a Maps scrape on a distance already computed for free."""
-    resolved = set()
-    origin_coords = geo_lookup.geocode(origin) if origin else None
+    No origin geocode means no landmark distance can be measured from
+    anywhere; recorded as a gap, never a guessed table."""
     if not origin_coords:
-        return resolved
-
-    for entry in facts.get("distances", []):
-        landmark = entry.get("landmark")
-        if not landmark:
-            continue
-        landmark_coords = geo_lookup.geocode(landmark)
-        if not landmark_coords:
-            continue
-        km = geo_lookup.haversine_km(origin_coords, landmark_coords)
-        entry["distance_time"] = f"{km:.1f} km (straight-line)"
-        entry["route_note"] = (
-            "Straight-line distance, computed via OpenStreetMap Nominatim geocoding this run "
-            "-- not a driving route."
-        )
-        resolved.add(landmark)
-    return resolved
-
-
-def _refine_distances_with_maps(facts: dict, origin: str, skip: set = frozenset()) -> dict:
-    """Opt-in (COMPANY_CHARTER_USE_MAPS_SCRAPE=1) precision upgrade: replaces
-    each distance entry's web_search-estimated distance_time/route_note with
-    a live-scraped Google Maps driving route when the lookup succeeds,
-    leaving the model's own estimate untouched (not silently dropped) when
-    it doesn't -- so a scrape failure degrades to exactly today's behavior
-    rather than blanking the field. `skip` names landmarks
-    _refine_distances_with_nominatim already resolved -- tried first,
-    unconditionally -- so this pass (the one carrying ToS risk) only runs
-    against what that one couldn't."""
-    if os.environ.get(_MAPS_SCRAPE_ENV_VAR) != "1":
+        facts["distances"] = []
+        facts["gaps"] = (facts.get("gaps") or []) + [
+            "Key Landmarks: the project's own locality could not be geocoded this run, so "
+            "nearest-landmark distances could not be computed."
+        ]
         return facts
 
-    for entry in facts.get("distances", []):
-        landmark = entry.get("landmark")
-        if not landmark or landmark in skip:
+    by_category = geo_lookup.find_nearest_landmarks(origin_coords, n_per_category=2)
+    entries = []
+    for category, landmarks in by_category.items():
+        if not landmarks:
+            entries.append({
+                "category": category,
+                "landmark": "None found",
+                "distance_time": "Not found",
+                "route_note": _LANDMARK_NOT_FOUND_NOTE.format(
+                    category=category.lower(), radius=geo_lookup.LANDMARK_RADIUS_STEPS_M[-1] // 1000
+                ),
+            })
             continue
-        result = _lookup_maps_distance(origin, landmark)
-        if result:
-            entry["distance_time"] = f"{result['duration']} / {result['distance']}"
-            entry["route_note"] = f"via {result['route']} (live Google Maps driving route, scraped this run)"
+        for lm in landmarks:
+            route = geo_lookup.driving_route(origin_coords, lm["coords"])
+            if route:
+                distance_time = f"{route['distance_km']:.1f} km (driving distance)"
+                route_note = (
+                    "Live driving distance, computed via OSRM (OpenStreetMap routing) this run -- "
+                    "no travel-time estimate is shown because OSRM's public server has no traffic "
+                    "model and its free-flow duration would understate real travel time."
+                )
+            else:
+                distance_time = "Can't route"
+                route_note = (
+                    f"Located via OpenStreetMap ({lm['straight_line_km']:.1f} km away, straight-line) "
+                    "but OSRM could not compute a driving route this run."
+                )
+            entries.append({
+                "category": category,
+                "landmark": lm["name"],
+                "distance_time": distance_time,
+                "route_note": route_note,
+            })
+    facts["distances"] = entries
+    return facts
+
+
+_COMPARABLE_RADIUS_KM = 2.0
+_PINCODE_PATTERN = re.compile(r"\b(\d{6})\b")
+
+
+def _comparable_geocode_query(item: dict) -> str:
+    """Builds the string to geocode for one comparable candidate, same
+    precedence promoter_portfolio._geocode_query_for already established
+    for a different geocoding need in this pipeline (portfolio entries'
+    5km-radius filter): a bare 6-digit Indian pincode, when present,
+    resolves far more reliably via Nominatim's free-text search than a
+    locality/neighbourhood name does, so it takes priority whenever the
+    model actually supplied one. Falls back to `locality`, then to the
+    bare `project` name (rarely succeeds, but costs nothing to try)."""
+    pincode_match = _PINCODE_PATTERN.search((item.get("pincode") or "").strip())
+    if pincode_match:
+        return f"{pincode_match.group(1)}, India"
+    locality = (item.get("locality") or "").strip()
+    if locality:
+        return locality
+    return (item.get("project") or "").strip()
+
+
+def _verify_comparables_within_radius(facts: dict, origin_coords: tuple | None,
+                                       radius_km: float = _COMPARABLE_RADIUS_KM) -> dict:
+    """Code-only check on the model's own `comparables` list -- never trusts
+    its self-reported `distance_km` at face value. Geocodes each candidate
+    via _comparable_geocode_query() -- preferring its `pincode` when given,
+    else its `locality`, ALONE, never combined with `project` -- confirmed
+    live (2026-09-28, against real comparables the model had proposed for a
+    real project) that Nominatim's structured search does not gracefully
+    ignore an unrecognised leading term: "<project name>, <real locality>"
+    returned nothing even for a real, well-known locality, while the
+    locality alone geocoded fine. A residential project's marketing name is
+    essentially never itself in OpenStreetMap, but the neighbourhood it's
+    in usually is; a pincode resolves more precisely still, since several
+    candidates sharing one broad locality string would otherwise all
+    collapse onto the exact same geocoded point (and therefore the same
+    computed distance) even though their real addresses differ. Drops any
+    entry that doesn't verify within `radius_km` of the subject project, or
+    that can't be geocoded at all (an unverifiable claim is not the same as
+    a confirmed one). Dropped candidates are named in `gaps`, never
+    silently removed."""
+    comparables = facts.get("comparables") or []
+    if not comparables:
+        return facts
+
+    if not origin_coords:
+        facts["gaps"] = (facts.get("gaps") or []) + [
+            f"Comparable projects: the subject project's own locality could not be geocoded this "
+            f"run, so the {len(comparables)} candidate(s) proposed could not be distance-verified "
+            f"and have been removed rather than shown unverified."
+        ]
+        facts["comparables"] = []
+        return facts
+
+    verified, dropped = [], []
+    for item in comparables:
+        project = (item.get("project") or "").strip()
+        query = _comparable_geocode_query(item)
+        coords = geo_lookup.geocode(query) if query else None
+        if not coords:
+            dropped.append(f"{project or 'an unnamed candidate'} (could not be geocoded to verify distance)")
+            continue
+        km = geo_lookup.haversine_km(origin_coords, coords)
+        if km > radius_km:
+            dropped.append(f"{project} (geocoded {km:.1f} km away, outside the {radius_km:.0f}km radius)")
+            continue
+        item["distance_km"] = f"{km:.1f}"
+        verified.append(item)
+
+    facts["comparables"] = verified
+    if dropped:
+        facts["gaps"] = (facts.get("gaps") or []) + [
+            "Comparable project(s) removed after distance verification: " + "; ".join(dropped) + "."
+        ]
     return facts
 
 
@@ -2061,19 +2102,19 @@ def _zaubacorp_charges(table) -> list:
     charges = []
     for row in rows:
         closure = (row.get("Charge Closure Date") or "").strip()
-        if closure in ("-", "", "--"):
+        if closure in ("-", "", "--") or _looks_paywalled(closure):
             closure = None
         amount = (row.get("Amount") or "").strip()
         if _looks_paywalled(amount):
             amount = None
         charges.append({
-            "charge_id": (row.get("Charge ID") or "").strip() or None,
-            "creation_date": (row.get("Charge Creation Date") or "").strip() or None,
-            "modification_date": ((row.get("Charge Modification Date") or "").strip() or None),
+            "charge_id": _zaubacorp_clean((row.get("Charge ID") or "").strip() or None),
+            "creation_date": _zaubacorp_clean((row.get("Charge Creation Date") or "").strip() or None),
+            "modification_date": _zaubacorp_clean((row.get("Charge Modification Date") or "").strip() or None),
             "closure_date": closure,
-            "assets_under_charge": (row.get("Assets Under Charge") or "").strip() or None,
+            "assets_under_charge": _zaubacorp_clean((row.get("Assets Under Charge") or "").strip() or None),
             "amount": amount,
-            "charge_holder": (row.get("Charge Holder") or "").strip() or None,
+            "charge_holder": _zaubacorp_clean((row.get("Charge Holder") or "").strip() or None),
             # Derived, not scraped -- see the docstring.
             "is_open": closure is None,
         })
@@ -2524,7 +2565,14 @@ def _tofler_resolve(cin: str, company_name: str):
                 pass
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        try:
+            browser = p.chromium.launch(headless=True)
+        except Exception:
+            # Bundled Chromium can fail to spawn on a machine missing the
+            # Windows runtime it needs (side-by-side config error) -- fall
+            # back to the system-installed Chrome. Same fix as
+            # nclt_search.py/bombay_hc_search.py.
+            browser = p.chromium.launch(channel="chrome", headless=True)
         page = browser.new_page()
         page.on("response", _capture)
         page.goto("https://www.tofler.in/", timeout=config.REQUEST_TIMEOUT * 1000)
@@ -3695,7 +3743,7 @@ def run_cts_lookup_standalone(
     except Exception as e:
         # type(e).__name__ only -- see the sibling cts_lookup_input.json
         # path above for why (Playwright launch failures embed local paths).
-        result = {"found": False, "note": f"CTS candidate search could not run this pass ({type(e).__name__})."}
+        result = {"found": False, "note": f"CTS candidate search could not run this pass ({e})."}
     else:
         if not candidates_result.get("found"):
             result = {"found": False, "note": candidates_result.get("note", "CTS candidate search failed")}
@@ -3717,7 +3765,7 @@ def run_cts_lookup_standalone(
             except (mahabhumi.CaptchaTimeoutError, mahabhumi.BrowserClosedError, mahabhumi.AmbiguousSelectionError) as e:
                 result = {"found": False, "note": f"CTS Property Card lookup did not complete: {e}"}
             except Exception as e:
-                result = {"found": False, "note": f"CTS Property Card lookup could not run this pass ({type(e).__name__})."}
+                result = {"found": False, "note": f"CTS Property Card lookup could not run this pass ({e})."}
 
     record = {
         "district": district, "office": office, "village": village,
@@ -4431,6 +4479,7 @@ def _set_paragraph_text_raw(paragraph, text: str) -> None:
 # it does not touch or refactor that existing dict.
 _JARGON_GLOSSARY = {
     "CIRP": "insolvency proceedings (CIRP)",
+    "IBBI": "the Insolvency and Bankruptcy Board of India (IBBI)",
     "NCLT": "the insolvency tribunal (NCLT)",
     "NCLAT": "the insolvency appellate tribunal (NCLAT)",
     "IBC": "the Insolvency and Bankruptcy Code (IBC)",
@@ -4440,26 +4489,49 @@ _JARGON_GLOSSARY = {
     "e-ASR": "the electronic Annual Statement of Rates (e-ASR)",
     "KMP": "Key Managerial Personnel (KMP)",
     "ROC": "the Registrar of Companies (ROC)",
+    "ICAI": "the Institute of Chartered Accountants of India (ICAI)",
+    "CNR": "the eCourts case number record (CNR)",
 }
 
 
+_EXPANDED_JARGON_THIS_RENDER: set = set()
+
+
+def _reset_jargon_expansion_state() -> None:
+    """Call once at the start of each doc_variant render (see
+    _fill_template_inner) so Internal and External each get their own
+    fresh first-use expansion, and so a re-render doesn't inherit state
+    from a previous one."""
+    _EXPANDED_JARGON_THIS_RENDER.clear()
+
+
 def _expand_jargon_first_use(text: str) -> str:
-    """CLAUDE.md Section B: on first use per text, expand a known jargon
-    term once -- keeping the term itself (still searchable/cross-
+    """CLAUDE.md Section B: on first use PER DOCUMENT, expand a known
+    jargon term once -- keeping the term itself (still searchable/cross-
     referenceable), just not left unexplained (e.g. "CIRP" -> "insolvency
-    proceedings (CIRP)"). Subsequent occurrences of the SAME term within
-    the same text are left bare, matching ordinary first-use-expands-then-
-    abbreviates writing convention. A plain-language pass, not a
-    dumbing-down pass -- the term is kept, not replaced."""
+    proceedings (CIRP)"). Every later occurrence, in this or any other
+    paragraph/heading, is left bare, matching ordinary first-use-expands-
+    then-abbreviates writing convention. Tracked in
+    _EXPANDED_JARGON_THIS_RENDER rather than scoped to just this one call's
+    `text`, because callers invoke this once PER PARAGRAPH (_set_paragraph_
+    text, _add_paragraph_sanitized) -- without document-wide tracking, every
+    separate paragraph that happens to mention e.g. "NCLT" would each
+    independently treat themselves as the first use, expanding the term
+    over and over (and mangling any paragraph that IS the term, such as a
+    "NCLT Case Status Check" heading) instead of just once. A plain-language
+    pass, not a dumbing-down pass -- the term is kept, not replaced."""
     if not text:
         return text
     for term, expansion in _JARGON_GLOSSARY.items():
+        if term in _EXPANDED_JARGON_THIS_RENDER:
+            continue
         pattern = re.compile(rf"\b{re.escape(term)}\b")
         first = pattern.search(text)
         if not first:
             continue
         start, end = first.span()
         text = text[:start] + expansion + text[end:]
+        _EXPANDED_JARGON_THIS_RENDER.add(term)
     return text
 
 
@@ -6514,6 +6586,7 @@ def _fill_template_inner(
 
     facts["_doc_variant"] = doc_variant
     facts["_citation_registry"] = {"order": [], "index": {}}
+    _reset_jargon_expansion_state()
 
     # CLAUDE.md Section B, "A clean check produces no sentence". Runs here so
     # EVERY caller gets it, including scripts that hit _fill_template directly.
@@ -6823,7 +6896,9 @@ def _fill_template_inner(
     _remove_gap_rows(t[2], value_col=1)
 
     def _fill_distance_row(row, item):
-        _set_row_cell(row, 0, item["landmark"])
+        category = item.get("category")
+        label = f"{category} -- {item['landmark']}" if category else item["landmark"]
+        _set_row_cell(row, 0, label)
         _set_row_cell(row, 1, item["distance_time"])
         _set_row_cell(row, 2, item["route_note"])
 
@@ -8774,7 +8849,14 @@ def _compute_documentation_confidence_score(facts: dict, authenticity_summary: d
     confirmed_count = len(_FINANCIAL_FIGURE_MARKERS) - len(unconfirmed_figures)
     note = f"{confirmed_count} of {len(_FINANCIAL_FIGURE_MARKERS)} core figures (FSI, land/built-up area, unit counts, pricing) have no unresolved gap against them"
     if unconfirmed_figures:
-        note += f" -- flagged as an open gap: {', '.join(unconfirmed_figures)}"
+        # Display names, not the raw dict keys (rules.md: never a snake_case
+        # field name in reader-facing text) -- confirmed live: "unit_counts"
+        # surfaced verbatim in the Documentation Confidence Summary. Also
+        # plain punctuation, not " -- ", matching every other note in this
+        # function.
+        _display_names = {"fsi": "FSI", "land_built_up_area": "land/built-up area",
+                           "unit_counts": "unit counts", "pricing": "pricing"}
+        note += ". Flagged as open gap(s): " + ", ".join(_display_names.get(n, n) for n in unconfirmed_figures) + "."
     criteria["financial_figures_confirmed"] = {
         "score": 100 * confirmed_count / len(_FINANCIAL_FIGURE_MARKERS),
         "note": note,
@@ -9335,7 +9417,7 @@ def _score_past_area_developed(facts: dict) -> dict:
     other registered projects, not yet computed by every pipeline run."""
     area = ((facts.get("promoter_portfolio") or {}).get("totals") or {}).get("total_area_developed_lakh_sqft")
     if not isinstance(area, (int, float)):
-        return {"score": None, "tier": None, "reason": "promoter_portfolio.totals.total_area_developed_lakh_sqft not available -- requires area figures aggregated across the promoter's other RERA-registered projects, not yet computed this pass."}
+        return {"score": None, "tier": None, "reason": "Not available. This requires area figures aggregated across the promoter's other RERA-registered projects, not yet computed this pass."}
     if area > 120:
         tier = "AAA"
     elif area >= 81:
@@ -9359,7 +9441,7 @@ def _score_area_within_5km(facts: dict) -> dict:
     the same portfolio data as criterion 3."""
     area = ((facts.get("promoter_portfolio") or {}).get("totals") or {}).get("area_within_5km_lakh_sqft")
     if not isinstance(area, (int, float)):
-        return {"score": None, "tier": None, "reason": "promoter_portfolio.totals.area_within_5km_lakh_sqft not available -- this pass's promoter_portfolio.json predates the geocoding-based 5km filter (build_promoter_portfolio's subject_project_partners_data/subject_reg_no params), or no subject location could be geocoded. Re-run the pipeline to compute it, rather than treating this as a permanent gap."}
+        return {"score": None, "tier": None, "reason": "Not available. This run's promoter-portfolio data predates the geocoding-based 5km distance filter, or no subject location could be geocoded. This can be computed on a future run rather than treated as a permanent gap."}
     if area > 50:
         tier = "AAA"
     elif area >= 21:
@@ -11000,9 +11082,20 @@ def _append_bombay_hc_check_section(doc, facts: dict) -> None:
         ),
     )
 
-    problems = [r for r in runs if r.get("note")]
-    clean = [r for r in runs if not r.get("note") and not r.get("found")]
+    # A run's own `note` alone doesn't mean it failed to complete -- every
+    # zero-result response carries the same inherent parser-uncertainty
+    # note (see bombay_hc_search's own module note), whether the CAPTCHA
+    # was solved and a real response received or not. `raw_response` is
+    # the actual signal: it is a real parsed dict when the search genuinely
+    # completed, and None only when _safe_bombay_hc_check's own except
+    # block caught a real failure (CAPTCHA timeout, rejection, browser
+    # closed). Bucketing on `note` alone told a human who solved all 10
+    # CAPTCHAs and got 10 genuine zero-result responses that their searches
+    # "did not complete" -- confirmed live 2026-09-28 against Oxford
+    # Navrang Realty LLP.
     hits = [r for r in runs if r.get("found")]
+    clean = [r for r in runs if not r.get("found") and r.get("raw_response")]
+    problems = [r for r in runs if not r.get("found") and not r.get("raw_response")]
 
     if not runs:
         doc.add_paragraph("Nothing found.")
@@ -13375,11 +13468,16 @@ def run_company_charter(
     land = facts.get("land_identification", {})
     origin_locality = (land.get("village_locality") or {}).get("value", "")
     origin_district = (land.get("mandal_taluka_district") or {}).get("value", "")
+    origin_coords = None
     if origin_locality:
         _state_name = _profile_for_run.state_name
         origin = f"{origin_locality}, {origin_district}, {_state_name}" if origin_district else f"{origin_locality}, {_state_name}"
-        _resolved_via_nominatim = _refine_distances_with_nominatim(facts, origin)
-        facts = _refine_distances_with_maps(facts, origin, skip=_resolved_via_nominatim)
+        origin_coords = geo_lookup.geocode(origin)
+    # Both always run (even with no origin_coords) so facts["distances"] and
+    # facts["comparables"] are guaranteed to exist in the shape downstream
+    # rendering expects -- see the module docstring.
+    facts = _compute_landmark_distances(facts, origin_coords)
+    facts = _verify_comparables_within_radius(facts, origin_coords)
 
     # Runs last, after every other step above has had its chance to add a
     # source -- otherwise a topic that only looks single-sourced mid-assembly

@@ -124,15 +124,6 @@ with st.sidebar:
     captcha_timeout = st.number_input("CAPTCHA timeout (seconds)", min_value=60, max_value=600, value=config.CAPTCHA_TIMEOUT_SECONDS, step=30)
     explicit_token = st.text_input("Manual session token (optional)", type="password", help="Paste a token you already captured yourself to skip auto-auth entirely.")
     st.caption(f"Cached session: {token_cache.minutes_left()} min left" if token_cache.minutes_left() > 0 else "Cached session: none / expired")
-    use_maps_scrape = st.checkbox(
-        "Enable Maps-scrape distances (experimental)",
-        value=False,
-        help="Company Charter only: replaces web-search distance estimates with a live-scraped "
-        "Google Maps driving route per landmark. Off by default -- this scrapes Google's "
-        "consumer UI (not their paid Distance Matrix API), so it may not comply with Google's "
-        "Terms of Service and can break without warning if Google changes their page. Falls "
-        "back to the web-search estimate on any failure.",
-    )
 
 st.title("\U0001F3E2 MahaRERA Project Scraper")
 
@@ -287,13 +278,7 @@ with tab_run:
             # --- company charter ---
             charter_path = None
             charter_facts = None
-            if use_maps_scrape:
-                os.environ[company_charter._MAPS_SCRAPE_ENV_VAR] = "1"
-            else:
-                os.environ.pop(company_charter._MAPS_SCRAPE_ENV_VAR, None)
             spinner_msg = "Generating Company Charter docx -- this calls the Claude API and can take several minutes"
-            if use_maps_scrape:
-                spinner_msg += " (Maps-scrape enabled: also launches a headless browser per landmark, adding time)"
             # No automated review-fetching mechanism exists in this pipeline --
             # this only picks up reviews a user has separately collected and
             # saved here (e.g. via the Browser pane against a review site).

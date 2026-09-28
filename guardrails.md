@@ -51,6 +51,31 @@ underlying pass does not signal failure by raising -- it returns an explicit
 not-found or unverified result carrying its own reason -- so this wrapper only
 covers a hard failure of the OCR stack itself.
 
+`company_charter._compute_landmark_distances` and
+`company_charter._verify_comparables_within_radius` are the Key Landmarks and
+Comparable Projects tables -- entirely code-computed against the free,
+keyless OpenStreetMap ecosystem (`geo_lookup.find_nearest_landmarks`,
+`geo_lookup.driving_route`, `geo_lookup.geocode`), replacing what used to be
+a model web_search guess. None of the three ever raises past its caller: a
+category Overpass can't resolve within its widest search radius renders as
+an explicit "None found" row, not a blank or a guessed landmark; a landmark
+OSRM can't route renders as "Can't route", never a silent fallback to the
+straight-line distance Overpass used internally for ranking (that number
+would look like a real driving distance without being one); an origin that
+fails to geocode at all empties both tables and records why in `gaps`,
+rather than leaving the model's own unverified figures in place. Only
+`driving_route`'s `distance_km` is ever shown to a reader -- its
+`duration_min` is a pure free-flow number with no traffic model at all
+(confirmed live, 2026-09-28: a real 9.7km Mumbai route came back as 10
+minutes) and would misinform a reader far worse than an omitted figure. A
+comparable the model proposes is never trusted at its self-reported
+`distance_km` -- it is independently geocoded (via
+`company_charter._comparable_geocode_query`, preferring a 6-digit pincode
+over a locality name when the model supplied one, the same
+pincode-over-locality precedence `promoter_portfolio._geocode_query_for`
+already established for the Developer Score's 5km filter) and dropped, by
+name, into `gaps` if it does not actually verify within 2km.
+
 ## 2c. Coverage — "not found" and "never asked" are different findings
 
 `states.candidate_profiles` REFUSES a registration number it recognises but
