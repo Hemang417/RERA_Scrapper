@@ -71,6 +71,11 @@ LANDMARK_CATEGORIES = (
     ("School", ('node["amenity"="school"]',)),
     ("Metro station", ('node["railway"="station"]["station"~"subway|light_rail"]',
                         'node["station"="subway"]')),
+    # shop=mall alone has no tag distinguishing a real large mall from a
+    # small local shopping plaza -- unlike Hospital/Metro/Airport, whose
+    # own tags are already unambiguous, so this can't get an airport-style
+    # hard exclusion. See _PREFER_MAPPED_FOOTPRINT below for the (weaker,
+    # preference-only) fix.
     ("Mall", ('node["shop"="mall"]', 'way["shop"="mall"]')),
     ("Hospital", ('node["amenity"="hospital"]', 'way["amenity"="hospital"]')),
     ("Religious place", ('node["amenity"="place_of_worship"]',)),
@@ -78,6 +83,21 @@ LANDMARK_CATEGORIES = (
     ("Infrastructure", ('node["highway"="motorway_junction"]',
                          'node["railway"="station"]["station"!~"subway|light_rail"]')),
 )
+
+# Categories where a candidate mapped as a real building footprint (a
+# `way`/`relation`, not a bare `node`) should be preferred over one that
+# isn't -- confirmed live (2026-09-28, a real Andheri West/Goregaon query):
+# every well-known large Mumbai mall in a sample (Oberoi, InOrbit, Infiniti,
+# Citi, Evershine, Express Zone) was way-tagged, while bare nodes were
+# smaller/less-recognized names (Crystal Plaza, Harmony Mall, Tirumala
+# Shopping Center). This is a real, live-confirmed correlation, but only a
+# PREFERENCE, not a hard exclusion like Airport's iata/icao requirement --
+# a node-tagged mall is still kept if too few way-tagged ones exist nearby,
+# since sparser OSM mapping in a smaller city shouldn't turn "Mall" into a
+# false "None found". Only Mall needs this: every other category's own tag
+# is already unambiguous (a small hospital is still genuinely a hospital;
+# a mall-vs-plaza mismatch is closer to Airport's real-vs-toy problem).
+_PREFER_MAPPED_FOOTPRINT = {"Mall"}
 
 
 def geocode(query: str) -> tuple | None:
@@ -163,13 +183,16 @@ def find_nearest_landmarks(origin_coords: tuple, n_per_category: int = 2) -> dic
     is exhausted). Fully deterministic, code-computed -- no model
     involvement, so no hallucinated landmark names or distances.
 
-    Returns {category: [{"name", "coords", "straight_line_km"}, ...]},
-    each list containing 0, 1, or n_per_category entries -- fewer than
-    requested means genuinely fewer than that exist within the widest
-    radius tried (or every Overpass call for that category failed), never
-    a padded/guessed entry. Ranking here is by straight-line distance only
-    (Overpass has no routing concept); driving_route() is a separate step
-    for the entries actually selected."""
+    Returns {category: [{"name", "coords", "straight_line_km", "geometry"},
+    ...]}, each list containing 0, 1, or n_per_category entries -- fewer
+    than requested means genuinely fewer than that exist within the
+    widest radius tried (or every Overpass call for that category
+    failed), never a padded/guessed entry. Ranking is by straight-line
+    distance only (Overpass has no routing concept) -- except for
+    categories in _PREFER_MAPPED_FOOTPRINT, which rank a `way`/`relation`
+    candidate ahead of any `node` before sorting by distance within each
+    tier. driving_route() is a separate step for the entries actually
+    selected."""
     results = {}
     if not origin_coords:
         return {category: [] for category, _ in LANDMARK_CATEGORIES}
@@ -177,6 +200,7 @@ def find_nearest_landmarks(origin_coords: tuple, n_per_category: int = 2) -> dic
 
     for category, filters in LANDMARK_CATEGORIES:
         found = []
+        prefer_footprint = category in _PREFER_MAPPED_FOOTPRINT
         for radius_m in LANDMARK_RADIUS_STEPS_M:
             clauses = "".join(f"{f}(around:{radius_m},{lat},{lon});" for f in filters)
             query = f"[out:json][timeout:{_OVERPASS_TIMEOUT_S - 5}];({clauses});out center 20;"
@@ -192,9 +216,14 @@ def find_nearest_landmarks(origin_coords: tuple, n_per_category: int = 2) -> dic
                     continue
                 km = haversine_km(origin_coords, coords)
                 if name not in by_name or km < by_name[name]["straight_line_km"]:
-                    by_name[name] = {"name": name, "coords": coords, "straight_line_km": km}
+                    by_name[name] = {"name": name, "coords": coords, "straight_line_km": km,
+                                      "geometry": el.get("type", "node")}
 
-            found = sorted(by_name.values(), key=lambda c: c["straight_line_km"])
+            if prefer_footprint:
+                found = sorted(by_name.values(),
+                                key=lambda c: (0 if c["geometry"] != "node" else 1, c["straight_line_km"]))
+            else:
+                found = sorted(by_name.values(), key=lambda c: c["straight_line_km"])
             if len(found) >= n_per_category:
                 break
         results[category] = found[:n_per_category]

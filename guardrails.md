@@ -75,6 +75,28 @@ over a locality name when the model supplied one, the same
 pincode-over-locality precedence `promoter_portfolio._geocode_query_for`
 already established for the Developer Score's 5km filter) and dropped, by
 name, into `gaps` if it does not actually verify within 2km.
+
+Two quality filters on which OSM points of interest ever reach the Key
+Landmarks table, in `geo_lookup.LANDMARK_CATEGORIES`/
+`geo_lookup.find_nearest_landmarks`, both confirmed live (2026-09-28)
+rather than assumed:
+- **Airport (hard exclusion).** `aeroway=aerodrome` alone matched a private
+  gliderdrome as a Pune project's "nearest airport" -- misleading, since it
+  offers no commercial air access. Now requires an `iata` or `icao` tag.
+  Checked every other category's own tag for the same class of problem;
+  none have it (a hospital tag doesn't include clinics, a metro tag
+  doesn't include mainline halts, etc.), so none get an equivalent filter.
+- **Mall (soft preference only, via `geo_lookup._PREFER_MAPPED_FOOTPRINT`).**
+  `shop=mall` has no tag distinguishing a real large mall from a small
+  local plaza -- no airport-style hard exclusion is possible. A live
+  sample near Andheri West/Goregaon showed every well-known large mall
+  (Oberoi, InOrbit, Infiniti, Citi, Evershine, Express Zone) mapped as a
+  `way`/`relation` (a real building footprint), while bare `node`s were
+  smaller/less-recognized names. Ranks a footprint-mapped candidate ahead
+  of a bare node, but still keeps a node if too few footprint-mapped ones
+  exist nearby -- a preference, not an exclusion, so sparser OSM mapping
+  in a smaller city can't turn "Mall" into a false "None found".
+
 `company_charter._verify_comparables_match_configuration` runs next, on the
 distance-verified survivors: it drops any whose parsed unit-configuration
 tokens share NO overlap with the subject's own real unit mix

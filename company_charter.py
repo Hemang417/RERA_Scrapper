@@ -45,7 +45,14 @@ _compute_landmark_distances():
    2 are found -- there is no distance cap for landmarks (a metro station
    50km away is still "nearest", not "none"); fewer than 2 in a category
    means genuinely fewer than that exist within the widest radius tried,
-   stated as such rather than padded.
+   stated as such rather than padded. Airport requires an iata/icao tag
+   (excludes private gliderdromes/airstrips -- confirmed live to
+   otherwise surface one as a "nearest airport"); Mall prefers a
+   way/relation (a real mapped building footprint) over a bare node,
+   confirmed live to correlate with genuinely large/known malls, but only
+   a preference -- see geo_lookup.LANDMARK_CATEGORIES/
+   _PREFER_MAPPED_FOOTPRINT for why neither the reasoning nor the
+   remedy generalizes to the other 6 categories.
 3. Computes a real driving DISTANCE for each selected landmark via the
    free OSRM routing server (geo_lookup.driving_route) -- distance only,
    deliberately never OSRM's duration, confirmed live to be a pure
