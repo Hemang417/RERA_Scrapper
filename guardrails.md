@@ -75,6 +75,15 @@ over a locality name when the model supplied one, the same
 pincode-over-locality precedence `promoter_portfolio._geocode_query_for`
 already established for the Developer Score's 5km filter) and dropped, by
 name, into `gaps` if it does not actually verify within 2km.
+`company_charter._verify_comparables_match_configuration` runs next, on the
+distance-verified survivors: it drops any whose parsed unit-configuration
+tokens share NO overlap with the subject's own real unit mix
+(`facts["blocks"]`) -- a candidate can pass the distance check and still be
+a different segment. Never drops on a parsing failure (an unparseable
+configuration string is not evidence of a mismatch) and deliberately does
+NOT check price -- MahaRERA discloses no figure anywhere in `facts` for the
+subject project's own selling price, so a price threshold here would be an
+invented rule, not a verified fact.
 
 ## 2c. Coverage — "not found" and "never asked" are different findings
 

@@ -1,11 +1,14 @@
 """
-Standalone verification for company_charter.py's two code-computed Maps
-passes: _compute_landmark_distances() (the Key Landmarks table -- entirely
+Standalone verification for company_charter.py's code-computed Maps passes:
+_compute_landmark_distances() (the Key Landmarks table -- entirely
 code-driven via geo_lookup.find_nearest_landmarks/driving_route, no model
-involvement at all) and _verify_comparables_within_radius() (drops any
+involvement at all), _verify_comparables_within_radius() (drops any
 AI-proposed comparable that doesn't independently geocode-verify within
-2km). No real Overpass/Nominatim/OSRM traffic -- geo_lookup.find_nearest_landmarks,
-geo_lookup.driving_route, and geo_lookup.geocode are all mocked.
+2km), and _verify_comparables_match_configuration() (drops any distance-
+verified survivor whose unit configuration shares no overlap with the
+subject project's own real unit mix). No real Overpass/Nominatim/OSRM
+traffic -- geo_lookup.find_nearest_landmarks, geo_lookup.driving_route, and
+geo_lookup.geocode are all mocked.
 
 Run directly: python test_distance_refinement.py
 """
@@ -196,6 +199,49 @@ def test_verify_comparables_falls_back_to_project_name_when_locality_missing():
     print("test_verify_comparables_falls_back_to_project_name_when_locality_missing: PASS")
 
 
+def test_configuration_tokens_parses_bhk_rk_studio_never_a_bare_number():
+    assert company_charter._configuration_tokens("1, 2 and 3 BHK, carpet areas 458-1292 sq. ft.") == {"1", "2", "3"}
+    assert company_charter._configuration_tokens("2.5 BHK duplex") == {"2.5"}
+    # Real comparable text (confirmed live, 2026-09-28): a "to" range spanning
+    # BHK counts must not lose its lower bound.
+    assert company_charter._configuration_tokens("2.5 to 5 BHK, 937-2308 sq. ft.") == {"2.5", "5"}
+    assert company_charter._configuration_tokens("Studio and 1 RK units") == {"studio", "1rk"}
+    # A bare number (floor count, area, price) must never be misread as a configuration.
+    assert company_charter._configuration_tokens("44 units in one tower, 630-905 sq. ft.") == set()
+    assert company_charter._configuration_tokens("") == set()
+    print("test_configuration_tokens_parses_bhk_rk_studio_never_a_bare_number: PASS")
+
+
+def test_verify_comparables_match_configuration_no_op_without_subject_blocks():
+    # No confirmed subject configuration -- never guess a mismatch from missing data.
+    facts = {"comparables": [_comparable("Luxury Project", "Some Locality")], "blocks": []}
+    facts["comparables"][0]["configuration"] = "4 BHK and 5 BHK penthouses"
+    result = company_charter._verify_comparables_match_configuration(facts)
+    assert len(result["comparables"]) == 1
+    print("test_verify_comparables_match_configuration_no_op_without_subject_blocks: PASS")
+
+
+def test_verify_comparables_match_configuration_drops_zero_overlap_keeps_match_and_unparseable():
+    facts = {
+        "blocks": [{"block_wing": "A", "floors": "10", "config": "1 BHK, 2 BHK", "units_counted": "40", "note": ""}],
+        "comparables": [
+            _comparable("Matching Project", "Loc A"),   # configuration set below to overlap
+            _comparable("Luxury Project", "Loc B"),      # configuration set below to NOT overlap
+            _comparable("Unparseable Project", "Loc C"), # configuration set below to have no recognizable token
+        ],
+    }
+    facts["comparables"][0]["configuration"] = "2 BHK units"
+    facts["comparables"][1]["configuration"] = "4 BHK and 5 BHK penthouses only"
+    facts["comparables"][2]["configuration"] = "premium residences, carpet area 900 sq ft"
+
+    result = company_charter._verify_comparables_match_configuration(facts)
+
+    kept_names = {c["project"] for c in result["comparables"]}
+    assert kept_names == {"Matching Project", "Unparseable Project"}, kept_names
+    assert any("Luxury Project" in g and "configuration mismatch" in g for g in result["gaps"])
+    print("test_verify_comparables_match_configuration_drops_zero_overlap_keeps_match_and_unparseable: PASS")
+
+
 if __name__ == "__main__":
     test_compute_landmark_distances_no_op_when_origin_ungeocodable()
     test_compute_landmark_distances_fills_category_and_driving_route()
@@ -206,4 +252,7 @@ if __name__ == "__main__":
     test_verify_comparables_drops_all_when_origin_ungeocodable()
     test_verify_comparables_keeps_within_radius_drops_outside_and_ungeocodable()
     test_verify_comparables_falls_back_to_project_name_when_locality_missing()
+    test_configuration_tokens_parses_bhk_rk_studio_never_a_bare_number()
+    test_verify_comparables_match_configuration_no_op_without_subject_blocks()
+    test_verify_comparables_match_configuration_drops_zero_overlap_keeps_match_and_unparseable()
     print("\nAll tests passed.")

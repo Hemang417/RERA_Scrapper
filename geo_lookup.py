@@ -58,7 +58,16 @@ LANDMARK_RADIUS_STEPS_M = (3000, 5000, 10000, 20000, 40000, 80000, 160000)
 # station category; "!~" in Overpass QL matches when the key is absent too,
 # so a plain mainline station with no `station` tag still counts.
 LANDMARK_CATEGORIES = (
-    ("Airport", ('node["aeroway"="aerodrome"]', 'way["aeroway"="aerodrome"]')),
+    # `aeroway=aerodrome` alone matches any airfield, including a private
+    # gliderdrome/airstrip -- confirmed live (2026-09-28): "NDA Gliderdrome"
+    # surfaced as a Pune project's "nearest airport", which misleads a
+    # reader into thinking there's commercial air access nearby when there
+    # isn't. Requiring an `iata` or `icao` code excludes those -- a real
+    # gliderdrome/private airstrip has neither, while any airport actually
+    # open to scheduled or general commercial traffic carries at least an
+    # ICAO code.
+    ("Airport", ('node["aeroway"="aerodrome"]["iata"]', 'node["aeroway"="aerodrome"]["icao"]',
+                  'way["aeroway"="aerodrome"]["iata"]', 'way["aeroway"="aerodrome"]["icao"]')),
     ("School", ('node["amenity"="school"]',)),
     ("Metro station", ('node["railway"="station"]["station"~"subway|light_rail"]',
                         'node["station"="subway"]')),

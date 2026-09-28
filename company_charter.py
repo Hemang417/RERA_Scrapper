@@ -59,10 +59,22 @@ _compute_landmark_distances():
 Comparable projects table (`comparables`): the model proposes candidates
 via web_search (must be genuinely independent developments -- not the
 subject's own adjacent phase -- similar in segment, ready-to-move or
-under construction) with NO distance cap enforced by the model itself;
-_verify_comparables_within_radius() then geocodes each candidate and
-drops any that don't actually verify within 2km of the subject project,
-rather than trusting the model's own distance claim at face value.
+under construction) with NO distance/segment cap enforced by the model
+itself; two code-only passes then check what it proposed, never trusting
+either claim at face value:
+1. _verify_comparables_within_radius() geocodes each candidate (preferring
+   a pincode over a locality name -- see _comparable_geocode_query) and
+   drops any that don't actually verify within 2km of the subject project.
+2. _verify_comparables_match_configuration() drops any survivor whose
+   parsed unit-configuration tokens (1BHK/2BHK/.../Studio/RK) share NO
+   overlap with the subject project's own real unit mix
+   (facts["blocks"][].config) -- distance alone doesn't make something
+   "comparable" if it's a different segment entirely. Deliberately does
+   NOT check price/price-per-sqft: MahaRERA is a registration record, not
+   a price listing, so this pipeline has no reliably-sourced figure for
+   the subject project's OWN selling price anywhere in `facts` to check a
+   candidate's price against -- inventing a threshold here would be a
+   guess dressed up as a rule.
 
     python company_charter.py <REG_NO>
 """
@@ -617,7 +629,8 @@ _CHARTER_FACTS_SCHEMA = {
             "items": {
                 "type": "object",
                 "properties": {
-                    "project": {"type": "string"}, "configuration": {"type": "string"},
+                    "project": {"type": "string"},
+                    "configuration": {"type": "string", "description": "This comparable's own unit configuration(s), stated with recognizable tokens (e.g. '1 BHK', '2BHK', '3 BHK', 'Studio', '1 RK') rather than only carpet-area numbers -- a later code-only step parses these tokens to verify this candidate genuinely shares at least one configuration with the subject project's own unit mix (`blocks[].config`), and drops it if it shares none (e.g. the subject is exclusively 1-2 BHK compact units and this candidate is exclusively 4+ BHK luxury -- a different segment, not a comparable)."},
                     "pricing": {"type": "string"}, "source": {"type": "string"},
                     "locality": {"type": "string", "description": "This comparable's own well-known neighbourhood/area name and city -- NOT the subject project's, and NOT a specific street or building -- e.g. 'Wakad, Pune', not 'Building name, XYZ Road, Wakad, Pune'. A later code-only step geocodes this (preferring `pincode` below when given) to independently verify the 2km distance claim; an unfindable or overly specific/obscure locality means that verification fails and the candidate gets dropped, so prefer the broadest well-known area name that is still accurate."},
                     "pincode": {"type": "string", "description": "This comparable's own 6-digit Indian PIN code, if your source states one -- NOT the subject project's. Omit entirely if unknown; never guess one. A later code-only step geocodes THIS in preference to `locality` when present, because a bare pincode resolves far more reliably via free-text geocoding than a locality/neighbourhood name does."},
@@ -965,6 +978,83 @@ def _verify_comparables_within_radius(facts: dict, origin_coords: tuple | None,
     if dropped:
         facts["gaps"] = (facts.get("gaps") or []) + [
             "Comparable project(s) removed after distance verification: " + "; ".join(dropped) + "."
+        ]
+    return facts
+
+
+_BHK_LIST_PATTERN = re.compile(r"((?:\d+(?:\.\d+)?\s*(?:,|and|to)?\s*)+)bhk", re.IGNORECASE)
+_NUMBER_PATTERN = re.compile(r"\d+(?:\.\d+)?")
+_RK_TOKEN_PATTERN = re.compile(r"\b(\d+)\s*rk\b", re.IGNORECASE)
+_STUDIO_TOKEN_PATTERN = re.compile(r"\bstudio\b", re.IGNORECASE)
+
+
+def _configuration_tokens(text: str) -> set:
+    """Pulls recognizable unit-configuration tokens ('1', '2.5', '1rk',
+    'studio') out of free text. Deliberately narrow -- only numbers that sit
+    directly in front of a BHK/RK anchor (or the literal word "studio") ever
+    count, never a bare number that could be a floor count, a price, or an
+    area in sq ft misread as a configuration. Real listings commonly state
+    a shared list before one "BHK" (e.g. "1, 2 and 3 BHK, carpet areas
+    458-1292 sq. ft." -- confirmed against a real comparable's own text),
+    so this pulls every number out of the matched list, not just the one
+    immediately adjacent to "BHK"."""
+    text = text or ""
+    tokens = set()
+    for m in _BHK_LIST_PATTERN.finditer(text):
+        tokens |= set(_NUMBER_PATTERN.findall(m.group(1)))
+    tokens |= {f"{m.group(1)}rk" for m in _RK_TOKEN_PATTERN.finditer(text)}
+    if _STUDIO_TOKEN_PATTERN.search(text):
+        tokens.add("studio")
+    return tokens
+
+
+def _verify_comparables_match_configuration(facts: dict) -> dict:
+    """Code-only check on the model's own `comparables` list, run after
+    _verify_comparables_within_radius (distance alone doesn't establish
+    "comparable" -- a candidate can be genuinely 1km away and still be a
+    completely different segment). Drops any candidate whose parsed
+    configuration tokens share NO overlap with the subject project's own
+    real unit mix (facts["blocks"][].config, not model-authored -- see
+    _fill_block_row's caller) -- e.g. the subject is exclusively 1-2 BHK
+    compact units and the candidate is exclusively 4+ BHK luxury.
+
+    Deliberately does NOT attempt a price/price-per-sqft segment check:
+    MahaRERA is a registration record, not a price listing, so this
+    pipeline has no reliably-sourced figure for the SUBJECT project's own
+    selling price anywhere in `facts` to check a candidate's price against
+    -- any threshold here would be an invented rule, not a verified fact,
+    which this codebase's own "never guess" discipline rules out.
+
+    Never drops on a parsing failure: if either side's configuration text
+    doesn't contain a recognizable BHK/RK/Studio token, that is not
+    evidence of a mismatch, so the candidate is kept as-is and this check
+    is silently skipped for it (its distance verification already ran)."""
+    comparables = facts.get("comparables") or []
+    if not comparables:
+        return facts
+
+    subject_tokens = set()
+    for block in facts.get("blocks") or []:
+        subject_tokens |= _configuration_tokens(block.get("config", ""))
+    if not subject_tokens:
+        return facts  # nothing confirmed to compare against -- never guess a mismatch from missing data
+
+    kept, dropped = [], []
+    for item in comparables:
+        candidate_tokens = _configuration_tokens(item.get("configuration", ""))
+        if not candidate_tokens or (subject_tokens & candidate_tokens):
+            kept.append(item)
+            continue
+        dropped.append(
+            f"{item.get('project', '') or 'an unnamed candidate'} (configuration "
+            f"{sorted(candidate_tokens)} shares no overlap with the subject project's own "
+            f"configuration {sorted(subject_tokens)})"
+        )
+
+    facts["comparables"] = kept
+    if dropped:
+        facts["gaps"] = (facts.get("gaps") or []) + [
+            "Comparable project(s) removed for configuration mismatch: " + "; ".join(dropped) + "."
         ]
     return facts
 
@@ -13478,6 +13568,7 @@ def run_company_charter(
     # rendering expects -- see the module docstring.
     facts = _compute_landmark_distances(facts, origin_coords)
     facts = _verify_comparables_within_radius(facts, origin_coords)
+    facts = _verify_comparables_match_configuration(facts)
 
     # Runs last, after every other step above has had its chance to add a
     # source -- otherwise a topic that only looks single-sourced mid-assembly
