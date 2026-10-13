@@ -9,3 +9,7 @@ pytesseract>=0.3
 Pillow>=10.0
 beautifulsoup4>=4.12
 docx2pdf>=0.1.8
+matplotlib>=3.8
+pdfplumber>=0.11
+pip-system-certs>=4.0
+pytest>=8.0

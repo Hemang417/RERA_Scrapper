@@ -3917,6 +3917,18 @@ def run_cts_lookup_standalone(
 _MAHARERA_ORDERS_URL = "https://maharera.maharashtra.gov.in/orders-judgements"
 _MAHARERA_COMPLAINT_TYPES = ("rulings_of_MahaRERA", "judgements_by_adjudicating_officer")
 _BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+# Generic words common to almost every Indian company/LLP name -- excluded
+# from the respondent-name match check in _maharera_orders_search_once so
+# that check isn't trivially satisfied by every row sharing "private",
+# "limited", "llp", etc. rather than anything specific to the query.
+_MAHARERA_ORG_SUFFIX_TOKENS = {
+    "private", "limited", "pvt", "ltd", "llp", "and", "the", "developer",
+    "developers", "builder", "builders", "construction", "constructions",
+    "project", "projects", "realty", "realtors", "promoter", "promoters",
+    "infrastructure", "infra", "home", "homes", "property", "properties",
+    "group", "landmark", "landmarks", "residency", "residencies",
+    "enterprises", "corporation", "corp", "industries", "ventures",
+}
 
 
 def _maharera_orders_form_defaults(html: str) -> dict | None:
@@ -3985,6 +3997,16 @@ def _maharera_orders_search_once(project_name: str = "", complaint_type: str = "
     whole point: result cards, the portal's own "No Record" (a real nil),
     or neither -- which means the filter never applied and the caller must
     NOT read it as an absence.
+
+    A FOURTH outcome, confirmed live 2026-10-13: the follow-up GET lands on
+    the portal's own generic, unfiltered recent-orders listing, which also
+    contains result cards and so is indistinguishable from a genuine
+    filtered result by marker alone -- it silently returns the same handful
+    of unrelated orders for every respondent_name queried. Guarded against
+    below by requiring at least one returned row's own respondent_name to
+    actually relate to the query when a respondent filter was requested;
+    failing that check is treated the same as "filter never applied" (None),
+    never as a found result.
     """
     from bs4 import BeautifulSoup
 
@@ -4069,6 +4091,37 @@ def _maharera_orders_search_once(project_name: str = "", complaint_type: str = "
             "judgment_pdf_base64": pdf_link.get("oj-data") if pdf_link else None,
             "complaint_type": complaint_type,
         })
+
+    # Confirmed live 2026-10-13: the follow-up GET above (the "ask once more
+    # via the session" fallback) can land on the portal's own GENERIC,
+    # UNFILTERED recent-orders listing rather than a page that actually
+    # reflects this search's respondent_name -- both pages carry
+    # _ORDERS_RESULT_MARKER, so the check above alone can't tell them apart.
+    # Confirmed by searching 57 different real promoter names in one pass:
+    # every one of them "matched" the SAME ~113 orders (1640 rows total),
+    # and not one of those rows actually named the promoter that was
+    # searched for. That is a silent FALSE POSITIVE, a more dangerous
+    # failure than the already-handled "filter never applied" case, because
+    # it looks exactly like real data downstream. Guard against it here:
+    # when a respondent filter was requested, at least one returned row
+    # must actually carry that respondent's name (loosely matched, since
+    # the portal's own formatting -- "M/s", punctuation, suffixes -- never
+    # matches the query string verbatim). If none do, this is the
+    # unfiltered-listing leak, not a real (even if partial) result, and
+    # must be reported as "never applied" (None) rather than as rows.
+    if respondent_name and results:
+        query_tokens = {
+            t for t in re.findall(r"[a-z0-9]+", respondent_name.casefold())
+            if len(t) > 3 and t not in _MAHARERA_ORG_SUFFIX_TOKENS
+        }
+        if query_tokens:
+            def _matches_query(row):
+                row_tokens = set(re.findall(r"[a-z0-9]+", (row.get("respondent_name") or "").casefold()))
+                return bool(query_tokens & row_tokens)
+
+            if not any(_matches_query(r) for r in results):
+                return None
+
     return results
 
 
