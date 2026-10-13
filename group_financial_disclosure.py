@@ -257,7 +257,7 @@ def sweep(rera_sweep, downloaders=None, ocr=None, cache_dir=DEFAULT_CACHE_DIR,
                 except Exception as e:
                     limitations.append(
                         f"{state} document '{entry.get('label')}' on {reg_no} could not be read "
-                        f"this pass: {type(e).__name__}: {e}"
+                        f"this pass: {e}"
                     )
                     continue
                 finally:

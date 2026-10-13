@@ -218,7 +218,14 @@ def _launch(headless: bool):
             "playwright is required. Run: pip install playwright && playwright install chromium"
         ) from e
     p = sync_playwright().start()
-    browser = p.chromium.launch(headless=headless)
+    try:
+        browser = p.chromium.launch(headless=headless)
+    except Exception:
+        # Bundled Chromium can fail to spawn on a machine missing the
+        # Windows runtime it needs (side-by-side config error) -- fall
+        # back to the system-installed Chrome, which doesn't have that
+        # dependency gap. Same fix as nclt_search.py/bombay_hc_search.py.
+        browser = p.chromium.launch(channel="chrome", headless=headless)
     page = browser.new_context(viewport={"width": 1280, "height": 900}).new_page()
     return p, browser, page
 
@@ -839,7 +846,7 @@ def save_embedded_card_image(page, directory: str) -> dict:
                  .filter(s => s.startsWith('data:image'))"""
         )
     except Exception as e:
-        return {"error": f"{type(e).__name__}: {e}"}
+        return {"error": f"{e}"}
 
     import base64
 
@@ -883,7 +890,7 @@ def _dom_inventory(page) -> dict:
             }"""
         )
     except Exception as e:
-        return {"error": f"{type(e).__name__}: {e}"}
+        return {"error": f"{e}"}
 
 
 def _scrape_result_page(page, screenshot_path: str | None = None, captured: dict | None = None) -> dict:

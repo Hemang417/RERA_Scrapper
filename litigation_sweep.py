@@ -196,7 +196,7 @@ def sweep(graph, directors=None, known_places=None, searcher=None,
             rows = fetcher(subject["name"]) or []
         except Exception as e:
             subject["status"] = STATUS_UNREACHABLE
-            subject["note"] = f"{type(e).__name__}: {e}"
+            subject["note"] = f"{e}"
             continue
 
         searched += 1
@@ -309,7 +309,7 @@ def state_order_sweep(graph, searcher=None, register_coverage=None, karnataka_de
         except Exception as e:
             limitations.append(
                 f"The Karnataka order register could not be searched for "
-                f"{subject['name']} this pass: {type(e).__name__}: {e}"
+                f"{subject['name']} this pass: {e}"
             )
             continue
         searched += 1
@@ -357,7 +357,7 @@ def state_order_sweep(graph, searcher=None, register_coverage=None, karnataka_de
             except Exception as e:
                 limitations.append(
                     f"WBRERA's order register could not be joined for "
-                    f"{subject['name']} this pass: {type(e).__name__}: {e}"
+                    f"{subject['name']} this pass: {e}"
                 )
         if jharkhand is not None:
             try:
@@ -377,7 +377,7 @@ def state_order_sweep(graph, searcher=None, register_coverage=None, karnataka_de
             except Exception as e:
                 limitations.append(
                     f"JHARERA's order register could not be searched for "
-                    f"{subject['name']} this pass: {type(e).__name__}: {e}"
+                    f"{subject['name']} this pass: {e}"
                 )
         for row in rows:
             entries.append({
@@ -408,7 +408,7 @@ def state_order_sweep(graph, searcher=None, register_coverage=None, karnataka_de
             except Exception as e:
                 limitations.append(
                     f"K-RERA's Default Project List could not be searched for "
-                    f"{subject['name']} this pass: {type(e).__name__}: {e}"
+                    f"{subject['name']} this pass: {e}"
                 )
         if karnataka_revenue_recovery is not None:
             try:
@@ -427,7 +427,7 @@ def state_order_sweep(graph, searcher=None, register_coverage=None, karnataka_de
             except Exception as e:
                 limitations.append(
                     f"K-RERA's Revenue Recovery Certificate list could not be searched for "
-                    f"{subject['name']} this pass: {type(e).__name__}: {e}"
+                    f"{subject['name']} this pass: {e}"
                 )
     # WHICH OF K-RERA'S OWN REGISTERS ACTUALLY LOADED. Its authority-orders
     # page is 10.4 MB and has been seen to arrive truncated, dropping the

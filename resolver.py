@@ -124,7 +124,14 @@ def _search(
     candidates: list[ProjectCandidate] = []
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
+        try:
+            browser = p.chromium.launch(headless=headless)
+        except Exception:
+            # Bundled Chromium can fail to spawn on a machine missing the
+            # Windows runtime it needs (side-by-side config error) -- fall
+            # back to the system-installed Chrome, which doesn't have that
+            # dependency gap. Same fix as nclt_search.py/bombay_hc_search.py.
+            browser = p.chromium.launch(channel="chrome", headless=headless)
         page = browser.new_context(viewport={"width": 1920, "height": 1080}).new_page()
         try:
             _run_search(page, query, tab_selector, input_selector, submit_selector)

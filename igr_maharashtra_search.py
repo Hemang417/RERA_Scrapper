@@ -123,7 +123,14 @@ def _launch(headless: bool):
             "playwright is required. Run: pip install playwright && playwright install chromium"
         ) from e
     p = sync_playwright().start()
-    browser = p.chromium.launch(headless=headless)
+    try:
+        browser = p.chromium.launch(headless=headless)
+    except Exception:
+        # Bundled Chromium can fail to spawn on a machine missing the
+        # Windows runtime it needs (side-by-side config error) -- fall
+        # back to the system-installed Chrome, which doesn't have that
+        # dependency gap. Same fix as nclt_search.py/bombay_hc_search.py.
+        browser = p.chromium.launch(channel="chrome", headless=headless)
     page = browser.new_context(viewport={"width": 1366, "height": 950}).new_page()
     return p, browser, page
 
@@ -391,20 +398,95 @@ def search_by_document_number(
             }
 
         page.select_option("#ddlYearForDoc", label=str(year))
+        _settle(page)
         page.fill("#txtDocumentNo", str(doc_number))
+        # Confirmed live (screenshot evidence): a captcha this function had
+        # already told the human to read sometimes showed "Entered Captcha
+        # is incorrect" on the VERY FIRST submit despite a correct-looking
+        # read, and once even rendered with no image at all. The likely
+        # cause: #txtDocumentNo can itself carry a server-side postback
+        # (like the two selects above), which would silently swap in a new
+        # CAPTCHA image right as -- or just after -- the human started
+        # reading the old one. Settle fully, then wait for the CAPTCHA
+        # image itself to be present and have really finished loading
+        # (a broken/blank img still "exists" for wait_for_selector) before
+        # ever telling a human to look at it.
+        _settle(page)
+        try:
+            page.wait_for_function(
+                "() => { const img = document.querySelector('img[src*=\"Captcha\"], img[id*=\"Captcha\" i], img[id*=\"img\" i]'); "
+                "return img && img.complete && img.naturalWidth > 0; }",
+                timeout=10000,
+            )
+        except Exception:
+            pass  # best-effort -- fall through and let the human judge what they see
 
         print(f"\n[INFO] A browser window has opened at {_BASE_URL}")
         print(f"[INFO] Registration Type={registration_type}, District={district_label}, "
               f"SRO={matched_sro!r}, Year={year}, Doc No.={doc_number} are pre-filled.")
         print("[INFO] Please read the CAPTCHA shown there, type it into the box, and click Search.")
-        try:
-            _wait_for_human_submit(
-                page, timeout_seconds,
-                request_predicate=lambda req: req.method == "POST" and "btnSearchDoc" in (req.post_data or ""),
-                post_submit_marker="#txtDocumentNo",
-            )
-        except (CaptchaTimeoutError, BrowserClosedError) as e:
-            return {"found": False, "rows": [], "raw_text": "", "url": page.url, "note": str(e)}
+        # This portal rejects a wrong CAPTCHA in place -- same page, no
+        # navigation, a fresh CAPTCHA image swapped in -- rather than
+        # reloading. Confirmed live: _wait_for_human_submit's request
+        # predicate matches btnSearchDoc on THAT FIRST (wrong) submit just
+        # as validly as a correct one, so without this loop the function
+        # returned immediately after the human's first attempt, started
+        # tearing the browser down, and cut them off before they could ever
+        # give the real second answer. Retry the same wait, budgeted off
+        # the ORIGINAL timeout_seconds so a human who needs several tries
+        # still gets the full time they were promised, not
+        # timeout_seconds-per-attempt.
+        deadline = time.time() + timeout_seconds
+        max_attempts = 30
+        for attempt in range(1, max_attempts + 1):
+            remaining = max(5, int(deadline - time.time()))
+            try:
+                _wait_for_human_submit(
+                    page, remaining,
+                    request_predicate=lambda req: req.method == "POST" and "btnSearchDoc" in (req.post_data or ""),
+                    post_submit_marker="#txtDocumentNo",
+                )
+            except (CaptchaTimeoutError, BrowserClosedError) as e:
+                return {"found": False, "rows": [], "raw_text": "", "url": page.url, "note": str(e)}
+
+            # The "Entered Captcha is incorrect" message is an ASP.NET
+            # UpdatePanel partial postback, not a full navigation, so
+            # _wait_for_human_submit's own "load" event wait can return
+            # before this text has actually rendered -- confirmed live: a
+            # single fixed 2.5s wait still missed it (a screenshot taken
+            # moments later, after _wait_for_search_to_finish, caught the
+            # message that this exact check had just declared absent). Poll
+            # instead of guessing one fixed delay: check repeatedly for up
+            # to 12s, and treat "still not there after 12s" as a real
+            # accept rather than a slow reject.
+            rejected = False
+            poll_deadline = time.time() + 20
+            while time.time() < poll_deadline:
+                body_now = _safe_read(lambda: page.inner_text("body"), min_length=1) or ""
+                if "entered captcha is incorrect" in body_now.lower():
+                    rejected = True
+                    break
+                page.wait_for_timeout(500)
+            if not rejected:
+                break
+            if attempt == max_attempts or time.time() >= deadline:
+                return {
+                    "found": False, "rows": [], "raw_text": body_now, "url": page.url,
+                    "note": f"CAPTCHA rejected {attempt} time(s) in a row; gave up rather than keep the browser open indefinitely.",
+                }
+            # Same freshness wait as before the first attempt -- the new
+            # CAPTCHA image that replaces the rejected one needs a moment
+            # to actually finish loading too.
+            try:
+                page.wait_for_function(
+                    "() => { const img = document.querySelector('img[src*=\"Captcha\"], img[id*=\"Captcha\" i], img[id*=\"img\" i]'); "
+                    "return img && img.complete && img.naturalWidth > 0; }",
+                    timeout=10000,
+                )
+            except Exception:
+                pass
+            print(f"[INFO] That CAPTCHA was rejected (attempt {attempt}). A new one has appeared -- "
+                  f"please read it and click Search again.")
 
         finished = _wait_for_search_to_finish(page)
         html = _safe_read(page.content, min_length=5000)

@@ -70,7 +70,14 @@ def acquire_token_via_browser(
     url = config.DETAIL_VIEW_URL_TEMPLATE.format(project_id)
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
+        try:
+            browser = p.chromium.launch(headless=False)
+        except Exception:
+            # Bundled Chromium can fail to spawn on a machine missing the
+            # Windows runtime it needs (side-by-side config error) -- fall
+            # back to the system-installed Chrome, which doesn't have that
+            # dependency gap. Same fix as nclt_search.py/bombay_hc_search.py.
+            browser = p.chromium.launch(channel="chrome", headless=False)
         page = browser.new_context(viewport={"width": 1280, "height": 900}).new_page()
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=config.SEARCH_TIMEOUT_MS)

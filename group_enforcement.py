@@ -163,7 +163,7 @@ def _safe_fetch(fn, limitations, what):
     try:
         return fn() or []
     except Exception as e:
-        limitations.append(f"{what} could not be read this pass: {type(e).__name__}: {e}")
+        limitations.append(f"{what} could not be read this pass: {e}")
         return []
 
 
@@ -360,7 +360,7 @@ def sweep(graph, directors=None, fetchers=None, appeal_ocr_limit=None,
         except Exception as e:
             limitations.append(
                 f"TNRERA's enforcement PDFs could not be searched for {name} this "
-                f"pass: {type(e).__name__}: {e}"
+                f"pass: {e}"
             )
 
         for row in wb_rows:

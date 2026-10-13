@@ -349,7 +349,7 @@ def sweep(graph, pans=None, intake=None, limit=DEFAULT_ENTITY_LIMIT, reporter=No
             checked += 1
         except Exception as e:
             row["status"] = STATUS_LOOKUP_FAILED
-            row["note"] = f"{type(e).__name__}: {e}"
+            row["note"] = f"{e}"
 
     without_pan = sum(1 for r in rows if r["status"] == STATUS_NO_PAN)
     skipped = sum(1 for r in rows if r["status"] == STATUS_BUDGET_EXHAUSTED)

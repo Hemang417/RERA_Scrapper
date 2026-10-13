@@ -70,7 +70,14 @@ def search_and_fetch(
         ) from e
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
+        try:
+            browser = p.chromium.launch(headless=False)
+        except Exception:
+            # Bundled Chromium can fail to spawn on a machine missing the
+            # Windows runtime it needs (side-by-side config error) -- fall
+            # back to the system-installed Chrome, which doesn't have that
+            # dependency gap. Same fix as nclt_search.py/bombay_hc_search.py.
+            browser = p.chromium.launch(channel="chrome", headless=False)
         page = browser.new_context(viewport={"width": 1280, "height": 900}).new_page()
         try:
             page.goto(TG_RERA_SEARCH_URL, wait_until="domcontentloaded", timeout=60000)
@@ -135,7 +142,14 @@ def fetch_detail_by_url(print_preview_url: str, timeout_seconds: int = 60) -> di
     from playwright.sync_api import sync_playwright
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
+        try:
+            browser = p.chromium.launch(headless=False)
+        except Exception:
+            # Bundled Chromium can fail to spawn on a machine missing the
+            # Windows runtime it needs (side-by-side config error) -- fall
+            # back to the system-installed Chrome, which doesn't have that
+            # dependency gap. Same fix as nclt_search.py/bombay_hc_search.py.
+            browser = p.chromium.launch(channel="chrome", headless=False)
         page = browser.new_context(viewport={"width": 1280, "height": 900}).new_page()
         try:
             page.goto(print_preview_url, wait_until="domcontentloaded", timeout=timeout_seconds * 1000)

@@ -59,7 +59,14 @@ def _launch(headless: bool):
             "playwright is required. Run: pip install playwright && playwright install chromium"
         ) from e
     p = sync_playwright().start()
-    browser = p.chromium.launch(headless=headless)
+    try:
+        browser = p.chromium.launch(headless=headless)
+    except Exception:
+        # Bundled Chromium can fail to spawn on a machine missing the
+        # Windows runtime it needs (side-by-side config error) -- fall
+        # back to the system-installed Chrome, which doesn't have that
+        # dependency gap. Same fix as nclt_search.py/bombay_hc_search.py.
+        browser = p.chromium.launch(channel="chrome", headless=headless)
     page = browser.new_context(viewport={"width": 1366, "height": 950}).new_page()
     return p, browser, page
 

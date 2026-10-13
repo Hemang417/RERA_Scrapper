@@ -203,8 +203,11 @@ def sweep(entity_names, state_codes=None, searcher=None, reporter=None,
                 hits = fn(name, reporter=reporter) or []
             except Exception as e:
                 # One state's outage must not sink the sweep, and must not
-                # be reported as "no projects there".
-                per_state[code]["failed"] = type(e).__name__
+                # be reported as "no projects there". The exception's own
+                # message, not its raw class name -- rules.md bans a raw
+                # exception string in either Charter document, and every
+                # raise site this sweeps over already writes clean prose.
+                per_state[code]["failed"] = str(e) or "a network or portal error"
                 continue
             for hit in hits:
                 row = dict(hit)
@@ -351,7 +354,7 @@ def enrich_projects(result, fetcher=None, reporter=None, limit=DEFAULT_DETAIL_LI
         try:
             summary = fn(reference, reporter=reporter) or {}
         except Exception as e:
-            project["detail_status"] = f"could not be opened ({type(e).__name__})"
+            project["detail_status"] = f"could not be opened ({e or 'a network or portal error'})"
             continue
         if not summary.get("opened"):
             project["detail_status"] = summary.get("note") or "could not be opened"
