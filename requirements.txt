@@ -12,4 +12,5 @@ docx2pdf>=0.1.8
 matplotlib>=3.8
 pdfplumber>=0.11
 pip-system-certs>=4.0
+certifi>=2024.0
 pytest>=8.0

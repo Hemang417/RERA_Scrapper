@@ -43,6 +43,7 @@ import time
 import pytesseract
 from PIL import Image
 
+import captcha_solver
 import config
 import gst_compliance
 
@@ -54,6 +55,10 @@ _SEL_INPUT = "#for_gstin"
 _SEL_SEARCH_BTN = "#lotsearch"
 _SEL_FILING_TABLE_BTN = "#filingTable"
 _FY_RE = re.compile(r"^\d{4}-\d{4}$")
+
+# CONFIRMED LIVE 2026-10-14 (same pass as captcha_solver._SEL_CAPTCHA_IMAGE):
+# id="fo-captcha" (name="cap"), placeholder "Enter Characters shown below".
+_SEL_CAPTCHA_INPUT = "#fo-captcha"
 
 # Same Tesseract-path bootstrap as mahabhumi.py, for the same reason:
 # pytesseract shells out to the tesseract binary by name, and on a
@@ -165,11 +170,146 @@ def _wait_for_captcha_solve(page, timeout_seconds: int, poll_interval: float, su
     raise CaptchaTimeoutError(f"No result within {timeout_seconds}s -- the CAPTCHA wasn't solved in time.")
 
 
+_SEL_CAPTCHA_REFRESH_BTN = "button:has(i.fa-refresh)"
+_MAX_AUTOSOLVE_ATTEMPTS = 4
+
+
+def _autosolve_attempt_succeeded(page, success_texts: tuple, timeout_ms: int = 20000) -> bool:
+    """After an autosolve + Search click, waits to see whether the page
+    actually moves past the CAPTCHA (one of `success_texts` showing up).
+
+    CONFIRMED LIVE 2026-10-14, two distinct bugs fixed in this function
+    after a real correct CapSolver solve ('904925') got misreported as
+    rejected:
+      1. A short (4s) window was nowhere near enough -- the real postback
+         after a CORRECT solve can take noticeably longer than that to
+         render the results table, so this used to give up and refresh the
+         CAPTCHA (discarding a right answer) before the result ever
+         rendered. Widened to 20s, matching the latency margin already used
+         elsewhere in this codebase for similar ASPX/Angular postbacks.
+      2. This used to return False the INSTANT it saw
+         _CAPTCHA_VALIDATION_ERROR_TEXT -- but that text can be stale,
+         still sitting in the DOM from the PREVIOUS failed attempt for a
+         moment after the new click, before Angular's digest cycle clears
+         it. Short-circuiting on it caught that leftover text and reported
+         failure before the real (possibly correct) result ever had a
+         chance to render. Never short-circuits on it any more -- only
+         `success_texts` ends the wait early; the error text no longer
+         matters once the retry loop's own outer timeout is the backstop.
+
+    Returns True/False rather than raising; a transient read error during
+    the check is treated as "not yet succeeded" so the retry loop above
+    gets another attempt rather than crashing on a flaky read."""
+    elapsed_ms = 0
+    poll_ms = 500
+    while elapsed_ms < timeout_ms:
+        try:
+            body_text = page.inner_text("body")
+            if any(text in body_text for text in success_texts):
+                return True
+        except Exception:
+            pass
+        page.wait_for_timeout(poll_ms)
+        elapsed_ms += poll_ms
+    return False
+
+
+def _solve_captcha_and_submit(
+    page,
+    search_btn_selector: str,
+    timeout_seconds: int,
+    poll_interval: float,
+    success_texts: tuple,
+    autosolve: bool | None,
+):
+    """Tries autosolve (CapSolver, see captcha_solver.py) when
+    requested, retrying up to _MAX_AUTOSOLVE_ATTEMPTS times against a FRESH
+    CAPTCHA image (via the portal's own refresh button) whenever a solve is
+    wrong -- CONFIRMED LIVE 2026-10-14: this portal gives instant, silent
+    feedback on a wrong guess (the page just redisplays with a validation
+    error, no lockout), so repeated attempts are safe and turn a
+    probabilistic per-attempt accuracy into a much higher eventual success
+    rate. ALWAYS falls back to the human wait-loop
+    (`_wait_for_captcha_solve`) if every attempt is exhausted or a non-solve
+    error occurs (a down solver account, a missing API key, a genuine
+    selector miss) -- rather than ever raising past this point without
+    giving a human the chance to finish the search in the same already-open
+    browser. `autosolve=None` (the default) defers to the
+    GST_CAPTCHA_AUTOSOLVE env var via captcha_solver's own gate."""
+    want_autosolve = autosolve if autosolve is not None else os.environ.get("GST_CAPTCHA_AUTOSOLVE") == "1"
+    if want_autosolve:
+        solved = False
+        for attempt in range(1, _MAX_AUTOSOLVE_ATTEMPTS + 1):
+            try:
+                backend_name, solved_text = captcha_solver.solve_gst_captcha(page, enabled=True)
+            except Exception as e:
+                print(f"[INFO] CAPTCHA autosolve attempt {attempt}/{_MAX_AUTOSOLVE_ATTEMPTS} failed ({e}).")
+                break  # a non-solve error (missing key, selector miss, etc.) won't fix itself on retry
+
+            # CONFIRMED LIVE 2026-10-14: this portal's CAPTCHA is always
+            # exactly 6 digits, but neither solver backend reliably honors
+            # the length/numeric hints passed to it (answers have come back
+            # anywhere from 4 to 6 characters). Catching an obviously wrong
+            # shape here, before ever filling it in and clicking Search,
+            # saves a full submit-and-wait cycle on an answer that cannot
+            # possibly be right.
+            if len(solved_text) != 6 or not solved_text.isdigit():
+                print(f"[INFO] {backend_name}'s solve ({solved_text!r}) isn't a valid 6-digit answer -- "
+                      f"skipping submission (attempt {attempt}/{_MAX_AUTOSOLVE_ATTEMPTS}).")
+            else:
+                try:
+                    # CONFIRMED LIVE 2026-10-14: page.fill() sets the DOM
+                    # value directly but does not reliably fire the full
+                    # keydown/keypress/keyup sequence this portal's Angular
+                    # form validator needs to mark the field ng-valid (the
+                    # visible green border) -- a genuinely CORRECT solve
+                    # ('981351'-shaped case) got misread as "rejected" because
+                    # Search was clicked before Angular considered the field
+                    # validly filled. press_sequentially() simulates real
+                    # per-character typing instead, the same events a human
+                    # typing it produces.
+                    captcha_input = page.locator(_SEL_CAPTCHA_INPUT)
+                    captcha_input.click()
+                    captcha_input.fill("")
+                    captcha_input.press_sequentially(solved_text, delay=50)
+                    page.click(search_btn_selector, timeout=10000)
+                except Exception as e:
+                    print(f"[INFO] CAPTCHA autosolve attempt {attempt}/{_MAX_AUTOSOLVE_ATTEMPTS} failed ({e}).")
+                    break
+
+                if _autosolve_attempt_succeeded(page, success_texts):
+                    print(f"[INFO] {backend_name} solved the CAPTCHA ({solved_text!r}) on attempt "
+                          f"{attempt}/{_MAX_AUTOSOLVE_ATTEMPTS} and Search was submitted automatically.")
+                    solved = True
+                    break
+
+                print(f"[INFO] {backend_name}'s solve ({solved_text!r}) was rejected by the portal "
+                      f"(attempt {attempt}/{_MAX_AUTOSOLVE_ATTEMPTS}).")
+
+            if attempt < _MAX_AUTOSOLVE_ATTEMPTS:
+                try:
+                    page.click(_SEL_CAPTCHA_REFRESH_BTN, timeout=5000)
+                    page.wait_for_timeout(1000)  # let the new image actually load before re-screenshotting
+                except Exception as e:
+                    print(f"[INFO] Could not refresh the CAPTCHA for another attempt ({e}).")
+                    break
+
+        if not solved:
+            print(f"[INFO] CAPTCHA autosolve did not succeed within {_MAX_AUTOSOLVE_ATTEMPTS} attempt(s) "
+                  f"-- falling back to a human solve.")
+            print("[INFO] Please read the CAPTCHA shown there, type it in, and click Search.")
+    else:
+        print("[INFO] Please read the CAPTCHA shown there, type it in, and click Search.")
+
+    _wait_for_captcha_solve(page, timeout_seconds, poll_interval, success_texts=success_texts)
+
+
 def search_gstins_by_pan(
     pan: str,
     timeout_seconds: int = config.CAPTCHA_TIMEOUT_SECONDS,
     poll_interval: float = config.CAPTCHA_POLL_INTERVAL_SECONDS,
     screenshot_path: str | None = None,
+    autosolve: bool | None = True,
 ) -> dict:
     """Opens a VISIBLE browser at the Search-by-PAN page, fills in `pan`,
     then waits for a human to solve the CAPTCHA and click Search. Returns
@@ -183,15 +323,36 @@ def search_gstins_by_pan(
     p, browser, page = _launch(headless=False)
     try:
         page.goto(_SEARCH_BY_PAN_URL, timeout=30000)
-        page.wait_for_selector(_SEL_INPUT, timeout=15000)
+        try:
+            page.wait_for_selector(_SEL_INPUT, timeout=15000)
+        except Exception:
+            # DIAGNOSTIC ONLY (temporary, 2026-10-14): this selector has
+            # timed out 3 times in a row against this exact URL while a
+            # different browser engine loaded the same page fine seconds
+            # apart -- capturing what Playwright actually received to tell
+            # a genuine bot-detection response apart from ordinary slowness
+            # before changing anything further.
+            diag_path = os.path.join(os.path.dirname(screenshot_path) if screenshot_path else ".", "_pan_search_timeout_diag.png")
+            try:
+                page.screenshot(path=diag_path, full_page=True)
+            except Exception:
+                diag_path = "(screenshot also failed)"
+            print(f"[DIAG] #for_gstin never appeared. url={page.url!r} title={page.title()!r} "
+                  f"screenshot={diag_path!r}")
+            print(f"[DIAG] body text (first 500 chars): {page.inner_text('body')[:500]!r}")
+            raise
         page.fill(_SEL_INPUT, pan.strip().upper())
+        # CONFIRMED LIVE 2026-10-14: the CAPTCHA (#imgCaptcha) does not mount
+        # into the DOM until the PAN field validates -- fill() alone doesn't
+        # trigger that, an Enter keypress does.
+        page.press(_SEL_INPUT, "Enter")
 
         print(f"\n[INFO] A browser window has opened at {_SEARCH_BY_PAN_URL}")
-        print("[INFO] Please read the CAPTCHA shown there, type it in, and click Search.")
         try:
-            _wait_for_captcha_solve(
-                page, timeout_seconds, poll_interval,
+            _solve_captcha_and_submit(
+                page, _SEL_SEARCH_BTN, timeout_seconds, poll_interval,
                 success_texts=("GSTIN", "Legal Name", "State Jurisdiction", "No records found"),
+                autosolve=autosolve,
             )
         except (CaptchaTimeoutError, BrowserClosedError) as e:
             return {"found": False, "gstins": [], "note": str(e)}
@@ -220,6 +381,7 @@ def fetch_gstin_filing_table(
     poll_interval: float = config.CAPTCHA_POLL_INTERVAL_SECONDS,
     screenshot_path: str | None = None,
     years: tuple[str, ...] | None = None,
+    autosolve: bool | None = True,
 ) -> dict:
     """Opens a VISIBLE browser at the Search-by-GSTIN page, fills in
     `gstin`, waits for a human to solve the CAPTCHA and click Search, then
@@ -244,13 +406,15 @@ def fetch_gstin_filing_table(
         page.goto(_SEARCH_BY_GSTIN_URL, timeout=30000)
         page.wait_for_selector(_SEL_INPUT, timeout=15000)
         page.fill(_SEL_INPUT, gstin.strip().upper())
+        # Same CAPTCHA-mount trigger as search_gstins_by_pan above.
+        page.press(_SEL_INPUT, "Enter")
 
         print(f"\n[INFO] A browser window has opened at {_SEARCH_BY_GSTIN_URL}")
-        print("[INFO] Please read the CAPTCHA shown there, type it in, and click Search.")
         try:
-            _wait_for_captcha_solve(
-                page, timeout_seconds, poll_interval,
+            _solve_captcha_and_submit(
+                page, _SEL_SEARCH_BTN, timeout_seconds, poll_interval,
                 success_texts=("Legal Name", "Registration Effective", "Constitution of Business", "No records found"),
+                autosolve=autosolve,
             )
         except (CaptchaTimeoutError, BrowserClosedError) as e:
             return {"found": False, "note": str(e)}

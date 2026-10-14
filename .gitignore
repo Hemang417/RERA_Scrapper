@@ -16,3 +16,7 @@ _up_captcha_*_result.txt
 
 # igr_maharashtra_search.py's own result dumps -- same, diagnostic output.
 _igr_maharashtra_*_result.txt
+
+# captcha_solver.py's own persisted spend tracker -- local runtime state,
+# not source; see captcha_usage_summary().
+captcha_solve_usage.json
