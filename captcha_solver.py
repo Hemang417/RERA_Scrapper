@@ -593,6 +593,153 @@ def solve_mahabhumi_captcha(
     return "Claude vision", _solve_with_claude_vision(raw_bytes, _MAHABHUMI_FORMAT_HINT, "mahabhumi")
 
 
+# CONFIRMED LIVE 2026-10-15 against rerait.telangana.gov.in/SearchList/Search:
+# id="captchaImage", served from a dedicated endpoint
+# (/SearchList/SearchCaptcha) rather than a data: URI or a URL with a
+# changing token -- the <img>'s own src string is IDENTICAL across loads
+# even though the rendered content differs, so the before/after src-token
+# diff IGR/Mahabhumi use to detect rejection does NOT work here. A live
+# sample read cleanly by a human as uppercase letters only ("BYXSN") in a
+# stylized italic serif font against a plain dotted-border background, no
+# grid noise or strikethrough line.
+_SEL_TS_RERA_CAPTCHA_IMAGE = "#captchaImage"
+_TS_RERA_FORMAT_HINT = (
+    "The text is uppercase letters only, rendered in a stylized italic serif font, shown against "
+    "a plain background with a dotted border -- no grid noise or strikethrough line."
+)
+
+
+def solve_ts_rera_captcha(
+    page,
+    enabled: bool = False,
+    image_selector: str = _SEL_TS_RERA_CAPTCHA_IMAGE,
+) -> tuple[str, str]:
+    """Screenshots the CAPTCHA image on `page` (a Playwright Page, same
+    object ts_rera_client.py already holds) and solves it via Claude vision
+    on the raw screenshot (no preprocessing -- no adversarial noise
+    confirmed, unlike GST). Returns (backend_name, solved_text). Raises
+    CaptchaSolveError/CaptchaSolverNotConfigured if Claude vision isn't
+    configured or the call fails -- the caller's own retry loop (see
+    ts_rera_client.py's search_and_fetch) is what absorbs an occasional
+    misread.
+
+    `enabled` must be passed True explicitly (or TS_RERA_CAPTCHA_AUTOSOLVE=1
+    set in the environment) -- same deliberate double gate as the other
+    solve_*_captcha functions, so autosolve can never fire just because this
+    module is imported or a key happens to be set in the environment for an
+    unrelated reason."""
+    if not (enabled or os.environ.get("TS_RERA_CAPTCHA_AUTOSOLVE") == "1"):
+        raise CaptchaSolveError(
+            "CAPTCHA autosolve is not enabled -- pass enabled=True or set TS_RERA_CAPTCHA_AUTOSOLVE=1."
+        )
+
+    if not _anthropic_api_key():
+        raise CaptchaSolverNotConfigured(
+            "ANTHROPIC_API_KEY is not set -- required to auto-solve the TS-RERA CAPTCHA."
+        )
+
+    locator = page.locator(image_selector).first
+    locator.wait_for(state="visible", timeout=15000)
+    raw_bytes = locator.screenshot()
+    return "Claude vision", _solve_with_claude_vision(raw_bytes, _TS_RERA_FORMAT_HINT, "ts_rera")
+
+
+# CONFIRMED LIVE 2026-10-15 against www.up-rera.in/View_projects.aspx: the
+# <img> has no id (ASP.NET's CaptchaImage.axd handler control renders a bare
+# <img src="CaptchaImage.axd?guid=...">), so this is matched by its src
+# pattern rather than an id. A live sample read as mixed-case alphanumeric
+# in GREEN text ("PV9NK") against light dot noise, no strikethrough/grid --
+# similar style to IGR's own colored CAPTCHA.
+_SEL_UP_RERA_CAPTCHA_IMAGE = "img[src*='CaptchaImage']"
+_UP_RERA_FORMAT_HINT = (
+    "The text is colored (green), mixed-case alphanumeric, shown against light dot noise -- no "
+    "strikethrough line or grid. Read and report the EXACT case of each character; do not "
+    "normalize to uppercase or lowercase."
+)
+
+
+def solve_up_rera_captcha(
+    page,
+    enabled: bool = False,
+    image_selector: str = _SEL_UP_RERA_CAPTCHA_IMAGE,
+) -> tuple[str, str]:
+    """Screenshots the CAPTCHA image on `page` (a Playwright Page, same
+    object up_captcha_search.py already holds) and solves it via Claude
+    vision on the raw screenshot (no preprocessing -- no adversarial noise
+    confirmed, unlike GST). Returns (backend_name, solved_text). Raises
+    CaptchaSolveError/CaptchaSolverNotConfigured if Claude vision isn't
+    configured or the call fails -- the caller's own retry loop (see
+    up_captcha_search.py) is what absorbs an occasional misread.
+
+    `enabled` must be passed True explicitly (or UP_RERA_CAPTCHA_AUTOSOLVE=1
+    set in the environment) -- same deliberate double gate as the other
+    solve_*_captcha functions, so autosolve can never fire just because this
+    module is imported or a key happens to be set in the environment for an
+    unrelated reason."""
+    if not (enabled or os.environ.get("UP_RERA_CAPTCHA_AUTOSOLVE") == "1"):
+        raise CaptchaSolveError(
+            "CAPTCHA autosolve is not enabled -- pass enabled=True or set UP_RERA_CAPTCHA_AUTOSOLVE=1."
+        )
+
+    if not _anthropic_api_key():
+        raise CaptchaSolverNotConfigured(
+            "ANTHROPIC_API_KEY is not set -- required to auto-solve the UP-RERA/UP-REAT CAPTCHA."
+        )
+
+    locator = page.locator(image_selector).first
+    locator.wait_for(state="visible", timeout=15000)
+    raw_bytes = locator.screenshot()
+    return "Claude vision", _solve_with_claude_vision(raw_bytes, _UP_RERA_FORMAT_HINT, "up_rera")
+
+
+# CONFIRMED LIVE 2026-10-15 against efilingreat.up.gov.in/upreat/judgement.php
+# (a DIFFERENT government portal/domain than up-rera.in's own project search
+# just above, with a visually distinct CAPTCHA style -- each gets its own
+# dedicated solver, same convention as every other portal in this file):
+# class="captcha" src="captcha.php". A live sample read as digits only
+# ("67942") in yellow/orange italic text on a solid blue background box, no
+# dot noise or strikethrough line.
+_SEL_UP_REAT_CAPTCHA_IMAGE = "img.captcha"
+_UP_REAT_FORMAT_HINT = (
+    "The text is digits only (0-9), rendered in yellow/orange italic text on a solid blue "
+    "background box -- no dot noise, grid, or strikethrough line."
+)
+
+
+def solve_up_reat_captcha(
+    page,
+    enabled: bool = False,
+    image_selector: str = _SEL_UP_REAT_CAPTCHA_IMAGE,
+) -> tuple[str, str]:
+    """Screenshots the CAPTCHA image on `page` (a Playwright Page, same
+    object up_captcha_search.py already holds) and solves it via Claude
+    vision on the raw screenshot. Returns (backend_name, solved_text).
+    Raises CaptchaSolveError/CaptchaSolverNotConfigured if Claude vision
+    isn't configured or the call fails -- the caller's own retry loop (see
+    up_captcha_search.py's search_appeals) is what absorbs an occasional
+    misread.
+
+    `enabled` must be passed True explicitly (or UP_REAT_CAPTCHA_AUTOSOLVE=1
+    set in the environment) -- same deliberate double gate as the other
+    solve_*_captcha functions, so autosolve can never fire just because this
+    module is imported or a key happens to be set in the environment for an
+    unrelated reason."""
+    if not (enabled or os.environ.get("UP_REAT_CAPTCHA_AUTOSOLVE") == "1"):
+        raise CaptchaSolveError(
+            "CAPTCHA autosolve is not enabled -- pass enabled=True or set UP_REAT_CAPTCHA_AUTOSOLVE=1."
+        )
+
+    if not _anthropic_api_key():
+        raise CaptchaSolverNotConfigured(
+            "ANTHROPIC_API_KEY is not set -- required to auto-solve the UP-REAT CAPTCHA."
+        )
+
+    locator = page.locator(image_selector).first
+    locator.wait_for(state="visible", timeout=15000)
+    raw_bytes = locator.screenshot()
+    return "Claude vision", _solve_with_claude_vision(raw_bytes, _UP_REAT_FORMAT_HINT, "up_reat")
+
+
 def translate_indian_name(name: str, context: str = "") -> str:
     """Translates/transliterates an Indian person or company name written in
     Devanagari (or another Indian script) into the idiomatic English

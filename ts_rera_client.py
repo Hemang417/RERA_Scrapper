@@ -10,12 +10,12 @@ accounts, land, land-owner/investor promoters, building/unit detail) lives on
 one server-rendered "PrintPreview" page reached from the search results'
 "View" link.
 
-Nothing here solves the CAPTCHA -- a human must read and type it into the
-visible browser window this opens, exactly like session_auth.py's MahaRERA
-flow. This only automates the plumbing around that: launching the browser,
-pre-filling the project name, waiting for the human to submit a successful
-search, then (if one candidate is chosen) opening its PrintPreview page and
-parsing the parts of it that matter for a Company Charter.
+CAPTCHA solving is Claude-vision-only (captcha_solver.solve_ts_rera_captcha),
+same zero-human-intervention policy as every other portal in this codebase.
+This automates the plumbing around that: launching the browser, pre-filling
+the project name, solving the CAPTCHA and submitting itself, then (if one
+candidate is chosen) opening its PrintPreview page and parsing the parts of
+it that matter for a Company Charter.
 
 Standalone use:
     python ts_rera_client.py "constella"
@@ -25,10 +25,29 @@ import re
 import sys
 import time
 
+import captcha_solver
+
 TG_RERA_SEARCH_URL = "https://rerait.telangana.gov.in/SearchList/Search"
 
 DEFAULT_TIMEOUT_SECONDS = 300
 DEFAULT_POLL_INTERVAL_SECONDS = 1.0
+
+_SEL_PROJECT_INPUT = "input[placeholder='Project Name']"
+_SEL_CAPTCHA_IMAGE = "#captchaImage"
+_SEL_CAPTCHA_INPUT = "#Captcha"
+_SEL_SUBMIT_BTN = "#btnSearch"
+# Same cap as every other portal's Claude-vision autosolve loop.
+_MAX_AUTOSOLVE_ATTEMPTS = 8
+# How long a single attempt gets to show a results transition (either "No
+# Records Found" or a populated table -- see _try_extract_results) before
+# giving up on it and trying again. This is a traditional full-page POST
+# (id="btnSearch" is type=submit, not an AJAX button), so a rejected CAPTCHA
+# means the server simply re-renders the SAME search form -- nothing here
+# ever transitions to "Search Result"/"No Records Found" text, which is
+# exactly what _try_extract_results returning None (not [] or a list) across
+# this whole window means: reuse it as the accept/reject signal directly
+# rather than inventing a second one.
+_AUTOSOLVE_ATTEMPT_TIMEOUT_SECONDS = 15.0
 
 
 class TSReraTimeoutError(Exception):
@@ -58,10 +77,10 @@ def search_and_fetch(
             "detail": {...} | None,   # populated iff exactly one candidate and auto_open_single_match
         }
 
-    Raises TSReraTimeoutError if no results table appears within
-    timeout_seconds, TSReraNotFoundError if the search legitimately returns
-    zero rows. Never solves the CAPTCHA itself -- see module docstring.
-    """
+    Raises TSReraTimeoutError if the CAPTCHA isn't accepted within
+    _MAX_AUTOSOLVE_ATTEMPTS or the overall `timeout_seconds` budget runs out
+    first, TSReraNotFoundError if the search legitimately returns zero
+    rows."""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError as e:
@@ -88,25 +107,68 @@ def search_and_fetch(
 
             print(f"[INFO] A browser window has opened at {TG_RERA_SEARCH_URL}")
             print(f"[INFO] Project Name has been pre-filled with '{project_name}' where possible.")
-            print("[INFO] Please solve the CAPTCHA and click Search.")
-            print(f"[INFO] Waiting up to {timeout_seconds}s for a result...")
+            print(f"[INFO] Solving the CAPTCHA via Claude vision (up to {_MAX_AUTOSOLVE_ATTEMPTS} attempts)...")
 
-            elapsed = 0.0
-            last_status_at = 0.0
             candidates = None
-            while elapsed < timeout_seconds:
-                candidates = _try_extract_results(page)
-                if candidates is not None:
+            loop_deadline = time.time() + timeout_seconds
+            for attempt in range(1, _MAX_AUTOSOLVE_ATTEMPTS + 1):
+                if page.is_closed():
+                    raise TSReraBrowserClosedError("Browser window was closed before the CAPTCHA was solved.")
+                if time.time() > loop_deadline:
+                    print(f"[INFO] Overall timeout_seconds={timeout_seconds}s budget exhausted "
+                          f"before attempt {attempt}/{_MAX_AUTOSOLVE_ATTEMPTS} -- stopping.")
                     break
-                time.sleep(poll_interval)
-                elapsed += poll_interval
-                if elapsed - last_status_at >= 30:
-                    print(f"[INFO] Still waiting ({int(elapsed)}s/{timeout_seconds}s)...")
-                    last_status_at = elapsed
+
+                # Cheap insurance against the project-name field being reset
+                # by the same full-page re-render a rejected CAPTCHA causes
+                # -- not yet confirmed live to happen here, but costs
+                # nothing to guard against given it's a known pattern on
+                # every ASP.NET-family portal this codebase has automated so
+                # far.
+                try:
+                    if page.input_value(_SEL_PROJECT_INPUT) != project_name:
+                        page.fill(_SEL_PROJECT_INPUT, project_name)
+                except Exception:
+                    pass
+
+                try:
+                    backend_name, solved_text = captcha_solver.solve_ts_rera_captcha(page, enabled=True)
+                    captcha_input = page.locator(_SEL_CAPTCHA_INPUT)
+                    captcha_input.click()
+                    captcha_input.fill("")
+                    captcha_input.press_sequentially(solved_text, delay=50)
+                    page.click(_SEL_SUBMIT_BTN, timeout=10000)
+                except Exception as e:
+                    print(f"[INFO] CAPTCHA autosolve attempt {attempt}/{_MAX_AUTOSOLVE_ATTEMPTS} failed ({e}).")
+                    continue
+
+                # This is a traditional full-page POST (btnSearch is
+                # type=submit) -- a rejected CAPTCHA just re-renders the SAME
+                # search form with a fresh image (standard MVC validation-
+                # failure behavior), which never produces "Search Result" or
+                # "No Records Found" text. _try_extract_results returning
+                # None across this whole window IS the reject signal; no
+                # separate CAPTCHA-image-token check is needed (and none is
+                # possible here -- see captcha_solver.py's own note that this
+                # <img>'s src string never changes regardless of content).
+                deadline = time.time() + _AUTOSOLVE_ATTEMPT_TIMEOUT_SECONDS
+                while time.time() < deadline:
+                    candidates = _try_extract_results(page)
+                    if candidates is not None:
+                        break
+                    time.sleep(poll_interval)
+
+                if candidates is not None:
+                    print(f"[OK] {backend_name}'s solve ('{solved_text}') was accepted on attempt "
+                          f"{attempt}/{_MAX_AUTOSOLVE_ATTEMPTS}.")
+                    break
+                print(f"[INFO] {backend_name}'s solve ('{solved_text}') on attempt "
+                      f"{attempt}/{_MAX_AUTOSOLVE_ATTEMPTS} was not accepted within "
+                      f"{_AUTOSOLVE_ATTEMPT_TIMEOUT_SECONDS:.0f}s -- trying again.")
 
             if candidates is None:
                 raise TSReraTimeoutError(
-                    f"No search result (or 'No Records Found') within {timeout_seconds}s."
+                    f"CAPTCHA was not accepted after {_MAX_AUTOSOLVE_ATTEMPTS} Claude-vision attempts."
                 )
             if not candidates:
                 raise TSReraNotFoundError(f"TS-RERA search for '{project_name}' returned zero results.")
