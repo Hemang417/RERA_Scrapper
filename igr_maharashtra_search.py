@@ -109,7 +109,12 @@ _REGISTRATION_TYPE_RADIO = {
 }
 
 _SEL_CAPTCHA_INPUT = "#TextBox1"
-_MAX_AUTOSOLVE_ATTEMPTS = 4
+# Bumped from 4 2026-10-15 when the human-wait fallback was removed from
+# both search_by_document_number and search_by_property -- autosolve is
+# now the only path, so a bit more retry headroom costs nothing (each
+# Claude vision call is a fraction of a cent) and is cheaper than the $5
+# cross-run budget cap ever becoming the real limiting factor.
+_MAX_AUTOSOLVE_ATTEMPTS = 8
 
 
 class CaptchaTimeoutError(Exception):
@@ -187,47 +192,12 @@ def _select_by_contains(page, selector: str, text_contains: str,
     return None
 
 
-def _wait_for_human_submit(page, timeout_seconds, request_predicate, post_submit_marker=None):
-    """Blocks until a request matching `request_predicate` fires, or
-    `timeout_seconds` elapses -- the SAME shape as up_captcha_search.py's
-    helper of the same name, because the failure modes are identical on an
-    ASP.NET WebForms page: waiting for ANY navigation or ANY body-text
-    change trips on things a human does before ever reaching Search (a
-    district select's own postback, a CAPTCHA refresh click). The
-    predicate must therefore name the SPECIFIC request the real Search
-    button makes -- confirmed live here for both modes: property search
-    POSTs the control name `btnSearch`, document-number search POSTs
-    `btnSearchDoc`.
-    """
-    print(f"[INFO] Waiting up to {timeout_seconds}s for you to solve the CAPTCHA and click Search...")
-    try:
-        with page.expect_request(request_predicate, timeout=timeout_seconds * 1000):
-            pass
-    except Exception as e:
-        if page.is_closed():
-            raise BrowserClosedError("Browser window was closed before the CAPTCHA was solved.") from e
-        raise CaptchaTimeoutError(
-            f"No Search submit within {timeout_seconds}s -- the CAPTCHA wasn't solved in time."
-        ) from e
-    try:
-        page.wait_for_load_state("load", timeout=8000)
-    except Exception:
-        pass
-    _settle(page, timeout_ms=8000)
-    if post_submit_marker:
-        try:
-            page.wait_for_selector(post_submit_marker, timeout=15000)
-        except Exception:
-            pass
-    time.sleep(1.0)
-
-
 def _wait_for_search_to_finish(page, timeout_seconds=120):
-    """After a human submits, THIS PORTAL CAN GENUINELY TAKE MINUTES to
+    """After Search is submitted, THIS PORTAL CAN GENUINELY TAKE MINUTES to
     render the real result -- its own FAQ says so outright ("Search result
-    will take few minutes to show result"). _wait_for_human_submit only
-    proves the Search POST fired and the page began reloading; it does
-    NOT prove the result has actually rendered by the time it returns.
+    will take few minutes to show result"). The submit itself only proves
+    the Search POST fired and the page began reloading; it does NOT prove
+    the result has actually rendered by the time it returns.
 
     CONFIRMED LIVE 2026-09-01, a real human CAPTCHA solve against
     region=urban/Pune/Gulatekadi/3223: reading raw_text right after
@@ -315,9 +285,9 @@ def _captcha_image_token(page) -> str | None:
 
 
 def _autosolve_docno_captcha(page, autosolve: bool | None) -> bool:
-    """Attempts CapSolver/Claude-vision autosolve (see
-    captcha_solver.solve_igr_captcha) up to _MAX_AUTOSOLVE_ATTEMPTS times
-    against the Document Number search's CAPTCHA, reusing this portal's own
+    """Attempts Claude-vision autosolve (see captcha_solver.solve_igr_captcha)
+    up to _MAX_AUTOSOLVE_ATTEMPTS times against the Document Number search's
+    CAPTCHA, reusing this portal's own
     already-proven behavior: a wrong CAPTCHA rejects IN PLACE (no
     navigation) with "Entered Captcha is incorrect" and swaps in a fresh
     CAPTCHA image automatically -- no refresh button needed, unlike GST/
@@ -462,10 +432,29 @@ def _parse_document_results(html: str) -> list[dict]:
     {"name"}) -- the portal's own formatting for a party list, kept as-is
     rather than stripped, since a multi-party deed's braces are the only
     thing separating one party from the next.
+
+    CONFIRMED LIVE 2026-10-15 against a real 12-row RegistrationGrid: this
+    grid's own PAGER renders as its table's LAST <tr>, one <td> spanning
+    every column, wrapping a NESTED <table> of page-number links -- and
+    `table.find_all("tr")` recurses into that nested table too, so a naive
+    row collection picked up TWO garbage "rows" out of it (the wrapping
+    <tr> itself, cell text collapsed to "1 2 3 4 5", and the nested
+    table's own <tr> with "1"/"2"/"3"/... as separate cells) in addition
+    to the 10 genuine documents on that page. Those two caused Index II
+    fetches to time out, since 'indexII$10'/'indexII$11' postback targets
+    don't exist -- there IS no row 10/11, just a mis-parsed pager. Both
+    are excluded here by provenance, not by guessing at their text: a row
+    is only this table's OWN row if its nearest <table> ancestor is this
+    exact table (excludes the nested pager table's own <tr>), and only
+    kept if it doesn't itself wrap a further nested <table> (excludes the
+    wrapping pager <tr>).
     """
     soup = BeautifulSoup(html, "html.parser")
     for table in soup.find_all("table"):
-        rows = [tr.find_all(["td", "th"]) for tr in table.find_all("tr")]
+        rows = [
+            tr.find_all(["td", "th"]) for tr in table.find_all("tr")
+            if tr.find_parent("table") is table and tr.find("table") is None
+        ]
         rows = [r for r in rows if r]
         if not rows:
             continue
@@ -497,28 +486,105 @@ def _parse_document_results(html: str) -> list[dict]:
 _INDEX_II_REPORT_PATH = "isaritaHTMLReportSuchiKramank2_RegLive.aspx"
 
 
-def _fetch_index_ii_documents(page, row_count: int) -> list[str | None]:
+def _fetch_index_ii_documents(page, row_count: int, max_attempts: int = 3) -> list[str | None]:
     """Fetches the Index II text for every row (0-indexed, matching the
     portal's own indexII$N convention) on the CURRENTLY DISPLAYED results
     page, in order, using Playwright's popup capture so the main results
     page's own DOM/session state is never reloaded or disturbed between
     rows. Returns one entry per row -- the Index II text on success, None
-    on any per-row failure (never raises; one bad row must not lose every
-    other row's document)."""
+    if every attempt for that row failed (never raises; one bad row must
+    not lose every other row's document).
+
+    CONFIRMED LIVE 2026-10-15: individual rows can intermittently time out
+    waiting for the popup even on a genuine, correctly-paged results page
+    -- not a pagination/dedup issue, just occasional popup-open flakiness
+    that got noticeably worse later in a page's row sequence (rows 6/7/9
+    of 10 failed in one run) -- so each row gets up to `max_attempts`
+    tries with a short pause before retrying, and a brief pause after
+    every row (success or not) to avoid firing popups back-to-back as
+    fast as Playwright can, which is the likely reason later rows in a
+    page degraded more than earlier ones."""
     texts: list[str | None] = []
     for i in range(row_count):
-        try:
-            with page.expect_popup(timeout=15000) as popup_info:
-                page.evaluate(f"__doPostBack('RegistrationGrid','indexII${i}')")
-            popup = popup_info.value
-            popup.wait_for_load_state("load", timeout=15000)
-            text = popup.inner_text("body")
-            popup.close()
-            texts.append(text)
-        except Exception as e:
-            print(f"[INFO] Could not fetch Index II for row {i} ({e}).")
-            texts.append(None)
+        text = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                with page.expect_popup(timeout=15000) as popup_info:
+                    page.evaluate(f"__doPostBack('RegistrationGrid','indexII${i}')")
+                popup = popup_info.value
+                popup.wait_for_load_state("load", timeout=15000)
+                text = popup.inner_text("body")
+                popup.close()
+                break
+            except Exception as e:
+                if attempt < max_attempts:
+                    print(f"[INFO] Index II fetch for row {i} failed on attempt "
+                          f"{attempt}/{max_attempts} ({e}) -- retrying.")
+                    page.wait_for_timeout(1500)
+                else:
+                    print(f"[INFO] Could not fetch Index II for row {i} after "
+                          f"{max_attempts} attempt(s) ({e}).")
+        texts.append(text)
+        page.wait_for_timeout(300)
     return texts
+
+
+def _collect_all_results(page, fetch_index_ii: bool) -> list[dict]:
+    """Walks EVERY page of the RegistrationGrid results table, not just the
+    first -- CONFIRMED LIVE 2026-10-15 this grid paginates (PageSize=10,
+    standard ASP.NET GridView numeric pager) and a single read silently
+    dropped every row past the first 10. Assumes the CURRENT page (as
+    loaded by the caller) is page 1.
+
+    Navigates via the SAME __doPostBack('RegistrationGrid','Page$N')
+    convention the pager's own numeric links use, incrementing N by one
+    each time and stopping as soon as that literal target string no
+    longer appears anywhere in the current page's HTML -- i.e. following
+    "is there a next page" rather than reading a total page count up
+    front, since the pager's own numeric links don't include the current
+    page (so there's no single "you are on page N of M" line to parse).
+
+    CONFIRMED LIVE 2026-10-15: the pager can advertise MORE page-number
+    targets (Page$2..Page$5) than real pages of DISTINCT data actually
+    exist -- clicking 'Page$N' past the true last page re-renders the
+    EXACT SAME 10 rows rather than failing or going blank, which an
+    earlier version of this loop (following link presence alone) read as
+    4 more genuine pages, producing 50 rows that were really the same 10
+    documents five times over (and wasted/flaky Index II popups on each
+    repeat). Each page's row set is fingerprinted (docno/rdate/sroname
+    tuples) and compared against every page already collected; a repeat
+    fingerprint means the real last page was already passed, so it stops
+    there instead of trusting the pager's own link count."""
+    all_rows: list[dict] = []
+    seen_page_signatures: set[tuple] = set()
+    current_page = 1
+    while True:
+        html = _safe_read(page.content, min_length=5000)
+        page_rows = _parse_document_results(html)
+        signature = tuple(sorted(
+            (r.get("docno", ""), r.get("rdate", ""), r.get("sroname", "")) for r in page_rows
+        ))
+        if signature in seen_page_signatures:
+            break
+        seen_page_signatures.add(signature)
+
+        if fetch_index_ii and page_rows:
+            index_ii_texts = _fetch_index_ii_documents(page, len(page_rows))
+            for row, text in zip(page_rows, index_ii_texts):
+                row["index_ii_text"] = text
+        all_rows.extend(page_rows)
+
+        next_page = current_page + 1
+        if f"Page${next_page}" not in html:
+            break
+        try:
+            page.evaluate(f"__doPostBack('RegistrationGrid','Page${next_page}')")
+        except Exception:
+            break
+        _settle(page, timeout_ms=10000)
+        page.wait_for_timeout(2000)
+        current_page = next_page
+    return all_rows
 
 
 def search_by_document_number(
@@ -621,69 +687,15 @@ def search_by_document_number(
               f"SRO={matched_sro!r}, Year={year}, Doc No.={doc_number} are pre-filled.")
 
         if not _autosolve_docno_captcha(page, autosolve):
-            print("[INFO] Please read the CAPTCHA shown there, type it into the box, and click Search.")
-            # This portal rejects a wrong CAPTCHA in place -- same page, no
-            # navigation, a fresh CAPTCHA image swapped in -- rather than
-            # reloading. Confirmed live: _wait_for_human_submit's request
-            # predicate matches btnSearchDoc on THAT FIRST (wrong) submit just
-            # as validly as a correct one, so without this loop the function
-            # returned immediately after the human's first attempt, started
-            # tearing the browser down, and cut them off before they could ever
-            # give the real second answer. Retry the same wait, budgeted off
-            # the ORIGINAL timeout_seconds so a human who needs several tries
-            # still gets the full time they were promised, not
-            # timeout_seconds-per-attempt.
-            deadline = time.time() + timeout_seconds
-            max_attempts = 30
-            for attempt in range(1, max_attempts + 1):
-                remaining = max(5, int(deadline - time.time()))
-                try:
-                    _wait_for_human_submit(
-                        page, remaining,
-                        request_predicate=lambda req: req.method == "POST" and "btnSearchDoc" in (req.post_data or ""),
-                        post_submit_marker="#txtDocumentNo",
-                    )
-                except (CaptchaTimeoutError, BrowserClosedError) as e:
-                    return {"found": False, "rows": [], "raw_text": "", "url": page.url, "note": str(e)}
-
-                # The "Entered Captcha is incorrect" message is an ASP.NET
-                # UpdatePanel partial postback, not a full navigation, so
-                # _wait_for_human_submit's own "load" event wait can return
-                # before this text has actually rendered -- confirmed live: a
-                # single fixed 2.5s wait still missed it (a screenshot taken
-                # moments later, after _wait_for_search_to_finish, caught the
-                # message that this exact check had just declared absent). Poll
-                # instead of guessing one fixed delay: check repeatedly for up
-                # to 12s, and treat "still not there after 12s" as a real
-                # accept rather than a slow reject.
-                rejected = False
-                poll_deadline = time.time() + 20
-                while time.time() < poll_deadline:
-                    body_now = _safe_read(lambda: page.inner_text("body"), min_length=1) or ""
-                    if "entered captcha is incorrect" in body_now.lower():
-                        rejected = True
-                        break
-                    page.wait_for_timeout(500)
-                if not rejected:
-                    break
-                if attempt == max_attempts or time.time() >= deadline:
-                    return {
-                        "found": False, "rows": [], "raw_text": body_now, "url": page.url,
-                        "note": f"CAPTCHA rejected {attempt} time(s) in a row; gave up rather than keep the browser open indefinitely.",
-                    }
-                # Same freshness wait as before the first attempt -- the new
-                # CAPTCHA image that replaces the rejected one needs a moment
-                # to actually finish loading too.
-                try:
-                    page.wait_for_function(
-                        "() => { const img = document.querySelector('img[src*=\"Captcha\"], img[id*=\"Captcha\" i], img[id*=\"img\" i]'); "
-                        "return img && img.complete && img.naturalWidth > 0; }",
-                        timeout=10000,
-                    )
-                except Exception:
-                    pass
-                print(f"[INFO] That CAPTCHA was rejected (attempt {attempt}). A new one has appeared -- "
-                      f"please read it and click Search again.")
+            # No human-wait fallback (removed 2026-10-15, see
+            # captcha_solver.py's own module docstring) -- a fully
+            # unattended run has no one there to solve it, so an honest
+            # failure here beats tying up the browser waiting for someone
+            # who isn't coming.
+            return {
+                "found": False, "rows": [], "raw_text": "", "url": page.url,
+                "note": "CAPTCHA autosolve did not succeed -- no human-wait fallback.",
+            }
 
         finished = _wait_for_search_to_finish(page)
         html = _safe_read(page.content, min_length=5000)
@@ -691,10 +703,10 @@ def search_by_document_number(
         if screenshot_path:
             _safe_read(lambda: page.screenshot(path=screenshot_path, full_page=True))
         rows = _parse_document_results(html)
-        if rows and fetch_index_ii:
-            index_ii_texts = _fetch_index_ii_documents(page, len(rows))
-            for row, text in zip(rows, index_ii_texts):
-                row["index_ii_text"] = text
+        if rows:
+            # CONFIRMED LIVE 2026-10-15: this grid paginates at 10 rows --
+            # walk every page rather than reporting only this first one.
+            rows = _collect_all_results(page, fetch_index_ii)
         if rows:
             note = ""
         elif not finished:
@@ -819,10 +831,45 @@ def _fill_mumbai_area(page, village: str, timeout_ms: int = 25000) -> bool:
     site's autocomplete only resolves on a genuine change-triggered
     postback, not on keystrokes. Neither rest_of_maharashtra nor urban has
     an equivalent free-text step; their area/village selects cascade
-    straight off a district or taluka select instead."""
-    page.fill("#txtAreaName", village)
-    page.evaluate("__doPostBack('txtAreaName','')")
-    return _select_cascading(page, "#ddlareaname", village, timeout_ms)
+    straight off a district or taluka select instead.
+
+    CONFIRMED LIVE 2026-10-15 by a human watching the real browser: typing
+    via press_sequentially() then pressing a real Tab key -- a genuine
+    blur, not a forced page.evaluate("__doPostBack(...)") call -- fires
+    this field's own autopostback the same way a person tabbing through
+    the form would, and #ddlareaname populates from it exactly as before.
+    Kept because the earlier evaluate()-driven postback is what every
+    prior field-reset investigation was built on top of; switching to a
+    real keyboard-driven commit here is the one combination not yet tried
+    against the CAPTCHA-rejection reset bug (see _autosolve_property_
+    captcha's own docstring)."""
+    field = page.locator("#txtAreaName")
+    field.click()
+    field.fill("")
+    field.press_sequentially(village, delay=50)
+    page.keyboard.press("Tab")
+    matched = _select_cascading(page, "#ddlareaname", village, timeout_ms)
+    if not matched:
+        return False
+
+    # CONFIRMED LIVE 2026-10-15 by a human watching the real browser: the
+    # postback above also clears #txtAreaName back to empty (the real
+    # selected value lives in the dropdown, not the text box -- this part
+    # is normal/expected, not a bug). But leaving it empty at submit time
+    # risks the portal treating Village Name as an unfilled required
+    # field. A plain fill() here (no Tab, no triggering another postback)
+    # puts the text back without disturbing #ddlareaname's own selection.
+    #
+    # NOTE: an earlier version of this function also fired a second,
+    # "warm-up" postback on #ddlareaname itself here, on the theory that
+    # its selection wasn't valid server-side without one. That was
+    # DISPROVEN by directly diffing the real POST payload of a failing run
+    # against a working one (see _autosolve_property_captcha's own
+    # docstring for the actual cause, a stale __EVENTTARGET) -- the
+    # warm-up changed nothing live and was removed rather than left in as
+    # dead weight.
+    field.fill(village)
+    return True
 
 
 def _setup_property_search_form(
@@ -885,41 +932,180 @@ def _setup_property_search_form(
               f"notes some names need an unusual spelling (e.g. 'Daadar' not 'Dadar')."
         )
 
-    page.fill(fields["property"], str(property_number))
+    # Real Tab (not a plain fill()) to keep the whole chain -- village name,
+    # village select, property no., captcha -- committed via genuine
+    # keyboard events the same way _fill_mumbai_area's village field now is,
+    # leaving focus in the CAPTCHA field ready for _autosolve_property_
+    # captcha to type straight into.
+    property_field = page.locator(fields["property"])
+    property_field.click()
+    property_field.fill("")
+    property_field.press_sequentially(str(property_number), delay=50)
+    page.keyboard.press("Tab")
+
+    # CONFIRMED LIVE 2026-10-15 by diffing the real POST payload of a
+    # failing run against a working one: the __doPostBack('txtAreaName',
+    # ...) call(s) above leave __EVENTTARGET pointing at that textbox, and
+    # nothing clears it afterward -- so whichever submission comes next
+    # (autosolve or the human-fallback click) gets silently routed to
+    # Village Name's own postback handler server-side instead of the
+    # Search button's, meaning the CAPTCHA validates fine but the actual
+    # search query never runs. Cleared here, once, right after setup
+    # finishes, so BOTH paths start from a clean state regardless of which
+    # one ends up submitting; _autosolve_property_captcha clears it again
+    # before every one of its own retries for the same reason.
+    try:
+        page.evaluate(
+            "document.getElementById('__EVENTTARGET').value = ''; "
+            "document.getElementById('__EVENTARGUMENT').value = '';"
+        )
+    except Exception:
+        pass
     return None
+
+
+def _recover_blanked_property_fields(page, fields: dict, district_label: str, year, village: str, property_number) -> bool:
+    """Refills ONLY whichever of District/Year/Select Village/Village Name/
+    Property No. are currently wrong, IN PLACE on the current page -- no
+    page.goto(), no re-running the whole setup sequence. CONFIRMED LIVE
+    2026-10-15 by a human watching the real browser: after a rejected
+    CAPTCHA, any of these can revert to a placeholder/default while still
+    WITHIN THE SAME page load/session. The human explicitly corrected a
+    full-page-reload recovery here: reloading starts an entirely new
+    CAPTCHA session with the portal rather than cleanly continuing the
+    current one, so this stays on the same page and only touches whatever
+    has actually gone wrong. Returns True if anything needed refilling
+    (purely informational for the caller's own logging)."""
+    wrong = _property_field_status(page, fields, district_label, year, village, property_number)
+    if "district" in wrong:
+        page.select_option(fields["district"], label=district_label)
+        _settle(page)
+        page.wait_for_timeout(3000)
+    if "year" in wrong and year is not None:
+        page.select_option(fields["year"], label=str(year))
+        _settle(page)
+        page.wait_for_timeout(3000)
+    if "select_village" in wrong:
+        _select_cascading(page, "#ddlareaname", village, timeout_ms=10000)
+    if "village_name" in wrong:
+        page.locator("#txtAreaName").fill(village)
+    if "property_no" in wrong:
+        page.locator(fields["property"]).fill(str(property_number))
+    return bool(wrong)
+
+
+def _property_field_status(page, fields: dict, district_label: str, year, village: str, property_number) -> dict:
+    """Reads back District/Year/Select Village/Village Name/Property No.'s
+    CURRENT values against what they should be, WITHOUT changing anything.
+    Returns a dict naming only the field(s) that are wrong (empty dict if
+    everything matches).
+
+    CONFIRMED LIVE 2026-10-15 by a human watching the real browser, TWICE:
+    first an earlier version of the caller's own "was this genuinely
+    accepted" check only ever looked at Property No., missing a Select
+    Village reset that produced a stable-but-FALSE "no results" reading
+    across an entire multi-year sweep (see [[feedback_partial_field_reset_
+    check_false_negative]]). After THAT was fixed to also check Select
+    Village/Village Name, the SAME class of false negative recurred for a
+    year (2020) already confirmed to have real documents -- this time
+    because District and/or Year, mentioned in this module's own older
+    comments as part of the same "whole form reset" but never actually
+    added to this check, were the fields that had reset. Every field this
+    module has EVER observed resetting is checked here now, not just
+    whichever ones were implicated by the most recent failure -- a partial
+    fix for a partial-check bug is still a partial check."""
+    wrong = {}
+
+    district_select = page.locator(fields["district"])
+    try:
+        current_district = district_select.locator("option:checked").inner_text().strip()
+    except Exception:
+        current_district = ""
+    if current_district.casefold() != district_label.strip().casefold():
+        wrong["district"] = current_district
+
+    if year is not None:
+        year_select = page.locator(fields["year"])
+        try:
+            current_year = year_select.locator("option:checked").inner_text().strip()
+        except Exception:
+            current_year = ""
+        if current_year != str(year):
+            wrong["year"] = current_year
+
+    village_select = page.locator("#ddlareaname")
+    try:
+        selected_text = village_select.locator("option:checked").inner_text().strip()
+    except Exception:
+        selected_text = ""
+    if selected_text.casefold() != village.strip().casefold():
+        wrong["select_village"] = selected_text
+
+    area_name_field = page.locator("#txtAreaName")
+    current_area_name = _safe_read(lambda: area_name_field.input_value(), min_length=0)
+    if not current_area_name:
+        wrong["village_name"] = current_area_name
+
+    property_field = page.locator(fields["property"])
+    current_property = _safe_read(lambda: property_field.input_value(), min_length=0)
+    if current_property != str(property_number):
+        wrong["property_no"] = current_property
+
+    return wrong
 
 
 def _autosolve_property_captcha(
     page, region: str, fields: dict, district_label: str, year, taluka, village: str, property_number,
     autosolve: bool | None,
 ) -> bool:
-    """Tries CapSolver/Claude-vision autosolve (see
-    captcha_solver.solve_igr_captcha) against Property Details search's
-    CAPTCHA, adapted to this mode's own confirmed signal: a correct solve
-    hides the Search button and/or shows "Entered Correct Captcha" (see
-    _property_search_shows_no_result). Only runs where `fields` has a
-    'captcha_image' key (a CONFIRMED selector, currently only the "mumbai"
-    region) -- returns False immediately otherwise, same as
-    autosolve-not-configured, so an unconfirmed region always falls
-    through to the proven human-wait loop untouched.
+    """Tries Claude-vision autosolve (see captcha_solver.solve_igr_captcha)
+    against Property Details search's CAPTCHA.
 
-    FULL RESTART on each retry, unlike _autosolve_docno_captcha's
-    in-place retry -- CONFIRMED LIVE 2026-10-14 across THREE separate
-    in-place-refill strategies (immediate, delayed+field-by-field with
-    its own success check, and button-visibility detection alone): a
-    non-accepted submit here can reset Year/Village/Area/Property No. on
-    a DELAYED, apparently RECURRING basis that is not a single
-    predictable-window event -- one attempt's refill reported success
-    (no error, the selection call completed) and the form still reverted
-    to blank again moments later with no further action taken, confirmed
-    by a human watching the real browser. No in-place JS fix can reliably
-    win against a reset that can recur after its own success was already
-    confirmed. A full page navigation sidesteps the problem entirely
-    instead of trying to win that race: it discards whatever pending
-    client- or server-driven state existed, so each attempt begins from a
-    guaranteed-clean document, verified via _setup_property_search_form's
-    own already-proven-reliable field-by-field sequence -- the same one
-    the very first attempt already uses successfully."""
+    IN-PLACE retry, STAYING ON THE SAME PAGE/SESSION throughout: a
+    rejected submit is re-solved without navigating away. Select Village/
+    Property No. (occasionally Village Name's own text box too) can still
+    go blank after a rejection even with Village Name committed via real
+    keystrokes + an actual Tab keypress (see _fill_mumbai_area /
+    _setup_property_search_form) -- when that happens, only the blanked
+    field(s) are refilled in place (_recover_blanked_property_fields),
+    never via a fresh page.goto(). CONFIRMED LIVE 2026-10-15 by a human
+    watching the real browser and explicitly correcting an earlier version
+    of this function that reloaded the page on every reset: reloading
+    starts an entirely new CAPTCHA session with the portal rather than
+    continuing the current one -- the whole point of staying in place is
+    that the session itself (not just the visible field values) carries
+    state across a rejected attempt. A full _setup_property_search_form
+    reload is kept only as a last resort if in-place recovery itself
+    doesn't hold.
+
+    ACCEPT SIGNAL -- TWO rounds of live correction, CONFIRMED 2026-10-15 by
+    a human watching the real browser both times:
+      1. Neither the Search button's own visibility nor "Entered Correct
+         Captcha" text can be trusted the way _autosolve_docno_captcha
+         trusts them on Document Number search -- both read as "accepted"
+         here on an attempt that had NOT actually been accepted.
+      2. The "Please Wait....." loader appearing is ALSO not itself an
+         accept signal -- it appears for EVERY submit, accepted or not, as
+         the portal's own field/captcha validation step; on a rejected
+         CAPTCHA specifically, once that check finishes the portal swaps in
+         a FRESH CAPTCHA image for another try, rather than showing any
+         "incorrect" text the way Document Number search does.
+    The one signal left unfalsified: after "Please Wait" clears, has the
+    CAPTCHA image's own src token changed? A changed token means the
+    portal rejected that attempt and is waiting for a new one -- loop back
+    and solve the NEW image. An unchanged token (or the image no longer
+    present at all) means the submission actually went through to a real
+    results page -- stop here and let the caller's own result-table
+    polling take over, exactly per that live correction: stop submitting
+    CAPTCHAs the moment the loader appears, and let the wait-for-results
+    step run from there.
+
+    A staleness check guards against the possibility that the earlier
+    field-reset bug can still recur for some other reason: before
+    re-solving on attempt 2+, the Property No. field is read back, and
+    only if it no longer matches what was set is the old full
+    _setup_property_search_form redo used -- kept as a fallback, not the
+    default path."""
     want_autosolve = autosolve if autosolve is not None else os.environ.get("IGR_CAPTCHA_AUTOSOLVE") == "1"
     if not want_autosolve or "captcha_image" not in fields:
         return False
@@ -929,68 +1115,131 @@ def _autosolve_property_captcha(
     image_selector = fields["captcha_image"]
 
     for attempt in range(1, _MAX_AUTOSOLVE_ATTEMPTS + 1):
-        if attempt > 1:
-            setup_error = _setup_property_search_form(
-                page, region, fields, district_label, year, taluka, village, property_number
-            )
-            if setup_error:
-                print(f"[INFO] Could not re-set-up the search form on attempt "
-                      f"{attempt}/{_MAX_AUTOSOLVE_ATTEMPTS} ({setup_error}).")
-                continue
+        # CONFIRMED LIVE 2026-10-15, per explicit user instruction after
+        # watching this live: check+fix every field BEFORE every single
+        # CAPTCHA attempt, including the very first -- not just retries.
+        # Setup just ran moments before attempt 1, but a field can still
+        # have drifted by the time this point is reached (confirmed: a
+        # reset was once caught on "attempt 1" itself, before any
+        # rejection had even been recorded).
+        wrong = _property_field_status(page, fields, district_label, year, village, property_number)
+        if wrong:
+            print(f"[INFO] {sorted(wrong)} no longer match before attempt {attempt} -- "
+                  f"refilling in place, same session (no page reload).")
+            _recover_blanked_property_fields(page, fields, district_label, year, village, property_number)
+            still_wrong = _property_field_status(page, fields, district_label, year, village, property_number)
+            if still_wrong:
+                print(f"[INFO] In-place recovery did not hold on attempt {attempt}/"
+                      f"{_MAX_AUTOSOLVE_ATTEMPTS} ({sorted(still_wrong)} still wrong) -- redoing "
+                      f"full setup from a fresh page load as a last resort.")
+                setup_error = _setup_property_search_form(
+                    page, region, fields, district_label, year, taluka, village, property_number
+                )
+                if setup_error:
+                    print(f"[INFO] Could not re-set-up the search form on attempt "
+                          f"{attempt}/{_MAX_AUTOSOLVE_ATTEMPTS} ({setup_error}).")
+                    continue
 
+        pre_solve_token = _safe_read(lambda: page.locator(image_selector).first.get_attribute("src"), min_length=0)
         try:
             backend_name, solved_text = captcha_solver.solve_igr_captcha(page, image_selector=image_selector, enabled=True)
             captcha_input = page.locator(captcha_input_selector)
             captcha_input.click()
             captcha_input.fill("")
             captcha_input.press_sequentially(solved_text, delay=50)
+            # ROOT CAUSE, CONFIRMED LIVE 2026-10-15 by diffing the actual
+            # POST data of a failing run against a working one: on a FIRST
+            # CAPTCHA attempt, __EVENTTARGET is still 'txtAreaName' --
+            # leftover from the __doPostBack('txtAreaName',...) calls
+            # _fill_mumbai_area fires during setup, which nothing clears
+            # afterward. ASP.NET routes a postback to WHATEVER control
+            # __EVENTTARGET names, so the server re-runs Village Name's own
+            # postback handler instead of the Search button's -- the
+            # CAPTCHA still gets validated (a page-level check, not tied to
+            # a specific control's event), so "Entered Correct Captcha"
+            # genuinely appears, but the actual search query never runs,
+            # which is why every first-attempt accept came back with 0
+            # rows. A REJECTED attempt's own response resets these hidden
+            # fields to empty by default, which is why every retry-accept
+            # worked. Clearing them explicitly right before every click --
+            # not just retries -- removes the dependency on an accidental
+            # prior rejection to reach a correct state.
+            page.evaluate(
+                "document.getElementById('__EVENTTARGET').value = ''; "
+                "document.getElementById('__EVENTARGUMENT').value = '';"
+            )
             page.click(search_selector, timeout=10000)
         except Exception as e:
             print(f"[INFO] CAPTCHA autosolve attempt {attempt}/{_MAX_AUTOSOLVE_ATTEMPTS} failed ({e}).")
             continue
 
-        try:
-            page.wait_for_load_state("load", timeout=8000)
-        except Exception:
-            pass
-        _settle(page, timeout_ms=8000)
-        time.sleep(1.0)
-
-        # CONFIRMED LIVE 2026-10-14 by a human watching the real browser
-        # (the same signal already fixed into _autosolve_docno_captcha's
-        # own detection): the portal hides the Search button once a
-        # submission is GENUINELY accepted and starts processing -- a
-        # more reliable, faster signal than waiting for "Entered Correct
-        # Captcha" text, which can be slow to render or even be a stale
-        # leftover from a PREVIOUS attempt still sitting in the DOM. The
-        # button's own visibility is checked FIRST, every poll, and
-        # treated as authoritative over the text.
-        accepted = False
-        poll_deadline = time.time() + 20
-        while time.time() < poll_deadline:
-            try:
-                button_visible = page.locator(search_selector).is_visible()
-            except Exception:
-                button_visible = False
-            if not button_visible:
-                accepted = True
-                break
+        # "Please Wait" appears for EVERY submit, accepted or not (it's the
+        # portal's own validation step) -- wait for it to clear before
+        # reading anything, same signal _wait_for_search_to_finish already
+        # polls for elsewhere in this module.
+        wait_deadline = time.time() + 20
+        while time.time() < wait_deadline:
             body_now = _safe_read(lambda: page.inner_text("body"), min_length=1) or ""
-            if "entered correct captcha" in body_now.casefold():
-                accepted = True
+            if "please wait" not in body_now.casefold():
                 break
             page.wait_for_timeout(500)
 
-        if accepted:
+        # CONFIRMED LIVE 2026-10-15 by a human watching the real browser: a
+        # REJECTED attempt's only visible aftermath is a FRESH CAPTCHA
+        # image swapped in once "Please Wait" clears -- no "incorrect"
+        # text the way Document Number search shows. So a CHANGED image
+        # token means rejected (solve the new one next); an unchanged
+        # token, or the image no longer present at all, means the
+        # submission went through to a real results page.
+        #
+        # The swap isn't necessarily instant the moment "Please Wait" text
+        # disappears -- poll briefly rather than reading the token once,
+        # so a delayed swap isn't misread as "unchanged" (accepted).
+        rejected = False
+        settle_deadline = time.time() + 5
+        while time.time() < settle_deadline:
+            current_token = _safe_read(lambda: page.locator(image_selector).first.get_attribute("src"), min_length=0)
+            if current_token and current_token != pre_solve_token:
+                rejected = True
+                break
+            page.wait_for_timeout(500)
+
+        if not rejected:
+            # CONFIRMED LIVE 2026-10-15: an "unchanged" reading also covers
+            # the CAPTCHA image being GONE entirely -- which happened once
+            # not because Search succeeded, but because the WHOLE FORM had
+            # been reset back to its blank placeholders (District back to
+            # "---Select District----", Property No. cleared), the same
+            # reset bug _setup_property_search_form's own retry exists
+            # for. A genuine results page leaves every field exactly as
+            # submitted; a silent reset does not -- check ALL of them (not
+            # just Property No., which an earlier version of this check
+            # missed -- see _property_field_status's own docstring for the
+            # live-confirmed false-negative that gap caused) before
+            # trusting "no fresh CAPTCHA" as acceptance.
+            wrong = _property_field_status(page, fields, district_label, year, village, property_number)
+            if wrong:
+                print(f"[INFO] {backend_name}'s solve ({solved_text!r}) on attempt "
+                      f"{attempt}/{_MAX_AUTOSOLVE_ATTEMPTS} left no fresh CAPTCHA behind, but "
+                      f"{sorted(wrong)} no longer match -- the form was reset, not accepted. "
+                      f"Refilling in place, same session, before the next attempt.")
+                _recover_blanked_property_fields(page, fields, district_label, year, village, property_number)
+                continue
             print(f"[INFO] {backend_name} solved the CAPTCHA ({solved_text!r}) on attempt "
-                  f"{attempt}/{_MAX_AUTOSOLVE_ATTEMPTS} and Search was submitted automatically.")
+                  f"{attempt}/{_MAX_AUTOSOLVE_ATTEMPTS} -- no fresh CAPTCHA appeared after "
+                  f"'Please Wait' cleared, so Search went through to a real results page.")
             return True
 
-        print(f"[INFO] {backend_name}'s solve ({solved_text!r}) was not confirmed accepted "
-              f"(attempt {attempt}/{_MAX_AUTOSOLVE_ATTEMPTS}).")
+        print(f"[INFO] {backend_name}'s solve ({solved_text!r}) was rejected (attempt "
+              f"{attempt}/{_MAX_AUTOSOLVE_ATTEMPTS}) -- a fresh CAPTCHA appeared after "
+              f"'Please Wait' cleared; solving that one next, fields left untouched.")
 
-    print(f"[INFO] CAPTCHA autosolve did not succeed within {_MAX_AUTOSOLVE_ATTEMPTS} full attempt(s) "
-          f"-- falling back to a human solve.")
+        try:
+            page.wait_for_selector(search_selector, state="visible", timeout=10000)
+        except Exception:
+            pass
+
+    print(f"[INFO] CAPTCHA autosolve did not succeed within {_MAX_AUTOSOLVE_ATTEMPTS} attempt(s).")
     return False
 
 
@@ -1063,16 +1312,15 @@ def search_by_property(
               + f"Village/Area={village!r}, Property No.={property_number} are pre-filled.")
 
         if not _autosolve_property_captcha(page, region, fields, district_label, year, taluka, village, property_number, autosolve):
-            print("[INFO] Please read the CAPTCHA shown there, type it into the box, and click Search.")
-            control_name = fields["search_control_name"]
-            try:
-                _wait_for_human_submit(
-                    page, timeout_seconds,
-                    request_predicate=lambda req: req.method == "POST" and control_name in (req.post_data or ""),
-                    post_submit_marker=fields["property"],
-                )
-            except (CaptchaTimeoutError, BrowserClosedError) as e:
-                return {"found": False, "rows": [], "raw_text": "", "url": page.url, "note": str(e)}
+            # No human-wait fallback (removed 2026-10-15, see
+            # captcha_solver.py's own module docstring) -- a fully
+            # unattended run has no one there to solve it, so an honest
+            # failure here beats tying up the browser waiting for someone
+            # who isn't coming.
+            return {
+                "found": False, "rows": [], "raw_text": "", "url": page.url,
+                "note": "CAPTCHA autosolve did not succeed -- no human-wait fallback.",
+            }
 
         finished = _wait_for_search_to_finish(page)
         # CONFIRMED LIVE 2026-10-14: _wait_for_search_to_finish's "please
@@ -1090,17 +1338,37 @@ def search_by_property(
         body_text = ""
         rows = []
         if finished:
-            poll_deadline = time.time() + 90
+            # CONFIRMED LIVE 2026-10-15: widening the TOTAL window alone
+            # (90s->150s) did nothing, because the stability counter was
+            # exiting after only 3-5 consecutive "no result" reads (~15s),
+            # nowhere near either ceiling -- a real result that takes
+            # longer than ~15s to render past "Entered Correct Captcha"
+            # would always lose the race. Separately: every "0 rows" run
+            # so far was accepted on the VERY FIRST CAPTCHA attempt, and
+            # every real-match run had at least one prior rejection/reset
+            # cycle -- consistent with a cold first-accept search genuinely
+            # taking longer behind the scenes than a session that already
+            # did a postback or two. So the fix is a much longer required
+            # STABILITY window (60s of continuous "no result" reads, not
+            # ~15s) before giving up, not just a longer ceiling -- plus
+            # timing logged so a future run can confirm or rule this out
+            # with real numbers instead of another guess.
+            poll_started = time.time()
+            poll_deadline = poll_started + 150
             stable_no_result_checks = 0
+            required_stable_checks = 20  # ~60s of continuous "no result" reads
             while time.time() < poll_deadline:
                 html = _safe_read(page.content, min_length=5000)
                 body_text = _safe_read(lambda: page.inner_text("body"), min_length=200)
                 rows = _parse_document_results(html)
                 if rows:
+                    print(f"[INFO] Real results table appeared after {time.time() - poll_started:.1f}s of polling.")
                     break
                 if _property_search_shows_no_result(body_text):
                     stable_no_result_checks += 1
-                    if stable_no_result_checks >= 3:
+                    if stable_no_result_checks >= required_stable_checks:
+                        print(f"[INFO] 'No result' reading held stable for "
+                              f"{time.time() - poll_started:.1f}s -- concluding no match.")
                         break
                 else:
                     stable_no_result_checks = 0
@@ -1121,10 +1389,10 @@ def search_by_property(
         # honest that this had never been tested against a real hit).
         # Try the real parser FIRST; only fall through to the inferred
         # "no results" reading when it finds nothing.
-        if rows and fetch_index_ii:
-            index_ii_texts = _fetch_index_ii_documents(page, len(rows))
-            for row, text in zip(rows, index_ii_texts):
-                row["index_ii_text"] = text
+        if rows:
+            # CONFIRMED LIVE 2026-10-15: this grid paginates at 10 rows --
+            # walk every page rather than reporting only this first one.
+            rows = _collect_all_results(page, fetch_index_ii)
         if rows:
             found, note = True, ""
         elif not finished:

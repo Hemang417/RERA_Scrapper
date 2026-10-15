@@ -1,28 +1,19 @@
 """
 Captures a MahaRERA guest access token by opening a real, visible browser on
-the project's public detail page and waiting for a human to solve the
-CAPTCHA gate shown there.
+the project's public detail page and autosolving the CAPTCHA gate shown
+there via Claude vision (see captcha_solver.solve_maharera_captcha).
 
-By default, nothing here solves the CAPTCHA itself -- a person must read and
-type it in the browser window that pops up. This only automates the
-plumbing around that: launching the browser, waiting for the site to mint
-the token into sessionStorage once the CAPTCHA is passed, reading it out,
-and caching it -- the same token a human would otherwise copy manually via
-DevTools > Application > Session Storage.
-
-Autosolve (CapSolver, see captcha_solver.solve_maharera_captcha) is an
-explicit opt-in on top of that (autosolve=True, the default for this
-function, or MAHARERA_CAPTCHA_AUTOSOLVE=1) -- same policy-reversal caveat as
-gst_portal.py/captcha_solver.py: this automates a step every other
-CAPTCHA-gated module here deliberately leaves to a human (see
-guardrails.md's "HUMAN budget" framing). Autosolve ALWAYS falls back to the
-proven human-wait loop below on any failure -- a wrong solve, a missing
-CAPSOLVER_API_KEY, a selector miss -- so a human can always still finish the
-job in the same already-open browser.
+Autosolve (autosolve=True, the default for this function, or
+MAHARERA_CAPTCHA_AUTOSOLVE=1) is a policy reversal from every other
+CAPTCHA-gated module in this pipeline's original design (see guardrails.md's
+"HUMAN budget" framing) -- CONFIRMED LIVE across repeated trials this is
+reliable enough (proven 5/5) that, as of 2026-10-15, this no longer falls
+back to a human-wait loop on failure: a fully unattended run has no one
+there to solve it anyway, so that wait was dead time, not a real fallback.
+Raises CaptchaTimeoutError if every autosolve attempt fails.
 """
 
 import os
-import time
 
 import captcha_solver
 import config
@@ -63,7 +54,11 @@ _SEL_CAPTCHA_INPUT = 'input[name="captcha"]'
 _SEL_CAPTCHA_SUBMIT_BTN = "button.next"
 _SEL_CAPTCHA_REFRESH_BTN = "a.cpt-btn"
 _SEL_ERROR_MODAL_CLOSE_BTN = "button.btn-close"
-_MAX_AUTOSOLVE_ATTEMPTS = 4
+# Bumped from 4 2026-10-15 when the human-wait fallback was removed --
+# autosolve is now the only path, so a bit more retry headroom costs
+# nothing (each Claude vision call is a fraction of a cent) and is cheaper
+# than the $5 cross-run budget cap ever becoming the real limiting factor.
+_MAX_AUTOSOLVE_ATTEMPTS = 8
 
 
 def _read_token(page):
@@ -74,14 +69,14 @@ def _read_token(page):
 
 
 def _try_autosolve(page, autosolve: bool | None) -> str | None:
-    """Attempts CapSolver autosolve up to _MAX_AUTOSOLVE_ATTEMPTS times,
+    """Attempts Claude-vision autosolve up to _MAX_AUTOSOLVE_ATTEMPTS times,
     refreshing the CAPTCHA between wrong guesses -- same retry discipline as
     gst_portal.py's _solve_captcha_and_submit, adapted to this portal's much
     more reliable success signal: the real accessToken appearing in
     sessionStorage once the portal actually accepts the solve, rather than a
     fragile page-text match. Returns the token on success, or None if
     autosolve isn't enabled/configured or every attempt fails -- the caller
-    then proceeds to the existing human-wait loop unchanged."""
+    raises CaptchaTimeoutError in that case (no human-wait fallback)."""
     want_autosolve = autosolve if autosolve is not None else os.environ.get("MAHARERA_CAPTCHA_AUTOSOLVE") == "1"
     if not want_autosolve:
         return None
@@ -146,16 +141,17 @@ def acquire_token_via_browser(
     poll_interval: float = config.CAPTCHA_POLL_INTERVAL_SECONDS,
     autosolve: bool | None = True,
 ) -> str:
-    """Opens a visible browser on the project's public detail page, tries
-    CapSolver autosolve (see _try_autosolve; pass autosolve=False to skip
-    straight to the human wait), then waits for a human to solve the
-    CAPTCHA gate shown there, then reads and caches the resulting guest
-    accessToken.
+    """Opens a visible browser on the project's public detail page, autosolves
+    the CAPTCHA gate shown there via Claude vision (see _try_autosolve), then
+    reads and caches the resulting guest accessToken.
 
-    Raises CaptchaTimeoutError if nobody solves it within timeout_seconds, or
-    BrowserClosedError if the window is closed early. Callers should treat
-    both as "no token available this time" and fall back gracefully rather
-    than aborting the whole run.
+    Raises CaptchaTimeoutError if every autosolve attempt fails (no
+    human-wait fallback -- removed 2026-10-15, see this module's own
+    docstring), or BrowserClosedError if the window is closed early. Callers
+    should treat both as "no token available this time" and fall back
+    gracefully rather than aborting the whole run. `timeout_seconds`/
+    `poll_interval` are kept for call-site compatibility but no longer
+    control a wait loop here.
     """
     try:
         from playwright.sync_api import sync_playwright
@@ -190,30 +186,9 @@ def acquire_token_via_browser(
                 token_cache.save(token)
                 return token
 
-            print(f"[INFO] A browser window has opened at {url}")
-            print("[INFO] Please solve the CAPTCHA shown there and click Submit.")
-            print(f"[INFO] Waiting up to {timeout_seconds}s for you to finish...")
-
-            elapsed = 0.0
-            last_status_at = 0.0
-            while elapsed < timeout_seconds:
-                token = _read_token(page)
-                if token:
-                    token_cache.save(token)
-                    print("[OK] Session captured -- continuing automatically.")
-                    return token
-
-                time.sleep(poll_interval)
-                elapsed += poll_interval
-                if elapsed - last_status_at >= 30:
-                    print(
-                        f"[INFO] Still waiting for the CAPTCHA to be solved "
-                        f"({int(elapsed)}s/{timeout_seconds}s)..."
-                    )
-                    last_status_at = elapsed
-
             raise CaptchaTimeoutError(
-                f"No session captured within {timeout_seconds}s -- the CAPTCHA wasn't solved in time."
+                f"CAPTCHA autosolve did not succeed within {_MAX_AUTOSOLVE_ATTEMPTS} attempt(s) -- "
+                "no human-wait fallback (removed 2026-10-15; see this module's own docstring)."
             )
         finally:
             try:

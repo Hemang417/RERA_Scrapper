@@ -20,3 +20,8 @@ _igr_maharashtra_*_result.txt
 # captcha_solver.py's own persisted spend tracker -- local runtime state,
 # not source; see captcha_usage_summary().
 captcha_solve_usage.json
+
+# Local API keys, read by captcha_solver.py's _load_dotenv_once() as a
+# fallback when a Machine-level env var isn't visible to this process's
+# own sandboxed execution environment -- never committed.
+.env

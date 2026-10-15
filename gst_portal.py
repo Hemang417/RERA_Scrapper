@@ -120,58 +120,12 @@ def _ocr_screenshot(page, screenshot_path: str) -> str:
         return f"[OCR unavailable: {e}]"
 
 
-def _wait_for_captcha_solve(page, timeout_seconds: int, poll_interval: float, success_texts: tuple):
-    """Shared CAPTCHA-wait loop for both search flows below -- same
-    hard-won robustness as mahabhumi.py's fetch_property_card (built and
-    live-fixed earlier this session against a structurally similar
-    ASP.NET/ASPX-style postback site): checks for any of `success_texts`
-    appearing (the most specific, lowest-false-positive signal), a URL
-    change, or a substantial jump in rendered visible text, and treats a
-    mid-postback "execution context destroyed" error as evidence
-    something just happened rather than a fatal failure. NOT YET
-    confirmed live past an actual CAPTCHA solve (see module docstring) --
-    the exact success_texts to look for here are this module's own best
-    guess (GST-portal-specific labels its documented UI is known to show),
-    to be corrected by a real live test the same way mahabhumi.py's
-    detection was."""
-    elapsed = 0.0
-    last_status_at = 0.0
-    starting_url = page.url
-    try:
-        starting_visible_text_len = len(page.inner_text("body"))
-    except Exception:
-        # A transient read failure this early (before the loop's own
-        # per-iteration protection even applies) must not crash the whole
-        # wait -- 0 is a safe fallback baseline, since any real content
-        # appearing later will still trip the "substantial jump" check.
-        starting_visible_text_len = 0
-    print(f"[INFO] Waiting up to {timeout_seconds}s for you to finish...")
-    while elapsed < timeout_seconds:
-        if page.is_closed():
-            raise BrowserClosedError("Browser window was closed before the CAPTCHA was solved.")
-        try:
-            body_text = page.inner_text("body")
-            changed = (
-                any(text in body_text for text in success_texts)
-                or page.url != starting_url
-                or abs(len(body_text) - starting_visible_text_len) > 200
-            )
-        except Exception:
-            time.sleep(poll_interval)
-            elapsed += poll_interval
-            continue
-        if changed:
-            return
-        time.sleep(poll_interval)
-        elapsed += poll_interval
-        if elapsed - last_status_at >= 30:
-            print(f"[INFO] Still waiting for the CAPTCHA to be solved ({int(elapsed)}s/{timeout_seconds}s)...")
-            last_status_at = elapsed
-    raise CaptchaTimeoutError(f"No result within {timeout_seconds}s -- the CAPTCHA wasn't solved in time.")
-
-
 _SEL_CAPTCHA_REFRESH_BTN = "button:has(i.fa-refresh)"
-_MAX_AUTOSOLVE_ATTEMPTS = 4
+# Bumped from 4 2026-10-15 when the human-wait fallback was removed --
+# autosolve is now the only path, so a bit more retry headroom costs
+# nothing (each Claude vision call is a fraction of a cent) and is cheaper
+# than the $5 cross-run budget cap ever becoming the real limiting factor.
+_MAX_AUTOSOLVE_ATTEMPTS = 8
 
 
 def _autosolve_attempt_succeeded(page, success_texts: tuple, timeout_ms: int = 20000) -> bool:
@@ -222,86 +176,84 @@ def _solve_captcha_and_submit(
     success_texts: tuple,
     autosolve: bool | None,
 ):
-    """Tries autosolve (CapSolver, see captcha_solver.py) when
-    requested, retrying up to _MAX_AUTOSOLVE_ATTEMPTS times against a FRESH
-    CAPTCHA image (via the portal's own refresh button) whenever a solve is
-    wrong -- CONFIRMED LIVE 2026-10-14: this portal gives instant, silent
-    feedback on a wrong guess (the page just redisplays with a validation
-    error, no lockout), so repeated attempts are safe and turn a
-    probabilistic per-attempt accuracy into a much higher eventual success
-    rate. ALWAYS falls back to the human wait-loop
-    (`_wait_for_captcha_solve`) if every attempt is exhausted or a non-solve
-    error occurs (a down solver account, a missing API key, a genuine
-    selector miss) -- rather than ever raising past this point without
-    giving a human the chance to finish the search in the same already-open
-    browser. `autosolve=None` (the default) defers to the
+    """Tries Claude-vision autosolve (see captcha_solver.py), retrying up to
+    _MAX_AUTOSOLVE_ATTEMPTS times against a FRESH CAPTCHA image (via the
+    portal's own refresh button) whenever a solve is wrong -- CONFIRMED LIVE
+    2026-10-14: this portal gives instant, silent feedback on a wrong guess
+    (the page just redisplays with a validation error, no lockout), so
+    repeated attempts are safe and turn a probabilistic per-attempt accuracy
+    into a much higher eventual success rate. Raises CaptchaTimeoutError if
+    autosolve isn't enabled or every attempt is exhausted -- no human-wait
+    fallback (removed 2026-10-15, see captcha_solver.py's own module
+    docstring for why). `autosolve=None` (the default) defers to the
     GST_CAPTCHA_AUTOSOLVE env var via captcha_solver's own gate."""
     want_autosolve = autosolve if autosolve is not None else os.environ.get("GST_CAPTCHA_AUTOSOLVE") == "1"
-    if want_autosolve:
-        solved = False
-        for attempt in range(1, _MAX_AUTOSOLVE_ATTEMPTS + 1):
+    if not want_autosolve:
+        raise CaptchaTimeoutError(
+            "GST CAPTCHA autosolve is not enabled -- pass autosolve=True or set "
+            "GST_CAPTCHA_AUTOSOLVE=1 (no human-wait fallback)."
+        )
+    solved = False
+    for attempt in range(1, _MAX_AUTOSOLVE_ATTEMPTS + 1):
+        try:
+            backend_name, solved_text = captcha_solver.solve_gst_captcha(page, enabled=True)
+        except Exception as e:
+            print(f"[INFO] CAPTCHA autosolve attempt {attempt}/{_MAX_AUTOSOLVE_ATTEMPTS} failed ({e}).")
+            break  # a non-solve error (missing key, selector miss, etc.) won't fix itself on retry
+
+        # CONFIRMED LIVE 2026-10-14: this portal's CAPTCHA is always
+        # exactly 6 digits, but Claude vision doesn't always reliably
+        # honor that (answers have come back anywhere from 4 to 6
+        # characters). Catching an obviously wrong shape here, before
+        # ever filling it in and clicking Search, saves a full
+        # submit-and-wait cycle on an answer that cannot possibly be
+        # right.
+        if len(solved_text) != 6 or not solved_text.isdigit():
+            print(f"[INFO] {backend_name}'s solve ({solved_text!r}) isn't a valid 6-digit answer -- "
+                  f"skipping submission (attempt {attempt}/{_MAX_AUTOSOLVE_ATTEMPTS}).")
+        else:
             try:
-                backend_name, solved_text = captcha_solver.solve_gst_captcha(page, enabled=True)
+                # CONFIRMED LIVE 2026-10-14: page.fill() sets the DOM
+                # value directly but does not reliably fire the full
+                # keydown/keypress/keyup sequence this portal's Angular
+                # form validator needs to mark the field ng-valid (the
+                # visible green border) -- a genuinely CORRECT solve
+                # ('981351'-shaped case) got misread as "rejected" because
+                # Search was clicked before Angular considered the field
+                # validly filled. press_sequentially() simulates real
+                # per-character typing instead, the same events a human
+                # typing it produces.
+                captcha_input = page.locator(_SEL_CAPTCHA_INPUT)
+                captcha_input.click()
+                captcha_input.fill("")
+                captcha_input.press_sequentially(solved_text, delay=50)
+                page.click(search_btn_selector, timeout=10000)
             except Exception as e:
                 print(f"[INFO] CAPTCHA autosolve attempt {attempt}/{_MAX_AUTOSOLVE_ATTEMPTS} failed ({e}).")
-                break  # a non-solve error (missing key, selector miss, etc.) won't fix itself on retry
+                break
 
-            # CONFIRMED LIVE 2026-10-14: this portal's CAPTCHA is always
-            # exactly 6 digits, but neither solver backend reliably honors
-            # the length/numeric hints passed to it (answers have come back
-            # anywhere from 4 to 6 characters). Catching an obviously wrong
-            # shape here, before ever filling it in and clicking Search,
-            # saves a full submit-and-wait cycle on an answer that cannot
-            # possibly be right.
-            if len(solved_text) != 6 or not solved_text.isdigit():
-                print(f"[INFO] {backend_name}'s solve ({solved_text!r}) isn't a valid 6-digit answer -- "
-                      f"skipping submission (attempt {attempt}/{_MAX_AUTOSOLVE_ATTEMPTS}).")
-            else:
-                try:
-                    # CONFIRMED LIVE 2026-10-14: page.fill() sets the DOM
-                    # value directly but does not reliably fire the full
-                    # keydown/keypress/keyup sequence this portal's Angular
-                    # form validator needs to mark the field ng-valid (the
-                    # visible green border) -- a genuinely CORRECT solve
-                    # ('981351'-shaped case) got misread as "rejected" because
-                    # Search was clicked before Angular considered the field
-                    # validly filled. press_sequentially() simulates real
-                    # per-character typing instead, the same events a human
-                    # typing it produces.
-                    captcha_input = page.locator(_SEL_CAPTCHA_INPUT)
-                    captcha_input.click()
-                    captcha_input.fill("")
-                    captcha_input.press_sequentially(solved_text, delay=50)
-                    page.click(search_btn_selector, timeout=10000)
-                except Exception as e:
-                    print(f"[INFO] CAPTCHA autosolve attempt {attempt}/{_MAX_AUTOSOLVE_ATTEMPTS} failed ({e}).")
-                    break
+            if _autosolve_attempt_succeeded(page, success_texts):
+                print(f"[INFO] {backend_name} solved the CAPTCHA ({solved_text!r}) on attempt "
+                      f"{attempt}/{_MAX_AUTOSOLVE_ATTEMPTS} and Search was submitted automatically.")
+                solved = True
+                break
 
-                if _autosolve_attempt_succeeded(page, success_texts):
-                    print(f"[INFO] {backend_name} solved the CAPTCHA ({solved_text!r}) on attempt "
-                          f"{attempt}/{_MAX_AUTOSOLVE_ATTEMPTS} and Search was submitted automatically.")
-                    solved = True
-                    break
+            print(f"[INFO] {backend_name}'s solve ({solved_text!r}) was rejected by the portal "
+                  f"(attempt {attempt}/{_MAX_AUTOSOLVE_ATTEMPTS}).")
 
-                print(f"[INFO] {backend_name}'s solve ({solved_text!r}) was rejected by the portal "
-                      f"(attempt {attempt}/{_MAX_AUTOSOLVE_ATTEMPTS}).")
+        if attempt < _MAX_AUTOSOLVE_ATTEMPTS:
+            try:
+                page.click(_SEL_CAPTCHA_REFRESH_BTN, timeout=5000)
+                page.wait_for_timeout(1000)  # let the new image actually load before re-screenshotting
+            except Exception as e:
+                print(f"[INFO] Could not refresh the CAPTCHA for another attempt ({e}).")
+                break
 
-            if attempt < _MAX_AUTOSOLVE_ATTEMPTS:
-                try:
-                    page.click(_SEL_CAPTCHA_REFRESH_BTN, timeout=5000)
-                    page.wait_for_timeout(1000)  # let the new image actually load before re-screenshotting
-                except Exception as e:
-                    print(f"[INFO] Could not refresh the CAPTCHA for another attempt ({e}).")
-                    break
-
-        if not solved:
-            print(f"[INFO] CAPTCHA autosolve did not succeed within {_MAX_AUTOSOLVE_ATTEMPTS} attempt(s) "
-                  f"-- falling back to a human solve.")
-            print("[INFO] Please read the CAPTCHA shown there, type it in, and click Search.")
-    else:
-        print("[INFO] Please read the CAPTCHA shown there, type it in, and click Search.")
-
-    _wait_for_captcha_solve(page, timeout_seconds, poll_interval, success_texts=success_texts)
+    if not solved:
+        raise CaptchaTimeoutError(
+            f"CAPTCHA autosolve did not succeed within {_MAX_AUTOSOLVE_ATTEMPTS} attempt(s) -- "
+            "no human-wait fallback (removed 2026-10-15; see captcha_solver.py's own module docstring)."
+        )
 
 
 def search_gstins_by_pan(

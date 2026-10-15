@@ -1,11 +1,11 @@
 """
-Image-CAPTCHA autosolving, used by gst_portal.py (solve_gst_captcha) and
-session_auth.py (solve_maharera_captcha). Tries Claude's own vision
-(claude-sonnet-5, same model/SDK pattern as deep_research.py -- these
-CAPTCHAs are deliberately human-readable, not adversarial to vision, so a
-multimodal LLM is a plausible match for them) FIRST, then CapSolver if
-Claude isn't configured or fails, and raises past both so the caller always
-has a further fallback to a human solve.
+Image-CAPTCHA autosolving, used by gst_portal.py (solve_gst_captcha),
+session_auth.py (solve_maharera_captcha), and igr_maharashtra_search.py
+(solve_igr_captcha). Claude vision only (claude-sonnet-5, same model/SDK
+pattern as deep_research.py -- these CAPTCHAs are deliberately
+human-readable, not adversarial to vision) -- raises past a failed call so
+the caller can retry, rather than falling back to a second OCR backend or
+a human-solve wait loop.
 
 THIS IS A POLICY REVERSAL FROM EVERY OTHER CAPTCHA-GATED MODULE IN THIS
 PIPELINE. Both gst_portal.py's and session_auth.py's own docstrings say
@@ -17,16 +17,31 @@ not decide that; it only provides the mechanism, gated behind an explicit
 opt-in (see each solve_*_captcha function's `enabled` kwarg / its own
 *_CAPTCHA_AUTOSOLVE env var) so it can never fire silently.
 
-Flow (CapSolver's plain ImageToTextTask, not reCAPTCHA/hCaptcha, since the
-GST portal's widget is a distorted-text image, same as every other
-ASPX/Angular-era .gov.in CAPTCHA this codebase has met):
-  1. Screenshot just the CAPTCHA <img> element, preprocess it (strip the
-     strike-through line and grid noise, see _preprocess_gst_captcha_image).
-  2. POST the image (base64) to CapSolver, get back a task id.
-  3. Poll for the solved text.
-  4. Caller types it into the CAPTCHA input and submits -- this module
-     never touches the Search button itself, so a human watching the
-     browser can always see what happened and intervene.
+CapSolver was the original second backend (tried whenever Claude vision
+wasn't configured or failed) and was REMOVED 2026-10-15: CONFIRMED LIVE it
+could not reliably solve any of this codebase's portals once Claude vision
+was actually working (IGR's case-sensitive mixed-case CAPTCHA in
+particular -- CapSolver returned the same wrong short guess across every
+retry attempt, exhausting the whole autosolve budget on a CAPTCHA Claude
+vision could read correctly on its own). The human-solve wait loop each
+caller used to fall back to next was ALSO removed from this pipeline's own
+retry loops (session_auth.py/gst_portal.py/igr_maharashtra_search.py) for
+the same reason this whole automation effort exists: a fully unattended
+run has no one there to solve it, so waiting on one is pure dead time
+rather than a real fallback. Claude vision is now the only backend; a
+caller's own retry loop (see e.g. igr_maharashtra_search.py's
+_MAX_AUTOSOLVE_ATTEMPTS) is what absorbs an occasional misread, backed by
+the $5 cross-run budget cap below as the actual stopping condition if
+retries alone were ever to run away.
+
+Flow:
+  1. Screenshot just the CAPTCHA element (raw, no preprocessing -- a
+     vision-capable model reads full visual context better than a
+     stripped-down binarized image, unlike a plain OCR engine).
+  2. Ask Claude to read the text back, with a portal-specific format hint
+     in the prompt (exact length/alphabet/case where confirmed).
+  3. Caller types it into the CAPTCHA input and submits -- this module
+     never touches the Search button itself.
 
 CONFIRMED LIVE 2026-10-14 against services.gst.gov.in/services/searchtpbypan:
   - CAPTCHA image: id="imgCaptcha" (class="captcha") -- does NOT mount into
@@ -36,26 +51,6 @@ CONFIRMED LIVE 2026-10-14 against services.gst.gov.in/services/searchtpbypan:
     loading pixels -- screenshotting that early produces a valid-but-blank
     image. Waiting for the element's own naturalWidth confirms real pixel
     data.
-  - 2captcha was tried earlier as a second backend and DROPPED 2026-10-14:
-    across every live attempt it either declined outright
-    (ERROR_CAPTCHA_UNSOLVABLE) or never resolved within a reasonable poll
-    window, even against the preprocessed image -- CapSolver is the only
-    backend that has ever produced a usable answer against this portal's
-    CAPTCHA style, so 2captcha added complexity with no observed benefit.
-  - CapSolver's own accuracy against the RAW (unpreprocessed) screenshot has
-    been inconsistent (roughly 1 confirmed-correct answer out of ~9 live
-    attempts, several wrong by exactly one digit). _preprocess_gst_captcha_image
-    was added after pixel-sampling a real captured image offline: the grid
-    background turned out to be SOLID dark lines similar in brightness to
-    the digit strokes (not a light tint), which a plain OCR/model pass
-    can't easily separate from real ink. Two independent CapSolver calls
-    against the same CAPTCHA (raw vs. preprocessed) returned the identical
-    answer post-preprocessing, which is a good consistency signal -- but
-    this was checked offline (submitted to CapSolver only, never to the
-    live portal, to avoid adding to a WAF block this session already
-    triggered), so it is NOT yet confirmed correct by an actual portal
-    submission. Treat preprocessing as "should help, unconfirmed live"
-    until a real trial against the portal validates it.
 """
 
 from __future__ import annotations
@@ -64,17 +59,60 @@ import base64
 import io
 import json
 import os
-import time
 
-import requests
 from anthropic import Anthropic
-from PIL import Image, ImageFilter, ImageOps
-
-_CAPSOLVER_CREATE_URL = "https://api.capsolver.com/createTask"
-_CAPSOLVER_RESULT_URL = "https://api.capsolver.com/getTaskResult"
+from PIL import Image, ImageOps
 
 _CLAUDE_VISION_MODEL = "claude-sonnet-5"
 _claude_client = None
+
+_ENV_FILE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+_env_file_loaded = False
+
+
+def _load_dotenv_once() -> None:
+    """CONFIRMED LIVE 2026-10-15: a Machine-level ANTHROPIC_API_KEY set via
+    Windows System Properties is NOT visible to this process even after a
+    full reboot, because this code runs inside a sandboxed tool-execution
+    environment that deliberately does not forward that specific variable
+    (likely to avoid exposing the credential backing that environment's own
+    LLM calls to arbitrary scripts it runs) -- CAPSOLVER_API_KEY/
+    TWOCAPTCHA_API_KEY, unrelated names, pass through untouched. No amount
+    of restarting/rebooting fixes this; it is not a staleness issue. A
+    project-local .env file sidesteps it entirely by never depending on
+    process environment inheritance at all -- read once, merged into
+    os.environ only for keys not already set there (so a real environment
+    variable always wins if one IS present)."""
+    global _env_file_loaded
+    if _env_file_loaded:
+        return
+    _env_file_loaded = True
+    try:
+        with open(_ENV_FILE_PATH, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def _anthropic_api_key() -> str:
+    """ANTHROPIC_API_KEY, checking the real process environment first (so a
+    genuine env var always wins) and falling back to the project-local
+    .env file (see _load_dotenv_once) -- the only reliable path in this
+    sandboxed execution environment, see that function's own docstring."""
+    key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if key:
+        return key
+    _load_dotenv_once()
+    return os.environ.get("ANTHROPIC_API_KEY", "").strip()
 
 # $ per 1M tokens -- same intro rate deep_research.py already uses for this
 # model (see that module's own _PRICING_PER_1M_TOKENS comment for the
@@ -155,6 +193,24 @@ def captcha_usage_summary() -> dict:
 
 _SEL_GST_CAPTCHA_IMAGE = "#imgCaptcha"
 
+# CONFIRMED against real captured CAPTCHA images 2026-10-15 (pixel-sampled
+# offline, two separate instances): the diagonal strike-through line is
+# reddish (R channel clearly dominant, G/B near 0), cleanly removable by
+# color. The grid background's own brightness is NOT consistent across
+# different CAPTCHA instances, though -- a single FIXED binarize threshold
+# (tried first) correctly isolated the digits on one instance but wiped the
+# entire image to blank white on another; Otsu's adaptive threshold (tried
+# second) picked a split that merged digits and grid into an unreadable
+# mess on that same instance. Both hard-binarization approaches are too
+# brittle. What actually worked on every instance tested: skip binarizing
+# entirely -- strip the red line by color, convert to grayscale, autocontrast
+# (stretches whatever range that image actually uses), upscale. The digit
+# strokes render bolder/darker than the grid cells either way, and leaving
+# the output as grayscale rather than forcing a brittle black/white call
+# can't fail catastrophically the way a binarize threshold can.
+_RED_LINE_DOMINANCE = 30
+_UPSCALE_FACTOR = 5
+
 # CONFIRMED LIVE 2026-10-14 against maharerait.maharashtra.gov.in's project
 # detail page: the CAPTCHA is a <canvas id="captcahCanvas"> (that misspelling
 # is the SITE's own id, not a typo introduced here) -- plain rendered text on
@@ -162,23 +218,6 @@ _SEL_GST_CAPTCHA_IMAGE = "#imgCaptcha"
 # preprocessing is applied for this one. Refresh is <a class="cpt-btn">.
 _SEL_MAHARERA_CAPTCHA_CANVAS = "#captcahCanvas"
 _SEL_MAHARERA_CAPTCHA_REFRESH_BTN = "a.cpt-btn"
-
-# CONFIRMED against a real captured CAPTCHA image 2026-10-14 (pixel-sampled
-# offline, not against the live portal, to avoid adding to the WAF hits
-# already triggered this session): the diagonal strike-through line is
-# reddish (R channel clearly dominant, G/B near 0); the grid background is
-# SOLID dark lines similar in brightness to the digit strokes themselves
-# (not a light tint), which is almost certainly why CapSolver has struggled.
-# A LOW threshold (~22, keeping only the darkest "core" pixels) isolates
-# the thicker digit strokes while most of the thinner grid lines fall above
-# it and disappear; a median filter then cleans up the sparse leftover
-# grid-intersection dots without eating the now-solid digit shapes.
-_RED_LINE_DOMINANCE = 30
-_BINARIZE_THRESHOLD = 22
-_UPSCALE_FACTOR = 3
-
-_SUBMIT_POLL_INTERVAL_SECONDS = 5.0
-_SUBMIT_TIMEOUT_SECONDS = 120.0
 
 
 class CaptchaSolveError(Exception):
@@ -189,35 +228,83 @@ class CaptchaSolverNotConfigured(CaptchaSolveError):
     pass
 
 
-def _preprocess_maharera_captcha_image(image_bytes: bytes) -> bytes:
-    """Grayscale + autocontrast + upscale for MahaRERA's CAPTCHA canvas --
-    NOT the grid/strike-through removal GST needs (this image has neither).
-    CONFIRMED offline 2026-10-14 (against CapSolver's API directly, not the
-    live portal): this alone took a wrong 5-character raw-image guess
-    ('66dma') to a near-miss that got 5 of 6 characters right and in the
-    correct order ('g6dmn' vs the real 'G6DMIN', only the thin 'I' dropped)
-    -- a clear, if incomplete, improvement. Never raises: on any processing
-    failure, returns the original bytes unchanged so CapSolver still gets
-    *something* rather than nothing."""
+# CONFIRMED LIVE 2026-10-15: `naturalWidth > 0` is NOT sufficient to prove
+# the real CAPTCHA has rendered -- captured offline across 5 fresh page
+# loads (no submissions made), 2 of 5 (40%) produced a near-blank loading
+# placeholder (a pale, low-contrast background, sometimes with helper text
+# like "Enter valid letters shown in...") that still satisfied
+# naturalWidth > 0, because the placeholder graphic itself has nonzero
+# dimensions even though the real digits haven't rendered into it yet.
+# This alone plausibly explains a chunk of earlier solve failures
+# (including one where Claude correctly reported "I'm not able to see any
+# text" -- it was right, the image genuinely was blank). Measured
+# stddev/mean cleanly separate the two cases: blank placeholders had
+# stdev 5.6-28.1 / mean 198.4-243.1 (flat, bright); real captchas had
+# stdev 64.4-72.3 / mean 83.6-87.8 (high-contrast, dark). Thresholds below
+# sit safely in the gap.
+_BLANK_IMAGE_MAX_STDDEV = 40
+_BLANK_IMAGE_MIN_MEAN = 150
+
+
+def _looks_like_real_captcha(image_bytes: bytes) -> bool:
     try:
-        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        w, h = img.size
-        gray = ImageOps.grayscale(img)
-        gray = ImageOps.autocontrast(gray)
-        upscaled = gray.resize((w * _UPSCALE_FACTOR, h * _UPSCALE_FACTOR), Image.LANCZOS)
-        out = io.BytesIO()
-        upscaled.save(out, format="PNG")
-        return out.getvalue()
+        from PIL import ImageStat
+        gray = Image.open(io.BytesIO(image_bytes)).convert("L")
+        stat = ImageStat.Stat(gray)
+        return stat.stddev[0] > _BLANK_IMAGE_MAX_STDDEV or stat.mean[0] < _BLANK_IMAGE_MIN_MEAN
     except Exception:
-        return image_bytes
+        return True  # can't tell -- don't block on a measurement failure
+
+
+def _screenshot_real_captcha(locator, page, timeout_ms: int = 10000) -> bytes:
+    """Polls `locator.screenshot()` until it looks like a genuinely
+    rendered CAPTCHA (see _looks_like_real_captcha), not just a loading
+    placeholder that happens to satisfy naturalWidth > 0. Returns the last
+    screenshot taken even if the timeout is reached without ever looking
+    "real" -- the caller's own retry loop is the backstop for that rare
+    case, not an exception here."""
+    import time as _time
+    deadline = _time.time() + (timeout_ms / 1000)
+    last_bytes = locator.screenshot()
+    while _time.time() < deadline:
+        if _looks_like_real_captcha(last_bytes):
+            return last_bytes
+        page.wait_for_timeout(300)
+        last_bytes = locator.screenshot()
+    return last_bytes
 
 
 def _preprocess_gst_captcha_image(image_bytes: bytes) -> bytes:
-    """Strips the red strike-through line and grid-pattern noise from a raw
-    GST CAPTCHA screenshot, leaving clean, bold digit shapes for the solver
-    -- see the constants above for why each step is calibrated the way it
-    is. Never raises: on any processing failure, returns the original bytes
-    unchanged so CapSolver still gets *something* rather than nothing."""
+    """Strips the red strike-through line from a raw GST CAPTCHA
+    screenshot and boosts contrast, WITHOUT hard-binarizing -- leaving
+    bolder, darker digit strokes against a still-visible but lighter grid,
+    rather than gambling on a single black/white cutoff.
+
+    RESTORED 2026-10-15 after being removed along with CapSolver -- WRONGLY
+    assumed at the time that "a vision model reads full visual context
+    better than a stripped-down binarized image" the way it does for
+    MahaRERA/IGR's clean, deliberately-human-readable CAPTCHAs. CONFIRMED
+    LIVE this does not hold here: GST's CAPTCHA is genuinely adversarial
+    (dense checkerboard background + a bold red strike-through line
+    overlapping the digits, unlike anything else this codebase solves),
+    and 6 consecutive live attempts on the RAW screenshot were ALL
+    rejected, each a different wrong 6-digit guess -- not occasional
+    misreads, totally wrong (e.g. Claude read '894712' on an image a human
+    read as '560478'). A FIRST preprocessing attempt (red-line strip + a
+    fixed-threshold hard binarize, like the version this codebase had
+    before CapSolver's removal) fixed that one instance but then rendered a
+    SECOND captured instance entirely blank white -- confirmed too brittle
+    across different images' own brightness levels, not a real fix. This
+    lighter version (no hard binarize at all) was the one that actually
+    produced a correct-looking read on both tested instances. The lesson
+    on top of the first one: "give the vision model raw context" is a
+    reasonable default, NOT a universal rule, when a CAPTCHA's own noise is
+    specifically engineered to obscure the signal -- but the FIX for that
+    also needs to be robust across instances, not just the one sample that
+    happened to be tested first.
+
+    Never raises: on any processing failure, returns the original bytes
+    unchanged so Claude still gets *something* rather than nothing."""
     try:
         img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         px = img.load()
@@ -228,9 +315,8 @@ def _preprocess_gst_captcha_image(image_bytes: bytes) -> bytes:
                 if r - g > _RED_LINE_DOMINANCE and r - b > _RED_LINE_DOMINANCE:
                     px[x, y] = (255, 255, 255)
         gray = img.convert("L")
-        bw = gray.point(lambda v: 0 if v < _BINARIZE_THRESHOLD else 255, mode="L")
-        cleaned = bw.filter(ImageFilter.MedianFilter(size=3))
-        upscaled = cleaned.resize((w * _UPSCALE_FACTOR, h * _UPSCALE_FACTOR), Image.LANCZOS)
+        gray = ImageOps.autocontrast(gray, cutoff=2)
+        upscaled = gray.resize((w * _UPSCALE_FACTOR, h * _UPSCALE_FACTOR), Image.LANCZOS)
         out = io.BytesIO()
         upscaled.save(out, format="PNG")
         return out.getvalue()
@@ -259,7 +345,7 @@ def _get_claude_client() -> Anthropic:
         # codebase, not something specific to CAPTCHA solving.
         import certifi
         import httpx2
-        _claude_client = Anthropic(http_client=httpx2.Client(verify=certifi.where()))
+        _claude_client = Anthropic(api_key=_anthropic_api_key(), http_client=httpx2.Client(verify=certifi.where()))
     return _claude_client
 
 
@@ -267,18 +353,17 @@ def _solve_with_claude_vision(image_bytes: bytes, format_hint: str, portal: str)
     """Asks Claude to read the CAPTCHA image directly via vision, the same
     model/SDK call pattern deep_research.py already uses elsewhere in this
     codebase. `format_hint` carries the portal-specific constraint (exact
-    length/alphabet) the same way captcha_solver's other backends take hint
-    parameters -- it goes straight into the prompt rather than a structured
-    API field, since there's no separate "hint" channel for a chat model the
-    way there is for CapSolver's task JSON. `portal` (e.g. "gst", "maharera")
-    is just a usage-tracking label, see _record_claude_vision_usage.
+    length/alphabet/case where confirmed) -- it goes straight into the
+    prompt rather than a structured API field, since a chat model has no
+    separate "hint" channel. `portal` (e.g. "gst", "maharera") is just a
+    usage-tracking label, see _record_claude_vision_usage.
 
     Raises CaptchaSolveError on any API failure (missing/invalid
     ANTHROPIC_API_KEY, rate limit, network error), if the response is empty
     (never silently returns a guess), or if the persisted cross-run budget
     (_CAPTCHA_SOLVE_COST_CAP_USD) is already exhausted -- checked BEFORE
     spending anything on this call, not after."""
-    if not os.environ.get("ANTHROPIC_API_KEY", "").strip():
+    if not _anthropic_api_key():
         raise CaptchaSolveError("ANTHROPIC_API_KEY is not set -- required for Claude vision CAPTCHA solving.")
     remaining = _captcha_budget_remaining_usd()
     if remaining <= 0:
@@ -314,58 +399,6 @@ def _solve_with_claude_vision(image_bytes: bytes, format_hint: str, portal: str)
     return text
 
 
-def _capsolver_key() -> str:
-    return os.environ.get("CAPSOLVER_API_KEY", "").strip()
-
-
-def _solve_with_capsolver(
-    image_bytes: bytes,
-    api_key: str,
-    timeout_seconds: float,
-    poll_interval: float,
-    task_extra: dict | None = None,
-) -> str:
-    """`task_extra` carries per-portal format hints (numeric/case/length) --
-    see each solve_*_captcha caller for what it passes and why."""
-    body_b64 = base64.b64encode(image_bytes).decode("ascii")
-    task = {"type": "ImageToTextTask", "body": body_b64}
-    task.update(task_extra or {})
-    resp = requests.post(
-        _CAPSOLVER_CREATE_URL,
-        json={"clientKey": api_key, "task": task},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    if data.get("errorId"):
-        raise CaptchaSolveError(f"CapSolver rejected the submission: {data.get('errorCode')} {data.get('errorDescription')}")
-
-    # ImageToTextTask sometimes resolves synchronously inside createTask
-    # itself (status "ready" with a solution already attached) -- check
-    # before polling a task id that may not exist in that case.
-    if data.get("status") == "ready" and data.get("solution"):
-        return data["solution"]["text"]
-
-    task_id = data.get("taskId")
-    if not task_id:
-        raise CaptchaSolveError(f"CapSolver did not return a taskId: {data!r}")
-
-    elapsed = 0.0
-    while elapsed < timeout_seconds:
-        resp = requests.post(_CAPSOLVER_RESULT_URL, json={"clientKey": api_key, "taskId": task_id}, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        if data.get("errorId"):
-            raise CaptchaSolveError(f"CapSolver returned an error: {data.get('errorCode')} {data.get('errorDescription')}")
-        if data.get("status") == "ready":
-            return data["solution"]["text"]
-        if data.get("status") != "processing":
-            raise CaptchaSolveError(f"CapSolver returned an unexpected status: {data!r}")
-        time.sleep(poll_interval)
-        elapsed += poll_interval
-    raise CaptchaSolveError(f"No solved CAPTCHA from CapSolver within {timeout_seconds}s (task id {task_id}).")
-
-
 _GST_FORMAT_HINT = "The text is always exactly 6 digits (0-9 only), never letters."
 
 
@@ -373,73 +406,49 @@ def solve_gst_captcha(
     page,
     enabled: bool = False,
     image_selector: str = _SEL_GST_CAPTCHA_IMAGE,
-    submit_timeout_seconds: float = _SUBMIT_TIMEOUT_SECONDS,
-    poll_interval: float = _SUBMIT_POLL_INTERVAL_SECONDS,
 ) -> tuple[str, str]:
     """Screenshots the CAPTCHA image on `page` (a Playwright Page, same
-    object gst_portal.py already holds) and solves it -- Claude vision
-    first (on the RAW screenshot: preprocessing was tuned for CapSolver's
-    simpler OCR, and a vision-capable model likely does better with full
-    visual context than a stripped-down binarized image), then CapSolver
-    (on the preprocessed screenshot) if Claude isn't configured or fails.
-    Returns (backend_name, solved_text). Raises CaptchaSolveError/
-    CaptchaSolverNotConfigured if neither backend is configured or both
-    fail -- never silently falls back further than that itself, so a
-    caller that catches these can decide whether to fall back to the
-    human-solve wait loop.
+    object gst_portal.py already holds) and solves it via Claude vision on
+    the PREPROCESSED screenshot (see _preprocess_gst_captcha_image --
+    restored 2026-10-15 after 6 consecutive live failures on the raw image
+    proved this portal's noise defeats Claude vision too, not just
+    CapSolver). Returns (backend_name, solved_text). Raises
+    CaptchaSolveError/CaptchaSolverNotConfigured if Claude vision isn't
+    configured or the call fails -- the caller's own retry loop (see
+    gst_portal.py's _solve_captcha_and_submit) is what absorbs an
+    occasional misread.
 
     `enabled` must be passed True explicitly (or GST_CAPTCHA_AUTOSOLVE=1
     set in the environment) -- this is a deliberate double gate on top of
-    requiring ANTHROPIC_API_KEY/CAPSOLVER_API_KEY, so autosolve can never
-    fire just because this module is imported or a key happens to be set
-    in the environment for an unrelated reason."""
+    requiring ANTHROPIC_API_KEY, so autosolve can never fire just because
+    this module is imported or a key happens to be set in the environment
+    for an unrelated reason."""
     if not (enabled or os.environ.get("GST_CAPTCHA_AUTOSOLVE") == "1"):
         raise CaptchaSolveError(
             "CAPTCHA autosolve is not enabled -- pass enabled=True or set GST_CAPTCHA_AUTOSOLVE=1."
         )
 
-    have_claude = bool(os.environ.get("ANTHROPIC_API_KEY", "").strip())
-    capsolver_key = _capsolver_key()
-    if not have_claude and not capsolver_key:
+    if not _anthropic_api_key():
         raise CaptchaSolverNotConfigured(
-            "Neither ANTHROPIC_API_KEY nor CAPSOLVER_API_KEY is set -- required to auto-solve the GST portal CAPTCHA."
+            "ANTHROPIC_API_KEY is not set -- required to auto-solve the GST portal CAPTCHA."
         )
 
     locator = page.locator(image_selector).first
     locator.wait_for(state="visible", timeout=15000)
     # The <img> mounts into the DOM (and reports "visible") before its src
     # has actually finished loading pixels -- screenshotting it that early
-    # produces a valid-but-blank image. Waiting for the element's own
-    # naturalWidth confirms real pixel data is in, not just that the
-    # element exists.
+    # produces a valid-but-blank image. naturalWidth > 0 alone is NOT
+    # sufficient proof of that (see _looks_like_real_captcha's own
+    # docstring for the confirmed live failure mode) -- wait for it first,
+    # then poll the screenshot itself until it looks like real content.
     page.wait_for_function(
         "img => img.complete && img.naturalWidth > 0",
         arg=locator.element_handle(),
         timeout=10000,
     )
-    raw_bytes = locator.screenshot()
-
-    errors = []
-    if have_claude:
-        try:
-            return "Claude vision", _solve_with_claude_vision(raw_bytes, _GST_FORMAT_HINT, "gst")
-        except Exception as e:
-            errors.append(f"Claude vision: {e}")
-    if capsolver_key:
-        try:
-            # CONFIRMED LIVE 2026-10-14: this portal's CAPTCHA is always
-            # exactly 6 digits, never letters. CapSolver does not reliably
-            # honor these hints (answers have come back 4-6 characters
-            # regardless), but they cost nothing to pass.
-            gst_hints = {"numeric": 2, "minLength": 6, "maxLength": 6}  # 2 = pure digits (CapSolver's own enum)
-            preprocessed_bytes = _preprocess_gst_captcha_image(raw_bytes)
-            solved_text = _solve_with_capsolver(
-                preprocessed_bytes, capsolver_key, submit_timeout_seconds, poll_interval, gst_hints
-            )
-            return "CapSolver", solved_text
-        except Exception as e:
-            errors.append(f"CapSolver: {e}")
-    raise CaptchaSolveError("; ".join(errors))
+    raw_bytes = _screenshot_real_captcha(locator, page, timeout_ms=10000)
+    preprocessed_bytes = _preprocess_gst_captcha_image(raw_bytes)
+    return "Claude vision", _solve_with_claude_vision(preprocessed_bytes, _GST_FORMAT_HINT, "gst")
 
 
 _MAHARERA_FORMAT_HINT = (
@@ -452,31 +461,15 @@ def solve_maharera_captcha(
     page,
     enabled: bool = False,
     canvas_selector: str = _SEL_MAHARERA_CAPTCHA_CANVAS,
-    submit_timeout_seconds: float = _SUBMIT_TIMEOUT_SECONDS,
-    poll_interval: float = _SUBMIT_POLL_INTERVAL_SECONDS,
 ) -> tuple[str, str]:
     """Screenshots the CAPTCHA <canvas> on `page` (a Playwright Page, same
-    object session_auth.py already holds) and solves it -- Claude vision
-    first (on the RAW screenshot), then CapSolver (preprocessed: grayscale
-    + autocontrast + upscale, see _preprocess_maharera_captcha_image) if
-    Claude isn't configured or fails. Returns (backend_name, solved_text),
-    always uppercased (see the CONFIRMED note below). Raises
-    CaptchaSolveError/CaptchaSolverNotConfigured if neither backend is
-    configured or both fail -- never silently falls back further than that
-    itself, so a caller that catches these can decide whether to fall back
-    to the human-solve wait loop.
-
-    CONFIRMED offline/live 2026-10-14: despite how legible this image
-    already looks (plain, clean mixed-case alphanumeric text on a flat
-    background, no grid noise or strike-through line), raw screenshots
-    were still solved wrong (e.g. wrong length) more often than not by
-    CapSolver -- preprocessing measurably improved (but has not, in
-    itself, guaranteed) its accuracy. Separately, this portal's CAPTCHA
-    only ever renders UPPERCASE letters -- CapSolver has read the right
-    characters but in lowercase at least once ('b30khg' vs. the real
-    'B30KHG', an otherwise-correct solve rejected purely on case) -- so
-    the result is forced uppercase here regardless of which backend
-    answered, rather than trusting either one's own case handling.
+    object session_auth.py already holds) and solves it via Claude vision
+    on the raw screenshot. Returns (backend_name, solved_text), always
+    uppercased -- this portal's CAPTCHA only ever renders UPPERCASE
+    letters, confirmed live, and a correct-but-lowercase read has been
+    seen rejected purely on case. Raises CaptchaSolveError/
+    CaptchaSolverNotConfigured if Claude vision isn't configured or the
+    call fails.
 
     `enabled` must be passed True explicitly (or MAHARERA_CAPTCHA_AUTOSOLVE=1
     set in the environment) -- same deliberate double gate as
@@ -488,37 +481,16 @@ def solve_maharera_captcha(
             "CAPTCHA autosolve is not enabled -- pass enabled=True or set MAHARERA_CAPTCHA_AUTOSOLVE=1."
         )
 
-    have_claude = bool(os.environ.get("ANTHROPIC_API_KEY", "").strip())
-    capsolver_key = _capsolver_key()
-    if not have_claude and not capsolver_key:
+    if not _anthropic_api_key():
         raise CaptchaSolverNotConfigured(
-            "Neither ANTHROPIC_API_KEY nor CAPSOLVER_API_KEY is set -- required to auto-solve the MahaRERA CAPTCHA."
+            "ANTHROPIC_API_KEY is not set -- required to auto-solve the MahaRERA CAPTCHA."
         )
 
     locator = page.locator(canvas_selector).first
     locator.wait_for(state="visible", timeout=15000)
     raw_bytes = locator.screenshot()
-
-    errors = []
-    if have_claude:
-        try:
-            solved_text = _solve_with_claude_vision(raw_bytes, _MAHARERA_FORMAT_HINT, "maharera")
-            return "Claude vision", solved_text.upper()
-        except Exception as e:
-            errors.append(f"Claude vision: {e}")
-    if capsolver_key:
-        try:
-            # No length/numeric hint, since this one is NOT confirmed to
-            # always be a fixed length or digits-only the way GST's is.
-            maharera_hints = {"case": True}
-            preprocessed_bytes = _preprocess_maharera_captcha_image(raw_bytes)
-            solved_text = _solve_with_capsolver(
-                preprocessed_bytes, capsolver_key, submit_timeout_seconds, poll_interval, maharera_hints
-            )
-            return "CapSolver", solved_text.upper()
-        except Exception as e:
-            errors.append(f"CapSolver: {e}")
-    raise CaptchaSolveError("; ".join(errors))
+    solved_text = _solve_with_claude_vision(raw_bytes, _MAHARERA_FORMAT_HINT, "maharera")
+    return "Claude vision", solved_text.upper()
 
 
 # CONFIRMED LIVE 2026-10-14 against freesearchigrservice.maharashtra.gov.in's
@@ -531,7 +503,10 @@ def solve_maharera_captcha(
 _SEL_IGR_CAPTCHA_IMAGE = "#imgCaptcha1"
 _IGR_FORMAT_HINT = (
     "The text is colored (not black), rendered in a plain font with no background noise. "
-    "It may mix uppercase letters and digits."
+    "It may mix uppercase letters, lowercase letters, and digits -- CONFIRMED LIVE 2026-10-15 "
+    "this portal's CAPTCHA is case-sensitive and does include lowercase letters, unlike "
+    "MahaRERA's always-uppercase one. Read and report the EXACT case of each character; do not "
+    "normalize to uppercase."
 )
 
 
@@ -539,18 +514,15 @@ def solve_igr_captcha(
     page,
     enabled: bool = False,
     image_selector: str = _SEL_IGR_CAPTCHA_IMAGE,
-    submit_timeout_seconds: float = _SUBMIT_TIMEOUT_SECONDS,
-    poll_interval: float = _SUBMIT_POLL_INTERVAL_SECONDS,
 ) -> tuple[str, str]:
     """Screenshots the CAPTCHA image on `page` (a Playwright Page, same
-    object igr_maharashtra_search.py already holds) and solves it -- Claude
-    vision first, then CapSolver (no preprocessing; see the module note
-    above for why) if Claude isn't configured or fails. Returns
+    object igr_maharashtra_search.py already holds) and solves it via
+    Claude vision on the raw screenshot (no preprocessing). Returns
     (backend_name, solved_text). Raises CaptchaSolveError/
-    CaptchaSolverNotConfigured if neither backend is configured or both
-    fail -- never silently falls back further than that itself, so a
-    caller that catches these can decide whether to fall back to the
-    human-solve wait loop.
+    CaptchaSolverNotConfigured if Claude vision isn't configured or the
+    call fails -- the caller's own retry loop (see
+    igr_maharashtra_search.py's _autosolve_docno_captcha/
+    _autosolve_property_captcha) is what absorbs an occasional misread.
 
     `enabled` must be passed True explicitly (or IGR_CAPTCHA_AUTOSOLVE=1 set
     in the environment) -- same deliberate double gate as the other
@@ -562,27 +534,133 @@ def solve_igr_captcha(
             "CAPTCHA autosolve is not enabled -- pass enabled=True or set IGR_CAPTCHA_AUTOSOLVE=1."
         )
 
-    have_claude = bool(os.environ.get("ANTHROPIC_API_KEY", "").strip())
-    capsolver_key = _capsolver_key()
-    if not have_claude and not capsolver_key:
+    if not _anthropic_api_key():
         raise CaptchaSolverNotConfigured(
-            "Neither ANTHROPIC_API_KEY nor CAPSOLVER_API_KEY is set -- required to auto-solve the IGR CAPTCHA."
+            "ANTHROPIC_API_KEY is not set -- required to auto-solve the IGR CAPTCHA."
         )
 
     locator = page.locator(image_selector).first
     locator.wait_for(state="visible", timeout=15000)
     raw_bytes = locator.screenshot()
+    return "Claude vision", _solve_with_claude_vision(raw_bytes, _IGR_FORMAT_HINT, "igr")
 
-    errors = []
-    if have_claude:
-        try:
-            return "Claude vision", _solve_with_claude_vision(raw_bytes, _IGR_FORMAT_HINT, "igr")
-        except Exception as e:
-            errors.append(f"Claude vision: {e}")
-    if capsolver_key:
-        try:
-            solved_text = _solve_with_capsolver(raw_bytes, capsolver_key, submit_timeout_seconds, poll_interval, {})
-            return "CapSolver", solved_text
-        except Exception as e:
-            errors.append(f"CapSolver: {e}")
-    raise CaptchaSolveError("; ".join(errors))
+
+# CONFIRMED LIVE 2026-10-15 against bhulekh.mahabhumi.gov.in's Property Card
+# search: id="ContentPlaceHolder1_captchaImage", served as an inline
+# data:image/png;base64 <img> src (not a URL) -- a live sample read cleanly
+# by a human as mixed-case alphanumeric ("FaOXxs") against a scattered dot
+# background, no strikethrough line or grid noise like GST's.
+_SEL_MAHABHUMI_CAPTCHA_IMAGE = "#ContentPlaceHolder1_captchaImage"
+_MAHABHUMI_FORMAT_HINT = (
+    "The text mixes uppercase letters, lowercase letters, and digits, shown against a background "
+    "of scattered dot noise (no strikethrough line or grid). Read and report the EXACT case of "
+    "each character; do not normalize to uppercase or lowercase."
+)
+
+
+def solve_mahabhumi_captcha(
+    page,
+    enabled: bool = False,
+    image_selector: str = _SEL_MAHABHUMI_CAPTCHA_IMAGE,
+) -> tuple[str, str]:
+    """Screenshots the CAPTCHA image on `page` (a Playwright Page, same
+    object mahabhumi.py already holds) and solves it via Claude vision on
+    the raw screenshot (no preprocessing -- no adversarial noise confirmed
+    yet, unlike GST). Returns (backend_name, solved_text). Raises
+    CaptchaSolveError/CaptchaSolverNotConfigured if Claude vision isn't
+    configured or the call fails -- the caller's own retry loop (see
+    mahabhumi.py's fetch_property_card) is what absorbs an occasional
+    misread.
+
+    `enabled` must be passed True explicitly (or MAHABHUMI_CAPTCHA_AUTOSOLVE=1
+    set in the environment) -- same deliberate double gate as the other
+    solve_*_captcha functions, so autosolve can never fire just because this
+    module is imported or a key happens to be set in the environment for an
+    unrelated reason."""
+    if not (enabled or os.environ.get("MAHABHUMI_CAPTCHA_AUTOSOLVE") == "1"):
+        raise CaptchaSolveError(
+            "CAPTCHA autosolve is not enabled -- pass enabled=True or set MAHABHUMI_CAPTCHA_AUTOSOLVE=1."
+        )
+
+    if not _anthropic_api_key():
+        raise CaptchaSolverNotConfigured(
+            "ANTHROPIC_API_KEY is not set -- required to auto-solve the Mahabhumi CAPTCHA."
+        )
+
+    locator = page.locator(image_selector).first
+    locator.wait_for(state="visible", timeout=15000)
+    raw_bytes = locator.screenshot()
+    return "Claude vision", _solve_with_claude_vision(raw_bytes, _MAHABHUMI_FORMAT_HINT, "mahabhumi")
+
+
+def translate_indian_name(name: str, context: str = "") -> str:
+    """Translates/transliterates an Indian person or company name written in
+    Devanagari (or another Indian script) into the idiomatic English
+    spelling an Indian person would actually use for it themselves (e.g.
+    "Jalgaonkar", not an academic transliteration scheme's "jaLagAvakara").
+
+    CONFIRMED LIVE 2026-10-15: neither a plain character-mapping fallback
+    (`unidecode`) nor a dedicated transliteration library
+    (`indic_transliteration`, IAST/Harvard-Kyoto schemes) reproduces this --
+    both preserve the exact phonetic/orthographic form of the Devanagari
+    (every schwa, every long vowel), which is NOT how these names are
+    conventionally spelled in English; real spelling involves irregular
+    contractions and conventions (dropped vowels, "v" vs "w", etc.) that
+    aren't mechanically derivable from the script alone and were previously
+    hand-translated one by one (see _translate_marathi.py's own
+    PARTY_NAMES dict, built that way for the 2020-2026 Parel/Property No.
+    10 IGR dataset). This automates that same judgment call via the same
+    Claude text call pattern solve_*_captcha already uses for vision,
+    reusing its budget cap/usage tracking (`portal="name_translation"` in
+    `captcha_usage_summary()`'s own breakdown) rather than a second,
+    separate spending limit.
+
+    `context` is optional free text (e.g. "a party in a Maharashtra
+    property registration document") to steer the model when the name
+    alone is ambiguous. Raises CaptchaSolveError on any API failure or if
+    the cross-run budget is exhausted -- same discipline as every other
+    Claude call in this module, so a caller can decide whether to fall
+    back to leaving the name untranslated."""
+    if not name or not name.strip():
+        return name
+    if not _anthropic_api_key():
+        raise CaptchaSolverNotConfigured(
+            "ANTHROPIC_API_KEY is not set -- required to translate names via Claude."
+        )
+    remaining = _captcha_budget_remaining_usd()
+    if remaining <= 0:
+        raise CaptchaSolveError(
+            f"Claude text-translation budget (${_CAPTCHA_SOLVE_COST_CAP_USD:.2f}) is exhausted "
+            f"(${-remaining:.6f} over) -- see captcha_usage_summary()."
+        )
+    context_line = f" ({context})" if context else ""
+    try:
+        resp = _get_claude_client().messages.create(
+            model=_CLAUDE_VISION_MODEL,
+            max_tokens=60,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"This is an Indian person or company name{context_line}, written in Devanagari "
+                    f"(or another Indian script): {name!r}\n\n"
+                    "Give the idiomatic English spelling an Indian person would actually use for this "
+                    "name themselves -- the way it would appear on their PAN card, passport, or in "
+                    "everyday English usage -- NOT an academic/phonetic transliteration scheme (so "
+                    "'Jalgaonkar', not 'Jalagavakara'; 'Prabhakar', not 'Prabhakara'). Preserve the "
+                    "name's full structure and level of detail without abbreviating or shortening any "
+                    "part of it (e.g. 'सहकारी पतपेढी' becomes '(Co-op. Credit Society Ltd.)', not just "
+                    "silently dropped; 'कुलमुखत्यार'/'मुखत्यार' becomes 'General Power of Attorney "
+                    "holder'/'Power of Attorney holder', never abbreviated to 'POA'). Respond with ONLY "
+                    "the English name, nothing else -- no explanation, no quotes."
+                ),
+            }],
+        )
+    except Exception as e:
+        raise CaptchaSolveError(f"Claude name-translation call failed: {e}") from e
+    cost_usd = _record_claude_vision_usage("name_translation", _CLAUDE_VISION_MODEL, resp)
+    text = "".join(
+        getattr(b, "text", "") for b in resp.content if getattr(b, "type", None) == "text"
+    ).strip()
+    if not text:
+        raise CaptchaSolveError(f"Claude returned no text for name translation (cost=${cost_usd:.6f}).")
+    return text

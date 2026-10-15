@@ -27,9 +27,10 @@ mechanism, confirmed by driving the real page and inspecting its DOM:
     (token_cache.py's model does not apply here -- there is nothing
     reusable to cache).
 
-Matching session_auth.py's own rule: nothing in this module solves or
-reads the CAPTCHA image. A human must look at the real browser window this
-opens and type it in themselves.
+CAPTCHA solving is Claude-vision-only (captcha_solver.solve_mahabhumi_captcha),
+same policy as every other portal in this codebase -- no human-wait fallback,
+no CapSolver. A fresh CAPTCHA solve is attempted on every call, up to
+_MAX_AUTOSOLVE_ATTEMPTS times, same budget as the other portals.
 
 Also matching the ICRA/ZaubaCorp convention elsewhere in this codebase:
 office and village names are NEVER fuzzy-matched or guessed across the
@@ -58,6 +59,7 @@ import time
 import pytesseract
 from PIL import Image
 
+import captcha_solver
 import config
 
 # Mirrors company_charter.py's own Tesseract-path bootstrap exactly (same
@@ -99,6 +101,17 @@ _SEL_CTS_SEARCH_BTN = "#ContentPlaceHolder1_btnsearchfind"
 _SEL_CTS_CANDIDATES = "#ContentPlaceHolder1_ddlsurveyno"
 _SEL_MOBILE = "#ContentPlaceHolder1_txtmobile1"
 _SEL_SUBMIT_BTN = "#ContentPlaceHolder1_btnmainsubmit"
+_SEL_CAPTCHA_IMAGE = "#ContentPlaceHolder1_captchaImage"
+_SEL_CAPTCHA_INPUT = "#ContentPlaceHolder1_txtcaptcha"
+_SEL_CAPTCHA_REFRESH = "#ContentPlaceHolder1_btnreferesh"
+# Same cap as every other portal's Claude-vision autosolve loop (session_
+# auth.py, gst_portal.py, igr_maharashtra_search.py) -- kept identical on
+# purpose rather than re-derived per portal.
+_MAX_AUTOSOLVE_ATTEMPTS = 8
+# How long a single attempt gets to either reveal the card or swap in a
+# fresh CAPTCHA (confirming rejection) before giving up on it and trying
+# again -- short, because nothing here waits on a human any more.
+_AUTOSOLVE_ATTEMPT_TIMEOUT_SECONDS = 25.0
 # The card renders in whichever language THIS dropdown holds, and every
 # label on it changes with the choice -- so it silently decides whether
 # parse_property_card can read anything at all. Confirmed live 2026-08-21:
@@ -866,8 +879,13 @@ def save_embedded_card_image(page, directory: str) -> dict:
     if not best:
         return {}
     extension, raw = best
-    os.makedirs(directory, exist_ok=True)
-    path = os.path.join(directory, f"property_card.{extension}")
+    # os.makedirs('') raises FileNotFoundError -- a bare filename (no
+    # directory component) passed as screenshot_path makes
+    # os.path.dirname(...) return "", which means "current directory",
+    # already guaranteed to exist, not "make nothing."
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, f"property_card.{extension}") if directory else f"property_card.{extension}"
     with open(path, "wb") as fh:
         fh.write(raw)
     return {"path": path, "bytes": len(raw)}
@@ -1031,7 +1049,6 @@ def fetch_property_card(
     village_label: str,
     cts_number: str,
     mobile: str,
-    timeout_seconds: int = config.CAPTCHA_TIMEOUT_SECONDS,
     poll_interval: float = config.CAPTCHA_POLL_INTERVAL_SECONDS,
     screenshot_path: str | None = None,
 ) -> dict:
@@ -1041,22 +1058,22 @@ def fetch_property_card(
     callers that don't pass it are unaffected).
 
     Opens a VISIBLE browser, drives every field up to and including the
-    exact CTS number, then waits for a human to read the CAPTCHA, type it,
-    and click Submit -- same human-in-the-loop contract as
-    session_auth.acquire_token_via_browser, except here a fresh CAPTCHA
-    solve is required on every call (see module note: no reusable session
-    was found).
+    exact CTS number, then solves the CAPTCHA via Claude vision and clicks
+    Submit itself -- no human-wait fallback, same zero-intervention policy
+    as every other portal in this codebase. A fresh CAPTCHA solve is
+    required on every call (see module note: no reusable session was
+    found).
 
     `office_label`/`village_label` must be exact strings already confirmed
     via list_offices()/list_villages() -- this function does not guess.
     `cts_number` must be one exact candidate already confirmed via
     search_cts_candidates() when more than one existed for that village.
 
-    Raises CaptchaTimeoutError if nobody submits within timeout_seconds,
-    BrowserClosedError if the window is closed early, or
-    AmbiguousSelectionError if office/village/cts_number isn't an exact
-    match. Callers should treat all three as "no result this time" and
-    degrade gracefully, same as the MahaRERA CAPTCHA flow."""
+    Raises CaptchaTimeoutError if the CAPTCHA isn't accepted within
+    _MAX_AUTOSOLVE_ATTEMPTS, BrowserClosedError if the window is closed
+    early, or AmbiguousSelectionError if office/village/cts_number isn't an
+    exact match. Callers should treat all three as "no result this time"
+    and degrade gracefully, same as the MahaRERA CAPTCHA flow."""
     district_label = resolve_district_label(district_name)
     if not district_label:
         return {"found": False, "note": f"district name {district_name!r} not recognized -- see _DISTRICT_NAME_MAP"}
@@ -1112,7 +1129,7 @@ def fetch_property_card(
                 _select_option_exact(page, _SEL_CTS_CANDIDATES, str(cts_number).strip(), cts_options)
 
                 page.fill(_SEL_MOBILE, str(mobile).strip())
-                # Set BEFORE the human takes over -- see _SEL_LANGUAGE.
+                # Set BEFORE autosolve submits -- see _SEL_LANGUAGE.
                 page.select_option(_SEL_LANGUAGE, label=_CARD_LANGUAGE)
                 setup_error = None
                 break
@@ -1124,86 +1141,135 @@ def fetch_property_card(
             return {"found": False, "note": f"Mahabhumi setup could not complete after 3 attempts: {setup_error}"}
 
         print(f"[INFO] A browser window has opened at {_BASE_URL}")
-        print("[INFO] Please read the CAPTCHA shown there, type it in, and click Submit.")
-        print(f"[INFO] Language is already set to {_CARD_LANGUAGE} -- please leave it alone;")
-        print("[INFO] the Marathi card is served as an image and cannot be parsed.")
-        print(f"[INFO] Waiting up to {timeout_seconds}s for you to finish...")
+        print(f"[INFO] Solving the CAPTCHA via Claude vision (up to {_MAX_AUTOSOLVE_ATTEMPTS} attempts)...")
+        print(f"[INFO] Language is already set to {_CARD_LANGUAGE} -- the Marathi card is served as an "
+              "image and cannot be parsed.")
 
-        elapsed = 0.0
-        last_status_at = 0.0
-        weak_signal_seconds = 0.0
-        starting_url = page.url
-        # Confirmed live (a real CAPTCHA solve, content changed in the SAME
-        # window, no new tab, no download -- and a screenshot of the actual
-        # result page): this site's post-submit transition is an ASP.NET
-        # partial postback, same technology as every other dropdown on this
-        # page -- which commonly means the submit button/panel gets hidden
-        # via CSS rather than removed from the DOM, so a bare .count() == 0
-        # check never fires even though a human plainly sees the page
-        # change. The confirmed result page is real structured Devanagari
-        # text (a table headed "मालमत्ता पत्रक" / "PU-ID: ..."), NOT a
-        # scanned image, and ends with a "मागे जा" (Go Back) button that
-        # only exists on that view -- the single most specific, lowest-
-        # false-positive signal available, checked first. The other three
-        # signals (URL change, submit button losing visibility, rendered
-        # text growing substantially) stay as a fallback in case a future
-        # variation of this page doesn't show that exact button.
-        starting_visible_text_len = len(page.inner_text("body"))
-        while elapsed < timeout_seconds:
+        for attempt in range(1, _MAX_AUTOSOLVE_ATTEMPTS + 1):
             if page.is_closed():
                 raise BrowserClosedError("Browser window was closed before the CAPTCHA was solved.")
+
+            # Mobile has nothing cascading into it the way District/Village
+            # do, so a silent reset here would be a different failure mode
+            # than IGR's -- but re-check anyway before every attempt, same
+            # discipline as that portal's own field-status check: cheap
+            # insurance against a reset discovered only after spending a
+            # solve on it.
+            wanted_mobile = str(mobile).strip()
+            for _mobile_try in range(2):
+                try:
+                    current_mobile = page.input_value(_SEL_MOBILE)
+                except Exception:
+                    current_mobile = None
+                if current_mobile == wanted_mobile:
+                    break
+                print(f"[INFO] Mobile field no longer matches before attempt {attempt} -- refilling in place "
+                      f"(try {_mobile_try + 1}/2).")
+                try:
+                    page.fill(_SEL_MOBILE, wanted_mobile)
+                except Exception:
+                    pass
+                # A refill issued the instant a reset is detected can itself
+                # still be mid-postback -- give it a moment, then verify on
+                # the next loop pass rather than trusting the write blind.
+                _settle(page, 800)
+
             try:
-                current_visible_text_len = len(page.inner_text("body"))
-                # STRONG signals: the card itself is on screen. Nothing else
-                # on this site shows a "मागे जा" (Go Back) button or a PU-ID.
-                card_on_screen = bool(_card_frame_text(page))
-                # WEAK signals: something moved. Confirmed live 2026-08-21 --
-                # these ALL fire during the site's "Processing , Please
-                # wait.." overlay, which hides the submit button and changes
-                # the rendered text length while the card is still being
-                # fetched. Treating them as equal to the strong signals
-                # scraped the overlay instead of the card and threw away a
-                # human CAPTCHA solve: raw_text came back as the bare search
-                # form, no PU-ID, no rows.
-                something_moved = (
-                    page.url != starting_url
-                    or not page.locator(_SEL_SUBMIT_BTN).is_visible()
-                    or abs(current_visible_text_len - starting_visible_text_len) > 200
-                )
-                page_changed = card_on_screen or (
-                    something_moved and weak_signal_seconds >= _WEAK_SIGNAL_GRACE_SECONDS
-                )
-                if something_moved and not card_on_screen:
-                    # Give the card time to arrive rather than scraping the
-                    # loading state. Still bounded: on expiry we scrape
-                    # whatever is there, so a solve is never lost outright,
-                    # and parse_property_card reports an unreadable result
-                    # rather than an empty one.
-                    weak_signal_seconds += poll_interval
-                elif card_on_screen:
-                    _settle(page, 1500)  # let the last rows paint
+                pre_solve_token = page.locator(_SEL_CAPTCHA_IMAGE).first.get_attribute("src")
             except Exception:
-                # Confirmed live: the moment a human submits the CAPTCHA, the
-                # resulting postback can destroy Playwright's execution
-                # context mid-check ("Execution context was destroyed, most
-                # likely because of a navigation") -- that error is itself
-                # strong evidence something just happened past the CAPTCHA
-                # gate, not a real failure. Treat it as "still settling":
-                # wait one more poll interval and let the NEXT iteration's
-                # checks run against the now-stable post-navigation page,
-                # rather than surfacing this as a fatal "could not run this
-                # pass" indistinguishable from a genuinely broken lookup.
+                pre_solve_token = None
+
+            try:
+                backend_name, solved_text = captcha_solver.solve_mahabhumi_captcha(page, enabled=True)
+                captcha_input = page.locator(_SEL_CAPTCHA_INPUT)
+                captcha_input.click()
+                captcha_input.fill("")
+                captcha_input.press_sequentially(solved_text, delay=50)
+                # Same stale-postback insurance confirmed live on IGR's own
+                # Property Details search (see igr_maharashtra_search.py's
+                # _autosolve_property_captcha) -- cheap, and removes any
+                # dependency on __EVENTTARGET already pointing at the submit
+                # button by accident.
+                page.evaluate(
+                    "document.getElementById('__EVENTTARGET').value = ''; "
+                    "document.getElementById('__EVENTARGUMENT').value = '';"
+                )
+                page.click(_SEL_SUBMIT_BTN, timeout=10000)
+            except Exception as e:
+                print(f"[INFO] CAPTCHA autosolve attempt {attempt}/{_MAX_AUTOSOLVE_ATTEMPTS} failed ({e}).")
+                continue
+
+            # Confirmed live (a real CAPTCHA solve, content changed in the
+            # SAME window, no new tab, no download -- and a screenshot of
+            # the actual result page): this site's post-submit transition is
+            # an ASP.NET partial postback, same technology as every other
+            # dropdown on this page -- which commonly means the submit
+            # button/panel gets hidden via CSS rather than removed from the
+            # DOM, so a bare .count() == 0 check never fires even though the
+            # page plainly changed. The confirmed result page is real
+            # structured Devanagari text (a table headed "मालमत्ता पत्रक" /
+            # "PU-ID: ..."), NOT a scanned image, and ends with a "मागे जा"
+            # (Go Back) button that only exists on that view -- the single
+            # most specific, lowest-false-positive signal available, checked
+            # first. The other three signals (URL change, submit button
+            # losing visibility, rendered text growing substantially) stay
+            # as a fallback in case a future variation of this page doesn't
+            # show that exact button.
+            elapsed = 0.0
+            weak_signal_seconds = 0.0
+            accepted = False
+            starting_url = page.url
+            starting_visible_text_len = len(page.inner_text("body"))
+            while elapsed < _AUTOSOLVE_ATTEMPT_TIMEOUT_SECONDS:
+                if page.is_closed():
+                    raise BrowserClosedError("Browser window was closed before the CAPTCHA was solved.")
+                try:
+                    current_visible_text_len = len(page.inner_text("body"))
+                    card_on_screen = bool(_card_frame_text(page))
+                    something_moved = (
+                        page.url != starting_url
+                        or not page.locator(_SEL_SUBMIT_BTN).is_visible()
+                        or abs(current_visible_text_len - starting_visible_text_len) > 200
+                    )
+                    page_changed = card_on_screen or (
+                        something_moved and weak_signal_seconds >= _WEAK_SIGNAL_GRACE_SECONDS
+                    )
+                    if something_moved and not card_on_screen:
+                        # Give the card time to arrive rather than scraping
+                        # the loading state.
+                        weak_signal_seconds += poll_interval
+                    elif card_on_screen:
+                        _settle(page, 1500)  # let the last rows paint
+                        accepted = True
+                        break
+                except Exception:
+                    # Confirmed live on IGR's own Property Details search:
+                    # the moment a submit goes through, the resulting
+                    # postback can destroy Playwright's execution context
+                    # mid-check ("Execution context was destroyed, most
+                    # likely because of a navigation") -- that error is
+                    # itself strong evidence something just happened past
+                    # the CAPTCHA gate, not a real failure. Treat it as
+                    # "still settling": wait one more poll interval and let
+                    # the NEXT iteration's checks run against the now-stable
+                    # post-navigation page.
+                    time.sleep(poll_interval)
+                    elapsed += poll_interval
+                    continue
+                if page_changed:
+                    accepted = True
+                    break
                 time.sleep(poll_interval)
                 elapsed += poll_interval
-                continue
-            if page_changed:
+
+            if accepted:
                 # Either a full postback navigated us on, or the form itself
                 # was replaced by a results view -- either way, something
                 # past the CAPTCHA gate happened. Scraping immediately after
                 # can hit the exact same transient "execution context
-                # destroyed" error if the page is still settling -- a couple
-                # of short retries here is cheap insurance against losing an
-                # entire human-in-the-loop CAPTCHA solve to one bad instant.
+                # destroyed" error if the page is still settling -- a
+                # couple of short retries here is cheap insurance against
+                # losing a confirmed accept to one bad instant.
                 scrape_error = None
                 for _scrape_attempt in range(3):
                     try:
@@ -1213,13 +1279,39 @@ def fetch_property_card(
                         time.sleep(poll_interval)
                 raise scrape_error
 
-            time.sleep(poll_interval)
-            elapsed += poll_interval
-            if elapsed - last_status_at >= 30:
-                print(f"[INFO] Still waiting for the CAPTCHA to be solved ({int(elapsed)}s/{timeout_seconds}s)...")
-                last_status_at = elapsed
+            # Not accepted within this attempt's window -- a rejected
+            # CAPTCHA is expected to swap in a fresh image on its own (same
+            # confirmed-live behavior as IGR's Property Details search); if
+            # the token genuinely didn't move, force a fresh one via the
+            # explicit refresh button rather than resolving the same
+            # rejected image again.
+            try:
+                post_token = page.locator(_SEL_CAPTCHA_IMAGE).first.get_attribute("src")
+            except Exception:
+                post_token = None
+            if post_token and post_token == pre_solve_token:
+                try:
+                    page.click(_SEL_CAPTCHA_REFRESH, timeout=5000)
+                except Exception:
+                    pass
+            # CONFIRMED LIVE 2026-10-15: without an unconditional settle here,
+            # the very next loop iteration's mobile-field check/refill can
+            # race the portal's own rejection postback (which swaps in the
+            # fresh CAPTCHA image and, same ASP.NET partial-postback pattern
+            # seen on IGR's Property Details search, can silently blank the
+            # mobile box too) -- a refill issued before that postback
+            # finishes gets overwritten right back to empty by it. Giving the
+            # page a moment to finish settling BEFORE the next attempt reads
+            # field state removes that race, whether or not the refresh
+            # button above needed to fire.
+            _settle(page, 1500)
+            print(f"[INFO] {backend_name}'s solve ({solved_text!r}) on attempt "
+                  f"{attempt}/{_MAX_AUTOSOLVE_ATTEMPTS} was not accepted within "
+                  f"{_AUTOSOLVE_ATTEMPT_TIMEOUT_SECONDS:.0f}s -- trying again.")
 
-        raise CaptchaTimeoutError(f"No result within {timeout_seconds}s -- the CAPTCHA wasn't solved in time.")
+        raise CaptchaTimeoutError(
+            f"CAPTCHA was not accepted after {_MAX_AUTOSOLVE_ATTEMPTS} Claude-vision attempts."
+        )
     finally:
         try:
             browser.close()
