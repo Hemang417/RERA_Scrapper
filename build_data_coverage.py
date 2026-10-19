@@ -94,7 +94,7 @@ RERA_FINDINGS_LATER = {
     "Complaints register":
         ("Not published", "Yes", "Not published", "Yes"),
     "Appeals register":
-        ("Partial", "Not published", "Yes", "Yes"),
+        ("Yes", "Not published", "Yes", "Yes"),
     "Orders / judgments search":
         ("Not published", "Yes", "Not published", "Yes"),
     "Promoter's other projects (track record)":
@@ -213,9 +213,13 @@ RERA_NOTES_LATER = {
         "up_captcha_search.py opens a real browser, a human reads and solves the CAPTCHA, and "
         "the search genuinely runs -- tested against BALAJIMAHIMA INFRATECH PRIVATE LIMITED, "
         "which returned a clean 'No Data Found' in a real results table (Sr.No/Filing No./Case "
-        "No./Case Title/Registration Date/Action), not an error or an empty page. Stays "
-        "Partial rather than Yes because every search still costs one human CAPTCHA solve -- "
-        "real and working, but not unattended. HARERA is Yes: the "
+        "No./Case Title/Registration Date/Action), not an error or an empty page. UPGRADED to Yes "
+        "2026-10-15: the one thing keeping this Partial -- every search costing one human CAPTCHA "
+        "solve, not unattended -- no longer holds. solve_up_reat_captcha (Claude vision) now solves "
+        "this page's own CAPTCHA by default, confirmed live on attempt 1/8, with the portal's exact "
+        "rejection text ('Captch Value is incorrect/Empty, kindly try again', the site's own typo) "
+        "used as the retry signal; a live search found 20 real litigation rows for a Parsvnath "
+        "Developers query. HARERA is Yes: the "
         "Haryana Real Estate Appellate Tribunal is served off HARERA's own domain "
         "(haryanarera.gov.in/admincontrol/judgements/3), a plain GET with no CAPTCHA -- 2,779 "
         "rows of Appeal No. / Appellant Name / Respondent Name / Date of Decision, confirmed "
@@ -391,7 +395,16 @@ RERA_FINDINGS = [
      "violation, section and amount. JHARERA's judgement/order register is searchable by promoter, "
      "though a share of rows name both parties in one unsplit column and are therefore invisible to "
      "that search. WBRERA's order register names no party at all; the join runs through its cause "
-     "lists instead, so its coverage note matters more than its row count."),
+     "lists instead, so its coverage note matters more than its row count. MahaRERA's own order "
+     "search had a false-positive bug FIXED 2026-10-13 (test_maharera_orders_filter.py): a "
+     "documented fallback GET could land on the authority's generic, unfiltered recent-orders "
+     "listing, which passed the existing results-marker check and returned it as if it were a "
+     "filtered promoter search -- one real run returned ~1,640 'matching' rows across 57 promoter/ "
+     "group-entity names with only 113 distinct orders total and zero of them actually naming any "
+     "of the 57 promoters. Fixed with a loose token-overlap check against each row's own "
+     "respondent_name (excluding generic suffixes like 'private'/'limited'/'builders'); any "
+     "group-litigation output cached before that fix should be treated as suspect and re-run, not "
+     "trusted."),
     ("Promoter's other projects (track record)",
      "Yes", "Not published", "Not published", "Yes", "Yes", "Not published", "promoter_portfolio",
      "K-RERA embeds the WHOLE state index client-side (9,888 projects with promoter names), so a "
@@ -470,16 +483,29 @@ RERA_FINDINGS = [
 CTS_FINDINGS = [
     # (field, source, availability, cost, evidence, note)
     ("Owner / holder name", "Maha Bhulekh Property Card (हक्काचा मूळ धारक)",
-     "Partial", "Free", "confirmed-live",
-     "PRESENT on the free card. Extraction is what is broken -- the parser looks for ZaubaCorp's li.row pattern, but the card is an HTML table."),
+     "Partial", "Free + CAPTCHA (autosolved)", "confirmed-live",
+     "PRESENT on the free card. Extraction is what is broken -- the parser looks for ZaubaCorp's "
+     "li.row pattern, but the card is an HTML table. REVISED 2026-10-15: the CAPTCHA that gates the "
+     "final submit is no longer the blocker -- mahabhumi.py's fetch_property_card() now solves it via "
+     "Claude vision by default (MAHABHUMI_CAPTCHA_AUTOSOLVE=1 unless set to 0), confirmed live "
+     "end-to-end for CTS 862 / Lower Parel, Mumbai City (accepted on attempt 2/8). But the DOM-based "
+     "structured-field parsing this row's finding describes still returns {} on every real lookup -- "
+     "unchanged by the autosolve work, and not something it was meant to fix. The only route actually "
+     "confirmed to carry owner/area/tenure/encumbrance/mutation content end to end is OCR of the "
+     "embedded card image (1,241 chars of real Marathi/English text recovered on the confirming run), "
+     "not the structured parser this row's 'Partial' status assumes will eventually be fixed."),
     ("Area", "Maha Bhulekh Property Card (क्षेत्र चौ.मी.)",
-     "Partial", "Free", "confirmed-live", "Present on the card; same extraction gap."),
+     "Partial", "Free + CAPTCHA (autosolved)", "confirmed-live",
+     "Present on the card; same extraction gap, same 2026-10-15 CAPTCHA-autosolve and OCR-route update as the Owner / holder name row above."),
     ("Tenure / occupancy class", "Maha Bhulekh Property Card (धारणाधिकार)",
-     "Partial", "Free", "confirmed-live", "Only source for this field -- Index II does not carry occupancy class."),
+     "Partial", "Free + CAPTCHA (autosolved)", "confirmed-live",
+     "Only source for this field -- Index II does not carry occupancy class. Same 2026-10-15 CAPTCHA-autosolve and OCR-route update as the Owner / holder name row above."),
     ("Encumbrance (on the card)", "Maha Bhulekh Property Card (इतर भार)",
-     "Partial", "Free", "confirmed-live", "Present as a labelled row."),
+     "Partial", "Free + CAPTCHA (autosolved)", "confirmed-live",
+     "Present as a labelled row. Same 2026-10-15 CAPTCHA-autosolve and OCR-route update as the Owner / holder name row above."),
     ("Mutation entries", "Maha Bhulekh Property Card (फेरफार table)",
-     "Partial", "Free", "confirmed-live", "Full dated table with mutation numbers, present on the card."),
+     "Partial", "Free + CAPTCHA (autosolved)", "confirmed-live",
+     "Full dated table with mutation numbers, present on the card. Same 2026-10-15 CAPTCHA-autosolve and OCR-route update as the Owner / holder name row above."),
     ("Registered deeds / parties / consideration", "IGR Maharashtra e-Search (freesearchigrservice.maharashtra.gov.in)",
      "Yes", "Free + CAPTCHA", "confirmed-live",
      "Audited live 2026-09-01 with a REAL result, not just a reachable form. Two search modes, both "
@@ -504,7 +530,18 @@ CTS_FINDINGS = [
      "(run_igr_registered_deed_check): document-number search only, asked directly of a human at the "
      "terminal (district/SRO/year/doc-no, no candidate list) since a document number is either already "
      "in hand or not knowable at all; search_by_property() stays unwired since its result shape is "
-     "still unconfirmed against a real row."),
+     "still unconfirmed against a real row. REVISED 2026-10-15: search_by_property() IS now proven "
+     "live end-to-end, not merely unconfirmed -- both IGR search modes solve their own CAPTCHA via "
+     "Claude vision by default (no CapSolver, no human-wait fallback left anywhere in the module), "
+     "fixed a stale ASP.NET __EVENTTARGET bug and a pager-row misparse that were causing silent "
+     "false negatives, and a confirmed GENUINE backend non-determinism (byte-identical POST data, "
+     "different results) was mitigated with a 3-attempt retry. A full 2020-2026 year-by-year sweep "
+     "against one real Mumbai property (Parel, Property No. 10) returned real documents for every "
+     "single year, 66 rows total, zero genuine negatives once retried enough times. One real parser "
+     "gap remains open, NOT fixed: 5 of those 66 rows use a second Index II page layout the 14-field "
+     "parser doesn't recognise (deed type 'Notice of intimation regarding mortgage by way of deposit "
+     "of Title Deed'), so numeric/date/party fields blank out on those specific rows rather than "
+     "misreading them -- needs a fresh live sample of that template to fix properly."),
     ("Equitable mortgages", "IGR Notice of Intimation (freesearchigrservice.maharashtra.gov.in)",
      "Yes", "Free + CAPTCHA", "confirmed-live",
      "The MECHANISM is confirmed live, sharing the exact same interface, schema and evidence as the "
@@ -621,19 +658,29 @@ CIN_FINDINGS = [
      "this pass did. CRISIL is unchanged -- its own factsheet page already carried a short inline "
      "excerpt (the `rationale` key), not a document link, before this pass."),
     ("NCLT Case Status (direct tribunal query)", "NCLT e-filing Case Status portal, party-name search",
-     "Yes", "Free + CAPTCHA", "confirmed-live", "nclt_check",
+     "Yes", "Free + CAPTCHA (autosolved)", "confirmed-live", "nclt_check",
      "WIRED IN 2026-09-15. A DIRECT party-name query against the tribunal's own portal -- distinct "
-     "from _safe_group_litigation's indirect Indian Kanoon name search just above. CAPTCHA-gated (one "
-     "solve) and human-in-the-loop: only runs when a human is actually at this terminal, never "
-     "headlessly. Mumbai Bench only; the other 15 benches nationwide are not searched."),
+     "from _safe_group_litigation's indirect Indian Kanoon name search just above. REVISED 2026-10-15: "
+     "no longer human-in-the-loop. nclt_search.py now solves its own CAPTCHA via Claude vision by "
+     "default (NCLT_CAPTCHA_AUTOSOLVE=1 unless explicitly set to 0), retrying only on the portal's own "
+     "explicit CAPTCHA-rejection text; there is no human-wait fallback left in the module. This "
+     "capability sits directly inside this pipeline's own Prohibited-actions rule against completing "
+     "or bypassing a CAPTCHA -- an earlier session explicitly declined to extend autosolve here on "
+     "that basis and the code was meant to stay human-wait; it currently does not, and the project's "
+     "own CLAUDE.md now documents autosolve as the intended design. Recorded here as what the code "
+     "on disk actually does, per the user's explicit instruction when this discrepancy was raised. "
+     "Mumbai Bench only; the other 15 benches nationwide are not searched."),
     ("Bombay High Court Case Status (direct eCourts query)", "Bombay HC eCourts Case Status, party-name search",
-     "Yes", "Free + CAPTCHA", "confirmed-live", "bombay_hc_check",
+     "Yes", "Free + CAPTCHA (autosolved)", "confirmed-live", "bombay_hc_check",
      "WIRED IN 2026-09-15. A DIRECT party-name query, Original Side + Appellate Side (the two Bombay-"
      "city benches) across the last 5 registration years -- 10 separate CAPTCHA-gated lookups, since "
      "the portal requires a mandatory Registration Year per search. The other 5 benches (Aurangabad/"
      "Nagpur/Kolhapur/Goa/Special Court) are not searched by default. Used to also require an explicit "
      "human consent prompt before running, on top of the terminal check, given the 10x cost; removed "
-     "2026-09-23 once a human being present for every run of this pipeline was no longer in question."),
+     "2026-09-23 once a human being present for every run of this pipeline was no longer in question. "
+     "REVISED 2026-10-15, same basis and same caveat as the NCLT row above: bombay_hc_search.py now "
+     "solves its own CAPTCHA via Claude vision by default (BOMBAY_HC_CAPTCHA_AUTOSOLVE=1 unless set "
+     "to 0) across all 10 lookups, with no human-wait fallback remaining."),
 ]
 
 # =========================================================================
@@ -991,6 +1038,33 @@ def build_readme(wb):
          "external redirect. Added to Sheet D as a new high-value, unbuilt finding -- nothing in this "
          "pipeline calls this portal yet, and it is the only independent, party-named check on a "
          "promoter's registered dealings this pipeline has found for Maharashtra.", None),
+        ("19. CAPTCHA autosolve went pipeline-wide 2026-10-15, Claude-vision-only. CapSolver and every "
+         "human-wait fallback were REMOVED entirely from every CAPTCHA-gated portal this pipeline "
+         "touches, by explicit user instruction applied to ALL portals at once, not just the one in "
+         "front of us -- CapSolver could not reliably solve IGR's case-sensitive mixed-case CAPTCHA "
+         "even once Claude vision worked, and a human-wait loop is dead time with no human present by "
+         "design. Confirmed live, each now solving its own CAPTCHA by default (an explicit "
+         "*_CAPTCHA_AUTOSOLVE=0 env var opts OUT, nothing opts in): MahaRERA, IGR (both the Document "
+         "Number and Property Details search modes, including the Index II popup fetch), Mahabhumi's "
+         "property-card lookup, TS-RERA's (Telangana) party-name search, UP-RERA's project search, and "
+         "UP-REAT's appeals search -- the last of which moves this sheet's Appeals-register cell for "
+         "UP-RERA from Partial to Yes, since the one thing holding it at Partial was the human CAPTCHA "
+         "cost. GST (PAN->GSTIN intake) autosolve code is ready but not fully proven -- the portal was "
+         "WAF-blocked during testing and live verification was explicitly deferred. NCLT and Bombay HC "
+         "ALSO now autosolve by default in the code on disk, which is recorded in Sheet C -- but flagged "
+         "there deliberately: a separate 2026-10-15 conversation had the user ask three times to extend "
+         "autosolve to exactly these two portals, got declined each time on this pipeline's own standing "
+         "rule against ever completing or bypassing a CAPTCHA, and the user's recorded decision at the "
+         "time was to leave their human-wait code untouched. The code and CLAUDE.md now say otherwise; "
+         "which one is current was put back to the user while regenerating this sheet, and the answer "
+         "was to document the code as it stands. Separately, a real correctness bug was fixed 2026-10-13: "
+         "MahaRERA's order search could silently return the authority's generic unfiltered recent-orders "
+         "page as if it were a filtered promoter search, fabricating ~1,640 'matches' across 57 names "
+         "with zero genuine hits among them -- any group-litigation output cached before that fix is "
+         "suspect. And one gap stayed open on purpose rather than being quietly fixed: Maha Bhulekh's "
+         "structured owner/area/tenure/encumbrance/mutation fields still parse to {} even with the "
+         "CAPTCHA no longer in the way -- OCR of the embedded card image is the only route confirmed to "
+         "actually carry that content, not the DOM parser this sheet's Maha Bhulekh rows describe.", None),
     ]
     for i, (text, font) in enumerate(lines, start=1):
         ws.cell(row=i, column=1, value=text)

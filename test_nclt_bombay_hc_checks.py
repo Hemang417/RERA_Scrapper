@@ -7,14 +7,12 @@ Mocks nclt_search.search_party / bombay_hc_search.search_party (network + a
 real browser/CAPTCHA) to keep this offline and fast, same convention as
 test_cts_intake.py mocking mahabhumi.search_cts_candidates/
 fetch_property_card -- this file tests company_charter's own wrapper logic
-(TTY gating, per-lookup failure isolation), not the Playwright/DOM internals
-of either search module, which need a real human CAPTCHA solve to fully
-validate (see each module's own docstring).
+(default-on/explicit-disable behavior, per-lookup failure isolation), not the
+Playwright/DOM internals of either search module against the live portals.
+Autosolve plumbing is covered offline in test_court_captcha_solver.py.
 
-Bombay HC's own extra "proceed with all N lookups?" consent prompt was
-removed once a human being present on this run was no longer in question --
-it now runs unconditionally once past the sys.stdin.isatty() gate, same as
-NCLT.
+Neither direct check has a human CAPTCHA fallback. The
+`*_CAPTCHA_AUTOSOLVE=0` switches skip the corresponding check.
 
 Run directly: python test_nclt_bombay_hc_checks.py
 """
@@ -26,27 +24,43 @@ import nclt_search
 import company_charter as cc
 
 
-def test_nclt_check_skips_when_not_interactive():
-    with mock.patch("sys.stdin.isatty", return_value=False), \
+def test_nclt_check_skips_when_autosolve_is_disabled():
+    with mock.patch.dict("os.environ", {"NCLT_CAPTCHA_AUTOSOLVE": "0"}), \
+         mock.patch("sys.stdin.isatty", return_value=False), \
          mock.patch.object(nclt_search, "search_party") as fake_search:
         result = cc._safe_nclt_check("Some Promoter LLP")
 
     assert result["attempted"] is False
     fake_search.assert_not_called()
-    print("test_nclt_check_skips_when_not_interactive: PASS")
+    print("test_nclt_check_skips_when_autosolve_is_disabled: PASS")
 
 
-def test_nclt_check_wraps_nclt_search_result():
+def test_nclt_check_autosolves_by_default_without_terminal():
+    fake_result = {"found": False, "rows": [], "raw_text": "", "url": "https://x", "note": ""}
+    with mock.patch.dict("os.environ", {}, clear=True), \
+         mock.patch("sys.stdin.isatty", return_value=False), \
+         mock.patch.object(nclt_search, "search_party", return_value=fake_result) as fake_search:
+        result = cc._safe_nclt_check("Some Promoter LLP")
+
+    fake_search.assert_called_once_with("Some Promoter LLP", "Mumbai")
+    assert result["attempted"] is True
+    assert result["captcha_mode"] == "Claude vision"
+    print("test_nclt_check_autosolves_by_default_without_terminal: PASS")
+
+
+def test_nclt_check_reports_claude_vision_mode():
     fake_result = {"found": False, "rows": [], "raw_text": "No Record Found In Case Detail.", "url": "https://x", "note": ""}
-    with mock.patch("sys.stdin.isatty", return_value=True), \
+    with mock.patch.dict("os.environ", {}, clear=True), \
+         mock.patch("sys.stdin.isatty", return_value=False), \
          mock.patch.object(nclt_search, "search_party", return_value=fake_result) as fake_search:
         result = cc._safe_nclt_check("Some Promoter LLP", bench="Mumbai")
 
     fake_search.assert_called_once_with("Some Promoter LLP", "Mumbai")
     assert result["attempted"] is True
+    assert result["captcha_mode"] == "Claude vision"
     assert result["bench"] == "Mumbai"
     assert result["found"] is False
-    print("test_nclt_check_wraps_nclt_search_result: PASS")
+    print("test_nclt_check_reports_claude_vision_mode: PASS")
 
 
 def test_nclt_check_exception_is_never_fatal():
@@ -84,34 +98,49 @@ def test_nclt_check_never_leaks_raw_exception_text():
     print("test_nclt_check_never_leaks_raw_exception_text: PASS")
 
 
-def test_bombay_hc_check_skips_when_not_interactive():
-    with mock.patch("sys.stdin.isatty", return_value=False), \
+def test_bombay_hc_check_skips_when_autosolve_is_disabled():
+    with mock.patch.dict("os.environ", {"BOMBAY_HC_CAPTCHA_AUTOSOLVE": "0"}), \
+         mock.patch("sys.stdin.isatty", return_value=False), \
          mock.patch.object(bombay_hc_search, "search_party") as fake_search:
         result = cc._safe_bombay_hc_check("Some Promoter LLP")
 
     assert result["attempted"] is False
     fake_search.assert_not_called()
-    print("test_bombay_hc_check_skips_when_not_interactive: PASS")
+    print("test_bombay_hc_check_skips_when_autosolve_is_disabled: PASS")
 
 
-def test_bombay_hc_check_runs_all_combinations_unconditionally():
-    """No consent prompt any more -- once past the isatty() gate, every
-    bench x year combination is attempted with no human "proceed?" step."""
+def test_bombay_hc_check_autosolves_by_default_without_terminal():
     fake_result = {"found": False, "rows": [], "raw_response": {"ok": True}, "url": "https://x", "note": ""}
-    with mock.patch("sys.stdin.isatty", return_value=True), \
+    with mock.patch.dict("os.environ", {}, clear=True), \
+         mock.patch("sys.stdin.isatty", return_value=False), \
+         mock.patch.object(bombay_hc_search, "search_party", return_value=fake_result) as fake_search:
+        result = cc._safe_bombay_hc_check("Some Promoter LLP")
+
+    assert result["attempted"] is True
+    assert fake_search.call_count == 10
+    assert result["captcha_mode"] == "Claude vision"
+    print("test_bombay_hc_check_autosolves_by_default_without_terminal: PASS")
+
+
+def test_bombay_hc_check_runs_all_combinations_without_human_input():
+    """Every bench/year combination runs without a TTY or human prompt."""
+    fake_result = {"found": False, "rows": [], "raw_response": {"ok": True}, "url": "https://x", "note": ""}
+    with mock.patch.dict("os.environ", {}, clear=True), \
+         mock.patch("sys.stdin.isatty", return_value=False), \
          mock.patch("builtins.input") as fake_input, \
          mock.patch.object(bombay_hc_search, "search_party", return_value=fake_result) as fake_search:
         result = cc._safe_bombay_hc_check("Some Promoter LLP")
 
     fake_input.assert_not_called()
     assert result["attempted"] is True
+    assert result["captcha_mode"] == "Claude vision"
     # 2 benches x 5 years, per _safe_bombay_hc_check's own scoping.
     assert len(result["runs"]) == 10
     assert fake_search.call_count == 10
     for run in result["runs"]:
         assert run["bench"] in result["benches_checked"]
         assert run["year"] in result["years_checked"]
-    print("test_bombay_hc_check_runs_all_combinations_unconditionally: PASS")
+    print("test_bombay_hc_check_runs_all_combinations_without_human_input: PASS")
 
 
 def test_bombay_hc_check_one_failure_does_not_abort_the_sweep():
@@ -157,12 +186,14 @@ def test_bombay_hc_check_never_leaks_raw_exception_text():
 
 
 if __name__ == "__main__":
-    test_nclt_check_skips_when_not_interactive()
-    test_nclt_check_wraps_nclt_search_result()
+    test_nclt_check_skips_when_autosolve_is_disabled()
+    test_nclt_check_autosolves_by_default_without_terminal()
+    test_nclt_check_reports_claude_vision_mode()
     test_nclt_check_exception_is_never_fatal()
     test_nclt_check_never_leaks_raw_exception_text()
-    test_bombay_hc_check_skips_when_not_interactive()
-    test_bombay_hc_check_runs_all_combinations_unconditionally()
+    test_bombay_hc_check_skips_when_autosolve_is_disabled()
+    test_bombay_hc_check_autosolves_by_default_without_terminal()
+    test_bombay_hc_check_runs_all_combinations_without_human_input()
     test_bombay_hc_check_one_failure_does_not_abort_the_sweep()
     test_bombay_hc_check_never_leaks_raw_exception_text()
     print("\nAll tests passed.")

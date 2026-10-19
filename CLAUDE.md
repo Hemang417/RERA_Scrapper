@@ -47,18 +47,31 @@ the run continue. Nothing else may swallow an error.
 
 1. Assemble facts (`_run_charter_pass`, registry and insolvency checks,
    document grounding). Section B of `rules.md` is injected into every such call.
-2. `run_cts_land_lookup()`, `run_igr_registered_deed_check()`, and
-   `run_gst_compliance_check()` **[opt-in]** — each does nothing without its
-   human-supplied input file, unless a human is actually at this terminal
-   (`sys.stdin.isatty()`), in which case CTS walks them through office →
-   village → CTS-number → mobile inline instead of stopping to wait for a
-   separate `cts_resolve.py` session (never auto-picks office/village —
-   Marathi labels don't reliably match RERA's own text), and IGR asks
-   directly for a district/SRO/year/document-number (no candidate list to
-   pick from — a document number is either already in hand, from e.g. the
-   project's own Title Report, or not knowable at all). IGR is Maharashtra
-   -only, checked explicitly (`facts["state"]["code"] == "MH"`) since unlike
-   CTS it has no district-hint step that would naturally fail elsewhere.
+2. `run_cts_land_lookup()`, `run_gr_citation_lookup()`,
+   `run_igr_registered_deed_check()`, and `run_gst_compliance_check()`
+   **[opt-in]** — each does nothing without its human-supplied input file,
+   unless a human is actually at this terminal (`sys.stdin.isatty()`), in
+   which case CTS walks them through office → village → CTS-number →
+   mobile inline instead of stopping to wait for a separate
+   `cts_resolve.py` session (never auto-picks office/village — Marathi
+   labels don't reliably match RERA's own text), and IGR asks directly for
+   a district/SRO/year/document-number (no candidate list to pick from —
+   a document number is either already in hand, from e.g. the project's
+   own Title Report, or not knowable at all). IGR is Maharashtra-only,
+   checked explicitly (`facts["state"]["code"] == "MH"`) since unlike CTS
+   it has no district-hint step that would naturally fail elsewhere.
+   `run_cts_land_lookup()` ALSO checks first whether the recorded CTS-like
+   value is actually shaped like a Government Resolution file number
+   (`gr_maharashtra_search._looks_like_gr_citation`, e.g.
+   `"CID-1812/CR-274/UD-10"` — CONFIRMED LIVE against a real Navi Mumbai
+   project this is a CIDCO land-compensation/resettlement SCHEME citation,
+   not a land-parcel identifier) — when it matches, the CTS flow is skipped
+   (it would only ever fail) and `run_gr_citation_lookup()` runs instead,
+   asking a human for department + date range (gr.maharashtra.gov.in's own
+   keyword search does NOT match a bare file-number fragment — CONFIRMED
+   LIVE; candidate dates come from an ordinary web search for the citation
+   string, outside this pipeline) and, on a single confirmed hit,
+   downloading the GR's PDF and extracting its full text.
 2b. **Identity and group passes** — code-computed, never model-authored, each
    with its own Charter section: `_safe_promoter_identity()` (PAN off the filed
    card), `_safe_charge_movement()` (borrowing moved since last run),
@@ -77,15 +90,17 @@ the run continue. Nothing else may swallow an error.
    the first four have ever produced a live-confirmed hit — via `--group-sweep`'s
    already-opened projects — needs `--group-sweep` on or there is nothing to check),
    `_safe_nclt_check()` (direct NCLT Case Status portal query by party name, NCLT,
-   Mumbai Bench only — 15 other benches nationwide not checked; a real CAPTCHA
-   solve, so only runs when a human is at this terminal), `_safe_bombay_hc_check()`
+   Mumbai Bench only — 15 other benches nationwide not checked; Claude-vision
+   autosolve by default, skipped with `NCLT_CAPTCHA_AUTOSOLVE=0`),
+   `_safe_bombay_hc_check()`
    (direct eCourts Case Status query for Original Side + Appellate Side, Bombay,
    last 5 registration years — the portal requires a mandatory year per search, so
-   this is 10 separate CAPTCHA-gated lookups; always asks explicit human consent
-   first, on top of the terminal check, given that cost — 5 other benches covering
+   this is 10 separate CAPTCHA-gated lookups; Claude-vision autosolve by
+   default, skipped with `BOMBAY_HC_CAPTCHA_AUTOSOLVE=0` — 5 other benches covering
    Aurangabad/Nagpur/Kolhapur/Goa/Special Court not checked). Both are DIRECT
    court/tribunal queries, distinct from `_safe_group_litigation()`'s indirect
-   Indian Kanoon name search just above.
+   Indian Kanoon name search just above. Check each portal's terms before
+   enabling autosolve against live searches.
    Each reports its own coverage: no finding never means no check (`guardrails.md`).
    `_append_promoter_profile_section()` consolidates the above into one
    scannable overview — corporate identity, a Brief Profile narrative (from
@@ -140,11 +155,19 @@ an API call. Full map of all four: `guardrails.md`.
 <PAN|GSTIN> <REG_NO>` · `charge_watch.py <CIN>` (borrowing repaid yet?) ·
 `group_sweep.py <names...>` · `cts_resolve.py` and `ts_rera_client.py <name>`
 (human-in-the-loop, CAPTCHA) · `nclt_search.py <party name> [bench]` and
-`bombay_hc_search.py <party name> <year> [bench]` (human-in-the-loop, CAPTCHA —
-direct court/tribunal portal queries) · `igr_maharashtra_search.py docno
+`bombay_hc_search.py <party name> <year> [bench]` (direct court/tribunal portal
+queries; Claude-vision autosolve by default, skipped via
+`NCLT_CAPTCHA_AUTOSOLVE=0` / `BOMBAY_HC_CAPTCHA_AUTOSOLVE=0`) ·
+`igr_maharashtra_search.py docno
 <district> <SRO> <year> <doc_no>` (human-in-the-loop, CAPTCHA — registered-deed
 search, Maharashtra only; also reachable inline via `run_igr_registered_deed_
-check()`) · `promoter_intake.py <CIN> [company_name]` (company profile/IBBI/
+check()`) · `gr_maharashtra_search.py <keyword> [--department D] [--from-date
+D] [--to-date D]` (human-in-the-loop, CAPTCHA — Maharashtra Government
+Resolutions portal; traces a GR file-number citation found in a project's
+land/title documents back to its published text; also reachable inline via
+`run_gr_citation_lookup()`, auto-triggered by `run_cts_land_lookup()` when the
+recorded value is GR-shaped rather than a real CTS number) ·
+`promoter_intake.py <CIN> [company_name]` (company profile/IBBI/
 group-companies/credit-rating checks from a bare CIN, no RERA number needed —
 writes `output/_pending/<CIN>/promoter_profile.json`) · `charter_report.py` via
 `run_charter_pipeline.py` / `build_report.py` · `executive_briefing.py` ·

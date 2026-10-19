@@ -32,8 +32,8 @@ CONFIRMED LIVE: an incorrect CAPTCHA gets back exactly {"Error":"ERROR_VAL"}
 (and the page separately shows "THERE IS AN ERROR") -- there is no
 ambiguity here the way there was on NCLT's party-name search; the CAPTCHA
 is genuinely server-validated. A CORRECT solve's response shape for an
-actual hit has NOT been confirmed live yet (this pass never had a real
-CAPTCHA solved) -- see search_party's own docstring.
+actual hit has NOT been confirmed live yet -- see search_party's own
+docstring.
 
 The Highcourt/Bench selects (#sess_state_code / #court_complex_code) are
 driven by their visible label text, not raw values -- confirmed live that
@@ -43,11 +43,11 @@ ID changes and matches how a human actually uses the page (same
 "never guess an internal code" reasoning that keeps CTS office/village
 picks label-based too).
 
-SAME POLICY AS EVERY OTHER CAPTCHA-GATED MODULE HERE (gst_portal.py /
-mahabhumi.py / up_captcha_search.py / nclt_search.py / session_auth.py):
-nothing in this file reads or solves a CAPTCHA image. A real, VISIBLE
-browser opens, a human reads it and types it in themselves, and this only
-reads the response AFTER that human submits.
+The CAPTCHA is solved and submitted via Claude vision by default in a real,
+VISIBLE browser. Setting BOMBAY_HC_CAPTCHA_AUTOSOLVE=0 disables the check;
+there is no human-wait fallback. Up to three attempts are made when eCourts
+explicitly rejects an answer. Check the portal's terms before running
+autosolve against live searches.
 
     python bombay_hc_search.py "<party name>" <year> [bench label,
         default "Original Side,Bombay"]
@@ -56,6 +56,7 @@ reads the response AFTER that human submits.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 
@@ -68,8 +69,12 @@ _SEL_BENCH = "#court_complex_code"
 _SEL_PARTY_NAME = "#petres_name"
 _SEL_YEAR = "#rgyearP"
 _SEL_CAPTCHA = "#captcha"
+_SEL_CAPTCHA_IMAGE = "#captcha_image"
+_SEL_CAPTCHA_REFRESH = 'a[title="Refresh Image"]'
+_MAX_AUTOSOLVE_ATTEMPTS = 3
 # funShowRecords('CSpartyName') is this exact form's own Go button --
 # distinct from every other tab's Go/Search button on the same page.
+# The search is submitted only after entering Claude's answer.
 _SEL_GO_BUTTON = "input[onclick=\"funShowRecords('CSpartyName');\"]"
 
 # Every bench under Bombay High Court on this portal, confirmed live via
@@ -99,11 +104,15 @@ class BrowserClosedError(Exception):
 
 class CaptchaRejectedError(Exception):
     """The AJAX response was the confirmed-live {"Error": "ERROR_VAL"}
-    shape -- the CAPTCHA was read and rejected server-side, not a timeout
-    and not a genuine (even if empty) result. Distinct from
-    CaptchaTimeoutError so a caller can tell "never solved" from "solved
-    wrong" -- both are still "this lookup did not complete", never a
-    clean check, but the second means the human DID engage."""
+    shape -- the submitted CAPTCHA answer was rejected server-side, not a
+    timeout and not a genuine (even if empty) result. Distinct from
+    CaptchaTimeoutError so callers can distinguish rejection from a search
+    that never received a response."""
+
+
+def _autosolve_enabled() -> bool:
+    """Autosolve by default; set BOMBAY_HC_CAPTCHA_AUTOSOLVE=0 to disable."""
+    return os.environ.get("BOMBAY_HC_CAPTCHA_AUTOSOLVE", "1") != "0"
 
 
 def _launch(headless: bool):
@@ -172,8 +181,10 @@ def search_party(
     """Opens a VISIBLE browser at eCourts' Case Status : Search by
     Petitioner/Respondent form for Bombay High Court, pre-fills `bench`,
     `party_name`, `year` (the mandatory Registration Year -- see module
-    note) and `status` ("Pending"/"Disposed"/"Both"), then waits for a
-    human to read the CAPTCHA and click Go.
+    note) and `status` ("Pending"/"Disposed"/"Both"), then solves and submits
+    the CAPTCHA via Claude vision. Autosolve is enabled by default; setting
+    BOMBAY_HC_CAPTCHA_AUTOSOLVE=0 disables this check. There is no
+    human-wait fallback.
 
     CONFIRMED LIVE this pass: a wrong CAPTCHA gets back exactly
     {"Error": "ERROR_VAL"} from the AJAX endpoint, raised here as
@@ -193,6 +204,11 @@ def search_party(
         return {
             "found": False, "rows": [], "raw_response": None, "url": "",
             "note": f"Unknown status {status!r} -- must be Pending, Disposed, or Both.",
+        }
+    if not _autosolve_enabled():
+        return {
+            "found": False, "rows": [], "raw_response": None, "url": "",
+            "note": "Bombay HC check disabled by BOMBAY_HC_CAPTCHA_AUTOSOLVE=0.",
         }
 
     p, browser, page = _launch(headless=False)
@@ -215,33 +231,80 @@ def search_party(
 
         print(f"\n[INFO] A browser window has opened at {_MAIN_URL}")
         print(f"[INFO] Bombay High Court / {bench}, party name ({party_name!r}), year ({year}), "
-              f"status ({status}) are pre-filled. Please read the CAPTCHA and click Go.")
-        print(f"[INFO] Waiting up to {timeout_seconds}s for you to solve the CAPTCHA and click Go...")
-        try:
-            with page.expect_response(
-                lambda resp: "index_qry.php" in resp.url and "action_code=showRecords" in resp.url,
-                timeout=timeout_seconds * 1000,
-            ) as resp_info:
-                page.click(_SEL_GO_BUTTON, timeout=5000)
-        except Exception as e:
-            if page.is_closed():
-                raise BrowserClosedError("Browser window was closed before the CAPTCHA was solved.") from e
-            raise CaptchaTimeoutError(
-                f"No search response within {timeout_seconds}s -- the CAPTCHA wasn't solved in time."
-            ) from e
+              f"status ({status}) are pre-filled.")
+        print("[INFO] Solving the Bombay HC CAPTCHA via Claude vision.")
 
-        response = resp_info.value
-        body_text = _read_body_safely(response)
+        parsed = None
+        body_text = ""
+        attempt_limit = _MAX_AUTOSOLVE_ATTEMPTS
+        for attempt in range(1, attempt_limit + 1):
+            try:
+                import captcha_solver
+
+                backend_name, solved_text = captcha_solver.solve_bombay_hc_captcha(page, enabled=True)
+                captcha_input = page.locator(_SEL_CAPTCHA)
+                captcha_input.click()
+                captcha_input.fill("")
+                captcha_input.press_sequentially(solved_text, delay=50)
+            except Exception as e:
+                if page.is_closed():
+                    raise BrowserClosedError(
+                        "Browser window closed during the Bombay HC CAPTCHA autosolve."
+                    ) from e
+                raise CaptchaTimeoutError(
+                    f"Bombay HC Claude vision CAPTCHA autosolve failed ({type(e).__name__})."
+                ) from e
+
+            try:
+                with page.expect_response(
+                    lambda resp: "index_qry.php" in resp.url and "action_code=showRecords" in resp.url,
+                    timeout=timeout_seconds * 1000,
+                ) as resp_info:
+                    page.click(_SEL_GO_BUTTON, timeout=10000)
+            except Exception as e:
+                if page.is_closed():
+                    raise BrowserClosedError("Browser window was closed before the CAPTCHA was solved.") from e
+                raise CaptchaTimeoutError(
+                    f"No search response within {timeout_seconds}s -- the CAPTCHA wasn't solved in time."
+                ) from e
+
+            response = resp_info.value
+            body_text = _read_body_safely(response)
+            try:
+                parsed = json.loads(body_text)
+            except (json.JSONDecodeError, TypeError):
+                parsed = None
+
+            if not (isinstance(parsed, dict) and parsed.get("Error")):
+                print(f"[INFO] {backend_name} submitted the Bombay HC CAPTCHA "
+                      f"(attempt {attempt}/{_MAX_AUTOSOLVE_ATTEMPTS}).")
+                break
+
+            if parsed.get("Error") == "ERROR_VAL" and attempt < attempt_limit:
+                print(f"[INFO] Bombay HC rejected the Claude vision answer "
+                      f"(attempt {attempt}/{attempt_limit}); refreshing the CAPTCHA.")
+                try:
+                    image = page.locator(_SEL_CAPTCHA_IMAGE)
+                    old_src = image.get_attribute("src")
+                    page.locator(_SEL_CAPTCHA_REFRESH).click(timeout=5000)
+                    page.wait_for_function(
+                        "(oldSrc) => { const img = document.querySelector('#captcha_image'); "
+                        "return !!img && img.getAttribute('src') !== oldSrc; }",
+                        arg=old_src,
+                        timeout=10000,
+                    )
+                except Exception as e:
+                    raise CaptchaTimeoutError(
+                        f"Bombay HC could not refresh the CAPTCHA ({type(e).__name__})."
+                    ) from e
+                continue
+            break
+
         if screenshot_path:
             try:
                 page.screenshot(path=screenshot_path, full_page=True)
             except Exception:
                 pass
-
-        try:
-            parsed = json.loads(body_text)
-        except (json.JSONDecodeError, TypeError):
-            parsed = None
 
         if isinstance(parsed, dict) and parsed.get("Error"):
             raise CaptchaRejectedError(

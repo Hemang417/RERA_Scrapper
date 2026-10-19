@@ -735,4 +735,13 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # Same fix as prereg_charter.py's own entry point -- see that module's
+    # comment for the confirmed-live UnicodeEncodeError this guards against
+    # (a Marathi CTS/office label print() crashing the whole Charter stage
+    # because stdout defaults to cp1252, not just when explicitly piped).
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     sys.exit(main())

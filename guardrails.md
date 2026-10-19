@@ -107,6 +107,17 @@ NOT check price -- MahaRERA discloses no figure anywhere in `facts` for the
 subject project's own selling price, so a price threshold here would be an
 invented rule, not a verified fact.
 
+## 2a. Court CAPTCHA autosolve defaults on
+
+`nclt_search._autosolve_enabled` and `bombay_hc_search._autosolve_enabled`
+use Claude vision by default. Set `NCLT_CAPTCHA_AUTOSOLVE=0` or
+`BOMBAY_HC_CAPTCHA_AUTOSOLVE=0` to skip that portal's check; neither the
+search modules nor `company_charter._safe_nclt_check` /
+`company_charter._safe_bombay_hc_check` wait for a human to solve the
+CAPTCHA. Calls remain within `captcha_solver`'s existing cross-run spend
+cap. Check each court portal's terms before using this against live
+searches.
+
 ## 2c. Coverage — "not found" and "never asked" are different findings
 
 `states.candidate_profiles` REFUSES a registration number it recognises but
@@ -536,6 +547,7 @@ never stubbed — see `states/base.py`.
 | `company_charter._state_dash_rewrites` | The External gate blocking a save | Generates the Internal/External subtitle pair together, per state, so they cannot drift out of lockstep |
 | `states.get_adapter` | A blank failure for a state with no adapter | Raises naming the `pre_built_facts` route that does work |
 | `company_charter.run_igr_registered_deed_check` | A Gujarat/Karnataka/etc. run asking a human IGR Maharashtra questions | IGR's e-Search only exists for Maharashtra and, unlike CTS, has no district-hint step that would naturally fail for another state — the interactive prompt asks for a district directly, so this checks `facts["state"]["code"] == "MH"` explicitly instead |
+| `company_charter.run_cts_land_lookup`'s own GR-citation guard | A redundant pre-check before the CTS flow it never changes | CONFIRMED LIVE against a real project: a value that LOOKS like a CTS number can actually be a Government Resolution file number (`"CID-1812/CR-274/UD-10"`), which Mahabhumi's CTS search would only ever fail or mislead against — `gr_maharashtra_search._looks_like_gr_citation` catches this shape BEFORE any office/village resolution is attempted, and routes to `run_gr_citation_lookup` instead |
 | `company_charter._promoter_trust_signals` | The Trust Signals table naming IGR Maharashtra for a non-Maharashtra promoter | Same check, so the row is absent rather than shown as "not checked" for a portal that was never applicable |
 
 Three capability gates fix live bugs rather than prevent future ones: the

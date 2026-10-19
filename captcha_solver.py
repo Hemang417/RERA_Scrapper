@@ -1,11 +1,12 @@
 """
 Image-CAPTCHA autosolving, used by gst_portal.py (solve_gst_captcha),
 session_auth.py (solve_maharera_captcha), and igr_maharashtra_search.py
-(solve_igr_captcha). Claude vision only (claude-sonnet-5, same model/SDK
-pattern as deep_research.py -- these CAPTCHAs are deliberately
-human-readable, not adversarial to vision) -- raises past a failed call so
-the caller can retry, rather than falling back to a second OCR backend or
-a human-solve wait loop.
+(solve_igr_captcha), and optionally the direct NCLT / Bombay High Court
+searches. Claude vision only (claude-sonnet-5, same model/SDK pattern as
+deep_research.py) -- raises past a failed call so the caller can retry,
+rather than falling back to a second OCR backend or a human-solve wait
+loop. The court-portal CAPTCHA adapters have not been validated with a live
+answer.
 
 THIS IS A POLICY REVERSAL FROM EVERY OTHER CAPTCHA-GATED MODULE IN THIS
 PIPELINE. Both gst_portal.py's and session_auth.py's own docstrings say
@@ -738,6 +739,70 @@ def solve_up_reat_captcha(
     locator.wait_for(state="visible", timeout=15000)
     raw_bytes = locator.screenshot()
     return "Claude vision", _solve_with_claude_vision(raw_bytes, _UP_REAT_FORMAT_HINT, "up_reat")
+
+
+_SEL_NCLT_CAPTCHA_IMAGE = "img.imgcaptcha"
+_NCLT_FORMAT_HINT = (
+    "The answer field accepts at most 6 alphanumeric characters. Read the exact text shown, "
+    "preserve its case, and do not add spaces or punctuation."
+)
+
+
+def solve_nclt_captcha(
+    page,
+    enabled: bool = False,
+    image_selector: str = _SEL_NCLT_CAPTCHA_IMAGE,
+) -> tuple[str, str]:
+    """Reads NCLT's CAPTCHA image with Claude vision.
+
+    Autosolving is deliberately opt-in via `enabled=True` or
+    NCLT_CAPTCHA_AUTOSOLVE=1. Check the portal's terms before enabling this
+    against live searches.
+    """
+    if not (enabled or os.environ.get("NCLT_CAPTCHA_AUTOSOLVE") == "1"):
+        raise CaptchaSolveError(
+            "CAPTCHA autosolve is not enabled -- pass enabled=True or set NCLT_CAPTCHA_AUTOSOLVE=1."
+        )
+    if not _anthropic_api_key():
+        raise CaptchaSolverNotConfigured(
+            "ANTHROPIC_API_KEY is not set -- required to auto-solve the NCLT CAPTCHA."
+        )
+
+    locator = page.locator(image_selector).first
+    locator.wait_for(state="visible", timeout=15000)
+    return "Claude vision", _solve_with_claude_vision(locator.screenshot(), _NCLT_FORMAT_HINT, "nclt")
+
+
+_SEL_BOMBAY_HC_CAPTCHA_IMAGE = "#captcha_image"
+_BOMBAY_HC_FORMAT_HINT = (
+    "The CAPTCHA contains exactly 6 alphanumeric characters. Read the characters "
+    "in their displayed case; do not add spaces or punctuation."
+)
+
+
+def solve_bombay_hc_captcha(
+    page,
+    enabled: bool = False,
+    image_selector: str = _SEL_BOMBAY_HC_CAPTCHA_IMAGE,
+) -> tuple[str, str]:
+    """Reads eCourts' CAPTCHA image for Bombay High Court with Claude vision.
+
+    Autosolving is deliberately opt-in via `enabled=True` or
+    BOMBAY_HC_CAPTCHA_AUTOSOLVE=1. Check the portal's terms before enabling
+    this against live searches.
+    """
+    if not (enabled or os.environ.get("BOMBAY_HC_CAPTCHA_AUTOSOLVE") == "1"):
+        raise CaptchaSolveError(
+            "CAPTCHA autosolve is not enabled -- pass enabled=True or set BOMBAY_HC_CAPTCHA_AUTOSOLVE=1."
+        )
+    if not _anthropic_api_key():
+        raise CaptchaSolverNotConfigured(
+            "ANTHROPIC_API_KEY is not set -- required to auto-solve the Bombay HC CAPTCHA."
+        )
+
+    locator = page.locator(image_selector).first
+    locator.wait_for(state="visible", timeout=15000)
+    return "Claude vision", _solve_with_claude_vision(locator.screenshot(), _BOMBAY_HC_FORMAT_HINT, "bombay_hc")
 
 
 def translate_indian_name(name: str, context: str = "") -> str:

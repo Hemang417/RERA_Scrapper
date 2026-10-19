@@ -318,4 +318,19 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # CONFIRMED LIVE 2026-10-16: this process's stdout/stderr default to the
+    # Windows console's own codepage (cp1252) even when NOT redirected to a
+    # file -- any print() of a Marathi/Devanagari string anywhere downstream
+    # (CTS office/village labels, GR citation titles, etc.) raises
+    # UnicodeEncodeError, which escaped as an uncaught exception and took
+    # down the ENTIRE Charter generation stage (not just the one print call)
+    # the first time this was hit live. reconfigure() is a no-op failure
+    # (never fatal) on a stream that doesn't support it (e.g. piped into
+    # something unusual) -- errors="replace" is the last-resort fallback so
+    # a genuinely unencodable character degrades to "?" instead of crashing.
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     sys.exit(main())

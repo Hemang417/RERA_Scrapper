@@ -22,11 +22,14 @@ import re
 import charter_report
 import company_charter
 import charge_watch
+import captcha_solver
+import bombay_hc_search
 import geo_lookup
 import group_enforcement
 import group_sweep
 import gst_group
 import litigation_sweep
+import nclt_search
 import promoter_identity
 import promoter_portfolio
 import states
@@ -38,6 +41,9 @@ _MODULES = {
     "company_charter": company_charter,
     "deep_research": deep_research,
     "charter_report": charter_report,
+    "captcha_solver": captcha_solver,
+    "bombay_hc_search": bombay_hc_search,
+    "nclt_search": nclt_search,
     "main": main,
     # The state seam documents its guards in guardrails.md too, so the same
     # rename-protection applies to them.

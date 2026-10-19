@@ -1,7 +1,7 @@
 {
   "domains": {
     "99acres.com": {
-      "hit_count": 7,
+      "hit_count": 8,
       "projects": [
         "P52100019639",
         "P51800077150",
@@ -9,7 +9,8 @@
         "P51700031409",
         "CONSTELLA_TS",
         "ABB-2329_MAYA-411038",
-        "KARMASHINE_MARKETYARD_411037"
+        "KARMASHINE_MARKETYARD_411037",
+        "PUSHPAK_ONE_PREREG"
       ],
       "promoted": true,
       "promoted_on_project": "CONSTELLA_TS",

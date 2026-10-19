@@ -15,17 +15,16 @@ form, not ASP.NET WebForms. Confirmed live by direct DOM inspection:
     postback; they're read directly off the DOM at submit time.
   - Only the final SEARCH click is CAPTCHA-gated (name="answer"), and it
     too is a real full-page POST (submitForm() -> document.frm.submit()),
-    not AJAX -- same mechanism as up_captcha_search.py's UP-RERA projects
-    search, which is why this module borrows its exact
-    _wait_for_human_submit/_safe_read helpers rather than mahabhumi.py's
-    (that site's ASP.NET UpdatePanel partial-postback model doesn't apply
-    here).
+    not AJAX -- same full-page-POST mechanism as mahabhumi.py and the
+    earlier human-wait versions of up_captcha_search.py /
+    igr_maharashtra_search.py. This module now uses Claude-vision autosolve
+    and retries only on explicit CAPTCHA rejection.
 
-SAME POLICY AS EVERY OTHER CAPTCHA-GATED MODULE HERE (gst_portal.py /
-mahabhumi.py / up_captcha_search.py / session_auth.py): nothing in this
-file reads or solves a CAPTCHA image. A real, VISIBLE browser opens, a
-human reads it and types it in themselves, and this only reads the page
-AFTER that human submits.
+The CAPTCHA is solved and submitted via Claude vision by default, in a
+real browser. Setting NCLT_CAPTCHA_AUTOSOLVE=0 disables the check; there is
+no human-wait fallback. Only explicit CAPTCHA-rejection text triggers
+another attempt. Check the portal's terms before running autosolve against
+live searches.
 
 16 benches nationwide (see _BENCHES). A Maharashtra-based promoter's
 filings are most plausibly under NCLT, Mumbai Bench -- the default here --
@@ -40,6 +39,8 @@ bench.
 
 from __future__ import annotations
 
+import os
+import re
 import sys
 import time
 
@@ -60,6 +61,10 @@ _BENCHES = {
 _SEL_BENCH = 'select[name="schemaname"]'
 _SEL_SEARCH_BY = 'select[name="search_by"]'
 _SEL_PARTY_NAME = 'input[name="namee"]'
+_SEL_CAPTCHA_IMAGE = "img.imgcaptcha"
+_SEL_CAPTCHA_INPUT = 'input[name="answer"]'
+_SEL_SEARCH_BUTTON = "#submit1"
+_MAX_AUTOSOLVE_ATTEMPTS = 3
 
 
 class CaptchaTimeoutError(Exception):
@@ -68,6 +73,76 @@ class CaptchaTimeoutError(Exception):
 
 class BrowserClosedError(Exception):
     pass
+
+
+def _autosolve_enabled() -> bool:
+    """Autosolve by default; setting NCLT_CAPTCHA_AUTOSOLVE=0 disables the check."""
+    return os.environ.get("NCLT_CAPTCHA_AUTOSOLVE", "1") != "0"
+
+
+def _is_captcha_rejection(body_text: str) -> bool:
+    """Only retry when the response explicitly says the CAPTCHA was wrong."""
+    text = body_text.casefold()
+    return bool(re.search(
+        r"\bcaptcha\b.{0,50}\b(?:invalid|incorrect|wrong|mismatch|does not match)\b"
+        r"|\b(?:invalid|incorrect|wrong)\b.{0,50}\bcaptcha\b",
+        text,
+    ))
+
+
+def _autosolve_and_submit(page, party_name: str, bench: str, timeout_seconds: int) -> None:
+    """Submits Claude's answer, retrying only on an explicit rejection."""
+    import captcha_solver
+
+    request_predicate = lambda req: (
+        req.method == "POST" and "case_status.php" in req.url
+        and "party_wise" in (req.post_data or "")
+        and "answer=" in (req.post_data or "")
+    )
+
+    for attempt in range(1, _MAX_AUTOSOLVE_ATTEMPTS + 1):
+        try:
+            backend_name, solved_text = captcha_solver.solve_nclt_captcha(page, enabled=True)
+            captcha_input = page.locator(_SEL_CAPTCHA_INPUT)
+            captcha_input.click()
+            captcha_input.fill("")
+            captcha_input.press_sequentially(solved_text, delay=50)
+            with page.expect_request(request_predicate, timeout=timeout_seconds * 1000):
+                page.click(_SEL_SEARCH_BUTTON, timeout=10000)
+            try:
+                page.wait_for_load_state("load", timeout=8000)
+            except Exception:
+                pass
+            _settle(page, timeout_ms=8000)
+        except Exception as e:
+            if page.is_closed():
+                raise BrowserClosedError("Browser window closed during the NCLT CAPTCHA autosolve.") from e
+            raise CaptchaTimeoutError(
+                f"NCLT Claude vision CAPTCHA autosolve failed ({type(e).__name__})."
+            ) from e
+
+        body_text = _safe_read(lambda: page.inner_text("body"), min_length=50)
+        if not _is_captcha_rejection(body_text):
+            print(f"[INFO] {backend_name} submitted the NCLT CAPTCHA (attempt "
+                  f"{attempt}/{_MAX_AUTOSOLVE_ATTEMPTS}).")
+            return
+
+        if attempt < _MAX_AUTOSOLVE_ATTEMPTS:
+            print(f"[INFO] NCLT rejected the Claude vision answer "
+                  f"(attempt {attempt}/{_MAX_AUTOSOLVE_ATTEMPTS}); retrying with the refreshed image.")
+            try:
+                page.wait_for_selector(_SEL_CAPTCHA_IMAGE, timeout=10000)
+                page.wait_for_selector(_SEL_PARTY_NAME, timeout=10000)
+                page.select_option(_SEL_BENCH, value=_BENCHES[bench])
+                page.fill(_SEL_PARTY_NAME, party_name)
+            except Exception as e:
+                raise CaptchaTimeoutError(
+                    f"NCLT could not prepare a refreshed CAPTCHA ({type(e).__name__})."
+                ) from e
+
+    raise CaptchaTimeoutError(
+        f"NCLT rejected Claude vision answers after {_MAX_AUTOSOLVE_ATTEMPTS} attempts."
+    )
 
 
 def _launch(headless: bool):
@@ -95,35 +170,6 @@ def _settle(page, timeout_ms=6000):
         page.wait_for_load_state("networkidle", timeout=timeout_ms)
     except Exception:
         pass
-
-
-def _wait_for_human_submit(page, timeout_seconds, request_predicate, post_submit_marker=None):
-    """Same shape as up_captcha_search._wait_for_human_submit (see that
-    module's own docstring for the two live bugs -- a body-text-length
-    delta and a captcha-refresh click both masquerading as "the human
-    submitted" -- that make a SPECIFIC request predicate, not a generic
-    page-change check, the only reliable signal here too)."""
-    print(f"[INFO] Waiting up to {timeout_seconds}s for you to solve the CAPTCHA and click SEARCH...")
-    try:
-        with page.expect_request(request_predicate, timeout=timeout_seconds * 1000):
-            pass
-    except Exception as e:
-        if page.is_closed():
-            raise BrowserClosedError("Browser window was closed before the CAPTCHA was solved.") from e
-        raise CaptchaTimeoutError(
-            f"No SEARCH submit within {timeout_seconds}s -- the CAPTCHA wasn't solved in time."
-        ) from e
-    try:
-        page.wait_for_load_state("load", timeout=8000)
-    except Exception:
-        pass
-    _settle(page, timeout_ms=8000)
-    if post_submit_marker:
-        try:
-            page.wait_for_selector(post_submit_marker, timeout=15000)
-        except Exception:
-            pass
-    time.sleep(1.0)
 
 
 def _safe_read(read_fn, attempts=6, delay=1.0, min_length=0):
@@ -188,14 +234,15 @@ def search_party(
 ) -> dict:
     """Opens a VISIBLE browser at NCLT's Case Status Report, switches
     SEARCH BY to PARTY NAME WISE, picks `bench` (default Mumbai) and
-    pre-fills the party name, then waits for a human to read the CAPTCHA
-    and click SEARCH.
+    pre-fills the party name and solves/submits the CAPTCHA via Claude
+    vision. Autosolve is enabled by default; setting
+    NCLT_CAPTCHA_AUTOSOLVE=0 disables the check. There is no human-wait
+    fallback.
 
     CONFIRMED LIVE this pass: a non-matching party name returns the exact
     page text 'No Record Found In Case Detail.' -- used below to recognize
     a genuine zero-result search. A MATCHING result's table shape has NOT
-    been confirmed live yet (this pass never had a real CAPTCHA solved
-    against a party actually on record) -- when neither the confirmed
+    been confirmed live yet -- when neither the confirmed
     no-match text nor a parseable results table appears, this returns
     found=False with a non-empty `note` flagging the result as
     inconclusive rather than a confirmed clean check, per this codebase's
@@ -209,6 +256,11 @@ def search_party(
         return {
             "found": False, "rows": [], "raw_text": "", "url": "",
             "note": f"Unknown bench {bench!r} -- must be one of {sorted(_BENCHES)}.",
+        }
+    if not _autosolve_enabled():
+        return {
+            "found": False, "rows": [], "raw_text": "", "url": "",
+            "note": "NCLT search was disabled by NCLT_CAPTCHA_AUTOSOLVE=0.",
         }
 
     p, browser, page = _launch(headless=False)
@@ -233,17 +285,10 @@ def search_party(
         page.fill(_SEL_PARTY_NAME, party_name)
 
         print(f"\n[INFO] A browser window has opened at {_CASE_STATUS_URL}")
-        print(f"[INFO] Bench ({bench}) and party name ({party_name!r}) are pre-filled. "
-              f"Please read the CAPTCHA and click SEARCH.")
+        print(f"[INFO] Bench ({bench}) and party name ({party_name!r}) are pre-filled.")
+        print("[INFO] Solving the NCLT CAPTCHA via Claude vision.")
         try:
-            _wait_for_human_submit(
-                page, timeout_seconds,
-                request_predicate=lambda req: (
-                    req.method == "POST" and "case_status.php" in req.url
-                    and "party_wise" in (req.post_data or "")
-                ),
-                post_submit_marker=_SEL_SEARCH_BY,
-            )
+            _autosolve_and_submit(page, party_name, bench, timeout_seconds)
         except (CaptchaTimeoutError, BrowserClosedError) as e:
             return {"found": False, "rows": [], "raw_text": "", "url": page.url, "note": str(e)}
 

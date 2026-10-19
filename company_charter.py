@@ -3435,7 +3435,35 @@ def run_cts_land_lookup(facts: dict, reg_no: str, output_dir: str = config.OUTPU
     developer-supplied CTS not matching RERA's own official record is
     exactly the kind of discrepancy the investment team should be able to
     question the developer about directly, not have it read past unnoticed
-    in a gaps list."""
+    in a gaps list.
+
+    FIRST CHECKS whether the recorded value even IS a CTS number: a project's
+    land/title documents sometimes cite something that LOOKS like it could be
+    one but is actually a Government Resolution file number (CONFIRMED LIVE
+    2026-10-16 against a real Navi Mumbai project: "CID-1812/CR-274/UD-10",
+    which turned out to be a CIDCO land-compensation/resettlement SCHEME
+    citation, not a land-parcel identifier -- Mahabhumi's own Property-Card
+    office list for that project's taluka doesn't even cover its village).
+    When _looks_like_gr_citation matches, this skips the CTS flow entirely
+    (it would only ever fail/mislead) and routes to run_gr_citation_lookup
+    instead -- see that function and gr_maharashtra_search.py's own module
+    docstring for the portal this runs against."""
+    recorded_cts_value = ((facts.get("land_identification", {}).get("survey_cts_plot_numbers") or {}).get("value") or "").strip()
+    if recorded_cts_value:
+        import gr_maharashtra_search
+        if gr_maharashtra_search._looks_like_gr_citation(recorded_cts_value):
+            facts["cts_land_record_check"] = {
+                "found": False,
+                "note": (
+                    f"{recorded_cts_value!r} has the shape of a Maharashtra Government Resolution file "
+                    f"number (e.g. 'CID-1812/CR-274/UD-10'), not a CTS/survey/gat number -- a policy-"
+                    f"document reference, not a land-parcel identifier. The Mahabhumi CTS lookup was "
+                    f"skipped rather than run against it; see gr_citation_check for the GR-portal lookup "
+                    f"this was automatically routed to instead."
+                ),
+            }
+            return facts
+
     carryover_path = os.path.join(output_dir, reg_no, "land_record_carryover.json")
     if os.path.exists(carryover_path):
         with open(carryover_path, "r", encoding="utf-8") as f:
@@ -3701,6 +3729,166 @@ def run_igr_registered_deed_check(facts: dict, reg_no: str, output_dir: str = co
             "label": "IGR Maharashtra e-Search (registered deed)",
             "ref": f"Doc #{igr_input['doc_number']}, {igr_input['sro_contains']}, {igr_input['year']} -- {result.get('url', '')}",
             "topic": "registered_deed",
+            "published_date": "unknown",
+            "accessed_date": datetime.now().strftime("%Y-%m-%d"),
+        })
+    return facts
+
+
+def _interactively_resolve_gr_citation(reg_no: str, output_dir: str) -> bool:
+    """Walks a human at THIS terminal through gr_maharashtra_search's own
+    search fields -- called only when run_gr_citation_lookup has already
+    confirmed the recorded land-identification value looks like a GR file
+    number (see _looks_like_gr_citation), so this never re-asks whether one
+    even exists, only for the search parameters. CONFIRMED LIVE 2026-10-16:
+    the portal's own keyword field matched nothing for the bare file-number
+    fragment (it searches the GR's subject text, which doesn't contain its
+    own file number) -- what actually found the real GR was a department +
+    exact-date search, after candidate dates were found via an ordinary web
+    search for the citation string itself. So this ONLY asks for department
+    and a date (or date range); it does not pretend a keyword search will
+    work and does not attempt to guess a date itself. Returns True and
+    writes output/<reg_no>/gr_citation_lookup_input.json only if the human
+    completes every step; False (nothing written) the moment they decline."""
+    print(
+        f"\n[INFO] GR citation lookup (gr.maharashtra.gov.in) -- this project's recorded land-identification "
+        f"value looks like a Government Resolution file number, not a CTS number. A web search for the "
+        f"citation string itself (outside this pipeline) usually turns up the dates it was issued/amended "
+        f"on, cited in other documents that reference the same file. Leave any answer blank to skip."
+    )
+    department = _safe_input(f"Department (one of {sorted(_GR_DEPARTMENTS_HINT)}, blank = Urban Development): ").strip() or "Urban Development"
+    if department not in _GR_DEPARTMENTS_HINT:
+        print(f"[INFO] {department!r} is not a recognized department -- skipping.")
+        return False
+    from_date = _safe_input("From date you want to search, YYYY-MM-DD (e.g. a date this citation is dated/amended): ").strip()
+    if not from_date:
+        return False
+    to_date = _safe_input(f"To date, YYYY-MM-DD (blank = same as From date, {from_date}): ").strip() or from_date
+    keyword = _safe_input("Keyword to additionally filter by (optional, blank = none): ").strip()
+
+    record = {"department": department, "from_date": from_date, "to_date": to_date, "keyword": keyword}
+    project_dir = os.path.join(output_dir, reg_no)
+    os.makedirs(project_dir, exist_ok=True)
+    with open(os.path.join(project_dir, "gr_citation_lookup_input.json"), "w", encoding="utf-8") as f:
+        json.dump(record, f, indent=2, ensure_ascii=False)
+    print("[OK] GR citation lookup input confirmed -- proceeding straight to the search.")
+    return True
+
+
+# Department names this module can ask a human to pick from interactively --
+# kept in sync with gr_maharashtra_search._DEPARTMENTS (imported lazily
+# inside run_gr_citation_lookup/the interactive resolver above, same
+# deferred-import convention every other browser-driven check here uses).
+_GR_DEPARTMENTS_HINT = ("Urban Development", "Revenue and Forest", "Revenue (incl. Land Acquisition)", "Housing", "General Administration", "Public Works")
+
+
+def run_gr_citation_lookup(facts: dict, reg_no: str, output_dir: str = config.OUTPUT_ROOT) -> dict:
+    """Runs gr_maharashtra_search.search_gr only if output/<reg_no>/
+    gr_citation_lookup_input.json exists, containing {"department",
+    "from_date", "to_date", "keyword"} (see _interactively_resolve_gr_
+    citation for how a human supplies these). Same opt-in shape as
+    run_cts_land_lookup/run_igr_registered_deed_check: silently returns
+    facts unchanged if that file is absent AND no human is at this terminal
+    to supply it interactively -- there is no automated, CAPTCHA-free path
+    here either.
+
+    AUTOMATICALLY offered (not silently skipped) whenever run_cts_land_
+    lookup's own _looks_like_gr_citation check already matched this
+    project's recorded land-identification value -- see that function's
+    docstring. This is a DIFFERENT, independent evidence source from the
+    CTS Property Card or the IGR registered-deed search: it confirms what a
+    GR FILE NUMBER actually says (a policy/scheme resolution), not what a
+    specific land PARCEL's current record says.
+
+    On a confirmed find, downloads the PDF and extracts its full text (see
+    gr_maharashtra_search.download_gr_pdf/extract_pdf_text) to
+    output/<reg_no>/gr_citation_grs/ -- the Charter's own land-record note
+    can then quote the GR's actual operative text, not just that a search
+    was attempted.
+
+    CHECKED FIRST, before any of that: output/<reg_no>/gr_citation_carryover
+    .json -- same convention as run_cts_land_lookup's own land_record_
+    carryover.json, reusing an already-confirmed result (no new browser/
+    CAPTCHA) when this exact GR was already traced down in an earlier pass."""
+    carryover_path = os.path.join(output_dir, reg_no, "gr_citation_carryover.json")
+    if os.path.exists(carryover_path):
+        with open(carryover_path, "r", encoding="utf-8") as f:
+            carryover = json.load(f)
+        facts["gr_citation_check"] = carryover.get("gr_citation_check", {"found": False, "note": "carryover record had no gr_citation_check"})
+        facts.setdefault("sources", []).extend(carryover.get("sources", []))
+        facts.setdefault("gaps", []).extend(carryover.get("gaps", []))
+        return facts
+
+    input_path = os.path.join(output_dir, reg_no, "gr_citation_lookup_input.json")
+    if not os.path.exists(input_path):
+        recorded_cts_value = ((facts.get("land_identification", {}).get("survey_cts_plot_numbers") or {}).get("value") or "").strip()
+        import gr_maharashtra_search
+        looks_like_gr = bool(recorded_cts_value) and gr_maharashtra_search._looks_like_gr_citation(recorded_cts_value)
+        if looks_like_gr and sys.stdin.isatty() and _interactively_resolve_gr_citation(reg_no, output_dir):
+            pass  # gr_citation_lookup_input.json now exists -- fall through below.
+        elif looks_like_gr:
+            facts.setdefault("gaps", []).append(
+                f"GR citation lookup: {recorded_cts_value!r} looks like a Government Resolution file number, "
+                f"not a CTS number (see cts_land_record_check). Tracing it back to its published text needs "
+                f"a human-supplied department + date (write output/{reg_no}/gr_citation_lookup_input.json, or "
+                f"re-run interactively) -- a web search for the citation string itself usually surfaces "
+                f"candidate dates, since it tends to get re-cited by amendments under the same file number."
+            )
+            return facts
+        else:
+            return facts
+
+    import gr_maharashtra_search
+
+    with open(input_path, "r", encoding="utf-8") as f:
+        gr_input = json.load(f)
+
+    department = gr_input.get("department") or "Urban Development"
+    from_date = gr_input.get("from_date") or None
+    to_date = gr_input.get("to_date") or from_date
+    keyword = gr_input.get("keyword") or ""
+
+    print(f"\n[INFO] {input_path} found -- opening a browser to search gr.maharashtra.gov.in. "
+          f"Please solve the CAPTCHA when it appears.")
+    try:
+        result = gr_maharashtra_search.search_gr(keyword, department, from_date, to_date)
+    except gr_maharashtra_search.UnknownDepartmentError as e:
+        result = {"found": False, "rows": [], "raw_text": "", "url": "", "note": str(e)}
+    except (gr_maharashtra_search.CaptchaTimeoutError, gr_maharashtra_search.BrowserClosedError) as e:
+        result = {"found": False, "rows": [], "raw_text": "", "url": "", "note": f"GR citation search did not complete: {e}"}
+    except Exception as e:
+        # type(e).__name__ only -- same Playwright-launch leak risk as every
+        # other browser-driven check here.
+        result = {"found": False, "rows": [], "raw_text": "", "url": "", "note": f"GR citation search could not run this pass ({type(e).__name__})."}
+
+    # A result with exactly one row is confirmed enough to fetch and read
+    # directly; more than one needs a human to pick which GR is the right
+    # one (same "never guess" discipline as CTS candidate matching) -- left
+    # as rows for the caller/human to inspect rather than auto-downloading
+    # the wrong document.
+    if result.get("found") and len(result.get("rows", [])) == 1:
+        row = result["rows"][0]
+        pdf_url = row.get("pdf_url")
+        if pdf_url:
+            project_dir = os.path.join(output_dir, reg_no, "gr_citation_grs")
+            safe_code = re.sub(r'[<>:"/\\|?*]', "_", row.get("gr_code") or "gr")
+            pdf_path = os.path.join(project_dir, f"{safe_code}.pdf")
+            if gr_maharashtra_search.download_gr_pdf(pdf_url, pdf_path):
+                row["saved_pdf"] = pdf_path
+                extracted_text = gr_maharashtra_search.extract_pdf_text(pdf_path)
+                if extracted_text:
+                    text_path = os.path.join(project_dir, f"{safe_code}.txt")
+                    with open(text_path, "w", encoding="utf-8") as f:
+                        f.write(extracted_text)
+                    row["saved_text"] = text_path
+                    row["extracted_text_excerpt"] = extracted_text[:2000]
+
+    facts["gr_citation_check"] = result
+    if result.get("found"):
+        facts.setdefault("sources", []).append({
+            "label": "Maharashtra Government Resolutions portal",
+            "ref": f"Department={department}, {from_date} to {to_date} -- {result.get('url', '')}",
+            "topic": "gr_citation",
             "published_date": "unknown",
             "accessed_date": datetime.now().strftime("%Y-%m-%d"),
         })
@@ -5854,7 +6042,34 @@ _ABSENCE_RESCUE_RE = re.compile(
     # paragraphs that cite dated MahaRERA orders ("Order No. 35 of 2022 (dated
     # 2022-08-12)") -- a clause naming a specific dated instrument is a
     # finding, which is the whole principle this rescue encodes.
-    r"|\b\d{4}-\d{2}-\d{2}\b",
+    r"|\b\d{4}-\d{2}-\d{2}\b"
+    # CONFIRMED LIVE 2026-10-16 against a real Pushpak One run: "No dedicated
+    # litigation search was run against the promoter..." tripped _ABSENCE_
+    # SHAPES on its own trailing "...run against..." (matching the "against"
+    # trigger word), and "Not available - no mortgage or charge document
+    # reviewed for this project" tripped the plain risk-noun pattern on
+    # "mortgage" -- both describe a DILIGENCE STEP that was never performed
+    # (a gap), not a risk that was checked for and is absent (a clean check),
+    # but the keyword heuristic alone can't tell those apart and no editorial-
+    # pass verdict existed for either clause this run. Rescuing "a search/
+    # review/etc. was (not) run/reviewed/conducted" and "document(s) (not)
+    # reviewed" phrasing keeps this on the safe side of "when genuinely
+    # unsure, answer gap" -- CLAUDE.md's own "no finding never means no
+    # check" distinction, encoded here rather than left to chance.
+    r"|\b(?:search|review|check|audit|verification|inspection)(?:es)?\s+(?:was|were|has been|have been)?\s*(?:not\s+)?"
+    r"(?:run|reviewed|conducted|performed|undertaken|carried\s+out)\b"
+    # CONFIRMED LIVE 2026-10-16: an EARLIER, unqualified version of this next
+    # alternative (bare "documents? reviewed", no "no" required) broke
+    # test_clean_check_scrubber.py by rescuing "...in either the documents
+    # reviewed or independent web research..." -- a completely ordinary,
+    # legitimate clean-check qualifier phrase ("checked across every document
+    # reviewed"), nothing like the actual gap it was meant to catch ("no
+    # mortgage or charge document reviewed for this project"). Requiring the
+    # governing "no" within a bounded span -- same shape as _ABSENCE_SHAPES'
+    # own "no ... found/disclosed" patterns -- is what actually distinguishes
+    # "a document was never reviewed" (gap) from "checked in the documents
+    # reviewed" (clean check's own evidence base).
+    r"|\bno\s+[\w\s,'()/-]{0,40}?\bdocuments?\s+(?:was|were)?\s*reviewed\b",
     re.IGNORECASE,
 )
 
@@ -11150,7 +11365,7 @@ def _append_nclt_check_section(doc, facts: dict) -> None:
 
     heading_style = doc.paragraphs[4].style
     doc.add_page_break()
-    heading_para = doc.add_paragraph(_external_heading(facts, "NCLT Case Status Check (Code-Assisted, Human-Verified)"))
+    heading_para = doc.add_paragraph(_external_heading(facts, "NCLT Case Status Check (Direct Portal)"))
     heading_para.style = heading_style
 
     if not check.get("attempted"):
@@ -11161,7 +11376,8 @@ def _append_nclt_check_section(doc, facts: dict) -> None:
         doc, facts,
         internal_text=(
             f"Checked directly against NCLT's own e-filing Case Status portal, {check.get('bench')} Bench, "
-            f"by party name -- a human read and solved the site's own CAPTCHA to run this search. Only this "
+            f"by party name -- the site's CAPTCHA was completed via {check.get('captcha_mode', 'not recorded')} "
+            f"for this search. Only this "
             f"one bench was checked; NCLT has 16 benches nationwide."
         ),
         external_text=f"Checked against NCLT's Case Status portal, {check.get('bench')} Bench, by party name.",
@@ -11206,7 +11422,7 @@ def _append_bombay_hc_check_section(doc, facts: dict) -> None:
 
     heading_style = doc.paragraphs[4].style
     doc.add_page_break()
-    heading_para = doc.add_paragraph(_external_heading(facts, "Bombay High Court Case Status Check (Code-Assisted, Human-Verified)"))
+    heading_para = doc.add_paragraph(_external_heading(facts, "Bombay High Court Case Status Check (Direct Portal)"))
     heading_para.style = heading_style
 
     if not check.get("attempted"):
@@ -11221,8 +11437,9 @@ def _append_bombay_hc_check_section(doc, facts: dict) -> None:
         internal_text=(
             f"Checked directly against the eCourts High Courts Services portal's Case Status : Search by "
             f"Petitioner/Respondent form, for {', '.join(benches)} -- {len(years)} registration year(s) "
-            f"({min(years) if years else '?'}-{max(years) if years else '?'}) per bench, one CAPTCHA solved "
-            f"by a human per bench-year combination. Bombay High Court has 7 benches total and this portal "
+            f"({min(years) if years else '?'}-{max(years) if years else '?'}) per bench, one CAPTCHA "
+            f"completed via {check.get('captcha_mode', 'not recorded')} per bench-year combination. "
+            f"Bombay High Court has 7 benches total and this portal "
             f"requires a specific registration year per search, so this check does not cover every possible "
             f"bench/year for this promoter -- see guardrails.md for the coverage discipline this follows."
         ),
@@ -12491,12 +12708,15 @@ def _safe_nclt_check(promoter_name: str, bench: str = "Mumbai") -> dict:
     `bench` (default Mumbai -- the natural bench for a Maharashtra-based
     promoter; see nclt_search.BENCHES for the other 15). Distinct from
     _safe_group_litigation's Indian Kanoon name search: this queries the
-    tribunal's own portal directly. CAPTCHA-gated (one solve), so this
-    only ever runs when a human is actually at this terminal -- same
-    Streamlit-safety gate as CTS's interactive resolution -- never
-    headlessly, and never fatal."""
-    if not sys.stdin.isatty():
-        return {"attempted": False, "bench": bench, "note": "No terminal available to solve a CAPTCHA -- skipped this pass."}
+    tribunal's own portal directly. CAPTCHA is solved with Claude vision by
+    default (up to three attempts after explicit rejection). Set
+    NCLT_CAPTCHA_AUTOSOLVE=0 to skip this check. Never fatal."""
+    autosolve_enabled = os.environ.get("NCLT_CAPTCHA_AUTOSOLVE", "1") != "0"
+    if not autosolve_enabled:
+        return {
+            "attempted": False, "bench": bench,
+            "note": "NCLT check skipped because NCLT_CAPTCHA_AUTOSOLVE=0.",
+        }
 
     import nclt_search
 
@@ -12515,7 +12735,12 @@ def _safe_nclt_check(promoter_name: str, bench: str = "Mumbai") -> dict:
             "attempted": True, "bench": bench, "found": False, "rows": [], "raw_text": "",
             "note": f"NCLT check could not run this pass ({type(e).__name__}).",
         }
-    return {"attempted": True, "bench": bench, **result}
+    return {
+        "attempted": True,
+        "bench": bench,
+        "captcha_mode": "Claude vision",
+        **result,
+    }
 
 
 def _safe_bombay_hc_check(promoter_name: str) -> dict:
@@ -12529,15 +12754,17 @@ def _safe_bombay_hc_check(promoter_name: str) -> dict:
     Unlike every other CAPTCHA-gated check in this codebase (one solve),
     this is genuinely heavy -- one CAPTCHA per bench x year, confirmed
     live that the portal requires a mandatory Registration Year alongside
-    the CAPTCHA (see bombay_hc_search's own module note). It used to also
-    ask for explicit human confirmation before running, on top of the
-    sys.stdin.isatty() gate below -- removed on the user's explicit
-    instruction once a human being present (on the terminal-owning side of
-    this run) was no longer in question, so the cost-disclosure prompt was
-    just an extra step with nothing left to decide. Never fatal; any single
-    lookup's failure is recorded, not raised."""
-    if not sys.stdin.isatty():
-        return {"attempted": False, "runs": [], "note": "No terminal available to solve a CAPTCHA -- skipped this pass."}
+    the CAPTCHA (see bombay_hc_search's own module note). It is automated
+    by default and does not wait for a human prompt. Never fatal; any
+    single lookup's failure is recorded, not raised. Claude vision solves
+    each CAPTCHA by default; set BOMBAY_HC_CAPTCHA_AUTOSOLVE=0 to skip this
+    check."""
+    autosolve_enabled = os.environ.get("BOMBAY_HC_CAPTCHA_AUTOSOLVE", "1") != "0"
+    if not autosolve_enabled:
+        return {
+            "attempted": False, "runs": [],
+            "note": "Bombay HC check skipped because BOMBAY_HC_CAPTCHA_AUTOSOLVE=0.",
+        }
 
     import bombay_hc_search
 
@@ -12560,7 +12787,13 @@ def _safe_bombay_hc_check(promoter_name: str) -> dict:
                     "note": f"Bombay HC check could not run this pass ({type(e).__name__}).",
                 }
             runs.append({"bench": bench, "year": year, **result})
-    return {"attempted": True, "runs": runs, "benches_checked": list(benches), "years_checked": years}
+    return {
+        "attempted": True,
+        "captcha_mode": "Claude vision",
+        "runs": runs,
+        "benches_checked": list(benches),
+        "years_checked": years,
+    }
 
 
 def _record_promoter_identity_gap(facts: dict) -> None:
@@ -13585,9 +13818,9 @@ def run_company_charter(
     # Direct government court checks -- distinct from _safe_group_litigation
     # just above, which is a NAME search against a third-party case-law
     # index (Indian Kanoon), never a confirmed finding. These query the
-    # tribunal/court portals themselves, CAPTCHA-gated like CTS/GST, so they
-    # only ever run when a human is actually at this terminal (see each
-    # function's own note) -- never headlessly, never guessing consent.
+    # tribunal/court portals themselves, CAPTCHA-gated like CTS/GST, with
+    # Claude vision enabled by default (see each wrapper's disable flag).
+    # Their browser flows remain visible, but do not wait for human input.
     if promoter_name_for_rating:
         facts["nclt_check"] = _safe_nclt_check(promoter_name_for_rating)
         facts["bombay_hc_check"] = _safe_bombay_hc_check(promoter_name_for_rating)
@@ -13612,6 +13845,7 @@ def run_company_charter(
     facts["state"] = _profile_for_run.as_facts_dict()
 
     facts = run_cts_land_lookup(facts, reg_no, output_dir)
+    facts = run_gr_citation_lookup(facts, reg_no, output_dir)
     facts = run_igr_registered_deed_check(facts, reg_no, output_dir)
     facts = run_gst_compliance_check(facts, reg_no, output_dir)
 
@@ -13814,4 +14048,13 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # Same fix as prereg_charter.py's own entry point -- see that module's
+    # comment for the confirmed-live UnicodeEncodeError this guards against
+    # (a Marathi CTS/office label print() crashing this whole module because
+    # stdout defaults to cp1252, not just when explicitly piped).
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     sys.exit(main())
