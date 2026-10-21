@@ -53,10 +53,13 @@ covers a hard failure of the OCR stack itself.
 
 `company_charter._compute_landmark_distances` and
 `company_charter._verify_comparables_within_radius` are the Key Landmarks and
-Comparable Projects tables -- entirely code-computed against the free,
-keyless OpenStreetMap ecosystem (`geo_lookup.find_nearest_landmarks`,
-`geo_lookup.driving_route`, `geo_lookup.geocode`), replacing what used to be
-a model web_search guess. None of the three ever raises past its caller: a
+Comparable Projects tables -- entirely code-computed against
+`geo_lookup.find_nearest_landmarks`/`geo_lookup.driving_route` (free, keyless
+OpenStreetMap Overpass/OSRM) and `geo_lookup.geocode` (the HERE Geocoding &
+Search API, `HERE_API_KEY` -- switched from OSM Nominatim 2026-10-21 for
+materially better India coverage of newer/smaller buildings; see
+`geo_lookup.py`'s own module docstring), replacing what used to be a model
+web_search guess. None of the three ever raises past its caller: a
 category Overpass can't resolve within its widest search radius renders as
 an explicit "None found" row, not a blank or a guessed landmark; a landmark
 OSRM can't route renders as "Can't route", never a silent fallback to the

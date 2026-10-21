@@ -158,12 +158,14 @@ def test_total_area_developed_sums_land_area():
 
 
 def test_geocode_query_prefers_pincode_over_noisy_address():
-    """Regression test for a real live-run finding: MahaRERA's own
+    """Regression test for a real live-run finding (confirmed against the
+    pipeline's then-geocoder, OSM Nominatim): MahaRERA's own
     past_experiences.address is often a full legal land description
-    (survey numbers, stray commas) that Nominatim's free-form search
-    fails to resolve at all, even when it contains the correct locality
-    name -- but a bare 6-digit pincode extracted from that same string
-    geocodes reliably. Pincode must be preferred whenever present."""
+    (survey numbers, stray commas) that a free-form geocoder search fails
+    to resolve at all, even when it contains the correct locality name --
+    but a bare 6-digit pincode extracted from that same string geocodes
+    reliably. Pincode must be preferred whenever present -- kept as the
+    default under HERE (geo_lookup.py, since 2026-10-21) too."""
     noisy_but_has_pincode = (
         "Plot 1 of Survey nos 11/1A, 12/1, 12/2/1, 12/2/2, 12/2/3, 13/1B part and 13/2, "
         "Village Mamurdi, Service road to Pune Mumbai Expressway, Mamurdi, , Haveli, Pune, "

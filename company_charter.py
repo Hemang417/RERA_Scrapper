@@ -26,7 +26,10 @@ Guardrails, same philosophy as deep_research.py:
     replace that), but every candidate is independently geocoded and
     distance-verified afterward -- see _verify_comparables_within_radius().
 
-Requires: ANTHROPIC_API_KEY (same as deep_research.py), and a local
+Requires: ANTHROPIC_API_KEY (same as deep_research.py), HERE_API_KEY
+(geo_lookup.geocode -- optional but never-fatal: without it, every Key
+Landmark distance and every comparable's distance-verification silently
+can't be computed, dropped as a gap rather than guessed), and a local
 Tesseract OCR install for scanned/no-text PDFs (falls back to a plain
 "[OCR unavailable]" marker per-document if Tesseract isn't found, rather
 than failing the whole run).
@@ -34,8 +37,10 @@ than failing the whole run).
 Key Landmarks table (`distances`): fully code-computed, no model
 involvement, so no hallucinated landmark names or distances --
 _compute_landmark_distances():
-1. Geocodes the subject project's own locality via OpenStreetMap's free
-   Nominatim API (geo_lookup.geocode).
+1. Geocodes the subject project's own locality via the HERE Geocoding &
+   Search API (geo_lookup.geocode) -- switched from OSM Nominatim
+   (2026-10-21) for materially better India coverage of newer/smaller
+   buildings; see geo_lookup.py's own module docstring for why.
 2. For each of geo_lookup.LANDMARK_CATEGORIES (Airport, School, Metro
    station, Mall, Hospital, Religious place, Hotel, Infrastructure --
    "Infrastructure" meaning major transport infra: highways/flyovers/
@@ -919,11 +924,17 @@ def _comparable_geocode_query(item: dict) -> str:
     """Builds the string to geocode for one comparable candidate, same
     precedence promoter_portfolio._geocode_query_for already established
     for a different geocoding need in this pipeline (portfolio entries'
-    5km-radius filter): a bare 6-digit Indian pincode, when present,
-    resolves far more reliably via Nominatim's free-text search than a
-    locality/neighbourhood name does, so it takes priority whenever the
-    model actually supplied one. Falls back to `locality`, then to the
-    bare `project` name (rarely succeeds, but costs nothing to try)."""
+    5km-radius filter): a bare 6-digit Indian pincode, when present, is
+    preferred over a locality/neighbourhood name, so it takes priority
+    whenever the model actually supplied one. This precedence was
+    confirmed live against Nominatim's free-text search (a project name
+    prefix broke the match even when the locality alone resolved fine);
+    HERE's geocoder (geo_lookup.geocode, since 2026-10-21) has not yet
+    been separately confirmed to share that exact failure mode, but a
+    precise pincode is the more reliable signal either way, so the
+    precedence is kept rather than re-tested before being trusted. Falls
+    back to `locality`, then to the bare `project` name (rarely succeeds,
+    but costs nothing to try)."""
     pincode_match = _PINCODE_PATTERN.search((item.get("pincode") or "").strip())
     if pincode_match:
         return f"{pincode_match.group(1)}, India"
@@ -938,16 +949,21 @@ def _verify_comparables_within_radius(facts: dict, origin_coords: tuple | None,
     """Code-only check on the model's own `comparables` list -- never trusts
     its self-reported `distance_km` at face value. Geocodes each candidate
     via _comparable_geocode_query() -- preferring its `pincode` when given,
-    else its `locality`, ALONE, never combined with `project` -- confirmed
-    live (2026-09-28, against real comparables the model had proposed for a
-    real project) that Nominatim's structured search does not gracefully
-    ignore an unrecognised leading term: "<project name>, <real locality>"
-    returned nothing even for a real, well-known locality, while the
-    locality alone geocoded fine. A residential project's marketing name is
-    essentially never itself in OpenStreetMap, but the neighbourhood it's
-    in usually is; a pincode resolves more precisely still, since several
-    candidates sharing one broad locality string would otherwise all
-    collapse onto the exact same geocoded point (and therefore the same
+    else its `locality`, ALONE, never combined with `project`. This
+    locality-alone precedence was confirmed live (2026-09-28, against real
+    comparables the model had proposed for a real project) against the
+    pipeline's then-geocoder, OSM Nominatim: its structured search did not
+    gracefully ignore an unrecognised leading term -- "<project name>, <real
+    locality>" returned nothing even for a real, well-known locality, while
+    the locality alone geocoded fine. Geocoding moved to the HERE Geocoding
+    & Search API on 2026-10-21 (see geo_lookup.py) specifically because
+    Nominatim's India building-level coverage was too thin for this
+    verification step; the locality-alone precedence is kept as the safer
+    default either way. A residential project's marketing name is
+    essentially never itself in a geocoder's index, but the neighbourhood
+    it's in usually is; a pincode resolves more precisely still, since
+    several candidates sharing one broad locality string would otherwise
+    all collapse onto the exact same geocoded point (and therefore the same
     computed distance) even though their real addresses differ. Drops any
     entry that doesn't verify within `radius_km` of the subject project, or
     that can't be geocoded at all (an unverifiable claim is not the same as
@@ -8317,8 +8333,8 @@ _EXTERNAL_DASH_REWRITES = {
         "Past-experience completion dates are self-reported by the promoter to MahaRERA, not independently verified against any external record; treat this as the promoter's own claimed track record, not a confirmed one.",
     "total_area_developed_lakh_sqft and area_within_5km_lakh_sqft are both summed from each portfolio project's own past_experiences.landArea (self-reported, sqm, converted to lakh sq ft), excluding the subject project's own entry -- if the promoter declared the SAME historical project's area under more than one of its current registrations, that area is counted once per declaration, not deduplicated (the same limitation already applies to on_time_count/delayed_count above).":
         "Total area developed and area within 5km figures are both summed from each portfolio project's own reported land area (self-reported, converted to lakh sq ft), excluding the subject project's own entry. If the promoter declared the same historical project's area under more than one of its current registrations, that area is counted once per declaration, not deduplicated.",
-    "area_within_5km_lakh_sqft additionally requires geocoding: the subject project's own locality (from its partners category data, if supplied) is resolved via OpenStreetMap's public Nominatim API -- a free, no-API-key service, rate-limited to ~1 request/second per its usage policy. Each past_experiences entry's own address is geocoded by preference on any 6-digit Indian pincode found inside it (confirmed live: MahaRERA's own `address` field is often a full legal land description -- survey numbers, stray commas -- that Nominatim's free-form search fails on entirely, even when the correct locality name is embedded in it; the pincode alone resolves reliably), falling back to the raw address text, then to the portfolio project's district, if no pincode is present. An entry that still can't be geocoded is excluded from the 5km sum entirely (never guessed in or out), and a pincode covers a small area, not a point, so this figure is a reasonable estimate, not a surveyed one. If no subject location was supplied at all, or it can't be geocoded, area_within_5km_lakh_sqft stays None entirely.":
-        "The area-within-5km figure additionally requires geocoding: the subject project's own locality is resolved via OpenStreetMap's public Nominatim API, a free, no-API-key service, rate-limited to roughly 1 request per second. Each portfolio entry's own address is geocoded by preference on any 6-digit Indian pincode found inside it, since MahaRERA's own address field is often a full legal land description (survey numbers, stray commas) that free-form search fails on, while the pincode alone resolves reliably, falling back to the raw address text and then to the project's district if no pincode is present. An entry that still cannot be geocoded is excluded from the 5km sum entirely, and a pincode covers a small area rather than a point, so this figure is a reasonable estimate, not a surveyed one. If no subject location was supplied at all, or it cannot be geocoded, this figure is left blank entirely.",
+    "area_within_5km_lakh_sqft additionally requires geocoding: the subject project's own locality (from its partners category data, if supplied) is resolved via the HERE Geocoding & Search API -- a free-tier, API-key-gated service (HERE_API_KEY), switched from OSM Nominatim on 2026-10-21 for materially better India coverage of newer/smaller buildings. Each past_experiences entry's own address is geocoded by preference on any 6-digit Indian pincode found inside it (confirmed live against the pipeline's then-geocoder, Nominatim: MahaRERA's own `address` field is often a full legal land description -- survey numbers, stray commas -- that free-form search fails on entirely, even when the correct locality name is embedded in it; the pincode alone resolves reliably, a precedence kept under HERE as the safer default), falling back to the raw address text, then to the portfolio project's district, if no pincode is present. An entry that still can't be geocoded is excluded from the 5km sum entirely (never guessed in or out), and a pincode covers a small area, not a point, so this figure is a reasonable estimate, not a surveyed one. If no subject location was supplied at all, or it can't be geocoded, area_within_5km_lakh_sqft stays None entirely.":
+        "The area-within-5km figure additionally requires geocoding: the subject project's own locality is resolved via the HERE Geocoding & Search API, a free-tier, API-key-gated service, switched from OSM Nominatim for materially better India coverage of newer and smaller buildings. Each portfolio entry's own address is geocoded by preference on any 6-digit Indian pincode found inside it, since MahaRERA's own address field is often a full legal land description (survey numbers, stray commas) that free-form search fails on, while the pincode alone resolves reliably, falling back to the raw address text and then to the project's district if no pincode is present. An entry that still cannot be geocoded is excluded from the 5km sum entirely, and a pincode covers a small area rather than a point, so this figure is a reasonable estimate, not a surveyed one. If no subject location was supplied at all, or it cannot be geocoded, this figure is left blank entirely.",
     "No public source discloses internal team headcounts by function (Liaisoning / Project Development / Sales & CRM) -- a structural limitation of publicly-available data, not something a future pass can close.":
         "No public source discloses internal team headcounts by function (Liaisoning / Project Development / Sales & CRM). This is a structural limitation of publicly available data, not something a future review can close.",
     "Debt-to-capital ratio, secured-debt ratio, and default occurrence are not disclosed by any source this pipeline checks (neither the RERA record nor the corporate registry carries balance-sheet debt structure) -- only resolvable when a credit-rating rationale or MCA financial filing states these figures.":

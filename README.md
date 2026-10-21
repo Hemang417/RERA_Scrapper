@@ -28,7 +28,10 @@ A Streamlit UI wrapping the same pipeline is available via `streamlit run app.py
 Requires `ANTHROPIC_API_KEY` for the deep-research and Company Charter
 generation steps -- either failing is never fatal to the run; retry them
 standalone with `python deep_research.py <REG_NO>` / `python
-company_charter.py <REG_NO>`.
+company_charter.py <REG_NO>`. Also uses `HERE_API_KEY` (free tier) for
+geocoding inside the Charter's Key Landmarks/Comparable Projects tables and
+the promoter portfolio's 5km filter -- optional, but every distance that
+depends on it silently can't be computed without one (see `geo_lookup.py`).
 
 See `requirements.txt` for dependencies (Playwright, Anthropic SDK,
 python-docx, PyMuPDF, BeautifulSoup, etc.).

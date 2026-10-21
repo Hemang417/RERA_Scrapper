@@ -7,6 +7,14 @@ node before sorting by distance within each tier; confirmed live,
 all way-tagged while smaller/less-recognized ones were node-tagged). No
 real Overpass traffic -- geo_lookup._run_overpass_query is mocked.
 
+Also covers geo_lookup.geocode()'s HERE Geocoding & Search API request/
+response handling (request params, response-shape parsing, and the
+never-guess failure contract: empty query, missing HERE_API_KEY, empty
+`items`, and a request exception must all return None, never raise or
+fabricate a coordinate) -- _here_api_key is mocked directly rather than
+touching real env/.env state, and no real HERE traffic is made
+(geo_lookup.requests.get is mocked).
+
 Run directly: python test_geo_lookup.py
 """
 
@@ -76,8 +84,87 @@ def test_other_categories_are_unaffected_by_the_footprint_preference():
     print("test_other_categories_are_unaffected_by_the_footprint_preference: PASS")
 
 
+class _FakeResponse:
+    def __init__(self, json_body, status_ok=True):
+        self._json_body = json_body
+        self._status_ok = status_ok
+
+    def raise_for_status(self):
+        if not self._status_ok:
+            raise geo_lookup.requests.HTTPError("bad status")
+
+    def json(self):
+        return self._json_body
+
+
+def test_geocode_returns_none_on_empty_query():
+    with patch.object(geo_lookup, "_here_api_key", return_value="test-key"), \
+         patch.object(geo_lookup.requests, "get") as mock_get:
+        assert geo_lookup.geocode("") is None
+        assert geo_lookup.geocode("   ") is None
+    mock_get.assert_not_called()
+    print("test_geocode_returns_none_on_empty_query: PASS")
+
+
+def test_geocode_returns_none_when_api_key_missing():
+    # Must never raise and never fall back to another service -- a missing
+    # key is exactly the same "can't verify this" case as a failed request.
+    with patch.object(geo_lookup, "_here_api_key", return_value=""), \
+         patch.object(geo_lookup.requests, "get") as mock_get:
+        assert geo_lookup.geocode("Andheri West, Mumbai") is None
+    mock_get.assert_not_called()
+    print("test_geocode_returns_none_when_api_key_missing: PASS")
+
+
+def test_geocode_sends_expected_here_request_and_parses_lat_lng():
+    fake_resp = _FakeResponse({"items": [{"position": {"lat": 19.1197, "lng": 72.8468}}]})
+    with patch.object(geo_lookup, "_here_api_key", return_value="test-key"), \
+         patch.object(geo_lookup.requests, "get", return_value=fake_resp) as mock_get:
+        coords = geo_lookup.geocode("400058, India")
+
+    assert coords == (19.1197, 72.8468), coords
+    _, kwargs = mock_get.call_args
+    assert kwargs["params"]["q"] == "400058, India"
+    assert kwargs["params"]["apiKey"] == "test-key"
+    assert kwargs["params"]["in"] == "countryCode:IND"
+    assert kwargs["params"]["limit"] == 1
+    print("test_geocode_sends_expected_here_request_and_parses_lat_lng: PASS")
+
+
+def test_geocode_returns_none_on_empty_items():
+    fake_resp = _FakeResponse({"items": []})
+    with patch.object(geo_lookup, "_here_api_key", return_value="test-key"), \
+         patch.object(geo_lookup.requests, "get", return_value=fake_resp):
+        assert geo_lookup.geocode("a nonsense query with no match") is None
+    print("test_geocode_returns_none_on_empty_items: PASS")
+
+
+def test_geocode_returns_none_on_request_exception_never_raises():
+    def raise_connection_error(*args, **kwargs):
+        raise geo_lookup.requests.exceptions.ConnectionError("network down")
+
+    with patch.object(geo_lookup, "_here_api_key", return_value="test-key"), \
+         patch.object(geo_lookup.requests, "get", side_effect=raise_connection_error):
+        assert geo_lookup.geocode("Andheri West, Mumbai") is None
+    print("test_geocode_returns_none_on_request_exception_never_raises: PASS")
+
+
+def test_geocode_returns_none_on_bad_http_status():
+    fake_resp = _FakeResponse({"items": []}, status_ok=False)
+    with patch.object(geo_lookup, "_here_api_key", return_value="bad-key"), \
+         patch.object(geo_lookup.requests, "get", return_value=fake_resp):
+        assert geo_lookup.geocode("Andheri West, Mumbai") is None
+    print("test_geocode_returns_none_on_bad_http_status: PASS")
+
+
 if __name__ == "__main__":
     test_mall_prefers_way_over_closer_node()
     test_mall_still_keeps_a_node_when_too_few_ways_exist()
     test_other_categories_are_unaffected_by_the_footprint_preference()
+    test_geocode_returns_none_on_empty_query()
+    test_geocode_returns_none_when_api_key_missing()
+    test_geocode_sends_expected_here_request_and_parses_lat_lng()
+    test_geocode_returns_none_on_empty_items()
+    test_geocode_returns_none_on_request_exception_never_raises()
+    test_geocode_returns_none_on_bad_http_status()
     print("\nAll tests passed.")

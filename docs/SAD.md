@@ -268,16 +268,16 @@ The punctuation constraint on B and C is not stylistic. `_verify_external_docume
   +-----------+ +----------+ +-----------+ +----------+ +-------------+
 
   +-----------+ +----------+ +-----------+ +----------+ +-------------+
-  | Maha      | | Open     | | Google    | | xAI      | | Tesseract   |
-  | Bhulekh   | | Street   | | Maps      | | Grok     | | OCR (local) |
-  | (land     | | Map      | | (opt-in,  | | (opt-in  | | eng + mar   |
-  |  records, | | Nominatim| |  ToS      | |  fallback| | traineddata |
-  |  Marathi, | | (geocode | |  caveat)  | |  verifier| | bundled     |
-  |  CAPTCHA  | |  1 req/s)| |           | |  XAI_API_| |             |
-  |  per call)| |          | | COMPANY_  | |  KEY)    | | TESSERACT_  |
-  +-----------+ +----------+ | CHARTER_  | +----------+ |  CMD        |
-                             | USE_MAPS_ |              +-------------+
-                             | SCRAPE=1  |
+  | Maha      | | HERE +   | | Google    | | xAI      | | Tesseract   |
+  | Bhulekh   | | OSM      | | Maps      | | Grok     | | OCR (local) |
+  | (land     | | (geocode:| | (opt-in,  | | (opt-in  | | eng + mar   |
+  |  records, | |  HERE_   | |  ToS      | |  fallback| | traineddata |
+  |  Marathi, | |  API_KEY)| |  caveat)  | |  verifier| | bundled     |
+  |  CAPTCHA  | | (land-   | |           | |  XAI_API_| |             |
+  |  per call)| |  marks,  | | COMPANY_  | |  KEY)    | | TESSERACT_  |
+  +-----------+ |  route:  | | CHARTER_  | +----------+ |  CMD        |
+                |  OSM)    | | USE_MAPS_ |              +-------------+
+                +----------+ | SCRAPE=1  |
                              +-----------+
 
    LEGEND:  ==  system boundary      --  component boundary
@@ -1526,7 +1526,9 @@ Three CAPTCHA gates, **three different session models**. This is the single most
 | InstaFinancials | ASP.NET web service, CIN search | `requests` | none | chain continues |
 | GST portal | `services.gst.gov.in` | Playwright + Tesseract | CAPTCHA/lookup | graded `note` strings; never raises |
 | Maha Bhulekh | `bhulekh.mahabhumi.gov.in` | Playwright + Tesseract `mar+eng` | CAPTCHA/call | graded `note` strings; never raises |
-| OSM Nominatim | `nominatim.openstreetmap.org/search` | `requests`, ≥1.1 s apart | none | failed geocode is **dropped**, never "0 km" |
+| HERE Geocoding & Search | `geocode.search.hereapi.com/v1/geocode` | `requests` | `HERE_API_KEY` | failed geocode is **dropped**, never "0 km" (switched from OSM Nominatim 2026-10-21, see `geo_lookup.py`) |
+| OSM Overpass | `overpass-api.de/api/interpreter` | `requests`, ≥1.0 s apart | none | failed/empty lookup is **dropped**, never a guessed landmark |
+| OSM OSRM (routing) | `router.project-osrm.org/route/v1/driving` | `requests`, ≥1.0 s apart | none | failed route shows "Can't route", never a straight-line fallback |
 | Google Maps | consumer UI | Playwright | none | **opt-in only**; ToS caveat; always falls back |
 | Anthropic | Claude API | `anthropic` SDK, `tool_runner` | `ANTHROPIC_API_KEY` | every helper returns empty → deterministic fallback |
 | xAI Grok | `https://api.x.ai/v1`, `grok-4.5` | `OpenAI` client | `XAI_API_KEY` | optional second opinion on document grounding |
@@ -2127,7 +2129,7 @@ Its gate, `verify_charter_report_quality(docx_path)`, walks every body paragraph
 - Every category and document worker creates **its own `requests.Session()`** — the library does not guarantee `Session` thread-safety, and the connection-reuse benefit of sharing one is marginal next to the risk.
 - One `threading.Lock` guards the only genuinely shared state in the download pool: `seen_filenames` and `seen_urls`. The check-then-add is the sole critical section.
 - `fetch_all_categories` consumes futures in submission order on the main thread, so the results dict is only ever mutated single-threaded.
-- `promoter_portfolio` uses a **module-global** `_last_geocode_at` to honour Nominatim's ~1 req/s policy — not thread-safe, by design, because the module is single-threaded.
+- `promoter_portfolio` uses a **module-global** `_last_geocode_at` (now a defensive throttle for the HERE Geocoding & Search API, formerly Nominatim's ~1 req/s policy) — not thread-safe, by design, because the module is single-threaded.
 - `deep_research._USAGE_LOG` and its lazily-created singleton client are process-global.
 
 ### 20.2 Measured bottlenecks
@@ -2155,7 +2157,8 @@ The three measured hot spots, therefore:
 | `token_cache.MAX_AGE_MINUTES` | 90 | vs ~100 min real TTL |
 | `_MAX_DOCUMENT_DOWNLOAD_WORKERS` | 8 | `api_client` |
 | `PROMOTER_PROJECT_LIMIT` | 25 | `config` |
-| `_GEOCODE_MIN_INTERVAL_S` | 1.1 | Nominatim politeness |
+| `_GEOCODE_MIN_INTERVAL_S` | 0.1 | HERE geocode, defensive throttle only (quota-metered, not req/sec-limited like Nominatim's ToS was) |
+| `_OVERPASS_MIN_INTERVAL_S` / `_OSRM_MIN_INTERVAL_S` | 1.0 each | OSM Overpass/OSRM politeness |
 | `_FIVE_KM_RADIUS` | 5.0 km | portfolio filter |
 | Earth radius | 6371.0 km | haversine |
 | `MAX_GAP_RETRY_ATTEMPTS` | 2 | `deep_research` |
@@ -2256,7 +2259,7 @@ There is **no exponential backoff anywhere in the system**. The only retry is `m
 
 1. **No CAPTCHA is ever read or solved by the system.** Stated in `session_auth.py`, `gst_portal.py` and `mahabhumi.py`. A human solves every one.
 2. **Google Maps scraping is opt-in and carries a ToS caveat.** `COMPANY_CHARTER_USE_MAPS_SCRAPE` defaults off; the code comment states plainly that it scrapes the consumer UI rather than the paid API and "may not comply with Google's Terms of Service."
-3. **Nominatim is rate-limited to ~1 req/s** with a descriptive `User-Agent` identifying the tool as a low-volume personal research tool.
+3. **Geocoding uses the HERE Geocoding & Search API (`HERE_API_KEY`), free-tier quota-metered** — switched from OSM Nominatim on 2026-10-21 for materially better India coverage of newer/smaller buildings (see `geo_lookup.py`). **OSM Overpass and OSRM (landmarks, routing) are unchanged**, still rate-limited to ~1 req/s with a descriptive `User-Agent` identifying the tool as a low-volume personal research tool.
 4. **DMS requests set `Origin` and `Referer`** mimicking the real detail page. This is anti-bot accommodation, not authentication bypass — the endpoints are public and require the guest token the site itself mints.
 5. **Group-company data is taken only from the source that publishes it freely** (ZaubaCorp); paywalled mirrors are detected (`_looks_paywalled`) rather than circumvented.
 

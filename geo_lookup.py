@@ -1,6 +1,15 @@
 """
-Shared OpenStreetMap geocoding (Nominatim), POI discovery (Overpass) and
-routing (OSRM) helpers -- all free, keyless, public OSM-ecosystem services,
+Geocoding (HERE Geocoding & Search API), POI discovery (OpenStreetMap
+Overpass) and routing (OSRM) helpers.
+
+Geocoding used to be OSM Nominatim -- switched to HERE (2026-10-21) because
+Nominatim's India coverage for newer/smaller residential buildings was too
+thin: comparable-set candidates and past-project localities routinely came
+back ungeocodable, which this pipeline correctly treats as "drop it, can't
+verify" rather than a guess -- but a coverage gap that looks like "no real
+comparables nearby" is a false negative, not a true one. HERE needs an API
+key (HERE_API_KEY, free tier) and is no longer keyless, but Overpass/OSRM
+(landmarks, routing) are untouched -- still free, keyless, OSM-ecosystem,
 no ToS ambiguity (unlike the old Google Maps scrape company_charter.py used
 to carry for landmark distances).
 
@@ -9,11 +18,14 @@ Used by promoter_portfolio.py (resolving a locality to lat/lon for the
 the subject project's own locality, then finding/measuring the "2 nearest
 per category" Key Landmarks and verifying comparable projects sit within
 2km -- see _compute_landmark_distances and _verify_comparables_within_radius).
-All three services can be hit within the same pipeline invocation, so each
-gets its own module-global rate limiter clock HERE, once -- two independent
-per-module clocks could each honour their own spacing while still landing
-requests back-to-back across a module boundary, breaching the free public
-instance's usage policy.
+Overpass and OSRM are still both hit within the same pipeline invocation, so
+they share one module-global rate limiter clock each here, same as before --
+two independent per-module clocks could each honour their own spacing while
+still landing requests back-to-back across a module boundary, breaching the
+free public instance's usage policy. HERE's geocode call has its own,
+separate clock: it is quota-metered (requests/month), not req/sec-throttled
+by ToS the way the public Nominatim instance was, so there is no shared
+OSM-ecosystem pacing requirement to honour for it.
 
 Never treat a failed/empty geocode, Overpass lookup, or OSRM route as "0km
 away", a guessed distance, or a silently-dropped landmark -- every caller
@@ -21,16 +33,68 @@ here must treat None/empty as "can't compute this" and say so plainly,
 never approximate it as a real answer.
 """
 import math
+import os
+import sys
 import time
 
 import requests
 
 import config
 
-_GEOCODE_URL = "https://nominatim.openstreetmap.org/search"
-_GEOCODE_USER_AGENT = "MahaRERA-Scrapper-DueDiligence/1.0 (personal research tool, low-volume)"
-_GEOCODE_MIN_INTERVAL_S = 1.1
+_GEOCODE_URL = "https://geocode.search.hereapi.com/v1/geocode"
+_GEOCODE_MIN_INTERVAL_S = 0.1  # defensive throttle only -- HERE's free tier is quota-metered, not req/sec-limited like Nominatim's ToS was
 _last_geocode_at = 0.0
+
+# Still used by Overpass/OSRM below (both real OSM-ecosystem public
+# instances with a genuine politeness/identification expectation) -- no
+# longer used by geocode() itself, which authenticates via HERE_API_KEY
+# instead of a descriptive User-Agent.
+_OSM_USER_AGENT = "MahaRERA-Scrapper-DueDiligence/1.0 (personal research tool, low-volume)"
+
+_ENV_FILE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+_env_file_loaded = False
+_warned_missing_here_key = False
+
+
+def _load_dotenv_once() -> None:
+    """Same project-local-.env fallback already duplicated in
+    captcha_solver.py/deep_research.py -- see captcha_solver._load_dotenv_once
+    for why this can't just rely on a real process environment variable in
+    this sandboxed execution environment. Read once, merged into os.environ
+    only for keys not already set there, so a genuine env var always wins."""
+    global _env_file_loaded
+    if _env_file_loaded:
+        return
+    _env_file_loaded = True
+    try:
+        with open(_ENV_FILE_PATH, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def _here_api_key() -> str:
+    """HERE_API_KEY, checking the real process environment first, falling
+    back to the project-local .env file. Never raises -- geocode() treats a
+    missing key the same as any other geocode failure (None, dropped as a
+    gap by every caller), consistent with this pipeline's "never fatal"
+    convention for optional enhancements; it only warns once, to stderr, so
+    a forgotten key doesn't silently degrade every comparable/landmark in a
+    run with no visible signal."""
+    key = os.environ.get("HERE_API_KEY", "").strip()
+    if key:
+        return key
+    _load_dotenv_once()
+    return os.environ.get("HERE_API_KEY", "").strip()
 
 _OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 _OVERPASS_MIN_INTERVAL_S = 1.0
@@ -102,12 +166,28 @@ _PREFER_MAPPED_FOOTPRINT = {"Mall"}
 
 def geocode(query: str) -> tuple | None:
     """Resolves a free-text address/locality/landmark string to (lat, lon)
-    via Nominatim, rate-limited to Nominatim's own usage policy. Returns
-    None -- never a guessed coordinate -- if the query is empty, the
-    request fails, or nothing matches."""
-    global _last_geocode_at
+    via the HERE Geocoding & Search API, country-restricted to India
+    (`in=countryCode:IND`) the same way the old Nominatim call was
+    (`countrycodes=in`). Returns None -- never a guessed coordinate -- if
+    the query is empty, no HERE_API_KEY is configured, the request fails,
+    or nothing matches. Every caller already treats None as "can't verify
+    this, drop it, say why in gaps" rather than "0km away" -- that contract
+    is unchanged; only the underlying service is new."""
+    global _last_geocode_at, _warned_missing_here_key
     query = (query or "").strip()
     if not query:
+        return None
+
+    api_key = _here_api_key()
+    if not api_key:
+        if not _warned_missing_here_key:
+            _warned_missing_here_key = True
+            print(
+                "geo_lookup.geocode: HERE_API_KEY is not set -- every geocode this run will "
+                "return None (dropped as a gap, never guessed). Set it in .env or the "
+                "environment.",
+                file=sys.stderr,
+            )
         return None
 
     elapsed = time.monotonic() - _last_geocode_at
@@ -118,15 +198,15 @@ def geocode(query: str) -> tuple | None:
     try:
         resp = requests.get(
             _GEOCODE_URL,
-            params={"q": query, "format": "json", "limit": 1, "countrycodes": "in"},
-            headers={"User-Agent": _GEOCODE_USER_AGENT},
+            params={"q": query, "apiKey": api_key, "in": "countryCode:IND", "limit": 1},
             timeout=config.REQUEST_TIMEOUT,
         )
         resp.raise_for_status()
-        results = resp.json()
-        if not results:
+        items = resp.json().get("items") or []
+        if not items:
             return None
-        return float(results[0]["lat"]), float(results[0]["lon"])
+        position = items[0]["position"]
+        return float(position["lat"]), float(position["lng"])
     except (requests.RequestException, ValueError, KeyError, IndexError, TypeError):
         return None
 
@@ -157,7 +237,7 @@ def _run_overpass_query(query: str) -> list | None:
         resp = requests.post(
             _OVERPASS_URL,
             data={"data": query},
-            headers={"User-Agent": _GEOCODE_USER_AGENT},
+            headers={"User-Agent": _OSM_USER_AGENT},
             timeout=_OVERPASS_TIMEOUT_S,
         )
         resp.raise_for_status()
@@ -261,7 +341,7 @@ def driving_route(origin_coords: tuple, dest_coords: tuple) -> dict | None:
         resp = requests.get(
             url,
             params={"overview": "false"},
-            headers={"User-Agent": _GEOCODE_USER_AGENT},
+            headers={"User-Agent": _OSM_USER_AGENT},
             timeout=config.REQUEST_TIMEOUT,
         )
         resp.raise_for_status()

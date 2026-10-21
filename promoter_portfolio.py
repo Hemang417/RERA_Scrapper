@@ -15,15 +15,16 @@ import config
 import geo_lookup
 import resolver
 
-# Geocoding (OpenStreetMap Nominatim, free-text address/locality -> lat/lon)
-# used to filter past_experiences entries by whether they're within 5km of
-# the subject project, for the Developer Score's "promoter influence in the
-# micro-market" criterion. The rate-limited HTTP call and the distance math
-# live in geo_lookup.py, shared with company_charter.py's Distances-table
-# refinement -- see that module's docstring for why the rate limiter must be
-# process-wide rather than per-module. Never treat a failed/empty geocode as
-# "0km away" -- it must just drop that entry from the 5km sum, not include or
-# exclude it by a guess.
+# Geocoding (HERE Geocoding & Search API, free-text address/locality ->
+# lat/lon -- switched from OSM Nominatim on 2026-10-21, see geo_lookup.py's
+# module docstring for why) used to filter past_experiences entries by
+# whether they're within 5km of the subject project, for the Developer
+# Score's "promoter influence in the micro-market" criterion. The HTTP call
+# and the distance math live in geo_lookup.py, shared with
+# company_charter.py's Distances-table refinement -- see that module's
+# docstring for the rate-limiter design. Never treat a failed/empty geocode
+# as "0km away" -- it must just drop that entry from the 5km sum, not
+# include or exclude it by a guess.
 _FIVE_KM_RADIUS = 5.0
 
 
@@ -37,15 +38,18 @@ def _haversine_km(a: tuple, b: tuple) -> float:
 
 def _geocode_query_for(address: str | None, district: str | None, state_name: str = "Maharashtra") -> str:
     """Builds the actual string to geocode for one past_experiences entry.
-    Verified live against real MahaRERA data: its own `address` field is
-    often a full legal land description (survey numbers, stray commas,
-    "Plot 1 of Survey nos 11/1A, ...") that Nominatim's free-form search
-    fails to resolve at all -- even when it contains the right locality
-    name in the middle of it. A bare 6-digit Indian pincode pulled out of
-    that same string geocodes reliably and precisely instead (confirmed:
-    the full address for one real entry returned no match, but its own
-    embedded pincode alone resolved within ~3km of the correct point), so
-    a pincode match takes priority whenever the address has one. Falls
+    Verified live against real MahaRERA data (against the pipeline's
+    then-geocoder, OSM Nominatim): its own `address` field is often a full
+    legal land description (survey numbers, stray commas, "Plot 1 of
+    Survey nos 11/1A, ...") that a free-form geocoder search fails to
+    resolve at all -- even when it contains the right locality name in the
+    middle of it. A bare 6-digit Indian pincode pulled out of that same
+    string geocoded reliably and precisely instead (confirmed: the full
+    address for one real entry returned no match, but its own embedded
+    pincode alone resolved within ~3km of the correct point), so a pincode
+    match takes priority whenever the address has one -- kept as the
+    default under HERE (geo_lookup.py, since 2026-10-21) too, though not
+    separately re-confirmed against HERE's own matching behaviour. Falls
     back to the raw address, then to the portfolio project's own district,
     if no pincode is present."""
     address = (address or "").strip()
@@ -406,13 +410,15 @@ def build_promoter_portfolio(
         "promoter's registrations is counted exactly once -- the same dedup now applies to "
         "on_time_count/delayed_count above.",
         "area_within_5km_lakh_sqft additionally requires geocoding: the subject project's own "
-        "locality (from its partners category data, if supplied) is resolved via OpenStreetMap's "
-        "public Nominatim API -- a free, no-API-key service, rate-limited to ~1 request/second "
-        "per its usage policy. Each past_experiences entry's own address is geocoded by "
-        "preference on any 6-digit Indian pincode found inside it (confirmed live: MahaRERA's "
-        "own `address` field is often a full legal land description -- survey numbers, stray "
-        "commas -- that Nominatim's free-form search fails on entirely, even when the correct "
-        "locality name is embedded in it; the pincode alone resolves reliably), falling back to "
+        "locality (from its partners category data, if supplied) is resolved via the HERE "
+        "Geocoding & Search API -- a free-tier, API-key-gated service (HERE_API_KEY), switched "
+        "from OSM Nominatim on 2026-10-21 for materially better India coverage of "
+        "newer/smaller buildings. Each past_experiences entry's own address is geocoded by "
+        "preference on any 6-digit Indian pincode found inside it (confirmed live against the "
+        "pipeline's then-geocoder, Nominatim: MahaRERA's own `address` field is often a full "
+        "legal land description -- survey numbers, stray commas -- that free-form search fails "
+        "on entirely, even when the correct locality name is embedded in it; the pincode alone "
+        "resolves reliably, a precedence kept under HERE as the safer default), falling back to "
         "the raw address text, then to the portfolio project's district, if no pincode is "
         "present. An entry that still can't be geocoded is excluded from the 5km sum entirely "
         "(never guessed in or out), and a pincode covers a small area, not a point, so this "

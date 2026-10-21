@@ -6,9 +6,10 @@ involvement at all), _verify_comparables_within_radius() (drops any
 AI-proposed comparable that doesn't independently geocode-verify within
 2km), and _verify_comparables_match_configuration() (drops any distance-
 verified survivor whose unit configuration shares no overlap with the
-subject project's own real unit mix). No real Overpass/Nominatim/OSRM
+subject project's own real unit mix). No real Overpass/HERE/OSRM
 traffic -- geo_lookup.find_nearest_landmarks, geo_lookup.driving_route, and
-geo_lookup.geocode are all mocked.
+geo_lookup.geocode are all mocked (geocode is HERE Geocoding & Search API-
+backed since 2026-10-21, formerly OSM Nominatim).
 
 Run directly: python test_distance_refinement.py
 """

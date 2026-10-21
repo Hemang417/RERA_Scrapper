@@ -650,7 +650,7 @@ Requirements are numbered `FR-<area>-<n>`. **MUST / SHOULD / MAY** carry RFC-211
 | FR-TRK-02 | Fan-out **MUST** be capped at `PROMOTER_PROJECT_LIMIT = 25`, and truncation **MUST NEVER** be silent — a `truncated` field and an extra limitation entry are required | P1 |
 | FR-TRK-03 | The system **MUST** aggregate complaints, appeals, delivered area and on-time completion rate across the portfolio | P1 |
 | FR-TRK-04 | On-time classification **MUST** compare actual against *original proposed* completion date, and **MUST** count an unparseable pair into neither bucket | P1 |
-| FR-TRK-05 | The system **MUST** geocode project locations via OSM Nominatim at no more than ~1 request/second, with a per-run cache | P1 |
+| FR-TRK-05 | The system **MUST** geocode project locations via the HERE Geocoding & Search API (HERE_API_KEY; switched from OSM Nominatim 2026-10-21 for materially better India coverage of newer/smaller buildings), with a per-run cache | P1 |
 | FR-TRK-06 | A project whose geocode fails **MUST** be **dropped** from the 5 km sum and **MUST NOT** be treated as "0 km away" | P0 |
 | FR-TRK-07 | The subject project **MUST** be excluded from area totals by the **entry's own** registration number or exact name — never by the fetch registration number, which destroyed real data for single-project SPVs | P1 |
 | FR-TRK-08 | The system **MUST** flag lapsed, revoked or cancelled projects | P1 |
@@ -1024,7 +1024,7 @@ These are product requirements, not style preferences. They are the reason the d
 | NFR-SEC-03 | The External document **MUST NOT** contain any internal tooling detail |
 | NFR-SEC-04 | `.facts.json` **MUST** be treated as Internal-classification and never forwarded to a counterparty |
 | NFR-SEC-05 | The system **MUST NOT** solve or read a CAPTCHA image |
-| NFR-SEC-06 | Third-party rate limits and politeness policies **MUST** be honoured (Nominatim ~1 req/s with an identifying User-Agent) |
+| NFR-SEC-06 | Third-party rate limits, quotas and politeness policies **MUST** be honoured (HERE Geocoding & Search API's free-tier monthly quota; Overpass/OSRM still ~1 req/s with an identifying User-Agent) |
 | NFR-SEC-07 | Any integration with a Terms-of-Service question **MUST** be opt-in, off by default, and carry an in-code caveat |
 
 ---
