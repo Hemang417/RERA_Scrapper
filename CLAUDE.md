@@ -153,13 +153,17 @@ an API call. Full map of all four: `guardrails.md`.
 
 `company_charter.py <REG_NO>` · `deep_research.py <REG_NO>` · `gst_intake.py
 <PAN|GSTIN> <REG_NO>` · `charge_watch.py <CIN>` (borrowing repaid yet?) ·
-`group_sweep.py <names...>` · `cts_resolve.py` and `ts_rera_client.py <name>`
-(human-in-the-loop, CAPTCHA) · `nclt_search.py <party name> [bench]` and
+`group_sweep.py <names...>` · `cts_resolve.py` (picks the exact office/
+village LABEL — a human judgment call, Marathi labels don't reliably match
+RERA's own text, never fuzzy-matched; not itself CAPTCHA-gated — the
+Property Card fetch it hands off to, via `mahabhumi.py`, is Claude-vision
+autosolve) · `ts_rera_client.py <name>` (Claude-vision autosolve) ·
+`nclt_search.py <party name> [bench]` and
 `bombay_hc_search.py <party name> <year> [bench]` (direct court/tribunal portal
 queries; Claude-vision autosolve by default, skipped via
 `NCLT_CAPTCHA_AUTOSOLVE=0` / `BOMBAY_HC_CAPTCHA_AUTOSOLVE=0`) ·
 `igr_maharashtra_search.py docno
-<district> <SRO> <year> <doc_no>` (human-in-the-loop, CAPTCHA — registered-deed
+<district> <SRO> <year> <doc_no>` (Claude-vision autosolve — registered-deed
 search, Maharashtra only; also reachable inline via `run_igr_registered_deed_
 check()`) · `gr_maharashtra_search.py <keyword> [--department D] [--from-date
 D] [--to-date D]` (human-in-the-loop, CAPTCHA — Maharashtra Government
