@@ -790,6 +790,10 @@ class JharkhandAdapter:
                 json.dump(payload, f, indent=2, ensure_ascii=False)
 
         documents_manifest = self._download_documents(session, detail_html, documents_dir, ctx)
+        financial_statements = self._financial_statements(documents_manifest, documents_dir, ctx)
+        category_data["financial_statements"] = financial_statements
+        with open(os.path.join(raw_dir, "financial_statements.json"), "w", encoding="utf-8") as f:
+            json.dump(financial_statements, f, indent=2, ensure_ascii=False)
 
         notes = list(_AUTHORITY_NOTES) + project_notes(parsed) + complaint_notes + rs_notes
         return AcquisitionResult(
@@ -951,6 +955,40 @@ class JharkhandAdapter:
         }
 
     # -- documents ---------------------------------------------------------
+    # -- financial statements ------------------------------------------
+    def _financial_statements(self, documents_manifest, documents_dir, ctx):
+        """P&L figures off this project's downloaded balance-sheet + 3-years-
+        ITR documents -- same gap as GujRERA's findoc block (financial-
+        strength sub-metric scores None for every project regardless of
+        state), never fed into anything until now. See company_charter.
+        financial_statements_from_documents for why this is P&L figures
+        only, never a balance-sheet net worth/total debt figure -- JHARERA's
+        own "Balance_Sheet"-labelled document turned out, on inspection, to
+        actually contain Statement of Profit & Loss content (a mislabel,
+        not a scraping error), which this extractor reads correctly because
+        it goes by the document's own text, never its label.
+
+        Lazy import: company_charter imports `states` at module level, so a
+        top-level import here would risk a circular import on whichever
+        module happens to load first.
+        """
+        import company_charter
+
+        try:
+            statements = company_charter.financial_statements_from_documents(
+                documents_manifest, documents_dir
+            )
+        except Exception as e:
+            ctx.reporter.warn(f"Financial-statement figure extraction failed ({e}) -- skipped.")
+            return []
+        found = sum(1 for s in statements if s["figures"])
+        if statements:
+            ctx.reporter.info(
+                f"{found}/{len(statements)} financial-statement document(s) yielded a "
+                f"recognisable P&L figure."
+            )
+        return statements
+
     def _download_documents(self, session, detail_html, documents_dir, ctx):
         """Every document the project page links to.
 

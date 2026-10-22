@@ -436,15 +436,20 @@ RERA_FINDINGS = [
      "GujRERA findoc block. JHARERA files three years of income-tax returns per project, also as "
      "downloadable documents."),
     ("Defaulters list",
-     "Not published", "Not published", "Not published", "Partial", "Partial", "Partial", "(unmapped)",
-     "K-RERA /viewDefaultProjects -- observed, not yet built. JHARERA's REJECTED and SURRENDERED "
-     "registers are the closest equivalent: their URLs are imported into the adapter but nothing "
-     "fetches them yet. WBRERA's defaulters list (17 rejected/defaulting applications by name) IS "
-     "parsed by adapter_westbengal.fetch_defaulters(), but that function is called from nowhere in "
-     "acquire() or the litigation sweep -- written, untested against a live page, and unused."),
+     "Not published", "Not published", "Not published", "Yes", "Yes", "Yes", "(unmapped)",
+     "K-RERA /viewDefaultProjects -- CONFIRMED LIVE 2026-09-09 (2,991 rows, clean REGISTRATION NO / "
+     "PROMOTER / PROJECT / DISTRICT columns), WIRED into KarnatakaAdapter.acquire() 2026-10-22 "
+     "(previously only reachable via litigation_sweep.py's group sweep). JHARERA's REJECTED and "
+     "SURRENDERED registers (13 rows combined) are the closest equivalent, WIRED 2026-10-22 via "
+     "JharkhandAdapter._rejected_or_surrendered_check(). WBRERA's defaulters list (18 rows) is WIRED "
+     "2026-10-22 via WestBengalAdapter._defaulter_check() -- note it matches on PROJECT name, not "
+     "promoter, since the register carries no promoter field at all."),
     ("Projects under investigation",
-     "Not published", "Not published", "Not published", "Partial", "Not published", "Not published", "(unmapped)",
-     "K-RERA /unregProjectList -- observed, not yet built."),
+     "Not published", "Not published", "Not published", "Yes", "Not published", "Not published", "(unmapped)",
+     "K-RERA /unregProjectList -- genuinely never fetched before 2026-10-22. CONFIRMED LIVE: 1,050 "
+     "rows, clean Project Name / Promoter Name / Status / Corporate Address / Published Date "
+     "columns, Status carrying the authority's own finding (e.g. 'No Reply from Promoter'). WIRED "
+     "the same day via KarnatakaAdapter._investigation_check()."),
     ("Cost incurred vs estimated cost",
      "Not published", "Not published", "Partial", "Yes", "Not published", "Not published", "(unmapped)",
      "K-RERA publishes both, per particular. Direct input to the financial-strength sub-metric."),
@@ -687,21 +692,43 @@ CIN_FINDINGS = [
 # Charter mapping -- what is available but NOT yet used
 # =========================================================================
 UNMAPPED = [
-    ("Audited balance sheet / P&L / ITR", "GujRERA findoc", "Gujarat projects only",
-     "Financial strength sub-metric currently scores None for every project. This would score it for GJ.",
+    ("Audited balance sheet / P&L / ITR", "GujRERA findoc -- WIRED 2026-10-22 via "
+     "GujaratAdapter._financial_statements() / company_charter.financial_statements_from_documents()",
+     "Gujarat projects only",
+     "PARTIALLY CLOSED: a P&L statement's revenue/profit/financial-year figures are now extracted "
+     "(same-line OCR matching only, confirmed live) and cited as evidence against the Financial "
+     "Strength sub-metric's reason text -- but the sub-metric's score itself still stays None for "
+     "every project. SCOPED DOWN ON PURPOSE: confirmed live against real saved documents that OCR "
+     "of a Balance Sheet collapses its table structure badly (a total can land several lines away "
+     "from its own label, with nothing left to say which belongs to which), so net worth/total "
+     "debt -- the actual ratios this sub-metric scores -- are deliberately never extracted, to "
+     "avoid a silently wrong number. Also confirmed live: a file labelled 'AHPL BALANCE SHEET "
+     "19-20.pdf' turned out to be an unrelated Gazette of India notification, not a financial "
+     "statement at all -- extraction goes by the document's own text, never trusts the label.",
      "High"),
     ("Group entity graph (confirmed vs proposed)", "group_entities.py", "All corporate promoters",
      "BUILT. Propose by brand name, confirm by shared director / office / filed relationship. "
      "Link strength tiered -- address-only links excluded from sweeps.", "High"),
-    ("K-RERA defaulters list", "K-RERA, observed", "Karnataka projects",
-     "No equivalent exists in any other authority. Direct red-flag input.",
+    ("K-RERA defaulters list", "adapter_karnataka.fetch_default_projects() / "
+     "search_default_projects_by_promoter() -- WIRED 2026-10-22 via KarnatakaAdapter._defaulter_check(), "
+     "live-verified 2026-09-09 and again on wiring", "Karnataka projects",
+     "No equivalent exists in any other authority. Direct red-flag input. CORRECTED 2026-10-22: "
+     "this row previously said 'observed, not yet built', but the fetch/parse/dedup logic "
+     "(2,991-row state-wide register) was already built and tested on 2026-09-09 -- only wired "
+     "to litigation_sweep.py's promoter-level group sweep, not this adapter's own per-project "
+     "output. Now also surfaced per-project as category_data['defaulter_check'].",
      "High"),
-    ("K-RERA projects under investigation", "K-RERA, observed", "Karnataka projects",
-     "Same -- a regulator-declared adverse signal.", "Medium"),
-    ("K-RERA cost incurred vs estimated", "K-RERA detail page", "Karnataka projects",
-     "Financial-strength scores None everywhere today. This is a direct, free input.", "High"),
-    ("K-RERA delay reasons + NOC expiry", "K-RERA detail page", "Karnataka projects",
-     "Promoter-declared delay reasons and lapsed-NOC tracking; no equivalent elsewhere.", "Medium"),
+    ("K-RERA projects under investigation", "adapter_karnataka.fetch_unregistered_investigation_list() / "
+     "search_unregistered_investigations_by_promoter() -- WIRED 2026-10-22 via "
+     "KarnatakaAdapter._investigation_check(), live-verified 2026-10-22 (1,050 rows)",
+     "Karnataka projects",
+     "A regulator-declared adverse signal -- genuinely new: /unregProjectList had never been "
+     "fetched by this pipeline before 2026-10-22 (the 'K-RERA, observed' this row previously "
+     "said was never backed by an actual fetch). Confirmed live: clean Project Name / Promoter "
+     "Name / Status / Corporate Address / Published Date columns, Status carrying the "
+     "authority's own finding per row (e.g. 'No Reply from Promoter'). Covers UNREGISTERED "
+     "sites only, so a hit is evidence about the promoter, never about an already-registered "
+     "project.", "Medium"),
     ("Maha Bhulekh card fields", "Free portal, now has an OCR fallback for image-only cards", "Maharashtra projects",
      "WIRED 2026-10-22: confirmed live that a property with no digitized attribute data on file "
      "renders as a single scanned JPEG even with English selected (parse_property_card correctly "
@@ -712,10 +739,15 @@ UNMAPPED = [
      "confidence scan guess. Verified against two real saved captures with digitized cards (full "
      "fields/mutations) and one real image-only capture (ocr_fields now the only route in).",
      "High"),
-    ("JHARERA audited balance sheet + 3 years ITR", "adapter_jharkhand.py document library (labelled, downloaded)",
+    ("JHARERA audited balance sheet + 3 years ITR", "adapter_jharkhand.py document library -- WIRED "
+     "2026-10-22 via JharkhandAdapter._financial_statements(), same mechanism as GujRERA's row above",
      "Jharkhand projects",
-     "Same gap as GujRERA's findoc block: the financial-strength sub-metric scores None for every "
-     "project regardless of state. This would score it for JH too.", "High"),
+     "Same gap as GujRERA's findoc block, same partial close: P&L figures now extracted and cited, "
+     "score stays None, see the Audited balance sheet / P&L / ITR row above for the full reasoning. "
+     "One extra live finding here: this project's own document labelled 'Balance Sheet' turned out "
+     "to actually CONTAIN Statement of Profit & Loss text (a portal mislabel, not a scraping error) "
+     "-- extracted correctly anyway, since this reads the document's own text, never its label.",
+     "High"),
     ("JHARERA rejected + surrendered registration lists",
      "REJECTED_LIST / SURRENDERED_LIST -- WIRED 2026-10-22 via "
      "JharkhandAdapter._rejected_or_surrendered_check(), live-verified on wiring (13 rows: "

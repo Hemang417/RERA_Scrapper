@@ -397,6 +397,15 @@ class GujaratAdapter:
 
         # --- documents ------------------------------------------------
         documents_manifest = self._download_documents(pool, docs, documents_dir, ctx)
+        category_data["financial_statements"] = self._financial_statements(
+            documents_manifest, documents_dir, ctx
+        )
+        # Written AFTER the bulk category_data dump above because it depends
+        # on documents_manifest, which is only built once documents are
+        # downloaded -- this one category is persisted on its own rather
+        # than reordering the whole dump loop around it.
+        with open(os.path.join(raw_dir, "financial_statements.json"), "w", encoding="utf-8") as f:
+            json.dump(category_data["financial_statements"], f, indent=2, ensure_ascii=False)
 
         promoter_name = _promoter_name(alldata, details)
         notes.append(
@@ -491,6 +500,36 @@ class GujaratAdapter:
         got = sum(1 for r in manifest if r["status"] in ("downloaded", "reused"))
         ctx.reporter.ok(f"{got}/{len(manifest)} GujRERA document(s) retrieved.")
         return manifest
+
+    # -- financial statements ------------------------------------------
+    def _financial_statements(self, documents_manifest, documents_dir, ctx):
+        """P&L figures off this project's downloaded balance-sheet/P&L/ITR
+        documents -- GujRERA's biggest differential finding (findoc block,
+        confirmed-live, highest-value gap in the coverage sheet), never fed
+        into anything until now. See company_charter.
+        financial_statements_from_documents for why this is P&L figures
+        only, never a balance-sheet net worth/total debt figure.
+
+        Lazy import: company_charter imports `states` at module level, so a
+        top-level import here would risk a circular import on whichever
+        module happens to load first.
+        """
+        import company_charter
+
+        try:
+            statements = company_charter.financial_statements_from_documents(
+                documents_manifest, documents_dir
+            )
+        except Exception as e:
+            ctx.reporter.warn(f"Financial-statement figure extraction failed ({e}) -- skipped.")
+            return []
+        found = sum(1 for s in statements if s["figures"])
+        if statements:
+            ctx.reporter.info(
+                f"{found}/{len(statements)} financial-statement document(s) yielded a "
+                f"recognisable P&L figure."
+            )
+        return statements
 
 
 def _promoter_details(alldata: dict, details: dict) -> dict:

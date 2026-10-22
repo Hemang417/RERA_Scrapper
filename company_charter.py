@@ -301,6 +301,149 @@ def _extract_complaint_outcome(document_text: str) -> str:
     return "not determinable from extracted text"
 
 
+# ---------------------------------------------------------------------------
+# Financial-figure extraction, P&L documents only. GujRERA and JHARERA both
+# publish audited balance sheet / P&L / ITR documents per project, already
+# downloaded by their adapters, but nothing ever reads a number out of them --
+# the financial-strength sub-metric scores None for every project regardless
+# of state for exactly this reason (see _score_financial_strength_debt).
+#
+# SCOPED TO P&L ONLY, DELIBERATELY. Checked against real saved documents
+# (output/JHARERA-PROJECT-82-2026's Balance_Sheet PDF, and
+# output/PRM-KA-RERA-1251-309-PR-201001-003607's AHPL balance sheets):
+# OCR of a Balance Sheet collapses its table structure badly -- "Total
+# Equity & Liabilities" sits on its own label line with NO number, while the
+# actual total appears several lines later, after an unrelated "NOTES TO
+# ACCOUNTS" line, with nothing left to say which label it belongs to.
+# Extracting net worth/total debt from that would mean guessing a number's
+# label from vertical proximity alone, which is exactly the kind of silent
+# wrong attribution this pipeline refuses to produce elsewhere (see
+# parse_property_card's own "a card that is there but unreadable is not a
+# card that is absent" discipline). A P&L statement's own label-to-value
+# rows survived OCR far better in the same sample (e.g. "Profit / (Loss)
+# for the period (XI+XIV) 397,200.92 (598,185.87)" keeps its number on the
+# label's own line) -- SAME-LINE matching only, never a multi-line search,
+# so a label with no number on its own line is honestly "not found", never
+# a guess from elsewhere on the page. Net worth and total debt are left
+# unextracted entirely; a reader needing them still has the saved PDF.
+# ---------------------------------------------------------------------------
+
+# Requires either a comma-grouped integer (so a bare OCR-noise digit like
+# the stray "3" after "Current Tax" in a real sample never qualifies) or an
+# explicit decimal point -- never a short bare integer.
+_MONEY_RE = re.compile(r"\(?-?\d{1,3}(?:,\d{2,3})+(?:\.\d+)?\)?|\(?-?\d+\.\d+\)?")
+
+_PNL_FIGURE_PATTERNS = [
+    ("total_revenue", re.compile(r"total\s+revenue", re.I)),
+    ("total_expenses", re.compile(r"total\s+expenses?", re.I)),
+    ("profit_before_tax", re.compile(r"profit\s+before\s+tax", re.I)),
+    ("net_profit_loss", re.compile(r"profit\s*/\s*\(?loss\)?\s*for\s+the\s+period", re.I)),
+]
+
+_PNL_YEAR_RE = re.compile(
+    r"year\s+ended\.?\s*(?:on)?\s*(\d{1,2}(?:st|nd|rd|th)?\s+\w+,?\s+\d{4})", re.I,
+)
+
+
+def _money_value(line: str) -> str | None:
+    """The first money-shaped token on this line, or None. A parenthesised
+    figure is returned with its parentheses kept -- that is how these
+    statements print a negative/loss figure, and stripping it would turn a
+    loss into a profit by accident."""
+    match = _MONEY_RE.search(line)
+    return match.group(0) if match else None
+
+
+# Label keywords for "this document is worth opening for P&L figures",
+# duplicated from group_financial_disclosure._is_high_priority rather than
+# imported -- same one-small-helper-per-check-domain convention that
+# module's own docstring follows (itself duplicated from
+# litigation_sweep._subjects). "blance sheet" (WBRERA's own filed misspelling,
+# confirmed live) is why this is a regex, not a plain substring.
+_FINANCIAL_LABEL_KEYWORDS = ("profit", "loss", "audited")
+_FINANCIAL_LABEL_BALANCE_SHEET_RE = re.compile(r"\bba?lance\s+sheet\b", re.I)
+
+
+def _is_financial_statement_label(label: str) -> bool:
+    label_lower = (label or "").lower()
+    return bool(
+        any(k in label_lower for k in _FINANCIAL_LABEL_KEYWORDS)
+        or _FINANCIAL_LABEL_BALANCE_SHEET_RE.search(label_lower)
+    )
+
+
+def financial_statements_from_documents(documents_manifest: list, documents_dir: str) -> list:
+    """Runs extract_pnl_figures over every downloaded document in
+    `documents_manifest` whose LABEL suggests a financial statement.
+
+    Matching is on the label, but the figures themselves come only from
+    what extract_pnl_figures actually reads off the document's own text --
+    a mislabeled file (confirmed live: a project's "AHPL BALANCE SHEET
+    19-20.pdf" turned out to be an unrelated Gazette of India notification)
+    still yields {} rather than a false figure, because the label only
+    decides which documents are worth opening, never what they are taken
+    to contain.
+
+    Returns one entry per matching document, INCLUDING those where nothing
+    was found (figures: {}) -- an entry missing from this list means "not
+    worth opening" (ITR acknowledgements, professional certificates, etc.),
+    while an entry with empty figures means "opened, read, nothing in it
+    this extractor recognised". The two must stay distinguishable.
+    """
+    out = []
+    for entry in documents_manifest or []:
+        label = entry.get("label")
+        if not _is_financial_statement_label(label):
+            continue
+        if entry.get("status") not in ("downloaded", "reused"):
+            continue
+        filename = entry.get("saved_filename") or entry.get("path")
+        if not filename:
+            continue
+        path = filename if os.path.isabs(filename) else os.path.join(documents_dir, filename)
+        text = _extract_document_text(path)
+        out.append({
+            "label": label,
+            "source_file": filename,
+            "figures": extract_pnl_figures(text),
+        })
+    return out
+
+
+def extract_pnl_figures(document_text: str) -> dict:
+    """Best-effort figures off a Profit & Loss statement's OWN extracted
+    text -- SAME-LINE matching only (see the module note above on why
+    Balance Sheet figures are not attempted here at all).
+
+    Returns {} when nothing recognisable as a P&L statement was found --
+    including when the "document" turns out to be something else entirely.
+    CONFIRMED LIVE: a file labelled "AHPL BALANCE SHEET 19-20.pdf" turned
+    out to be an unrelated Gazette of India notification, not a financial
+    statement at all -- a label is a claim about the file, not proof of its
+    contents, so this never trusts the filename, only what the text itself
+    says. A figure that cannot be found on its own label's line is left out
+    of the result rather than guessed, so an empty dict or a partial one
+    both mean exactly what they say: this, and only this, is what could be
+    confidently read."""
+    if not document_text or document_text.startswith("[Could not read") or "[OCR unavailable" in document_text:
+        return {}
+
+    figures = {}
+    for line in document_text.splitlines():
+        for key, pattern in _PNL_FIGURE_PATTERNS:
+            if key in figures or not pattern.search(line):
+                continue
+            value = _money_value(line)
+            if value:
+                figures[key] = value
+
+    year_match = _PNL_YEAR_RE.search(document_text)
+    if year_match:
+        figures["financial_year_ended"] = year_match.group(1)
+
+    return figures
+
+
 def summarize_complaint_outcomes(complaint_orders_manifest: list, documents_dir: str) -> dict:
     """For each successfully downloaded/reused complaint-order PDF, reads it
     and classifies its outcome. Returns {outcome_counts: {label: count},
@@ -9849,7 +9992,27 @@ def _score_financial_strength_debt(facts: dict) -> dict:
     unrated companies that make up most MahaRERA promoters."""
     points = (facts.get("developer_track_record") or {}).get("financial_strength_points")
     if not isinstance(points, (int, float)):
-        return {"score": None, "tier": None, "reason": "Debt-to-capital ratio, secured-debt ratio, and default occurrence are not disclosed by any source this pipeline checks (neither the RERA record nor the corporate registry carries balance-sheet debt structure) -- only resolvable when a credit-rating rationale or MCA financial filing states these figures."}
+        reason = (
+            "Debt-to-capital ratio, secured-debt ratio, and default occurrence are not "
+            "disclosed by any source this pipeline checks (neither the RERA record nor the "
+            "corporate registry carries balance-sheet debt structure) -- only resolvable "
+            "when a credit-rating rationale or MCA financial filing states these figures."
+        )
+        # EVIDENCE, NOT A SCORE -- see _safe_financial_statements. A revenue/
+        # profit figure off a filed P&L statement is not the debt/secured-
+        # debt ratio this sub-metric needs, so it is cited here as a pointer
+        # to the underlying document, never turned into a points value.
+        statements = facts.get("financial_statements") or []
+        if statements:
+            cites = "; ".join(
+                f"{s['label']}: " + ", ".join(f"{k}={v}" for k, v in s["figures"].items())
+                for s in statements
+            )
+            reason += (
+                f" A filed P&L statement was read for this project ({cites}), but it carries "
+                f"revenue/profit figures, not the debt-structure ratios this sub-metric scores."
+            )
+        return {"score": None, "tier": None, "reason": reason}
     if points <= 8:
         tier = "AAA"
     elif points <= 17:
@@ -13244,6 +13407,31 @@ def _safe_project_delay_noc(category_data: dict) -> dict:
         return {}
 
 
+def _safe_financial_statements(category_data: dict) -> list:
+    """GujRERA/JHARERA's downloaded balance-sheet/P&L/ITR documents, already
+    run through extract_pnl_figures by each adapter's own acquire() (see
+    states/adapter_gujarat.py / adapter_jharkhand.py's _financial_statements)
+    and left unread until now -- the same gap _safe_project_cost_extension
+    closed for K-RERA's cost/extension data. No other state adapter
+    populates this key, so the section this feeds is silent everywhere else
+    purely because the data is absent -- never because of a state check.
+
+    EVIDENCE, NOT A SCORE. This never writes developer_track_record.
+    financial_strength_points -- that sub-metric needs debt-to-capital and
+    secured-debt RATIOS this extraction does not attempt (see
+    _score_financial_strength_debt's own docstring for why), not a bare
+    revenue/profit figure. This only lets the Charter cite what a financial
+    document actually says, where one exists.
+
+    Never fatal: a shape this never expects costs one section, not the run.
+    """
+    try:
+        statements = (category_data or {}).get("financial_statements") or []
+        return [s for s in statements if s.get("figures")]
+    except Exception:
+        return []
+
+
 def _portal_promoter_name(category_data: dict) -> str:
     """The promoter's name AS THE AUTHORITY PUBLISHES IT.
 
@@ -13630,6 +13818,13 @@ def run_company_charter(
     # NOC tables (see _safe_project_delay_noc's own docstring), previously
     # fetched but never rendered anywhere.
     facts["project_delay_noc_check"] = _safe_project_delay_noc(category_data)
+
+    # Code-computed, unconditional: GujRERA's findoc block and JHARERA's
+    # document library both already download balance-sheet/P&L/ITR
+    # documents on every run of those two states -- figures extracted from
+    # them (P&L only; see _safe_financial_statements) were never surfaced
+    # anywhere until now.
+    facts["financial_statements"] = _safe_financial_statements(category_data)
 
     # Also code-computed, never model-authored (see summarize_professionals'
     # own note for the real mis-reporting this replaces): MahaRERA's

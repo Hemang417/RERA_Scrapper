@@ -60,6 +60,7 @@ from .karnataka import (
     REVENUE_RECOVERY_PAGE,
     SEARCH_PAGE,
     SEARCH_POST,
+    UNREGISTERED_PROJECTS_PAGE,
 )
 
 _TIMEOUT = 90
@@ -359,6 +360,51 @@ def search_default_projects_by_promoter(name: str, fetcher=None) -> list:
         return []
     return [row for row in fetch_default_projects(fetcher)
             if needle in " ".join((row.get("promoter") or "").upper().split())]
+
+
+def fetch_unregistered_investigation_list(fetcher=None) -> list:
+    """K-RERA's "Un-registered Project List" -- projects the authority is
+    pursuing for operating without ever registering at all. The closest
+    thing this portal publishes to "projects under investigation", distinct
+    from fetch_default_projects (registered projects flagged in default)
+    and from _ORDER_REGISTERS (case law).
+
+    CONFIRMED LIVE 2026-10-22: 1,050 rows, one table, clean columns
+    (S.No / Project Name / Promoter Name / Status / Corporate Address /
+    Published Date) -- Status carries the authority's own finding per row
+    (e.g. "No Reply from Promoter"), not a separate register to cross-
+    reference. Deduplicated by (promoter, project) since this register
+    carries no registration number at all -- these projects never got one.
+    """
+    if fetcher is not None:
+        html = fetcher()
+    else:
+        html = _fetch_complete(_session(), UNREGISTERED_PROJECTS_PAGE, "K-RERA unregistered project list")
+    seen, out = set(), []
+    for table in parse_register_tables(html):
+        if "promoter name" not in table["headers"] or "project name" not in table["headers"]:
+            continue
+        for row in table["rows"]:
+            key = (row.get("promoter name") or "", row.get("project name") or "")
+            if key == ("", "") or key in seen:
+                continue
+            seen.add(key)
+            out.append(row)
+    return out
+
+
+def search_unregistered_investigations_by_promoter(name: str, fetcher=None) -> list:
+    """Rows off fetch_unregistered_investigation_list whose PROMOTER NAME
+    names `name`.
+
+    Matched on a NAME substring -- same exposure as every other K-RERA
+    register, which publishes no company identity number to join on.
+    """
+    needle = " ".join(str(name or "").upper().split())
+    if not needle:
+        return []
+    return [row for row in fetch_unregistered_investigation_list(fetcher)
+            if needle in " ".join((row.get("promoter name") or "").upper().split())]
 
 
 def fetch_revenue_recovery_list(fetcher=None) -> list:
@@ -714,6 +760,12 @@ class KarnatakaAdapter:
             ctx.reporter.warn(f"K-RERA register lists {complaint_count} complaint(s) for this project.")
         else:
             ctx.reporter.ok("K-RERA complaint register lists no complaint for this project.")
+
+        defaulter_check, defaulter_notes = self._defaulter_check(entry["promoter_name"], ctx)
+        notes.extend(defaulter_notes)
+        investigation_check, investigation_notes = self._investigation_check(entry["promoter_name"], ctx)
+        notes.extend(investigation_notes)
+
         category_data = {
             "projects": parsed["project"],
             "partners": {"promoterDetails": {
@@ -733,6 +785,8 @@ class KarnatakaAdapter:
             "delay_reasons": parsed["delay_reasons"],
             "noc_status": parsed["noc_status"],
             "noc_expiry": parsed["noc_expiry"],
+            "defaulter_check": defaulter_check,
+            "investigation_check": investigation_check,
         }
         for name, payload in category_data.items():
             with open(os.path.join(raw_dir, f"{name}.json"), "w", encoding="utf-8") as f:
@@ -864,6 +918,79 @@ class KarnatakaAdapter:
             "noc_status": noc_status,
             "noc_expiry": noc_expiry,
         }
+
+    # -- default project register --------------------------------------
+    def _defaulter_check(self, promoter_name, ctx):
+        """K-RERA's "Default Project List", matched on PROMOTER.
+
+        fetch_default_projects()/search_default_projects_by_promoter() were
+        built for litigation_sweep.py's promoter-level group sweep and are
+        already tested, but this adapter's own per-project output never
+        surfaced the check -- wired in now, reusing those functions as-is.
+        """
+        try:
+            matches = search_default_projects_by_promoter(promoter_name)
+        except Exception:
+            return (None, [
+                "K-RERA's Default Project List could not be read this run, so whether this "
+                "promoter has a project on it is UNKNOWN. It must not be read as zero."
+            ])
+        if matches:
+            ctx.reporter.warn(
+                f"K-RERA's Default Project List names {len(matches)} matching project(s) "
+                f"against this promoter."
+            )
+            note = (
+                f"{len(matches)} project(s) on K-RERA's Default Project List name a promoter "
+                f"matching this promoter's name -- the authority's own register of registered "
+                f"projects it has flagged in default. Matched by name, so possible matches to "
+                f"confirm, not confirmed findings against this entity."
+            )
+        else:
+            ctx.reporter.ok("K-RERA's Default Project List names no matching promoter.")
+            note = None
+        return ({"total_default_projects": len(matches),
+                 "source": "K-RERA Default Project List (name match on promoter)",
+                 "matches": matches},
+                [note] if note else [])
+
+    # -- unregistered-project investigation list -------------------------
+    def _investigation_check(self, promoter_name, ctx):
+        """K-RERA's "Un-registered Project List", matched on PROMOTER NAME --
+        the closest thing this authority publishes to "projects under
+        investigation". Genuinely new: this register had never been
+        fetched by this pipeline before (see
+        fetch_unregistered_investigation_list's own docstring).
+        """
+        try:
+            matches = search_unregistered_investigations_by_promoter(promoter_name)
+        except Exception:
+            return (None, [
+                "K-RERA's Un-registered Project List could not be read this run, so whether "
+                "this promoter is linked to an unregistered project under investigation is "
+                "UNKNOWN. It must not be read as zero."
+            ])
+        if matches:
+            ctx.reporter.warn(
+                f"K-RERA's Un-registered Project List names {len(matches)} matching project(s) "
+                f"against this promoter."
+            )
+            note = (
+                f"{len(matches)} project(s) on K-RERA's Un-registered Project List name a "
+                f"promoter matching this promoter's name -- projects the authority is pursuing "
+                f"for operating without ever registering, each carrying the authority's own "
+                f"status finding (e.g. 'No Reply from Promoter'). These are UNREGISTERED sites, "
+                f"never this already-registered project, so a hit is evidence about the "
+                f"PROMOTER, not about this project. Matched by name, so possible matches to "
+                f"confirm, not confirmed findings against this entity."
+            )
+        else:
+            ctx.reporter.ok("K-RERA's Un-registered Project List names no matching promoter.")
+            note = None
+        return ({"total_unregistered_investigations": len(matches),
+                 "source": "K-RERA Un-registered Project List (name match on promoter)",
+                 "matches": matches},
+                [note] if note else [])
 
     def _complaint_count(self, session, project_name, ctx):
         """Complaint count from K-RERA's STATE-WIDE register.

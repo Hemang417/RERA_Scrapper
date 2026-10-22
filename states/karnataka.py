@@ -78,6 +78,14 @@ DEFAULT_PROJECTS_PAGE = BASE_URL + "/viewDefaultProjects"
 # richer than DEFAULT_PROJECTS_PAGE, and a different finding (unpaid
 # penalty enforcement, not registration default).
 REVENUE_RECOVERY_PAGE = BASE_URL + "/viewRevenueRecoveryList"
+# K-RERA's "Un-registered Project List" -- projects the authority is pursuing
+# for operating without ever registering, the closest thing this portal
+# publishes to "projects under investigation". A different register from
+# DEFAULT_PROJECTS_PAGE (which covers REGISTERED projects the authority has
+# flagged in default) and from _ORDER_REGISTERS (case law). Never fetched
+# before this constant was added -- live-verify the header shape before
+# trusting parse_register_tables() to read it the same way as the others.
+UNREGISTERED_PROJECTS_PAGE = BASE_URL + "/unregProjectList"
 CERTIFICATE_URL = BASE_URL + "/certificate?CER_NO={}"
 DOWNLOAD_URL = BASE_URL + "/download_jc?DOC_ID={}"
 
