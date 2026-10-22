@@ -957,6 +957,7 @@ class DelhiAdapter:
         promoter_name = chosen["promoter_name"]
         complaints, complaint_notes = self._complaints(promoter_name, ctx)
         suo_moto, suo_moto_notes = self._suo_moto(promoter_name, ctx)
+        execution_orders, execution_notes = self._execution_register(promoter_name, ctx)
         reat_appeals, reat_notes = self._reat_appeals(promoter_name, ctx)
 
         disclaimer_notes = []
@@ -995,6 +996,7 @@ class DelhiAdapter:
             "complaints": complaints,
             "appeals": reat_appeals,
             "suo_moto_investigations": suo_moto,
+            "execution_orders": execution_orders,
         }
         for name, payload in category_data.items():
             with open(os.path.join(raw_dir, f"{name}.json"), "w", encoding="utf-8") as f:
@@ -1020,7 +1022,7 @@ class DelhiAdapter:
                 "documents",
             },
             notes=list(_AUTHORITY_NOTES) + disclaimer_notes + complaint_notes
-            + suo_moto_notes + reat_notes,
+            + suo_moto_notes + execution_notes + reat_notes,
         )
 
     # -- complaints --------------------------------------------------------
@@ -1097,6 +1099,46 @@ class DelhiAdapter:
         return ({"total_suo_moto_count": len(matches),
                  "total_rows_published": len(rows),
                  "source": "Delhi-RERA suo-moto (own-motion) register (name match on respondent)",
+                 "matches": matches},
+                [note] if note else [])
+
+    # -- execution register --------------------------------------------------
+    def _execution_register(self, promoter_name, ctx):
+        """Delhi-RERA's execution register, matched on JUDGEMENT DEBTOR.
+
+        Written 2026-08-26 (parse_execution_register) but never called from
+        here -- the authority's own closest equivalent to a defaulters list:
+        every row is an order the promoter did not comply with, now pending
+        enforcement. One GET for the whole register, same cost shape as
+        _complaints/_suo_moto above.
+        """
+        try:
+            rows = fetch_execution_register()
+        except Exception:
+            return (None,
+                    ["Delhi-RERA's execution register could not be read this run, so whether "
+                     "this promoter has an order pending enforcement for non-compliance is "
+                     "UNKNOWN. It must not be read as zero."])
+        needle = " ".join((promoter_name or "").split()).casefold()
+        matches = [r for r in rows if needle and needle in r.get("judgement_debtor", "").casefold()]
+        if matches:
+            ctx.reporter.warn(
+                f"Delhi-RERA's execution register names {len(matches)} matching order(s) "
+                f"against this promoter as Judgement Debtor."
+            )
+            note = (
+                f"{len(matches)} order(s) on Delhi-RERA's execution register name this "
+                f"promoter as Judgement Debtor, out of {len(rows)} rows published -- orders "
+                f"referred for enforcement because the promoter did not comply with them. "
+                f"Matched by name, so possible matches to confirm, not confirmed findings "
+                f"against this entity."
+            )
+        else:
+            ctx.reporter.ok("Delhi-RERA's execution register names no matching Judgement Debtor.")
+            note = None
+        return ({"total_execution_orders": len(matches),
+                 "total_rows_published": len(rows),
+                 "source": "Delhi-RERA execution register (name match on Judgement Debtor)",
                  "matches": matches},
                 [note] if note else [])
 

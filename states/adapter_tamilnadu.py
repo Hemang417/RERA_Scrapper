@@ -1200,6 +1200,10 @@ class TamilNaduAdapter:
 
         orders, order_notes = self._orders(promoter, ctx)
         notes.extend(order_notes)
+        penalties, penalty_notes = self._penalty_check(promoter, session, ctx)
+        notes.extend(penalty_notes)
+        enforcement, enforcement_notes = self._enforcement_check(promoter, session, ctx)
+        notes.extend(enforcement_notes)
 
         category_data = {
             "projects": {
@@ -1233,6 +1237,8 @@ class TamilNaduAdapter:
             "documents": {"entries": chosen["documents"] + project_view.get("documents", [])},
             "complaints": orders,
             "appeals": None,
+            "penalty_check": penalties,
+            "enforcement_check": enforcement,
         }
         for name, payload in category_data.items():
             with open(os.path.join(raw_dir, f"{name}.json"), "w", encoding="utf-8") as f:
@@ -1386,6 +1392,96 @@ class TamilNaduAdapter:
                  "matches": hits,
                  "coverage": coverage},
                 notes)
+
+    # -- penalty register ----------------------------------------------------
+    def _penalty_check(self, promoter, session, ctx):
+        """TNRERA's live penalty register (both Building and Layout), matched
+        on PROMOTER BLOCK -- TNRERA's own closest equivalent to a defaulters
+        list, titled 'Penalty' rather than that. Written earlier but never
+        called from here.
+        """
+        matches = []
+        failed_kinds = []
+        needle = " ".join((promoter or "").split()).casefold()
+        total_rows = 0
+        for kind in ("building", "layout"):
+            try:
+                rows = fetch_penalty_notices(kind, session=session)
+            except Exception:
+                failed_kinds.append(kind)
+                continue
+            total_rows += len(rows)
+            if needle:
+                matches.extend(
+                    {**row, "kind": kind} for row in rows
+                    if needle in row.get("promoter_block", "").casefold()
+                )
+        notes = []
+        if failed_kinds:
+            notes.append(
+                f"TNRERA's {' and '.join(failed_kinds)} penalty register could not be read this "
+                f"run, so this promoter's penalty history there is UNKNOWN for that/those "
+                f"register(s). It must not be read as zero."
+            )
+        if len(failed_kinds) == 2:
+            return (None, notes)
+        if matches:
+            ctx.reporter.warn(
+                f"TNRERA's penalty register names {len(matches)} matching penalty notice(s) "
+                f"against this promoter."
+            )
+            notes.append(
+                f"{len(matches)} penalty notice(s) on TNRERA's live penalty register (Building "
+                f"and/or Layout) name a promoter matching this promoter's name, out of "
+                f"{total_rows} rows published across both. Names the promoter, project and the "
+                f"penalty amount levied. Matched by name, so possible matches to confirm, not "
+                f"confirmed findings against this entity."
+            )
+        else:
+            ctx.reporter.ok("TNRERA's penalty register names no matching promoter.")
+        return ({"total_penalty_notices": len(matches),
+                 "total_rows_published": total_rows,
+                 "source": "TNRERA penalty register (Building + Layout, name match on promoter)",
+                 "matches": matches},
+                notes)
+
+    # -- unregistered-project enforcement lists -------------------------------
+    def _enforcement_check(self, promoter, session, ctx):
+        """TNRERA's two unregistered-project enforcement PDFs (show-cause
+        and personal-use caution lists), matched by name via
+        search_enforcement_lists_by_name. Written earlier but never called
+        from here. Covers UNREGISTERED sites only -- never this already-
+        registered project -- so a hit is evidence about the PROMOTER, not
+        about this project.
+        """
+        try:
+            hits = search_enforcement_lists_by_name(promoter, session=session)
+        except Exception:
+            return (None, [
+                "TNRERA's unregistered-project enforcement lists (show-cause and personal-use "
+                "caution PDFs) could not be read this run, so this promoter's presence on them "
+                "is UNKNOWN. It must not be read as zero."
+            ])
+        if hits:
+            ctx.reporter.warn(
+                f"TNRERA's unregistered-project enforcement lists name {len(hits)} matching "
+                f"entry(ies) for this promoter."
+            )
+            note = (
+                f"{len(hits)} entry(ies) on TNRERA's unregistered-project enforcement lists "
+                f"(show-cause notices for non-registration, and/or the personal-use/not-for-"
+                f"sale caution list) name a party matching this promoter's name. These cover "
+                f"UNREGISTERED sites the promoter is linked to elsewhere -- not this project, "
+                f"which is itself registered -- and are matched off prose party descriptions, "
+                f"so possible matches to confirm, not confirmed findings."
+            )
+        else:
+            ctx.reporter.ok("TNRERA's unregistered-project enforcement lists name no matching party.")
+            note = None
+        return ({"total_enforcement_hits": len(hits),
+                 "source": "TNRERA unregistered-project enforcement lists (SCN + personal-use caution, name match)",
+                 "matches": hits},
+                [note] if note else [])
 
     # -- documents ---------------------------------------------------------
     def _download_documents(self, session, entries, documents_dir, ctx):

@@ -691,6 +691,7 @@ class WestBengalAdapter:
         detail_html = _get(pool, PROJECT_DETAIL.format(chosen["procode"]), ctx, what="project detail")
         parsed = parse_project_detail(detail_html)
         promoter_name = parsed["promoter_name"] or chosen["project_name"]
+        defaulter_check, defaulter_notes = self._defaulter_check(chosen["project_name"], ctx)
 
         land = parsed["land"]
         category_data = {
@@ -738,6 +739,7 @@ class WestBengalAdapter:
             "appeals": None,
             "litigation": parsed["litigation"],
             "agents": parsed["agents"],
+            "defaulter_check": defaulter_check,
         }
         for name, payload in category_data.items():
             with open(os.path.join(raw_dir, f"{name}.json"), "w", encoding="utf-8") as f:
@@ -761,8 +763,51 @@ class WestBengalAdapter:
             raw_record=None,
             auth_source="none",
             categories_not_published={"spocs", "sro_details", "complaints", "appeals"},
-            notes=list(_AUTHORITY_NOTES) + project_notes(parsed),
+            notes=list(_AUTHORITY_NOTES) + project_notes(parsed) + defaulter_notes,
         )
+
+    def _defaulter_check(self, project_name, ctx):
+        """WBRERA's rejected/defaulting applications register, matched on
+        PROJECT NAME.
+
+        Written earlier but never called from here. CONFIRMED LIVE
+        2026-10-22: despite being described as "keyed by name", the
+        register's own 'name' column is the PROJECT's name ("231 GARFA"),
+        not a promoter name -- there is no promoter field on this register
+        at all. So this matches on the project this acquire() call already
+        resolved, not on promoter_name the way every other adapter's
+        defaulter/complaint check does.
+        """
+        try:
+            rows = fetch_defaulters()
+        except Exception:
+            return (None, [
+                "WBRERA's rejected/defaulting-applications register could not be read this "
+                "run, so whether this project is on it is UNKNOWN. It must not be read as "
+                "zero."
+            ])
+        needle = " ".join((project_name or "").split()).casefold()
+        matches = [r for r in rows if needle and needle in r.get("name", "").casefold()]
+        if matches:
+            ctx.reporter.warn(
+                f"WBRERA's rejected/defaulting register names {len(matches)} matching "
+                f"application(s) for this project."
+            )
+            note = (
+                f"{len(matches)} application(s) on WBRERA's rejected/defaulting register name "
+                f"this project, out of {len(rows)} rows published. The register has no "
+                f"promoter field at all -- this is a PROJECT-name match, not a promoter-name "
+                f"match like every other defaulter check in this pipeline -- so it says "
+                f"nothing about this promoter's other projects."
+            )
+        else:
+            ctx.reporter.ok("WBRERA's rejected/defaulting register names no matching project.")
+            note = None
+        return ({"total_rejected_or_defaulting": len(matches),
+                 "total_rows_published": len(rows),
+                 "source": "WBRERA rejected/defaulting-applications register (name match on project, not promoter)",
+                 "matches": matches},
+                [note] if note else [])
 
     def _download_documents(self, pool, detail_html, documents_dir, ctx):
         """Downloads this project's filings.

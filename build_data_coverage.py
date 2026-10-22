@@ -717,34 +717,49 @@ UNMAPPED = [
      "Same gap as GujRERA's findoc block: the financial-strength sub-metric scores None for every "
      "project regardless of state. This would score it for JH too.", "High"),
     ("JHARERA rejected + surrendered registration lists",
-     "REJECTED_LIST / SURRENDERED_LIST, imported into the adapter but never fetched", "Jharkhand projects",
+     "REJECTED_LIST / SURRENDERED_LIST -- WIRED 2026-10-22 via "
+     "JharkhandAdapter._rejected_or_surrendered_check(), live-verified on wiring (13 rows: "
+     "10 rejected + 3 surrendered)", "Jharkhand projects",
      "A rejected or surrendered registration is diligence material with no equivalent on MahaRERA. "
-     "The URLs are already wired into the import list; nothing calls them yet.", "Medium"),
-    ("WBRERA defaulters list", "adapter_westbengal.fetch_defaulters() -- written, unwired, untested live",
+     "Runs unconditionally on every JHARERA acquire(): two cheap GETs for the whole state's "
+     "registers, not a per-project cost.", "Medium"),
+    ("WBRERA defaulters list", "adapter_westbengal.fetch_defaulters() -- WIRED 2026-10-22 via "
+     "WestBengalAdapter._defaulter_check(), live-verified on wiring (18 rows)",
      "West Bengal projects",
-     "17 rejected/defaulting applications keyed by name -- a cheap, direct red-flag input. The parser "
-     "exists but is called from nowhere in acquire() or the litigation sweep.", "Medium"),
+     "A cheap, direct red-flag input. CORRECTED ON WIRING 2026-10-22: the register's own 'name' "
+     "column is the PROJECT's name, not a promoter name -- there is no promoter field on this "
+     "register at all, confirmed live. So this matches on the resolved project's own name, not "
+     "promoter_name the way every other defaulter check in this pipeline does, and a hit says "
+     "nothing about the promoter's other projects.", "Medium"),
     ("UP-RERA de-registered/defaulter list", "adapter_uttarpradesh.fetch_defaulters() -- WIRED 2026-10-22 "
      "via UttarPradeshAdapter._defaulter_check(), live-verified 2026-08-26 and again on wiring (72 rows)",
      "Uttar Pradesh projects",
      "Named by promoter outright -- ANSAL PROPERTIES & INFRASTRUCTURE LIMITED is on it (3 matching "
      "rows, re-confirmed live). Runs unconditionally on every UP-RERA acquire(): one homepage GET "
      "plus one ASP.NET postback for the whole state's register, not a per-project cost.", "High"),
-    ("HARERA cancelled/defaulter projects", "adapter_haryana.fetch_defaulter_projects() -- written, unwired, "
-     "live-verified 2026-08-26 (23 Panchkula + 5 Gurugram)", "Haryana projects",
+    ("HARERA cancelled/defaulter projects", "adapter_haryana.fetch_defaulter_projects() -- WIRED 2026-10-22 "
+     "via HaryanaAdapter._defaulter_check(), live-verified 2026-08-26 and again on wiring "
+     "(23 Panchkula + 5 Gurugram)", "Haryana projects",
      "Distinct from the already-imported LAPSED_PROJECTS URL, which is validity expiry, not an "
-     "authority action -- conflating the two would understate lapsed rows as defaults or vice versa.",
-     "Medium"),
-    ("TNRERA penalty register", "adapter_tamilnadu.fetch_penalty_notices() -- written, unwired, "
-     "live-verified 2026-08-26 (147 rows across Building + Layout)", "Tamil Nadu projects",
+     "authority action -- conflating the two would understate lapsed rows as defaults or vice "
+     "versa. Only the resolved project's OWN bench is checked per acquire() call; a promoter "
+     "active on both benches under the same name would need both swept, left to the "
+     "group-enforcement pass rather than a single-project lookup.", "Medium"),
+    ("TNRERA penalty register", "adapter_tamilnadu.fetch_penalty_notices() -- WIRED 2026-10-22 via "
+     "TamilNaduAdapter._penalty_check(), live-verified 2026-08-26 and again on wiring (146 rows "
+     "across Building + Layout)", "Tamil Nadu projects",
      "Names promoter, project and the penalty amount levied -- TNRERA's own closest equivalent to a "
-     "defaulters list, titled 'Penalty' rather than that.", "Medium"),
+     "defaulters list, titled 'Penalty' rather than that. Runs unconditionally: two GETs (Building "
+     "+ Layout) on every TNRERA acquire().", "Medium"),
     ("TNRERA unregistered-project enforcement PDFs", "adapter_tamilnadu.search_enforcement_lists_by_name() "
-     "-- written, unwired, live-verified 2026-08-26 (35 + 1,502 rows, native-text PDFs, no OCR needed)",
+     "-- WIRED 2026-10-22 via TamilNaduAdapter._enforcement_check(), live-verified 2026-08-26 and "
+     "again on wiring (35 + 1,502 rows, native-text PDFs, no OCR needed)",
      "Tamil Nadu projects/promoters",
      "The show-cause and personal-use-caution lists, now actually searchable by name rather than merely "
      "linked as static PDFs. Ceiling is real, not fixable in code: both cover UNREGISTERED sites, never a "
-     "registered project under suo-moto scrutiny.", "Medium"),
+     "registered project under suo-moto scrutiny, so a hit is evidence about the PROMOTER, not this "
+     "project. Runs unconditionally, though the personal-use caution PDF is 118 pages and noticeably "
+     "slower than every other per-promoter check in this adapter.", "Medium"),
     ("Delhi-RERA suo-moto register", "adapter_delhi.parse_suo_moto_register() -- WIRED 2026-10-22 via "
      "DelhiAdapter._suo_moto(), live-verified 2026-08-26 and again on wiring (1,781 rows)", "Delhi projects",
      "Names a Respondent/Promoter and project per row -- the clearest 'projects under investigation' "
@@ -752,10 +767,12 @@ UNMAPPED = [
      "all. Runs unconditionally: one GET for the whole register, same cost shape as the complaint "
      "register sweep already in this adapter. Surfaced as category_data['suo_moto_investigations']; "
      "not yet mapped to a Charter facts field (still '(unmapped)' in Sheet A).", "High"),
-    ("Delhi-RERA execution register", "adapter_delhi.parse_execution_register() -- written, unwired, "
-     "live-verified 2026-08-26 (7,493 rows)", "Delhi projects",
+    ("Delhi-RERA execution register", "adapter_delhi.parse_execution_register() -- WIRED 2026-10-22 via "
+     "DelhiAdapter._execution_register(), live-verified 2026-08-26 and again on wiring (5,921 rows)",
+     "Delhi projects",
      "Orders referred for enforcement because the promoter (named as Judgement Debtor) did not comply "
-     "-- the authority's own closest equivalent to a defaulters list.", "Medium"),
+     "-- the authority's own closest equivalent to a defaulters list. Runs unconditionally: one GET "
+     "for the whole register.", "Medium"),
     ("Delhi-RERA Appellate Tribunal (REAT) register, WITH party names",
      "adapter_delhi.build_appeal_party_index() / search_appeals_by_party() -- WIRED 2026-10-22 via "
      "DelhiAdapter._reat_appeals(), live-verified 2026-08-26 (437/505 rows named, 481 PDFs OCR'd)",

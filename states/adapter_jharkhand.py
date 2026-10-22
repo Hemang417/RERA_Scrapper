@@ -759,6 +759,7 @@ class JharkhandAdapter:
         promoter_name = parsed["promoter_name"] or chosen["project_name"]
 
         complaints_payload, complaint_notes = self._complaints(session, promoter_name, ctx)
+        rejected_surrendered, rs_notes = self._rejected_or_surrendered_check(promoter_name, ctx)
 
         category_data = {
             "projects": {
@@ -782,6 +783,7 @@ class JharkhandAdapter:
             "complaints": complaints_payload,
             "appeals": None,
             "litigation": parsed["litigation"],
+            "rejected_or_surrendered_check": rejected_surrendered,
         }
         for name, payload in category_data.items():
             with open(os.path.join(raw_dir, f"{name}.json"), "w", encoding="utf-8") as f:
@@ -789,7 +791,7 @@ class JharkhandAdapter:
 
         documents_manifest = self._download_documents(session, detail_html, documents_dir, ctx)
 
-        notes = list(_AUTHORITY_NOTES) + project_notes(parsed) + complaint_notes
+        notes = list(_AUTHORITY_NOTES) + project_notes(parsed) + complaint_notes + rs_notes
         return AcquisitionResult(
             profile=PROFILE,
             reg_no=reg_no,
@@ -847,6 +849,64 @@ class JharkhandAdapter:
         return ({"total_complaints_count": len(rows),
                  "source": "JHARERA disposed-complaint register (name match on respondent)",
                  "matched_rows": rows}, notes)
+
+    # -- rejected/surrendered registers --------------------------------------
+    def _rejected_or_surrendered_check(self, promoter_name, ctx):
+        """JHARERA's rejected-application and surrendered-registration
+        registers, matched on PROMOTER NAME (both carry a clean column,
+        unlike the order register's combined party string).
+
+        URLs were imported into this adapter earlier but nothing fetched
+        them until now. A rejected or surrendered registration is diligence
+        material with no equivalent on MahaRERA.
+        """
+        needle = " ".join((promoter_name or "").split()).casefold()
+        matches = []
+        total_rows = 0
+        failed = []
+        for label, fetcher in (("rejected", fetch_rejected_projects),
+                                ("surrendered", fetch_surrendered_projects)):
+            try:
+                rows = fetcher()
+            except Exception:
+                failed.append(label)
+                continue
+            total_rows += len(rows)
+            if needle:
+                matches.extend(
+                    {**row, "register": label} for row in rows
+                    if needle in (row.get("promoter_name") or "").casefold()
+                )
+        notes = []
+        if failed:
+            notes.append(
+                f"JHARERA's {' and '.join(failed)} register could not be read this run, so this "
+                f"promoter's presence on that/those register(s) is UNKNOWN. It must not be read "
+                f"as zero."
+            )
+        if len(failed) == 2:
+            return (None, notes)
+        if matches:
+            ctx.reporter.warn(
+                f"JHARERA's rejected/surrendered registers name {len(matches)} matching "
+                f"entry(ies) for this promoter."
+            )
+            notes.append(
+                f"{len(matches)} entry(ies) on JHARERA's rejected-application and/or "
+                f"surrendered-registration registers name a promoter matching this promoter's "
+                f"name, out of {total_rows} rows published across both. A rejected application "
+                f"never reached registration at all; a surrendered one gave up an existing "
+                f"registration -- distinct findings, kept separate via the 'register' field on "
+                f"each match. Matched by name, so possible matches to confirm, not confirmed "
+                f"findings against this entity."
+            )
+        else:
+            ctx.reporter.ok("JHARERA's rejected/surrendered registers name no matching promoter.")
+        return ({"total_rejected_or_surrendered": len(matches),
+                 "total_rows_published": total_rows,
+                 "source": "JHARERA rejected-application + surrendered-registration registers (name match on promoter)",
+                 "matches": matches},
+                notes)
 
     # -- promoter portfolio ------------------------------------------------
     def _promoter_portfolio(self, session, promoter_name, this_reg_no, ctx):

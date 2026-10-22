@@ -684,7 +684,10 @@ class HaryanaAdapter:
                 ctx.reporter.warn(f"HARERA detail page unreadable ({e}) -- register row only.")
 
         promoter_name = parsed.get("promoter_name") or chosen["builder"]
-        notes = list(_AUTHORITY_NOTES)
+        defaulter_check, defaulter_notes = self._defaulter_check(
+            session, chosen.get("bench_code"), promoter_name, ctx
+        )
+        notes = list(_AUTHORITY_NOTES) + defaulter_notes
         if (chosen.get("project_id") or "").strip().upper() == "NA":
             notes.append(
                 f"HARERA's register prints no Project ID for this registration -- the column "
@@ -744,6 +747,7 @@ class HaryanaAdapter:
             # never 0, so nothing downstream reads an absence as clean.
             "complaints": None,
             "appeals": None,
+            "defaulter_check": defaulter_check,
         }
         for name, payload in category_data.items():
             with open(os.path.join(raw_dir, f"{name}.json"), "w", encoding="utf-8") as f:
@@ -774,6 +778,60 @@ class HaryanaAdapter:
             },
             notes=notes,
         )
+
+    # -- defaulter/cancelled register ---------------------------------------
+    def _defaulter_check(self, session, bench_code, promoter_name, ctx):
+        """This project's own bench's "Defaulter/ Cancelled/ Suspended/
+        Abeyance Projects" register, matched on BUILDER.
+
+        Written earlier but never called from here. Distinct from the
+        LAPSED_PROJECTS register (validity expiry, not an authority action)
+        -- see parse_lapsed_or_defaulter_register. Only this project's own
+        bench is checked: a promoter active on both benches under the same
+        name would need both benches swept, which the group-enforcement
+        pass (not a single-project acquire()) is the right place for.
+        """
+        if not bench_code:
+            return (None, [
+                "This project's HARERA bench could not be determined, so its "
+                "defaulter/cancelled register was not checked."
+            ])
+        try:
+            rows = fetch_defaulter_projects(bench_code, session=session)
+        except Exception:
+            return (None, [
+                f"HARERA's {BENCHES.get(bench_code, bench_code)} defaulter/cancelled register "
+                f"could not be read this run, so whether this promoter has a project on it is "
+                f"UNKNOWN. It must not be read as zero."
+            ])
+        needle = " ".join((promoter_name or "").split()).casefold()
+        matches = [r for r in rows if needle and needle in r.get("builder", "").casefold()]
+        if matches:
+            ctx.reporter.warn(
+                f"HARERA's {BENCHES.get(bench_code, bench_code)} defaulter/cancelled register "
+                f"names {len(matches)} matching project(s) against this promoter."
+            )
+            note = (
+                f"{len(matches)} project(s) on HARERA's {BENCHES.get(bench_code, bench_code)} "
+                f"'Defaulter/ Cancelled/ Suspended/ Abeyance Projects' register name a builder "
+                f"matching this promoter's name, out of {len(rows)} rows on that bench. This is "
+                f"the authority's own action against the promoter -- a much smaller, different "
+                f"set than a registration simply lapsing. Matched by name, so possible matches "
+                f"to confirm, not confirmed findings against this entity. Only this project's "
+                f"own bench was checked."
+            )
+        else:
+            ctx.reporter.ok(
+                f"HARERA's {BENCHES.get(bench_code, bench_code)} defaulter/cancelled register "
+                f"names no matching builder."
+            )
+            note = None
+        return ({"total_defaulter_projects": len(matches),
+                 "total_rows_published": len(rows),
+                 "bench_checked": BENCHES.get(bench_code, bench_code),
+                 "source": "HARERA Defaulter/Cancelled/Suspended/Abeyance register (name match on Builder)",
+                 "matches": matches},
+                [note] if note else [])
 
     # -- documents ---------------------------------------------------------
     def _download_documents(self, session, entries, documents_dir, ctx):
