@@ -956,6 +956,8 @@ class DelhiAdapter:
 
         promoter_name = chosen["promoter_name"]
         complaints, complaint_notes = self._complaints(promoter_name, ctx)
+        suo_moto, suo_moto_notes = self._suo_moto(promoter_name, ctx)
+        reat_appeals, reat_notes = self._reat_appeals(promoter_name, ctx)
 
         disclaimer_notes = []
         if chosen.get("has_disclaimer"):
@@ -991,7 +993,8 @@ class DelhiAdapter:
             "past_experiences": None,
             "documents": None,
             "complaints": complaints,
-            "appeals": None,
+            "appeals": reat_appeals,
+            "suo_moto_investigations": suo_moto,
         }
         for name, payload in category_data.items():
             with open(os.path.join(raw_dir, f"{name}.json"), "w", encoding="utf-8") as f:
@@ -1014,9 +1017,10 @@ class DelhiAdapter:
             auth_source="none",
             categories_not_published={
                 "professionals", "spocs", "sro_details", "past_experiences",
-                "documents", "appeals",
+                "documents",
             },
-            notes=list(_AUTHORITY_NOTES) + disclaimer_notes + complaint_notes,
+            notes=list(_AUTHORITY_NOTES) + disclaimer_notes + complaint_notes
+            + suo_moto_notes + reat_notes,
         )
 
     # -- complaints --------------------------------------------------------
@@ -1054,6 +1058,102 @@ class DelhiAdapter:
                  "total_orders_published": len(rows),
                  "source": "Delhi-RERA complaint register (name match on respondent)",
                  "matches": rows},
+                [note] if note else [])
+
+    # -- suo-moto (own-motion) register ------------------------------------
+    def _suo_moto(self, promoter_name, ctx):
+        """Delhi-RERA's own-motion register, matched on RESPONDENT.
+
+        Written 2026-08-26 (parse_suo_moto_register) but never called from
+        here -- the closest thing this authority publishes to "projects
+        under investigation" (see CLAUDE.md's Sheet D). One GET for the
+        whole register, same cost shape as _complaints above, so unlike the
+        REAT sweep below there is no reason to gate this behind a flag.
+        """
+        try:
+            rows = fetch_suo_moto_register()
+        except Exception:
+            return (None,
+                    ["Delhi-RERA's suo-moto (own-motion) register could not be read this run, "
+                     "so whether the authority has opened proceedings against this promoter on "
+                     "its own motion is UNKNOWN. It must not be read as zero."])
+        needle = " ".join((promoter_name or "").split()).casefold()
+        matches = [r for r in rows if needle and needle in r.get("respondent_name", "").casefold()]
+        if matches:
+            ctx.reporter.warn(
+                f"Delhi-RERA's suo-moto register names {len(matches)} matching proceeding(s) "
+                f"against this promoter."
+            )
+            note = (
+                f"{len(matches)} entry(ies) on Delhi-RERA's own-motion (suo moto) register name "
+                f"a respondent matching this promoter's name, out of {len(rows)} rows published. "
+                f"These are proceedings the AUTHORITY opened itself rather than ones a "
+                f"complainant filed -- matched by name, so possible matches to confirm, not "
+                f"confirmed findings against this entity."
+            )
+        else:
+            ctx.reporter.ok("Delhi-RERA's suo-moto register names no matching respondent.")
+            note = None
+        return ({"total_suo_moto_count": len(matches),
+                 "total_rows_published": len(rows),
+                 "source": "Delhi-RERA suo-moto (own-motion) register (name match on respondent)",
+                 "matches": matches},
+                [note] if note else [])
+
+    # -- REAT (Appellate Tribunal) appeals ----------------------------------
+    def _reat_appeals(self, promoter_name, ctx):
+        """Delhi-RERA's Appellate Tribunal (REAT) register, matched on the
+        appellant/respondent names OCR'd from each appeal order's own PDF --
+        the register itself names no party at all (see
+        build_appeal_party_index).
+
+        OFF BY DEFAULT: the register carries 481 distinct order PDFs, each
+        needing a fetch-and-OCR pass the first time it is seen -- far more
+        expensive than every other per-promoter check in this adapter, and
+        not something a routine single-project run should pay for silently.
+        Set DELHI_REAT_SWEEP=1 to run it. Results are cached to disk per PDF
+        under <output_dir>/_reat_pdf_cache, so a second sweep (this run or a
+        later one, same output dir) only pays OCR cost for PDFs it has not
+        seen before.
+        """
+        if os.environ.get("DELHI_REAT_SWEEP", "0") != "1":
+            return (None, [
+                "Delhi-RERA's Appellate Tribunal (REAT) register was NOT swept this run (set "
+                "DELHI_REAT_SWEEP=1 -- it OCRs up to ~480 order PDFs the first time, cached "
+                "afterwards). Appellate history is UNKNOWN for this promoter here, not "
+                "confirmed clean -- it is a real, searchable register (437/505 rows carry a "
+                "party name), just not run by default."
+            ])
+        cache_dir = os.path.join(ctx.output_dir, "_reat_pdf_cache")
+        try:
+            index = build_appeal_party_index(cache_dir=cache_dir, reporter=ctx.reporter)
+        except Exception as e:
+            return (None, [
+                f"Delhi-RERA's REAT appeal register could not be read this run "
+                f"({type(e).__name__}), so appellate history is UNKNOWN for this promoter. "
+                f"It must not be read as zero."
+            ])
+        matches = search_appeals_by_party(promoter_name, index["rows"])
+        if matches:
+            ctx.reporter.warn(
+                f"Delhi-RERA's REAT register names {len(matches)} matching appeal(s) against "
+                f"this promoter."
+            )
+            note = (
+                f"{len(matches)} appeal(s) on Delhi-RERA's Appellate Tribunal (REAT) register "
+                f"name an appellant or respondent matching this promoter's name, out of "
+                f"{index['coverage']['total_rows']} rows ({index['coverage']['rows_with_a_party_name']} "
+                f"carrying any party name at all). Each match comes from a scanned order PDF "
+                f"read by OCR, so these are possible matches to confirm, not confirmed appeals "
+                f"against this entity."
+            )
+        else:
+            ctx.reporter.ok("Delhi-RERA's REAT register names no matching party.")
+            note = None
+        return ({"total_appeals_count": len(matches),
+                 "coverage": index["coverage"],
+                 "source": "Delhi-RERA Appellate Tribunal (REAT) register (name match via OCR'd order PDFs)",
+                 "matches": matches},
                 [note] if note else [])
 
     # -- portfolio ---------------------------------------------------------

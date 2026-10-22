@@ -621,6 +621,53 @@ _MUTATION_NO_RE = re.compile(
     r"(?:\u092b\u0947\u0930\u092b\u093e\u0930|ferafar)[^0-9]{0,20}([0-9]{1,6})", re.I)
 
 
+def _fields_from_ocr_text(text: str) -> dict:
+    """Best-effort field extraction from OCR'd card text.
+
+    CONFIRMED LIVE 2026-10-15: not every property's card is the "English
+    card is real HTML tables" shape save_embedded_card_image's docstring
+    describes. A card with no digitized attribute data on file renders as a
+    single embedded scanned JPEG even with English selected -- parse_
+    property_card correctly returns {} on that page because there is no
+    markup to parse, not because it is broken. OCR of the card image is the
+    only route into that card's content at all.
+
+    Looser than the DOM parser by construction: OCR mangles Devanagari and
+    runs labels and values together with no cell boundaries, so this is a
+    last-resort fallback, never preferred over a real table read. Matches
+    each known label's plain-text form, then takes the text up to the next
+    matched label as that label's value -- noisy, but the only thing
+    available once a card is confirmed image-only."""
+    if not text:
+        return {}
+    positions = []
+    for label, key in _ALL_CARD_LABELS.items():
+        idx = text.find(label)
+        if idx >= 0:
+            positions.append((idx, idx + len(label), key))
+    # PU-ID is matched by its own regex (see parse_property_card), not a
+    # fixed label string, but its position must still act as a boundary --
+    # otherwise the label immediately before it bleeds its value into
+    # "...h-1 PU-ID: 12345678901" instead of stopping at "h-1".
+    pu_id = _PU_ID_RE.search(text)
+    if pu_id:
+        positions.append((pu_id.start(), pu_id.end(), None))
+    if not positions:
+        return {}
+    positions.sort()
+    fields = {}
+    for i, (start, end, key) in enumerate(positions):
+        if key is None:
+            continue
+        next_start = positions[i + 1][0] if i + 1 < len(positions) else min(end + 80, len(text))
+        value = " ".join(text[end:next_start].strip(" :\n\t-|").split())
+        if value and key not in fields:
+            fields[key] = value
+    if pu_id:
+        fields.setdefault("pu_id", pu_id.group(1))
+    return fields
+
+
 def _mutation_number_from(entry: dict) -> str:
     """The mutation (pherphar) number, wherever the card put it. On the real
     card it is prose inside the attestation cell, not its own column."""
@@ -986,19 +1033,6 @@ def _scrape_result_page(page, screenshot_path: str | None = None, captured: dict
             "NO READING TAKEN, not an empty record."
         )
 
-    ocr_text = ""
-    if screenshot_path:
-        try:
-            page.screenshot(path=screenshot_path, full_page=True)
-            ocr_text = _ocr_image(screenshot_path)
-        except Exception as e:
-            ocr_text = f"[OCR unavailable: {e}]"
-
-    # A note here means the card was ON the page and could not be read --
-    # see parse_property_card. It must reach the caller, not be inferred
-    # from an empty `fields`.
-    if mutations or len(fields) > 1:
-        notes = [n for n in notes if "none of" not in n]
     card_html = _card_frame_text(page)
     if card_html and screenshot_path:
         try:
@@ -1017,6 +1051,50 @@ def _scrape_result_page(page, screenshot_path: str | None = None, captured: dict
                 f"{card_image['path']} -- this is the authoritative record; "
                 "in Marathi it is the ONLY form the card takes."
             )
+
+    # OCR the CARD IMAGE itself when one was embedded -- a tight crop of
+    # just the card, not the full page's menus/headers/footers. Confirmed
+    # live 2026-10-15: a real card came back image-only (no PU-ID anywhere
+    # in any frame's HTML) even with English selected, so a full-page
+    # screenshot was the only OCR source this function ever had, and
+    # nothing parsed its text into fields -- ocr_text sat unused evidence,
+    # not data. Falls back to the full-page screenshot only when the page
+    # embeds no extractable card image at all.
+    ocr_text = ""
+    if screenshot_path:
+        try:
+            ocr_source = card_image.get("path") or screenshot_path
+            if not card_image.get("path"):
+                page.screenshot(path=screenshot_path, full_page=True)
+            ocr_text = _ocr_image(ocr_source)
+        except Exception as e:
+            ocr_text = f"[OCR unavailable: {e}]"
+
+    # fields/mutations above come from the DOM table parser only. When a
+    # card is confirmed image-only (PU-ID present nowhere in the DOM, so the
+    # DOM parser never had markup to read -- see parse_property_card), OCR
+    # of the card image is the only route to its content. Kept SEPARATE
+    # from `fields` rather than merged in: OCR-derived values are lower
+    # confidence (Devanagari gets mangled) and a caller must be able to tell
+    # a structured table read from a guess off scanned text.
+    ocr_fields = {}
+    if len(fields) <= 1 and not mutations and ocr_text and not ocr_text.startswith("[OCR unavailable"):
+        ocr_fields = _fields_from_ocr_text(ocr_text)
+        if ocr_fields:
+            notes.append(
+                "Card confirmed image-only (no structured markup in any frame): "
+                f"{len(ocr_fields)} field(s) recovered by OCR of the card image "
+                "instead -- see ocr_fields. Lower confidence than a DOM table "
+                "read; Devanagari words (holder name, tenure class) are the "
+                "most likely to be mangled, digits (CTS number, area, dates) "
+                "the most reliable."
+            )
+
+    # A note here means the card was ON the page and could not be read --
+    # see parse_property_card. It must reach the caller, not be inferred
+    # from an empty `fields`.
+    if mutations or len(fields) > 1 or ocr_fields:
+        notes = [n for n in notes if "none of" not in n]
 
     diagnostics = {"dom": _dom_inventory(page)}
     if captured is not None:
@@ -1039,8 +1117,8 @@ def _scrape_result_page(page, screenshot_path: str | None = None, captured: dict
                 "beside the screenshot. If the card is not in the DOM, it is in there."
             )
     return {"fields": fields, "mutations": mutations, "raw_text": raw_text,
-            "ocr_text": ocr_text, "url": page.url, "notes": notes,
-            "card_image": card_image, "diagnostics": diagnostics}
+            "ocr_text": ocr_text, "ocr_fields": ocr_fields, "url": page.url,
+            "notes": notes, "card_image": card_image, "diagnostics": diagnostics}
 
 
 def fetch_property_card(
@@ -1142,8 +1220,8 @@ def fetch_property_card(
 
         print(f"[INFO] A browser window has opened at {_BASE_URL}")
         print(f"[INFO] Solving the CAPTCHA via Claude vision (up to {_MAX_AUTOSOLVE_ATTEMPTS} attempts)...")
-        print(f"[INFO] Language is already set to {_CARD_LANGUAGE} -- the Marathi card is served as an "
-              "image and cannot be parsed.")
+        print(f"[INFO] Language is already set to {_CARD_LANGUAGE} -- some records still render as an "
+              "embedded scanned image regardless of language; OCR is the fallback for those.")
 
         for attempt in range(1, _MAX_AUTOSOLVE_ATTEMPTS + 1):
             if page.is_closed():

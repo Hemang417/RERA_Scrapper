@@ -702,8 +702,15 @@ UNMAPPED = [
      "Financial-strength scores None everywhere today. This is a direct, free input.", "High"),
     ("K-RERA delay reasons + NOC expiry", "K-RERA detail page", "Karnataka projects",
      "Promoter-declared delay reasons and lapsed-NOC tracking; no equivalent elsewhere.", "Medium"),
-    ("Maha Bhulekh card fields", "Free portal, extraction broken", "Maharashtra projects",
-     "Owner, area, tenure, encumbrance and mutation are all ON the card and none reach the document.",
+    ("Maha Bhulekh card fields", "Free portal, now has an OCR fallback for image-only cards", "Maharashtra projects",
+     "WIRED 2026-10-22: confirmed live that a property with no digitized attribute data on file "
+     "renders as a single scanned JPEG even with English selected (parse_property_card correctly "
+     "returns {} on that page -- there is no markup to read, not a parser bug). "
+     "mahabhumi._fields_from_ocr_text() now OCRs the cropped card image itself (not the noisy "
+     "full-page screenshot) and extracts labelled fields from the OCR text as `ocr_fields`, kept "
+     "separate from the DOM-parsed `fields` so a caller can tell a table read from a lower-"
+     "confidence scan guess. Verified against two real saved captures with digitized cards (full "
+     "fields/mutations) and one real image-only capture (ocr_fields now the only route in).",
      "High"),
     ("JHARERA audited balance sheet + 3 years ITR", "adapter_jharkhand.py document library (labelled, downloaded)",
      "Jharkhand projects",
@@ -717,10 +724,12 @@ UNMAPPED = [
      "West Bengal projects",
      "17 rejected/defaulting applications keyed by name -- a cheap, direct red-flag input. The parser "
      "exists but is called from nowhere in acquire() or the litigation sweep.", "Medium"),
-    ("UP-RERA de-registered/defaulter list", "adapter_uttarpradesh.fetch_defaulters() -- written, unwired, "
-     "live-verified 2026-08-26 (72 rows)", "Uttar Pradesh projects",
-     "Named by promoter outright -- ANSAL PROPERTIES & INFRASTRUCTURE LIMITED is on it. Reachable only "
-     "via an ASP.NET postback, not a plain URL, which is why nothing had fetched it before.", "High"),
+    ("UP-RERA de-registered/defaulter list", "adapter_uttarpradesh.fetch_defaulters() -- WIRED 2026-10-22 "
+     "via UttarPradeshAdapter._defaulter_check(), live-verified 2026-08-26 and again on wiring (72 rows)",
+     "Uttar Pradesh projects",
+     "Named by promoter outright -- ANSAL PROPERTIES & INFRASTRUCTURE LIMITED is on it (3 matching "
+     "rows, re-confirmed live). Runs unconditionally on every UP-RERA acquire(): one homepage GET "
+     "plus one ASP.NET postback for the whole state's register, not a per-project cost.", "High"),
     ("HARERA cancelled/defaulter projects", "adapter_haryana.fetch_defaulter_projects() -- written, unwired, "
      "live-verified 2026-08-26 (23 Panchkula + 5 Gurugram)", "Haryana projects",
      "Distinct from the already-imported LAPSED_PROJECTS URL, which is validity expiry, not an "
@@ -736,25 +745,32 @@ UNMAPPED = [
      "The show-cause and personal-use-caution lists, now actually searchable by name rather than merely "
      "linked as static PDFs. Ceiling is real, not fixable in code: both cover UNREGISTERED sites, never a "
      "registered project under suo-moto scrutiny.", "Medium"),
-    ("Delhi-RERA suo-moto register", "adapter_delhi.parse_suo_moto_register() -- written, unwired, "
-     "live-verified 2026-08-26 (1,797 rows)", "Delhi projects",
+    ("Delhi-RERA suo-moto register", "adapter_delhi.parse_suo_moto_register() -- WIRED 2026-10-22 via "
+     "DelhiAdapter._suo_moto(), live-verified 2026-08-26 and again on wiring (1,781 rows)", "Delhi projects",
      "Names a Respondent/Promoter and project per row -- the clearest 'projects under investigation' "
      "signal found on any of the four newest states, and Delhi otherwise has no per-project record at "
-     "all.", "High"),
+     "all. Runs unconditionally: one GET for the whole register, same cost shape as the complaint "
+     "register sweep already in this adapter. Surfaced as category_data['suo_moto_investigations']; "
+     "not yet mapped to a Charter facts field (still '(unmapped)' in Sheet A).", "High"),
     ("Delhi-RERA execution register", "adapter_delhi.parse_execution_register() -- written, unwired, "
      "live-verified 2026-08-26 (7,493 rows)", "Delhi projects",
      "Orders referred for enforcement because the promoter (named as Judgement Debtor) did not comply "
      "-- the authority's own closest equivalent to a defaulters list.", "Medium"),
     ("Delhi-RERA Appellate Tribunal (REAT) register, WITH party names",
-     "adapter_delhi.build_appeal_party_index() / search_appeals_by_party() -- written, unwired, "
-     "live-verified 2026-08-26 (437/505 rows named, 481 PDFs OCR'd)", "Delhi projects",
+     "adapter_delhi.build_appeal_party_index() / search_appeals_by_party() -- WIRED 2026-10-22 via "
+     "DelhiAdapter._reat_appeals(), live-verified 2026-08-26 (437/505 rows named, 481 PDFs OCR'd)",
+     "Delhi projects",
      "The register itself names no party -- not linked from any Delhi-RERA page either, found "
      "only by web search -- but every row links a scanned judgement PDF whose own case caption "
      "does. OCRing just the PDFs' first pages (PyMuPDF native text, confirmed zero on every "
      "sample -- Tesseract fallback) turned an unsearchable register into one where "
      "search_appeals_by_party('Parsvnath') returns 27 real hits. The only gaps are the "
      "authority's own 63 broken PDF links and 5 older (2021-2022) PDFs in a caption shape not "
-     "yet recognised.", "High"),
+     "yet recognised. OFF BY DEFAULT even though wired: 481 PDFs is too expensive to fetch+OCR on "
+     "every Delhi-RERA acquire() call, so it only runs with DELHI_REAT_SWEEP=1, caching each PDF's "
+     "OCR text to <output_dir>/_reat_pdf_cache so a repeat sweep only pays for PDFs not seen "
+     "before. A run without the flag set gets an explicit 'not swept' note, never a silent clean "
+     "record.", "High"),
 ]
 
 

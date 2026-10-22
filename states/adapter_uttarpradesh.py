@@ -622,6 +622,10 @@ class UttarPradeshAdapter:
         reg_no = storage_key(registration_number)
         ctx.reporter.ok(f"Resolved: {registration_number} | {detail['project_name']}")
 
+        defaulter_check, defaulter_notes = self._defaulter_check(
+            session, detail["promoter_name"], ctx
+        )
+
         project_out_dir = os.path.join(ctx.output_dir, reg_no)
         raw_dir = os.path.join(project_out_dir, "raw")
         documents_dir = os.path.join(project_out_dir, "documents")
@@ -669,6 +673,7 @@ class UttarPradeshAdapter:
             # None, never 0, so nothing downstream reads it as a clean record.
             "complaints": None,
             "appeals": None,
+            "defaulter_check": defaulter_check,
         }
         for name, payload in category_data.items():
             with open(os.path.join(raw_dir, f"{name}.json"), "w", encoding="utf-8") as f:
@@ -699,7 +704,7 @@ class UttarPradeshAdapter:
             categories_not_published={
                 "spocs", "sro_details", "past_experiences", "complaints", "appeals",
             },
-            notes=list(_AUTHORITY_NOTES) + project_notes(detail),
+            notes=list(_AUTHORITY_NOTES) + project_notes(detail) + defaulter_notes,
         )
 
     # -- fetching ----------------------------------------------------------
@@ -739,6 +744,49 @@ class UttarPradeshAdapter:
         }
         blocks = {k: v for k, v in blocks.items() if any(v.values())}
         return blocks or None
+
+    # -- defaulter / de-registered register ---------------------------------
+    def _defaulter_check(self, session, promoter_name, ctx):
+        """UP-RERA's de-registered/defaulter project register, matched on
+        promoter NAME (see fetch_defaulters above).
+
+        Written 2026-08-26, never called from acquire() until now. Unlike
+        the REAT sweep on Delhi-RERA, this is cheap -- one homepage GET plus
+        one postback for the WHOLE STATE's 72-row register, not a per-row
+        fetch -- so it runs unconditionally, the same cost shape as every
+        other promoter-name sweep in this adapter family.
+        """
+        try:
+            rows = fetch_defaulters(session=session)
+        except Exception:
+            return (None, [
+                "UP-RERA's de-registered/defaulter register could not be read this run, so "
+                "whether this promoter has a project on it is UNKNOWN. It must not be read "
+                "as zero."
+            ])
+        needle = " ".join((promoter_name or "").split()).casefold()
+        matches = [r for r in rows if needle and needle in r.get("promoter_name", "").casefold()]
+        if matches:
+            ctx.reporter.warn(
+                f"UP-RERA's de-registered/defaulter register names {len(matches)} matching "
+                f"project(s) against this promoter."
+            )
+            note = (
+                f"{len(matches)} project(s) on UP-RERA's de-registered/defaulter register name "
+                f"a promoter matching this promoter's name, out of {len(rows)} rows published. "
+                f"The register does not split de-registered from defaulter status into separate "
+                f"columns -- it is carried as a suffix on the project name itself. Matched by "
+                f"name, so possible matches to confirm, not confirmed findings against this "
+                f"entity."
+            )
+        else:
+            ctx.reporter.ok("UP-RERA's de-registered/defaulter register names no matching promoter.")
+            note = None
+        return ({"total_defaulter_projects": len(matches),
+                 "total_rows_published": len(rows),
+                 "source": "UP-RERA de-registered/defaulter register (name match on promoter)",
+                 "matches": matches},
+                [note] if note else [])
 
     # -- documents ---------------------------------------------------------
     def _download_documents(self, session, entries, documents_dir, ctx):
