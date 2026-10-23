@@ -94,6 +94,7 @@ either claim at face value:
 import argparse
 import concurrent.futures
 import copy
+import hashlib
 import json
 import os
 import re
@@ -442,6 +443,107 @@ def extract_pnl_figures(document_text: str) -> dict:
         figures["financial_year_ended"] = year_match.group(1)
 
     return figures
+
+
+# ---------------------------------------------------------------------------
+# Credit-rating rationale PDF figures (CARE, Infomerics). Confirmed live
+# 2026-10-23 against three REAL rationale PDFs -- Oberoi Realty Limited and
+# Sunteck Realty Limited (CARE), JSR Infra Developers Private Limited
+# (Infomerics) -- found by searching each agency's own search endpoint for
+# real listed/rated developers, not guessed at. Infomerics' document states
+# Total Debt and Tangible Net Worth directly, the exact figures
+# _score_financial_strength_debt's own docstring describes needing.
+#
+# A DIFFERENT LAYOUT PROBLEM FROM extract_pnl_figures, NOT THE SAME ONE.
+# These tables flatten COLUMN-MAJOR in native PDF text (no OCR involved in
+# any of the three samples): a row's label sits ALONE on its own line,
+# immediately followed by that row's own values, one per line -- e.g.
+# "Total Debt\n78.79\n80.94\n". A value is NEVER on its label's own line
+# here, so extract_pnl_figures's same-line rule would find nothing. But
+# unlike the OCR'd Balance Sheet case that rule was built to avoid, the
+# label-to-value adjacency here is exact and unbroken -- nothing unrelated
+# ever sits between a label and its values -- so "collect every line
+# immediately after the label that looks like a value, stop at the first
+# one that doesn't" is just as safe a rule as same-line matching, for this
+# specific table shape.
+_RATIONALE_TABLE_WINDOW = 60
+
+_RATIONALE_ANCHOR_RE = re.compile(r"brief\s+financials|financials\s*\(\s*(standalone|consolidated)\s*\)", re.I)
+_RATIONALE_BASIS_RE = re.compile(r"\b(standalone|consolidated)\b", re.I)
+
+_RATIONALE_LABEL_PATTERNS = [
+    ("total_operating_income", re.compile(r"^total\s+operating\s+income$", re.I)),
+    ("ebitda", re.compile(r"^(ebitda|pbildt)\*?$", re.I)),
+    ("pat", re.compile(r"^(pat|profit\s+after\s+tax\s*\(pat\))$", re.I)),
+    ("total_debt", re.compile(r"^total\s+debt$", re.I)),
+    ("tangible_net_worth", re.compile(r"^(tangible\s+)?net\s+worth$", re.I)),
+    ("overall_gearing", re.compile(r"^overall\s+gearing(\s+ratio)?\s*\((x|times)\)$", re.I)),
+    ("interest_coverage", re.compile(r"^interest\s+coverage(\s+ratio)?\s*\((x|times)\)$", re.I)),
+]
+
+_RATIONALE_VALUE_LINE_RE = re.compile(r"^\(?-?[\d,]+\.?\d*\)?$")
+_RATIONALE_NA_VALUES = {"NA", "N.A.", "N/A", "-"}
+
+
+def _is_rationale_value_line(line: str) -> bool:
+    stripped = line.strip()
+    return bool(_RATIONALE_VALUE_LINE_RE.match(stripped)) or stripped.upper() in _RATIONALE_NA_VALUES
+
+
+def extract_rationale_financials(document_text: str) -> dict:
+    """Total Debt / Tangible Net Worth / EBITDA / PAT / gearing figures off a
+    credit-rating agency's OWN rationale PDF text -- see the module note
+    above for why this is a label-then-following-lines rule rather than
+    extract_pnl_figures's same-line rule.
+
+    Returns {"standalone": {label_key: [value, ...]}, "consolidated": {...}}
+    -- a basis with nothing recognised in this document is simply absent
+    from the result, never an empty-but-present key. Each label's values are
+    an ORDERED LIST, one per reporting period found in the document (two or
+    three, typically), left unpaired with explicit period labels -- the
+    period-header rows above each table vary too much in shape across
+    agencies/documents to pair reliably without risking a wrong year
+    attached to a right number, so the ordering is the only claim made:
+    "these are this label's own values, in the document's own left-to-right
+    order," nothing stronger.
+    """
+    if not document_text or document_text.startswith("[Could not read") or "[OCR unavailable" in document_text:
+        return {}
+
+    lines = document_text.splitlines()
+    result = {}
+    for i, line in enumerate(lines):
+        if not _RATIONALE_ANCHOR_RE.search(line):
+            continue
+        basis_match = _RATIONALE_BASIS_RE.search(line)
+        if not basis_match and i > 0:
+            basis_match = _RATIONALE_BASIS_RE.search(lines[i - 1])
+        if not basis_match:
+            continue
+        basis = basis_match.group(1).lower()
+
+        figures = {}
+        window = lines[i + 1:i + 1 + _RATIONALE_TABLE_WINDOW]
+        for j, candidate in enumerate(window):
+            stripped = candidate.strip()
+            matched_key = None
+            for key, pattern in _RATIONALE_LABEL_PATTERNS:
+                if key not in figures and pattern.match(stripped):
+                    matched_key = key
+                    break
+            if not matched_key:
+                continue
+            values = []
+            for value_line in window[j + 1:]:
+                if not _is_rationale_value_line(value_line):
+                    break
+                values.append(value_line.strip())
+            if values:
+                figures[matched_key] = values
+        if figures:
+            result[basis] = figures
+
+    return result
 
 
 def summarize_complaint_outcomes(complaint_orders_manifest: list, documents_dir: str) -> dict:
@@ -2161,6 +2263,66 @@ def lookup_credit_rating(company_name: str) -> dict:
             f"RERA-registered promoters are too small or private to ever be rated."
         ),
     }
+
+
+# ---------------------------------------------------------------------------
+# Credit-rating rationale PDF download + figure extraction. `rationale_url`
+# above has existed since 2026-09-01 but was only ever stored as a citation
+# link -- nothing downloaded or read it. Scoped to CARE and Infomerics only:
+# both expose a direct PDF link; India Ratings' `rationale_url` points at a
+# JS-rendered press-release page this plain-requests approach cannot read
+# (confirmed live 2026-10-23), left for a future Playwright-based pass.
+#
+# TEXT-ONLY CACHE, same discipline as group_financial_disclosure.py's own
+# OCR cache and adapter_delhi's REAT appeal-order cache: the PDF bytes are
+# never kept, only the extracted text, keyed by a hash of the document's own
+# URL so a repeat run does not re-download/re-OCR a rationale already seen.
+# ---------------------------------------------------------------------------
+
+_RATIONALE_CACHE_DIR = os.path.join("output", "_cache", "credit_rating_rationale")
+
+
+def _rationale_cache_key(url: str) -> str:
+    return hashlib.sha1(str(url or "").encode("utf-8")).hexdigest()[:20]
+
+
+def fetch_rationale_financials(rationale_url: str) -> dict:
+    """Downloads a CARE/Infomerics rationale PDF (never India Ratings' HTML
+    page -- see module note above) and runs extract_rationale_financials on
+    its text. Returns {} for any URL that doesn't look like a PDF, for a
+    download/read failure, or when the document carries nothing this
+    extractor recognises -- never raises, since a caller wiring this into a
+    fan-out of agency ratings cannot let one PDF's quirks take down the
+    others.
+    """
+    if not rationale_url or not rationale_url.lower().split("?")[0].endswith(".pdf"):
+        return {}
+
+    cache_path = os.path.join(_RATIONALE_CACHE_DIR, _rationale_cache_key(rationale_url) + ".txt")
+    try:
+        if os.path.exists(cache_path):
+            with open(cache_path, "r", encoding="utf-8") as f:
+                text = f.read()
+        else:
+            resp = requests.get(rationale_url, timeout=config.REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            os.makedirs(_RATIONALE_CACHE_DIR, exist_ok=True)
+            tmp_path = cache_path + ".pdf.tmp"
+            with open(tmp_path, "wb") as f:
+                f.write(resp.content)
+            try:
+                text = _extract_document_text(tmp_path)
+            finally:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+            with open(cache_path, "w", encoding="utf-8") as f:
+                f.write(text)
+    except Exception:
+        return {}
+
+    return extract_rationale_financials(text)
 
 
 # ---------------------------------------------------------------------------
@@ -10012,6 +10174,29 @@ def _score_financial_strength_debt(facts: dict) -> dict:
                 f" A filed P&L statement was read for this project ({cites}), but it carries "
                 f"revenue/profit figures, not the debt-structure ratios this sub-metric scores."
             )
+        # Closer evidence than the P&L citation above: a CARE/Infomerics
+        # rationale PDF's own "Brief Financials"/"Financials (Standalone)"
+        # table can state Total Debt and (Tangible) Net Worth directly (see
+        # fetch_rationale_financials) -- still cited as a pointer, not
+        # turned into a score, because this sub-metric needs the DERIVED
+        # ratios (% debt in total capital employed, % secured debt in total
+        # debt) and a default-occurrence count, not the raw rupee figures
+        # alone, and no documented rubric exists in this codebase for
+        # deriving one from them.
+        for agency_rating in (facts.get("credit_rating_check") or {}).get("promoter", {}).get("ratings", []):
+            rationale_financials = agency_rating.get("rationale_financials")
+            if not rationale_financials:
+                continue
+            agency = agency_rating["agency"]
+            possessive = f"{agency}'" if agency.endswith("s") else f"{agency}'s"
+            for basis, figures in rationale_financials.items():
+                cites = ", ".join(f"{k}={v}" for k, v in figures.items())
+                reason += (
+                    f" {possessive} rating rationale states {basis} figures "
+                    f"({cites}, most recent period last), but turning these into the debt-to-"
+                    f"capital/secured-debt ratios this sub-metric scores is not something this "
+                    f"pipeline derives -- no documented formula exists for that conversion."
+                )
         return {"score": None, "tier": None, "reason": reason}
     if points <= 8:
         tier = "AAA"
@@ -13921,6 +14106,17 @@ def run_company_charter(
                     "published_date": "unknown",
                     "accessed_date": datetime.now().strftime("%Y-%m-%d"),
                 })
+                # CARE/Infomerics only, by construction -- see
+                # fetch_rationale_financials' own module note for why India
+                # Ratings' HTML rationale page is not attempted here. Never
+                # fatal: one agency's PDF failing to parse must not touch
+                # the other agency's rating or anything else in facts.
+                try:
+                    rationale_financials = fetch_rationale_financials(agency_rating["rationale_url"])
+                except Exception:
+                    rationale_financials = {}
+                if rationale_financials:
+                    agency_rating["rationale_financials"] = rationale_financials
 
     if "ibbi" in results:
         ibbi_result = results["ibbi"]
