@@ -775,19 +775,38 @@ _REGION_FIELDS = {
     "mumbai": {
         "year": "#ddlFromYear", "district": "#ddlDistrict",
         "property": "#txtAttributeValue", "captcha": "#txtImg",
-        # CONFIRMED LIVE 2026-10-14. Not guessed for rest_of_maharashtra/
-        # urban below -- autosolve only runs where this key is present.
+        # CONFIRMED LIVE 2026-10-14.
         "captcha_image": "#imgCaptcha",
         "search": "#btnSearch", "search_control_name": "btnSearch",
     },
     "rest_of_maharashtra": {
         "year": "#ddlFromYear1", "district": "#ddlDistrict1", "taluka": "#ddltahsil",
         "village": "#ddlvillage", "property": "#txtAttributeValue1", "captcha": "#txtImg1",
+        # CONFIRMED LIVE 2026-10-23, reproduced twice by hand: right after
+        # switching to this tab (before any selection), the visible captcha
+        # image is #imgCaptcha -- the SAME id the mumbai tab's own, untouched
+        # <img> uses. But the District/Taluka selects each fire a real
+        # ASP.NET postback (full page round-trip, not an in-place AJAX
+        # update), and after EITHER of those postbacks #imgCaptcha no longer
+        # exists in the DOM at all -- the server re-renders the same visible
+        # captcha under #imgCaptcha_new instead (confirmed present after
+        # District alone, and still present after Taluka). Since
+        # _setup_property_search_form always selects District (and, for this
+        # region, Taluka) before a solve is ever attempted, #imgCaptcha_new
+        # is the id that actually exists at solve time -- #imgCaptcha is only
+        # ever true on a page that has had zero postbacks yet, which this
+        # flow never reaches.
+        "captcha_image": "#imgCaptcha_new",
         "search": "#btnSearch_RestMaha", "search_control_name": "btnSearch_RestMaha",
     },
     "urban": {
         "year": "#ddlFromYearUrban", "district": "#ddlDistrictUrban", "village": "#ddlareanameUrban",
         "property": "#txtAttributeValueUrban", "captcha": "#txtImgUrban",
+        # CONFIRMED LIVE 2026-10-23: same #imgCaptcha_new id rest_of_maharashtra
+        # lands on post-postback (see that region's own comment) -- this
+        # region's District select postbacks the same way, so by solve time
+        # the page is already on #imgCaptcha_new here too.
+        "captcha_image": "#imgCaptcha_new",
         "search": "#btnSearchUrban", "search_control_name": "btnSearchUrban",
     },
 }
@@ -964,7 +983,7 @@ def _setup_property_search_form(
     return None
 
 
-def _recover_blanked_property_fields(page, fields: dict, district_label: str, year, village: str, property_number) -> bool:
+def _recover_blanked_property_fields(page, region: str, fields: dict, district_label: str, year, village: str, property_number) -> bool:
     """Refills ONLY whichever of District/Year/Select Village/Village Name/
     Property No. are currently wrong, IN PLACE on the current page -- no
     page.goto(), no re-running the whole setup sequence. CONFIRMED LIVE
@@ -975,8 +994,16 @@ def _recover_blanked_property_fields(page, fields: dict, district_label: str, ye
     CAPTCHA session with the portal rather than cleanly continuing the
     current one, so this stays on the same page and only touches whatever
     has actually gone wrong. Returns True if anything needed refilling
-    (purely informational for the caller's own logging)."""
-    wrong = _property_field_status(page, fields, district_label, year, village, property_number)
+    (purely informational for the caller's own logging).
+
+    `region` matters here: only "mumbai" has a separate free-text Village
+    Name box (#txtAreaName) alongside its cascading select -- the other two
+    regions' village/area field is a plain <select> with no companion text
+    box, so "village_name" never applies outside region="mumbai" (see
+    _property_field_status's own docstring for why this was hardcoded to
+    mumbai's shape for too long and silently crashed on every other
+    region)."""
+    wrong = _property_field_status(page, region, fields, district_label, year, village, property_number)
     if "district" in wrong:
         page.select_option(fields["district"], label=district_label)
         _settle(page)
@@ -986,7 +1013,7 @@ def _recover_blanked_property_fields(page, fields: dict, district_label: str, ye
         _settle(page)
         page.wait_for_timeout(3000)
     if "select_village" in wrong:
-        _select_cascading(page, "#ddlareaname", village, timeout_ms=10000)
+        _select_cascading(page, fields["village"], village, timeout_ms=10000)
     if "village_name" in wrong:
         page.locator("#txtAreaName").fill(village)
     if "property_no" in wrong:
@@ -994,8 +1021,8 @@ def _recover_blanked_property_fields(page, fields: dict, district_label: str, ye
     return bool(wrong)
 
 
-def _property_field_status(page, fields: dict, district_label: str, year, village: str, property_number) -> dict:
-    """Reads back District/Year/Select Village/Village Name/Property No.'s
+def _property_field_status(page, region: str, fields: dict, district_label: str, year, village: str, property_number) -> dict:
+    """Reads back District/Year/Select Village/[Village Name/]Property No.'s
     CURRENT values against what they should be, WITHOUT changing anything.
     Returns a dict naming only the field(s) that are wrong (empty dict if
     everything matches).
@@ -1013,7 +1040,16 @@ def _property_field_status(page, fields: dict, district_label: str, year, villag
     added to this check, were the fields that had reset. Every field this
     module has EVER observed resetting is checked here now, not just
     whichever ones were implicated by the most recent failure -- a partial
-    fix for a partial-check bug is still a partial check."""
+    fix for a partial-check bug is still a partial check.
+
+    CONFIRMED LIVE 2026-10-23: this function hardcoded mumbai's own field
+    ids (#ddlareaname / #txtAreaName) regardless of `region`, which is fine
+    for region="mumbai" but hung for 30s and then raised on
+    rest_of_maharashtra/urban, where #txtAreaName doesn't exist at all --
+    the actual reason autosolve had never been exercised past mumbai. Now
+    uses `fields["village"]` (the real select for whichever region is
+    active) and only checks the free-text Village Name box for mumbai,
+    the one region that actually has one."""
     wrong = {}
 
     district_select = page.locator(fields["district"])
@@ -1033,7 +1069,7 @@ def _property_field_status(page, fields: dict, district_label: str, year, villag
         if current_year != str(year):
             wrong["year"] = current_year
 
-    village_select = page.locator("#ddlareaname")
+    village_select = page.locator(fields["village"])
     try:
         selected_text = village_select.locator("option:checked").inner_text().strip()
     except Exception:
@@ -1041,10 +1077,11 @@ def _property_field_status(page, fields: dict, district_label: str, year, villag
     if selected_text.casefold() != village.strip().casefold():
         wrong["select_village"] = selected_text
 
-    area_name_field = page.locator("#txtAreaName")
-    current_area_name = _safe_read(lambda: area_name_field.input_value(), min_length=0)
-    if not current_area_name:
-        wrong["village_name"] = current_area_name
+    if region == "mumbai":
+        area_name_field = page.locator("#txtAreaName")
+        current_area_name = _safe_read(lambda: area_name_field.input_value(), min_length=0)
+        if not current_area_name:
+            wrong["village_name"] = current_area_name
 
     property_field = page.locator(fields["property"])
     current_property = _safe_read(lambda: property_field.input_value(), min_length=0)
@@ -1122,12 +1159,12 @@ def _autosolve_property_captcha(
         # have drifted by the time this point is reached (confirmed: a
         # reset was once caught on "attempt 1" itself, before any
         # rejection had even been recorded).
-        wrong = _property_field_status(page, fields, district_label, year, village, property_number)
+        wrong = _property_field_status(page, region, fields, district_label, year, village, property_number)
         if wrong:
             print(f"[INFO] {sorted(wrong)} no longer match before attempt {attempt} -- "
                   f"refilling in place, same session (no page reload).")
-            _recover_blanked_property_fields(page, fields, district_label, year, village, property_number)
-            still_wrong = _property_field_status(page, fields, district_label, year, village, property_number)
+            _recover_blanked_property_fields(page, region, fields, district_label, year, village, property_number)
+            still_wrong = _property_field_status(page, region, fields, district_label, year, village, property_number)
             if still_wrong:
                 print(f"[INFO] In-place recovery did not hold on attempt {attempt}/"
                       f"{_MAX_AUTOSOLVE_ATTEMPTS} ({sorted(still_wrong)} still wrong) -- redoing "
@@ -1217,13 +1254,13 @@ def _autosolve_property_captcha(
             # missed -- see _property_field_status's own docstring for the
             # live-confirmed false-negative that gap caused) before
             # trusting "no fresh CAPTCHA" as acceptance.
-            wrong = _property_field_status(page, fields, district_label, year, village, property_number)
+            wrong = _property_field_status(page, region, fields, district_label, year, village, property_number)
             if wrong:
                 print(f"[INFO] {backend_name}'s solve ({solved_text!r}) on attempt "
                       f"{attempt}/{_MAX_AUTOSOLVE_ATTEMPTS} left no fresh CAPTCHA behind, but "
                       f"{sorted(wrong)} no longer match -- the form was reset, not accepted. "
                       f"Refilling in place, same session, before the next attempt.")
-                _recover_blanked_property_fields(page, fields, district_label, year, village, property_number)
+                _recover_blanked_property_fields(page, region, fields, district_label, year, village, property_number)
                 continue
             print(f"[INFO] {backend_name} solved the CAPTCHA ({solved_text!r}) on attempt "
                   f"{attempt}/{_MAX_AUTOSOLVE_ATTEMPTS} -- no fresh CAPTCHA appeared after "
