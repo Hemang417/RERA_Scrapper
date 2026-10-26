@@ -6709,6 +6709,15 @@ def run_finding_research(facts: dict, researcher=None, force: bool = False) -> d
     in usage_summary.json, and the fan-out is capped by
     deep_research.MAX_FINDING_RESEARCH_CALLS.
 
+    The calls within that cap run CONCURRENTLY, one thread per finding, via
+    ThreadPoolExecutor -- the 8-finding cap was costing 8 sequential
+    round-trips' worth of wall-clock time for no reason, since the calls are
+    otherwise fully independent. Each finding still gets its own call, its own
+    full search budget and its own failure isolation (see below): only the
+    wait is shared now, not the work. Writing the resolved text back into
+    `facts` still happens afterwards, one finding at a time in the original
+    order, so there is no concurrent write into the same dict.
+
     Degrades safely and unconditionally. A finding whose research call fails,
     or that falls beyond the cap, keeps its original text verbatim -- an auth
     failure or a rate limit must never silently delete a finding, which would
@@ -6722,20 +6731,28 @@ def run_finding_research(facts: dict, researcher=None, force: bool = False) -> d
     cap = deep_research.MAX_FINDING_RESEARCH_CALLS
     context = _finding_research_context(facts)
 
-    results, enriched, failed = [], 0, 0
-    for i, finding in enumerate(findings):
-        if i >= cap:
-            results.append({**finding, "resolved": False, "note": f"beyond the {cap}-finding cap for one run"})
-            continue
+    in_budget, beyond_cap = findings[:cap], findings[cap:]
+
+    def _research_one(finding: dict) -> dict:
         try:
-            outcome = researcher(finding["clause"], context)
+            return researcher(finding["clause"], context)
         except Exception as e:
             # Per finding, not per run: deep_research.research_finding already
             # swallows its own failures, but an injected or future researcher
             # might not, and one bad finding must not cost the others their
             # research. This finding keeps its original text.
-            outcome = {"resolved": False, "text": finding["clause"],
-                       "still_live": "unknown", "note": f"deeper research could not run: {e}"}
+            return {"resolved": False, "text": finding["clause"],
+                    "still_live": "unknown", "note": f"deeper research could not run: {e}"}
+
+    outcomes = {}
+    if in_budget:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(in_budget)) as executor:
+            futures = {i: executor.submit(_research_one, finding) for i, finding in enumerate(in_budget)}
+            outcomes = {i: future.result() for i, future in futures.items()}
+
+    results, enriched, failed = [], 0, 0
+    for i, finding in enumerate(in_budget):
+        outcome = outcomes[i]
         record = {**finding, "resolved": bool(outcome.get("resolved")),
                   "still_live": outcome.get("still_live", "unknown"),
                   "note": outcome.get("note", "")}
@@ -6752,6 +6769,9 @@ def run_finding_research(facts: dict, researcher=None, force: bool = False) -> d
         else:
             failed += 1
         results.append(record)
+
+    for finding in beyond_cap:
+        results.append({**finding, "resolved": False, "note": f"beyond the {cap}-finding cap for one run"})
 
     # Carry forward what earlier runs recorded, then fingerprint every field
     # touched this run. Only fields that actually gained enriched text are

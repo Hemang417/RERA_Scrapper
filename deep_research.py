@@ -512,6 +512,26 @@ def _load_dotenv_once() -> None:
             os.environ[key] = value
 
 
+#  Bounds one HTTP request/response leg of a Claude call -- connect, write and
+# pool checkout fail fast (a stalled DNS lookup or dead connection is never
+# legitimate), while read gets enough room for one real streaming turn,
+# including server-side web_search latency. A full agentic pass makes several
+# of these legs in sequence (one per turn), so this bounds each leg, not the
+# whole multi-turn call -- that is the job of the caller's own turn/search
+# caps (MAX_FINDING_RESEARCH_CALLS etc.), not the transport.
+#
+# CONFIRMED LIVE 2026-10-26: without this, a stalled connection (no reachable
+# network, or a key-less request that never gets a prompt server response)
+# hangs well past the httpx2.Client default of Timeout(timeout=5.0) -- the
+# Anthropic SDK applies its own, much longer timeout per request when a
+# custom http_client is supplied and no explicit timeout overrides it, so the
+# client's own default silently does not apply. Every `[never fatal]` stage
+# that funnels through here was exposed to an effectively unbounded hang on
+# the one thing none of this pipeline's other budgets (cost cap, autosolve
+# attempts, finding cap) were ever meant to cover: the transport itself.
+_REQUEST_TIMEOUT = {"connect": 10.0, "write": 30.0, "pool": 10.0, "read": 90.0}
+
+
 def _get_client() -> Anthropic:
     global _client
     if _client is None:
@@ -531,7 +551,10 @@ def _get_client() -> Anthropic:
         # "Connection error." despite a valid API key.
         import certifi
         import httpx2
-        _client = Anthropic(http_client=httpx2.Client(verify=certifi.where()))
+        _client = Anthropic(
+            http_client=httpx2.Client(verify=certifi.where(), timeout=httpx2.Timeout(**_REQUEST_TIMEOUT)),
+            timeout=httpx2.Timeout(**_REQUEST_TIMEOUT),
+        )
     return _client
 
 
