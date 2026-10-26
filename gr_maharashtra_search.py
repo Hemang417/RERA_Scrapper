@@ -18,11 +18,35 @@ project sits in -- see _looks_like_gr_citation's own docstring for the
 format this module watches for). See company_charter.run_gr_citation_lookup
 for where this gets wired into the Charter pipeline's land-record section.
 
-SAME POLICY AS EVERY OTHER CAPTCHA-GATED MODULE HERE (gst_portal.py /
-mahabhumi.py / nclt_search.py / bombay_hc_search.py / session_auth.py):
-nothing in this file reads or solves a CAPTCHA image. A real, VISIBLE
-browser opens, a human reads it and types it in themselves, and this only
-reads the page AFTER that human submits.
+CLAUDE-VISION AUTOSOLVE (added 2026-10-26, see captcha_solver.solve_gr_captcha):
+unlike this module's original design, a real, VISIBLE browser opens but
+nothing waits on a human any more -- Claude vision reads #SitePH_ImgCaptcha
+and this module fills it in and clicks शोधा (Search) itself, same
+zero-human-intervention policy session_auth.py/up_captcha_search.py/
+ts_rera_client.py already use.
+
+CONFIRMED LIVE 2026-10-26 by deliberately submitting a wrong answer (twice:
+with no filters, and again with a real keyword filled in) -- and this is
+the one genuinely tricky part of autosolving this specific portal: UNLIKE
+UP-RERA's "Invalid Captcha!!!" text, this portal shows NO distinguishing
+rejection message at all. A wrong CAPTCHA just redisplays the page's own
+default, UNFILTERED recent-GRs listing -- and that listing renders INSIDE
+#SitePH_dgvDocuments itself (confirmed by direct DOM inspection: 11 rows
+present, same table id search_gr() already parses for a real result), not
+some other element -- so table-presence or row-count alone cannot tell a
+genuinely filtered result apart from "the search never actually ran". The
+one signal that does: #SitePH_ucPaging_lblTotalRecords (the "एकूण बाबी : N"
+total) only changes from its pre-submit baseline when a filter genuinely
+took effect, since a wrong CAPTCHA always redisplays the exact same
+all-departments total. _solve_captcha_and_search below records that total
+before the first attempt and, after each attempt, accepts the result only
+when the confirmed-empty "माहिती उपलब्ध नाही" text appears OR the total
+has moved from that baseline -- otherwise it refreshes the CAPTCHA and
+tries again. (A real search that happens to return exactly the same count
+as the unfiltered baseline would be misread as a wrong CAPTCHA and retried
+needlessly -- accepted as a known, very unlikely edge case given this
+module is only ever used for a narrow citation-keyword search, never an
+unfiltered one.)
 
 Mechanism, confirmed live by direct DOM inspection (classic ASP.NET
 WebForms, same full-page-postback style as nclt_search.py / up_captcha_
@@ -51,20 +75,21 @@ search.py's pre-autosolve incarnation, NOT an AJAX partial postback):
   - #SitePH_ImgCaptcha loads from a dedicated endpoint
     (Site/Information/captcha.aspx), re-rendering on every full postback --
     not a per-request guid in the src the way UP-RERA's CaptchaImage.axd is,
-    so there is no "did the token change" signal available here; this module
-    never needs one anyway since it never touches the CAPTCHA.
-  - CONFIRMED LIVE AND IMPORTANT: the "refresh CAPTCHA" icon next to the
-    image (`<input type="image" onclick="document.getElementById(
-    'form1').submit();">`) does a FULL PAGE POSTBACK TOO, exactly like the
+    so there is no "did the token change" signal available here. That turns
+    out not to matter: _solve_captcha_and_search only ever clicks the real
+    Search button itself (never the separate refresh icon, see below), and
+    a fresh image is already waiting after each such click since the whole
+    page reloads regardless of whether the answer was right.
+  - A separate "refresh CAPTCHA" icon also exists next to the image
+    (`<input type="image" onclick="document.getElementById(
+    'form1').submit();">`, no id/name -- alt="Refresh Captcha" is the one
+    stable selector) and does its own full page postback, exactly like the
     real Search button -- this is precisely the "captcha-refresh click
     masquerading as a human submit" bug class nclt_search.py's own
     docstring warns about, confirmed here by reading the actual onclick
-    handler rather than just guarding defensively against a hypothetical.
-    The distinguishing signal: WebForm_DoPostBackWithOptions (what btnSearch
-    actually calls) sets up the postback so the server sees
-    "ctl00$SitePH$btnSearch" in the POST body; the refresh icon's plain
-    `form.submit()` call does NOT carry that field at all. _wait_for_human_
-    submit's request_predicate below checks for exactly this.
+    handler. Not used by this module at all: with no human in the loop to
+    mistakenly click it, and Search's own postback already refreshing the
+    image, there is nothing left for it to do here.
   - Results render into #SitePH_dgvDocuments, a plain server-rendered
     <table> (not a grid widget), with a stable column shape confirmed live:
     Label6=department, Label1=title/subject, Label2=the system GR code,
@@ -86,6 +111,7 @@ import time
 
 from bs4 import BeautifulSoup
 
+import captcha_solver
 import config
 
 _SEARCH_URL = "https://gr.maharashtra.gov.in/1145/Government-Resolutions"
@@ -99,6 +125,11 @@ _SEL_GR_CODE = "#SitePH_txtGRNo"
 _SEL_CAPTCHA_INPUT = "#SitePH_txtimgcode"
 _SEL_SUBMIT_BTN = "#SitePH_btnSearch"
 _SEL_RESULTS_TABLE = "#SitePH_dgvDocuments"
+_SEL_TOTAL_RECORDS = "#SitePH_ucPaging_lblTotalRecords"
+_EMPTY_RESULT_TEXT = "माहिती उपलब्ध नाही"
+# Same cap as every other portal's Claude-vision autosolve loop in this
+# codebase (session_auth.py, up_captcha_search.py, ...).
+_MAX_AUTOSOLVE_ATTEMPTS = 8
 
 # Department value -> the live <select>'s own option value, confirmed live
 # 2026-10-16 by direct DOM inspection. Only the ones plausibly relevant to a
@@ -197,35 +228,73 @@ def _set_date_via_picker(page, date_input_selector: str, calendar_button_selecto
     day_cell.click()
 
 
-def _wait_for_human_submit(page, timeout_seconds: int) -> None:
-    """Waits for the REAL Search submit, not the CAPTCHA-refresh icon's own
-    full-page postback (both reload the same URL -- see this module's own
-    docstring for the confirmed-live onclick handlers that make this
-    distinction necessary). WebForm_DoPostBackWithOptions, what the real
-    btnSearch click fires, puts "ctl00$SitePH$btnSearch" in the POST body;
-    the refresh icon's plain form.submit() call never does."""
-    print(f"[INFO] Waiting up to {timeout_seconds}s for you to solve the CAPTCHA and click शोधा (Search)...")
+def _solve_captcha_and_search(page, timeout_seconds: int) -> None:
+    """Fills #SitePH_ImgCaptcha's answer in via Claude vision and clicks
+    शोधा (Search) itself, retrying against a FRESH CAPTCHA up to
+    _MAX_AUTOSOLVE_ATTEMPTS times. No separate refresh-icon click is needed
+    between attempts -- #SitePH_ImgCaptcha re-renders on every full postback
+    (confirmed live, including a plain Search click with no captcha-refresh
+    involved at all), so clicking Search again already hands the next
+    attempt a brand new image.
+
+    CONFIRMED LIVE 2026-10-26: this portal gives no rejection text at all
+    (see module docstring), so a wrong answer is recognized by
+    #SitePH_ucPaging_lblTotalRecords staying exactly at its pre-submit
+    baseline, not by any error message. Raises CaptchaTimeoutError if no
+    attempt within the budget produces a result distinguishable from that
+    baseline, or BrowserClosedError if the window closes first."""
     try:
-        with page.expect_request(
-            lambda req: (
-                req.method == "POST" and "Government-Resolutions" in req.url
-                and "btnSearch" in (req.post_data or "")
-            ),
-            timeout=timeout_seconds * 1000,
-        ):
-            pass
-    except Exception as e:
-        if page.is_closed():
-            raise BrowserClosedError("Browser window was closed before the CAPTCHA was solved.") from e
-        raise CaptchaTimeoutError(
-            f"No SEARCH submit within {timeout_seconds}s -- the CAPTCHA wasn't solved in time."
-        ) from e
-    try:
-        page.wait_for_load_state("load", timeout=15000)
+        baseline_total = _safe_read(lambda: page.inner_text(_SEL_TOTAL_RECORDS), attempts=3, delay=0.5)
     except Exception:
-        pass
-    _settle(page, timeout_ms=8000)
-    time.sleep(1.0)
+        baseline_total = None
+
+    print(f"\n[INFO] A browser window has opened at {_SEARCH_URL}")
+    print(f"[INFO] Solving the CAPTCHA via Claude vision (up to {_MAX_AUTOSOLVE_ATTEMPTS} attempts)...")
+    loop_deadline = time.time() + timeout_seconds
+    for attempt in range(1, _MAX_AUTOSOLVE_ATTEMPTS + 1):
+        if page.is_closed():
+            raise BrowserClosedError("Browser window was closed before the CAPTCHA was solved.")
+        if time.time() > loop_deadline:
+            raise CaptchaTimeoutError(
+                f"No confirmed result within {timeout_seconds}s -- the CAPTCHA wasn't solved in time."
+            )
+        try:
+            backend_name, solved_text = captcha_solver.solve_gr_captcha(page, enabled=True)
+            page.fill(_SEL_CAPTCHA_INPUT, solved_text)
+            page.click(_SEL_SUBMIT_BTN)
+        except Exception as e:
+            print(f"[INFO] CAPTCHA autosolve attempt {attempt}/{_MAX_AUTOSOLVE_ATTEMPTS} failed ({e}).")
+            continue
+
+        try:
+            page.wait_for_load_state("load", timeout=15000)
+        except Exception:
+            pass
+        _settle(page, timeout_ms=8000)
+        time.sleep(1.0)
+
+        body_text = _safe_read(lambda: page.inner_text("body"), min_length=50)
+        if _EMPTY_RESULT_TEXT in body_text:
+            print(f"[OK] {backend_name}'s solve ({solved_text!r}) was accepted on attempt "
+                  f"{attempt}/{_MAX_AUTOSOLVE_ATTEMPTS} (confirmed empty result).")
+            return
+        try:
+            current_total = page.inner_text(_SEL_TOTAL_RECORDS)
+        except Exception:
+            current_total = None
+        if current_total is not None and current_total != baseline_total:
+            print(f"[OK] {backend_name}'s solve ({solved_text!r}) was accepted on attempt "
+                  f"{attempt}/{_MAX_AUTOSOLVE_ATTEMPTS} (total moved from {baseline_total!r} to "
+                  f"{current_total!r}).")
+            return
+
+        print(f"[INFO] {backend_name}'s solve ({solved_text!r}) on attempt {attempt}/{_MAX_AUTOSOLVE_ATTEMPTS} "
+              f"is indistinguishable from the unfiltered default listing -- treating as a wrong CAPTCHA.")
+
+    raise CaptchaTimeoutError(
+        f"CAPTCHA autosolve did not produce a result distinguishable from the unfiltered default "
+        f"listing (total stayed at {baseline_total!r}) within {_MAX_AUTOSOLVE_ATTEMPTS} attempt(s)."
+    )
 
 
 def _safe_read(read_fn, attempts=6, delay=1.0, min_length=0):
@@ -297,8 +366,9 @@ def search_gr(
     UnknownDepartmentError if it isn't one), `keyword` (the right field for
     an old-style file-number citation -- see module note on why NOT the
     Code Number field), and `from_date`/`to_date` (ISO "YYYY-MM-DD",
-    optional, driven through the real datepicker), then waits for a human
-    to read the CAPTCHA and click शोधा (Search).
+    optional, driven through the real datepicker), then solves the CAPTCHA
+    via Claude vision and clicks शोधा (Search) itself (see
+    _solve_captcha_and_search).
 
     CONFIRMED LIVE 2026-10-16: a genuine zero-result search renders the
     exact text "माहिती उपलब्ध नाही." ("Information not available.") where
@@ -333,11 +403,9 @@ def search_gr(
             picker.locator(".ui-datepicker-month").select_option(label=_MONTH_ABBR[int(month) - 1])
             picker.locator(f"a.ui-state-default:text-is('{int(day)}')").first.click()
 
-        print(f"\n[INFO] A browser window has opened at {_SEARCH_URL}")
-        print(f"[INFO] Department ({department}) and keyword ({keyword!r}) are pre-filled. "
-              f"Please read the CAPTCHA and click शोधा (Search).")
+        print(f"[INFO] Department ({department}) and keyword ({keyword!r}) are pre-filled.")
         try:
-            _wait_for_human_submit(page, timeout_seconds)
+            _solve_captcha_and_search(page, timeout_seconds)
         except (CaptchaTimeoutError, BrowserClosedError) as e:
             return {"found": False, "rows": [], "raw_text": "", "url": page.url, "note": str(e)}
 
@@ -346,7 +414,7 @@ def search_gr(
         if screenshot_path:
             _safe_read(lambda: page.screenshot(path=screenshot_path, full_page=True))
 
-        if "माहिती उपलब्ध नाही" in body_text:
+        if _EMPTY_RESULT_TEXT in body_text:
             return {"found": False, "rows": [], "raw_text": body_text, "url": page.url, "note": ""}
 
         rows = _parse_results_rows(html, page.url)

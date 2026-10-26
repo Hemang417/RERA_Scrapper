@@ -594,6 +594,61 @@ def solve_mahabhumi_captcha(
     return "Claude vision", _solve_with_claude_vision(raw_bytes, _MAHABHUMI_FORMAT_HINT, "mahabhumi")
 
 
+# CONFIRMED LIVE 2026-10-26 against gr.maharashtra.gov.in's Government
+# Resolutions search: id="SitePH_ImgCaptcha", a classic ASP.NET <img> whose
+# src is a dedicated captcha.aspx endpoint (not inline base64, not a
+# per-request token in the src the way UP-RERA's is -- see
+# gr_maharashtra_search.py's own module docstring on why that matters for
+# detecting a wrong-guess rejection). A live sample read directly
+# ("NpQ1t7") is colored (green), mixed-case alphanumeric, 6 characters --
+# the page's own on-screen label says "Case Sensitive*" explicitly, so this
+# follows IGR's/Mahabhumi's "report the exact case" hint rather than
+# MahaRERA's always-uppercase one. Only one example seen so far, same
+# caveat IGR's own hint carries about asserting a fixed length.
+_SEL_GR_CAPTCHA_IMAGE = "#SitePH_ImgCaptcha"
+_GR_FORMAT_HINT = (
+    "The text is colored (green), rendered in a plain font with no background noise or "
+    "strikethrough line. It may mix uppercase letters, lowercase letters, and digits -- the "
+    "portal's own on-screen label says this field is Case Sensitive, so read and report the "
+    "EXACT case of each character; do not normalize to uppercase or lowercase."
+)
+
+
+def solve_gr_captcha(
+    page,
+    enabled: bool = False,
+    image_selector: str = _SEL_GR_CAPTCHA_IMAGE,
+) -> tuple[str, str]:
+    """Screenshots the CAPTCHA image on `page` (a Playwright Page, same
+    object gr_maharashtra_search.py already holds) and solves it via Claude
+    vision on the raw screenshot (no preprocessing -- no adversarial noise
+    confirmed, unlike GST). Returns (backend_name, solved_text). Raises
+    CaptchaSolveError/CaptchaSolverNotConfigured if Claude vision isn't
+    configured or the call fails -- the caller's own retry loop (see
+    gr_maharashtra_search.py's _solve_captcha_and_search) is what absorbs an
+    occasional misread.
+
+    `enabled` must be passed True explicitly (or GR_CAPTCHA_AUTOSOLVE=1 set
+    in the environment) -- same deliberate double gate as the other
+    solve_*_captcha functions, so autosolve can never fire just because this
+    module is imported or a key happens to be set in the environment for an
+    unrelated reason."""
+    if not (enabled or os.environ.get("GR_CAPTCHA_AUTOSOLVE") == "1"):
+        raise CaptchaSolveError(
+            "CAPTCHA autosolve is not enabled -- pass enabled=True or set GR_CAPTCHA_AUTOSOLVE=1."
+        )
+
+    if not _anthropic_api_key():
+        raise CaptchaSolverNotConfigured(
+            "ANTHROPIC_API_KEY is not set -- required to auto-solve the GR Maharashtra CAPTCHA."
+        )
+
+    locator = page.locator(image_selector).first
+    locator.wait_for(state="visible", timeout=15000)
+    raw_bytes = locator.screenshot()
+    return "Claude vision", _solve_with_claude_vision(raw_bytes, _GR_FORMAT_HINT, "gr")
+
+
 # CONFIRMED LIVE 2026-10-15 against rerait.telangana.gov.in/SearchList/Search:
 # id="captchaImage", served from a dedicated endpoint
 # (/SearchList/SearchCaptcha) rather than a data: URI or a URL with a
