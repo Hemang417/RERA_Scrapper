@@ -614,6 +614,24 @@ CTS_FINDINGS = [
      "unlike Karnataka, Gujarat or Uttar Pradesh above. A promoter's Telangana land details are "
      "therefore not reachable by this pipeline without an Indian mobile number to receive an OTP, which "
      "is a materially different access model from the other three states' CAPTCHA-only public search."),
+    ("Government Resolution (GR) file-number citation lookup", "Maharashtra GR portal (gr.maharashtra.gov.in)",
+     "Yes", "Free + CAPTCHA (autosolved)", "confirmed-live",
+     "NEW ROW 2026-10-26 -- gr_maharashtra_search.py, a genuinely separate workflow from Mahabhumi's "
+     "CTS/Property-Card lookup above: a project's land/title documents sometimes cite a reference that "
+     "LOOKS like a CTS/survey number but is actually a Government Resolution file number (Marathi "
+     "convention \"<dept-code>-<serial>/CR-<serial>/<dept-abbrev>-<serial>\", e.g. "
+     "\"CID-1812/CR-274/UD-10\") -- a policy document, not a land parcel, and Mahabhumi's own search "
+     "will never resolve it. company_charter.run_cts_land_lookup() detects the shape "
+     "(_looks_like_gr_citation) and routes to this portal instead. CONFIRMED LIVE 2026-08/09 against a "
+     "real Navi Mumbai CIDCO resettlement-scheme GR: Department + date range found the actual "
+     "published text. CLAUDE-VISION AUTOSOLVE ADDED 2026-10-26 (captcha_solver.solve_gr_captcha), "
+     "replacing the original human-wait design -- the one genuinely tricky part: this portal gives NO "
+     "rejection text on a wrong CAPTCHA at all (confirmed live by deliberately submitting a wrong "
+     "answer twice), and the default unfiltered recent-GRs listing renders inside the exact same "
+     "#SitePH_dgvDocuments table a real result would, so table-presence alone can't tell them apart. "
+     "The retry loop instead tracks #SitePH_ucPaging_lblTotalRecords (the total-record count) against "
+     "its pre-submit baseline and only accepts a result once that count moves or the confirmed-empty "
+     "'माहिती उपलब्ध नाही' marker appears."),
 ]
 
 # =========================================================================
@@ -1130,6 +1148,22 @@ def build_readme(wb):
          "structured owner/area/tenure/encumbrance/mutation fields still parse to {} even with the "
          "CAPTCHA no longer in the way -- OCR of the embedded card image is the only route confirmed to "
          "actually carry that content, not the DOM parser this sheet's Maha Bhulekh rows describe.", None),
+        ("20. 2026-10-26: GR Maharashtra's GR-citation lookup (Sheet B, new row) gained Claude-vision "
+         "autosolve, the same day the per-finding Charter research pass was parallelized (8 findings "
+         "now run concurrently instead of sequentially, same per-finding failure isolation) and the "
+         "shared Claude API client gained an explicit request timeout (connect=10s/read=90s/write=30s/"
+         "pool=10s) after a transport call hung with no bound in this sandbox -- every [never fatal] "
+         "stage that funnels through _run_agentic_pass now fails within a bounded window on a stalled "
+         "connection instead of risking an indefinite hang. GST was explicitly reverted to "
+         "human-by-default at the user's request (the one deliberate exception to the pipeline-wide "
+         "autosolve policy in entry 19 above) -- the autosolve code is untouched and still reachable "
+         "via autosolve=True/GST_CAPTCHA_AUTOSOLVE=1, it is simply no longer the default; entry 19's "
+         "own 'not fully proven, WAF-blocked' framing is superseded by this deliberate choice, not "
+         "resolved by it. Haryana's two CAPTCHA-gated endpoints (project search, case/complaint "
+         "search) were attempted but NOT built: haryanarera.gov.in was unreachable from this session's "
+         "browser across seven independent checks (https/http, two tabs, three paths, and a raw fetch "
+         "from the sibling hareraggm.gov.in domain, which loaded fine) -- no selector or CAPTCHA "
+         "mechanism was ever actually observed, so nothing was written against a guess.", None),
     ]
     for i, (text, font) in enumerate(lines, start=1):
         ws.cell(row=i, column=1, value=text)
