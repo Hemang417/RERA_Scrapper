@@ -168,6 +168,45 @@ def _autosolve_attempt_succeeded(page, success_texts: tuple, timeout_ms: int = 2
     return False
 
 
+def _wait_for_human_captcha_submit(page, timeout_seconds: int, poll_interval: float,
+                                   success_texts: tuple) -> None:
+    """Waits for a human to read the CAPTCHA, fill it in and click Search
+    themselves, in the real visible browser this module already opens -- this
+    function only watches, it never clicks Search itself.
+
+    REINSTATED 2026-10-26 as GST's own default -- every other CAPTCHA-gated
+    module in this pipeline moved to autosolve-only on 2026-10-15 (see
+    captcha_solver.py's module docstring), but GST's own autosolve stays
+    opt-in (GST_CAPTCHA_AUTOSOLVE=1 or autosolve=True) rather than the
+    default, a deliberate exception rather than an oversight.
+
+    Reuses _autosolve_attempt_succeeded's own success-text detection -- the
+    same signal the autosolve path already trusts to know a submit went
+    through -- polled against the FULL timeout budget instead of one
+    attempt's short window. Deliberately NOT the old body-text-length-delta
+    heuristic this module used before autosolve existed: that is exactly the
+    "CAPTCHA-refresh click masquerading as a human submit" bug class
+    up_captcha_search.py's own docstring warns about, and a better signal
+    already exists in this file, so there is no reason to bring the fragile
+    one back."""
+    print(f"[INFO] GST CAPTCHA autosolve is off by default -- please read the CAPTCHA in the "
+          f"browser window, enter it and click Search yourself. Waiting up to {timeout_seconds}s...")
+    elapsed = 0.0
+    chunk_ms = max(int(poll_interval * 1000), 500)
+    last_status_at = 0.0
+    while elapsed < timeout_seconds:
+        if page.is_closed():
+            raise BrowserClosedError("Browser window was closed before the CAPTCHA was solved.")
+        if _autosolve_attempt_succeeded(page, success_texts, timeout_ms=chunk_ms):
+            print("[INFO] CAPTCHA solved and Search submitted.")
+            return
+        elapsed += chunk_ms / 1000
+        if elapsed - last_status_at >= 30:
+            print(f"[INFO] Still waiting for you to solve the CAPTCHA ({int(elapsed)}s/{timeout_seconds}s)...")
+            last_status_at = elapsed
+    raise CaptchaTimeoutError(f"No result within {timeout_seconds}s -- the CAPTCHA wasn't solved in time.")
+
+
 def _solve_captcha_and_submit(
     page,
     search_btn_selector: str,
@@ -182,17 +221,19 @@ def _solve_captcha_and_submit(
     2026-10-14: this portal gives instant, silent feedback on a wrong guess
     (the page just redisplays with a validation error, no lockout), so
     repeated attempts are safe and turn a probabilistic per-attempt accuracy
-    into a much higher eventual success rate. Raises CaptchaTimeoutError if
-    autosolve isn't enabled or every attempt is exhausted -- no human-wait
-    fallback (removed 2026-10-15, see captcha_solver.py's own module
-    docstring for why). `autosolve=None` (the default) defers to the
-    GST_CAPTCHA_AUTOSOLVE env var via captcha_solver's own gate."""
+    into a much higher eventual success rate.
+
+    HUMAN BY DEFAULT (reinstated 2026-10-26): unlike every other CAPTCHA-gated
+    module in this pipeline, GST does NOT autosolve unless explicitly asked
+    to -- `autosolve=None` (the default) defers to the GST_CAPTCHA_AUTOSOLVE
+    env var, and when neither is set this falls back to
+    _wait_for_human_captcha_submit rather than raising. Pass autosolve=True
+    or set GST_CAPTCHA_AUTOSOLVE=1 to get the Claude-vision path below
+    instead."""
     want_autosolve = autosolve if autosolve is not None else os.environ.get("GST_CAPTCHA_AUTOSOLVE") == "1"
     if not want_autosolve:
-        raise CaptchaTimeoutError(
-            "GST CAPTCHA autosolve is not enabled -- pass autosolve=True or set "
-            "GST_CAPTCHA_AUTOSOLVE=1 (no human-wait fallback)."
-        )
+        _wait_for_human_captcha_submit(page, timeout_seconds, poll_interval, success_texts)
+        return
     solved = False
     for attempt in range(1, _MAX_AUTOSOLVE_ATTEMPTS + 1):
         try:
@@ -252,7 +293,8 @@ def _solve_captcha_and_submit(
     if not solved:
         raise CaptchaTimeoutError(
             f"CAPTCHA autosolve did not succeed within {_MAX_AUTOSOLVE_ATTEMPTS} attempt(s) -- "
-            "no human-wait fallback (removed 2026-10-15; see captcha_solver.py's own module docstring)."
+            "autosolve was explicitly requested (autosolve=True or GST_CAPTCHA_AUTOSOLVE=1), so this "
+            "does not fall back to a human wait; omit both to get the human-wait default instead."
         )
 
 
@@ -261,10 +303,12 @@ def search_gstins_by_pan(
     timeout_seconds: int = config.CAPTCHA_TIMEOUT_SECONDS,
     poll_interval: float = config.CAPTCHA_POLL_INTERVAL_SECONDS,
     screenshot_path: str | None = None,
-    autosolve: bool | None = True,
+    autosolve: bool | None = None,
 ) -> dict:
     """Opens a VISIBLE browser at the Search-by-PAN page, fills in `pan`,
-    then waits for a human to solve the CAPTCHA and click Search. Returns
+    then waits for a human to solve the CAPTCHA and click Search (pass
+    autosolve=True or set GST_CAPTCHA_AUTOSOLVE=1 for the Claude-vision path
+    instead -- see _solve_captcha_and_submit). Returns
     {"found": bool, "gstins": [str, ...], "raw_text": str, "ocr_text": str,
     "url": str, "note": str}. The GSTIN list is extracted with
     gst_compliance's own validate_gstin as a filter over every "word" on
@@ -333,11 +377,12 @@ def fetch_gstin_filing_table(
     poll_interval: float = config.CAPTCHA_POLL_INTERVAL_SECONDS,
     screenshot_path: str | None = None,
     years: tuple[str, ...] | None = None,
-    autosolve: bool | None = True,
+    autosolve: bool | None = None,
 ) -> dict:
     """Opens a VISIBLE browser at the Search-by-GSTIN page, fills in
-    `gstin`, waits for a human to solve the CAPTCHA and click Search, then
-    clicks "SHOW FILING TABLE" (#filingTable). Returns {"found": bool,
+    `gstin`, waits for a human to solve the CAPTCHA and click Search (pass
+    autosolve=True or set GST_CAPTCHA_AUTOSOLVE=1 for the Claude-vision path
+    instead), then clicks "SHOW FILING TABLE" (#filingTable). Returns {"found": bool,
     "by_year": {"2022-2023": {"raw_text": str}, ...}, "ocr_text": str,
     "url": str, "note": str}.
 

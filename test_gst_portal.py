@@ -34,61 +34,49 @@ class _FakePage:
     def is_closed(self):
         return self._closed
 
+    def wait_for_timeout(self, ms):
+        pass
+
     def screenshot(self, path, full_page=True):
         Image.new("RGB", (2, 2), color="white").save(path)  # a real, openable PNG
 
 
-def test_wait_for_captcha_solve_detects_success_text():
+# --- _wait_for_human_captcha_submit: GST's reinstated human-by-default path --
+
+def test_wait_for_human_captcha_submit_detects_success_text():
     page = _FakePage(["Search Taxpayer", "Search Taxpayer", "Legal Name: TEST COMPANY"])
-    gst_portal._wait_for_captcha_solve(page, timeout_seconds=5, poll_interval=0.01, success_texts=("Legal Name",))
-    print("test_wait_for_captcha_solve_detects_success_text: PASS")
+    gst_portal._wait_for_human_captcha_submit(page, timeout_seconds=5, poll_interval=0.01,
+                                              success_texts=("Legal Name",))
+    print("test_wait_for_human_captcha_submit_detects_success_text: PASS")
 
 
-def test_wait_for_captcha_solve_detects_url_change():
-    class _UrlChangingPage(_FakePage):
-        def __init__(self):
-            super().__init__(["same", "same", "same"])
-            self._calls = 0
-
-        @property
-        def url(self):
-            self._calls += 1
-            return "https://services.gst.gov.in/services/searchtp" if self._calls < 3 else "https://services.gst.gov.in/services/searchtp/results"
-
-        @url.setter
-        def url(self, value):
-            pass
-
-    page = _UrlChangingPage()
-    gst_portal._wait_for_captcha_solve(page, timeout_seconds=5, poll_interval=0.01, success_texts=("never appears",))
-    print("test_wait_for_captcha_solve_detects_url_change: PASS")
-
-
-def test_wait_for_captcha_solve_times_out_honestly():
+def test_wait_for_human_captcha_submit_times_out_honestly():
     page = _FakePage(["nothing changes"] * 200)
     try:
-        gst_portal._wait_for_captcha_solve(page, timeout_seconds=0.05, poll_interval=0.01, success_texts=("never appears",))
+        gst_portal._wait_for_human_captcha_submit(page, timeout_seconds=0.05, poll_interval=0.01,
+                                                  success_texts=("never appears",))
         assert False, "expected a CaptchaTimeoutError"
     except gst_portal.CaptchaTimeoutError as e:
         assert "wasn't solved in time" in str(e)
-    print("test_wait_for_captcha_solve_times_out_honestly: PASS")
+    print("test_wait_for_human_captcha_submit_times_out_honestly: PASS")
 
 
-def test_wait_for_captcha_solve_raises_on_closed_browser():
+def test_wait_for_human_captcha_submit_raises_on_closed_browser():
     class _ClosedPage(_FakePage):
         def is_closed(self):
             return True
 
     page = _ClosedPage(["x"])
     try:
-        gst_portal._wait_for_captcha_solve(page, timeout_seconds=5, poll_interval=0.01, success_texts=("x",))
+        gst_portal._wait_for_human_captcha_submit(page, timeout_seconds=5, poll_interval=0.01,
+                                                  success_texts=("x",))
         assert False, "expected a BrowserClosedError"
     except gst_portal.BrowserClosedError:
         pass
-    print("test_wait_for_captcha_solve_raises_on_closed_browser: PASS")
+    print("test_wait_for_human_captcha_submit_raises_on_closed_browser: PASS")
 
 
-def test_wait_for_captcha_solve_treats_transient_error_as_settling():
+def test_wait_for_human_captcha_submit_treats_transient_error_as_settling():
     class _FlakyPage(_FakePage):
         def __init__(self):
             super().__init__(["ok"])
@@ -101,8 +89,22 @@ def test_wait_for_captcha_solve_treats_transient_error_as_settling():
             return "Legal Name: recovered"
 
     page = _FlakyPage()
-    gst_portal._wait_for_captcha_solve(page, timeout_seconds=5, poll_interval=0.01, success_texts=("Legal Name",))
-    print("test_wait_for_captcha_solve_treats_transient_error_as_settling: PASS")
+    gst_portal._wait_for_human_captcha_submit(page, timeout_seconds=5, poll_interval=0.01,
+                                              success_texts=("Legal Name",))
+    print("test_wait_for_human_captcha_submit_treats_transient_error_as_settling: PASS")
+
+
+def test_solve_captcha_and_submit_defaults_to_human_wait_without_autosolve():
+    """The actual behavior change: no autosolve=True and no
+    GST_CAPTCHA_AUTOSOLVE=1 set must land in the human-wait path, not an
+    immediate CaptchaTimeoutError (that was the pre-2026-10-26 default)."""
+    os.environ.pop("GST_CAPTCHA_AUTOSOLVE", None)
+    page = _FakePage(["Search Taxpayer", "Search Taxpayer", "Legal Name: TEST COMPANY"])
+    gst_portal._solve_captcha_and_submit(
+        page, gst_portal._SEL_SEARCH_BTN, timeout_seconds=5, poll_interval=0.01,
+        success_texts=("Legal Name",), autosolve=None,
+    )
+    print("test_solve_captcha_and_submit_defaults_to_human_wait_without_autosolve: PASS")
 
 
 def test_ocr_screenshot_never_raises_on_bad_path():
@@ -155,6 +157,9 @@ class _FakeSearchPage(_FakePage):
 
     def fill(self, selector, value):
         self.filled[selector] = value
+
+    def press(self, selector, key):
+        pass
 
     def click(self, selector, timeout=10000):
         self.clicked.append(selector)
@@ -230,11 +235,11 @@ def test_fetch_gstin_filing_table_degrades_honestly_if_button_click_fails():
 
 
 if __name__ == "__main__":
-    test_wait_for_captcha_solve_detects_success_text()
-    test_wait_for_captcha_solve_detects_url_change()
-    test_wait_for_captcha_solve_times_out_honestly()
-    test_wait_for_captcha_solve_raises_on_closed_browser()
-    test_wait_for_captcha_solve_treats_transient_error_as_settling()
+    test_wait_for_human_captcha_submit_detects_success_text()
+    test_wait_for_human_captcha_submit_times_out_honestly()
+    test_wait_for_human_captcha_submit_raises_on_closed_browser()
+    test_wait_for_human_captcha_submit_treats_transient_error_as_settling()
+    test_solve_captcha_and_submit_defaults_to_human_wait_without_autosolve()
     test_ocr_screenshot_never_raises_on_bad_path()
     test_ocr_screenshot_succeeds_with_a_working_page()
     test_search_gstins_by_pan_extracts_gstins_from_results_text()
