@@ -48,7 +48,8 @@ the run continue. Nothing else may swallow an error.
 1. Assemble facts (`_run_charter_pass`, registry and insolvency checks,
    document grounding). Section B of `rules.md` is injected into every such call.
 2. `run_cts_land_lookup()`, `run_gr_citation_lookup()`,
-   `run_igr_registered_deed_check()`, and `run_gst_compliance_check()`
+   `run_igr_registered_deed_check()`, `run_dcpr_zoning_check()`, and
+   `run_gst_compliance_check()`
    **[opt-in]** — each does nothing without its human-supplied input file,
    unless a human is actually at this terminal (`sys.stdin.isatty()`), in
    which case CTS walks them through office → village → CTS-number →
@@ -72,6 +73,25 @@ the run continue. Nothing else may swallow an error.
    LIVE; candidate dates come from an ordinary web search for the citation
    string, outside this pipeline) and, on a single confirmed hit,
    downloading the GR's PDF and extracting its full text.
+   `run_dcpr_zoning_check()` — a DIFFERENT, independent land check: BMC's
+   own DP Remarks 2034 portal (`dcpr_zoning_search.py`), confirmed live and
+   CAPTCHA-free, headless-drivable end to end. Covers ONLY plots inside
+   BMC's 24 municipal wards (checked explicitly, same `facts["state"]
+   ["code"] == "MH"` gate as IGR, further narrowed to BMC's own
+   jurisdiction) — other Maharashtra municipal corporations each run a
+   separate DP portal not covered here, and MMR areas outside any municipal
+   corporation fall under MMRDA's Regional Plan, which has no plot-level
+   query tool at all (confirmed live 2026-10-28: MMRDA's own "Planning"/
+   "GIS" pages are policy/history text only). Asks a human for
+   ward/village/exact-CTS (same never-guess discipline as CTS/IGR) via
+   `output/<reg_no>/dcpr_lookup_input.json`, then reports the parcel's
+   Reservation(s)/Designation(s)/DP Road(s) status — whether a DP
+   reservation, road-widening line, or special-permission zone overlaps the
+   plot, which an architect's own FSI certificate would never volunteer.
+   Anything other than a plain "No Permission Required" value is recorded
+   as `facts["dcpr_zoning_flag"]`, promoted the same way `cts_mismatch_note`
+   is: surfaced for the investment team to raise with the developer
+   directly, not buried in a gaps list.
 2b. **Identity and group passes** — code-computed, never model-authored, each
    with its own Charter section: `_safe_promoter_identity()` (PAN off the filed
    card), `_safe_charge_movement()` (borrowing moved since last run),
@@ -171,6 +191,10 @@ Resolutions portal; traces a GR file-number citation found in a project's
 land/title documents back to its published text; also reachable inline via
 `run_gr_citation_lookup()`, auto-triggered by `run_cts_land_lookup()` when the
 recorded value is GR-shaped rather than a real CTS number) ·
+`dcpr_zoning_search.py wards|villages <ward>|cts <ward> <village> <query>|plot
+<ward> <village> <cts_number>` (no CAPTCHA, fully headless — BMC's own DP
+Remarks 2034 zoning/reservation portal; BMC municipal limits only; also
+reachable inline via `run_dcpr_zoning_check()`) ·
 `promoter_intake.py <CIN> [company_name]` (company profile/IBBI/
 group-companies/credit-rating checks from a bare CIN, no RERA number needed —
 writes `output/_pending/<CIN>/promoter_profile.json`) · `charter_report.py` via

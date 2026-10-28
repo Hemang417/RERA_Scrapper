@@ -4056,6 +4056,154 @@ def run_igr_registered_deed_check(facts: dict, reg_no: str, output_dir: str = co
     return facts
 
 
+def _interactively_resolve_dcpr_zoning(reg_no: str, output_dir: str) -> bool:
+    """Walks a human at THIS terminal through dcpr_zoning_search's own
+    Ward -> Village/Division -> CTS chain -- same shape as CTS's own
+    office/village resolution (_interactively_resolve_cts_lookup), but
+    simpler: BMC's DP Remarks portal has only 24 wards total, so they're
+    listed inline rather than requiring a separate live fetch first, and
+    the whole chain (ward, village, CTS candidates) is CAPTCHA-free, so
+    there is no separate "resolve now, fetch later" split the way CTS's own
+    Property Card step needs. Returns True and writes output/<reg_no>/
+    dcpr_lookup_input.json only if the human completes every step; False
+    (nothing written) the moment they decline."""
+    print(
+        "\n[INFO] DCPR-2034 zoning/reservation check (BMC's own DP Remarks 2034 portal) -- only covers plots "
+        "inside BMC's municipal limits (the 24 BMC wards). Confirms whether this plot sits under a DP "
+        "reservation/road-widening line or a zone needing the DP Department's own permission -- something a "
+        "promoter's own FSI claim would never volunteer. Leave any answer blank to skip."
+    )
+    ward = _safe_input(f"BMC Ward (one of {', '.join(sorted(dcpr_zoning_search_module().list_wards().get('wards', [])) or ['A', 'B', '...'])}): ").strip()
+    if not ward:
+        return False
+    village = _safe_input("Village/Division (exact label -- leave blank to skip): ").strip()
+    if not village:
+        return False
+    cts_number = _safe_input("Exact CTS/CS/FP number (e.g. 525/1A2 -- leave blank to skip): ").strip()
+    if not cts_number:
+        return False
+
+    record = {"ward": ward, "village": village, "cts_number": cts_number}
+    project_dir = os.path.join(output_dir, reg_no)
+    os.makedirs(project_dir, exist_ok=True)
+    with open(os.path.join(project_dir, "dcpr_lookup_input.json"), "w", encoding="utf-8") as f:
+        json.dump(record, f, indent=2, ensure_ascii=False)
+    print("[OK] DCPR zoning lookup input confirmed -- proceeding straight to the search.")
+    return True
+
+
+def dcpr_zoning_search_module():
+    """Lazy import, same deferred-import convention every other
+    browser-driven check in this module uses (mahabhumi, igr_maharashtra_
+    search, gr_maharashtra_search) -- keeps a Playwright dependency out of
+    company_charter's own import time for callers that never touch this
+    check."""
+    import dcpr_zoning_search
+    return dcpr_zoning_search
+
+
+# Reservation/Designation values BMC's own portal returns that mean "nothing
+# flagged" -- anything else (most commonly "DP Department's Permission
+# Required") means a reservation, road-widening line, or special-permission
+# zone overlaps this exact parcel, which the Charter should surface rather
+# than bury.
+_DCPR_CLEAR_VALUES = {"no permission required", "not applicable", "na", "n.a.", "nil", "-"}
+
+
+def run_dcpr_zoning_check(facts: dict, reg_no: str, output_dir: str = config.OUTPUT_ROOT) -> dict:
+    """Runs BMC's DP Remarks 2034 zoning/reservation lookup (see
+    dcpr_zoning_search.fetch_plot_info) only if output/<reg_no>/
+    dcpr_lookup_input.json exists, containing {"ward", "village",
+    "cts_number"}. Same opt-in shape as run_cts_land_lookup/run_igr_
+    registered_deed_check: silently returns facts unchanged if that file is
+    absent AND no human is at this terminal to supply it interactively.
+
+    BMC-municipal-limits-only, same explicit state+scope gate reasoning as
+    run_igr_registered_deed_check: unlike run_cts_land_lookup (which gets
+    its Maharashtra gate implicitly, since a non-Maharashtra project's land
+    text never matches), DCPR-2034 is further restricted to ONE municipal
+    corporation's own portal within Maharashtra -- a project outside BMC's
+    24 wards (another Maharashtra municipal corporation, or an MMR area
+    under MMRDA's Regional Plan rather than any municipal DP) has nothing
+    this check could ever resolve against, so it is never even offered
+    interactively for those.
+
+    Cross-checks the resolved CTS number against this Charter's own
+    RERA-sourced survey_cts_plot_numbers the same way run_cts_land_lookup
+    does -- a developer-supplied CTS not matching RERA's own official
+    record is recorded as facts["cts_mismatch_note"] if not already set by
+    an earlier check this pass.
+
+    This is a DIFFERENT evidence source from run_cts_land_lookup: Maha
+    Bhulekh's Property Card states ownership/tenure; this confirms (or
+    contradicts) whether the plot sits under a DP reservation, road-
+    widening line, or special-permission zone -- something an architect's
+    FSI certificate would never volunteer on its own, and the actual
+    baseline a promoter's claimed buildable area should be checked against."""
+    if (facts.get("state") or {}).get("code", "MH") != "MH":
+        return facts
+
+    input_path = os.path.join(output_dir, reg_no, "dcpr_lookup_input.json")
+    if not os.path.exists(input_path):
+        if sys.stdin.isatty() and _interactively_resolve_dcpr_zoning(reg_no, output_dir):
+            pass  # dcpr_lookup_input.json now exists -- fall through below.
+        else:
+            facts.setdefault("gaps", []).append(
+                "DCPR-2034 zoning/reservation check: not run. If this plot is inside BMC's municipal limits, "
+                f"supply ward/village/CTS number in {input_path} (ward/village from "
+                "`python dcpr_zoning_search.py wards` / `villages <ward>`) to cross-check its DP zone/"
+                "reservation status against the claimed FSI/area."
+            )
+            return facts
+
+    dcpr = dcpr_zoning_search_module()
+
+    with open(input_path, "r", encoding="utf-8") as f:
+        dcpr_input = json.load(f)
+
+    required = ("ward", "village", "cts_number")
+    missing = [k for k in required if not dcpr_input.get(k)]
+    if missing:
+        facts["dcpr_zoning_check"] = {"found": False, "note": f"{input_path} is missing required field(s): {', '.join(missing)}"}
+        return facts
+
+    recorded_cts = ((facts.get("land_identification", {}).get("survey_cts_plot_numbers") or {}).get("value") or "")
+    if recorded_cts and dcpr_input["cts_number"] not in recorded_cts and not facts.get("cts_mismatch_note"):
+        facts["cts_mismatch_note"] = (
+            f"CTS number mismatch: dcpr_lookup_input.json's CTS number ({dcpr_input['cts_number']!r}) does not "
+            f"appear in this Charter's own RERA-sourced survey_cts_plot_numbers ({recorded_cts!r}) -- confirm "
+            f"these refer to the same plot before trusting the DCPR zoning result below."
+        )
+
+    print(f"\n[INFO] {input_path} found -- checking BMC's DP Remarks 2034 zoning for CTS {dcpr_input['cts_number']}...")
+    try:
+        result = dcpr.fetch_plot_info(dcpr_input["ward"], dcpr_input["village"], dcpr_input["cts_number"])
+    except Exception as e:
+        # type(e).__name__ only -- same Playwright-launch leak risk as every
+        # other browser-driven check here.
+        result = {"found": False, "note": f"DCPR zoning check could not run this pass ({type(e).__name__})."}
+
+    facts["dcpr_zoning_check"] = result
+    if result.get("found"):
+        reservation = (result.get("fields", {}).get("Reservation(s)") or "").strip()
+        designation = (result.get("fields", {}).get("Designation(s)") or "").strip()
+        if reservation.lower() not in _DCPR_CLEAR_VALUES or designation.lower() not in _DCPR_CLEAR_VALUES:
+            facts["dcpr_zoning_flag"] = (
+                f"BMC's DP Remarks 2034 portal records this exact CTS parcel as Reservation(s)={reservation!r}, "
+                f"Designation(s)={designation!r} -- NOT a plain, unencumbered zone. Confirm with the developer "
+                f"whether the claimed buildable area/FSI already accounts for this before trusting it at face "
+                f"value."
+            )
+        facts.setdefault("sources", []).append({
+            "label": "BMC DP Remarks 2034 (zoning/reservation)",
+            "ref": f"CTS {dcpr_input['cts_number']}, {dcpr_input['village']} ward {dcpr_input['ward']} -- {result.get('url', '')}",
+            "topic": "land_record",
+            "published_date": "unknown",
+            "accessed_date": datetime.now().strftime("%Y-%m-%d"),
+        })
+    return facts
+
+
 def _interactively_resolve_gr_citation(reg_no: str, output_dir: str) -> bool:
     """Walks a human at THIS terminal through gr_maharashtra_search's own
     search fields -- called only when run_gr_citation_lookup has already
@@ -14254,6 +14402,7 @@ def run_company_charter(
     facts = run_cts_land_lookup(facts, reg_no, output_dir)
     facts = run_gr_citation_lookup(facts, reg_no, output_dir)
     facts = run_igr_registered_deed_check(facts, reg_no, output_dir)
+    facts = run_dcpr_zoning_check(facts, reg_no, output_dir)
     facts = run_gst_compliance_check(facts, reg_no, output_dir)
 
     land = facts.get("land_identification", {})
